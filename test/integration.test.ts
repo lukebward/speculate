@@ -29,7 +29,7 @@ const harnesses: Harness[] = [];
 
 async function startProxy(
   mode: 'strict' | 'annotated' | 'off',
-  opts: { profile?: boolean; rules?: unknown[] } = {},
+  opts: { profile?: boolean; rules?: unknown[]; statePath?: string } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'speculate-itest-'));
   const callLogPath = join(dir, 'calls.jsonl');
@@ -39,6 +39,8 @@ async function startProxy(
     JSON.stringify({
       mode,
       log: 'off',
+      // Hermetic by default: never write state into the runner's home dir.
+      persistence: opts.statePath ? { path: opts.statePath } : { enabled: false },
       servers: {
         github: {
           command: TSX,
@@ -283,6 +285,46 @@ describe('speculate end-to-end', () => {
     const stats = await readStats(client);
     expect(stats.perRule.some((r) => r.ruleId.startsWith('config:'))).toBe(true);
   }, 40_000);
+
+  it('persistence: learned transitions survive a proxy restart', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'speculate-state-'));
+    const statePath = join(stateDir, 'state.json');
+
+    // Session 1: teach the learner the transition, then shut down cleanly.
+    const first = await startProxy('annotated', { profile: false, statePath });
+    for (const n of [41, 42]) {
+      await timedCall(first.client, 'get_issue', { ...REPO, issue_number: n });
+      await timedCall(first.client, 'get_issue_comments', { ...REPO, issue_number: n });
+    }
+    await sleep(1_500); // let the debounced state save fire
+    expect(existsSync(statePath)).toBe(true);
+    await first.client.close();
+
+    // Session 2, same state file: the FIRST trigger already prefetches.
+    const second = await startProxy('annotated', { profile: false, statePath });
+    await timedCall(second.client, 'get_issue', { ...REPO, issue_number: 43 });
+    await sleep(LATENCY_MS * 3 + 200);
+    const warm = await timedCall(second.client, 'get_issue_comments', {
+      ...REPO,
+      issue_number: 43,
+    });
+    expect(warm.ms).toBeLessThan(LATENCY_MS * 0.5);
+
+    const stats = await readStats(second.client);
+    expect(stats.perRule.some((r) => r.ruleId.startsWith('learned:'))).toBe(true);
+    rmSync(stateDir, { recursive: true, force: true });
+  }, 60_000);
+
+  it('persistence disabled: no state file is written', async () => {
+    const { client } = await startProxy('annotated', { profile: false });
+    await timedCall(client, 'get_issue', { ...REPO, issue_number: 42 });
+    await timedCall(client, 'get_issue_comments', { ...REPO, issue_number: 42 });
+    await sleep(1_500);
+    // Nothing to assert on disk paths (none configured) — this test guards
+    // the wiring: stats still work and nothing crashed with the store off.
+    const stats = await readStats(client);
+    expect(stats.realCalls).toBeGreaterThanOrEqual(2);
+  }, 30_000);
 
   it('off mode is a pure pass-through: zero speculation', async () => {
     const { client, callLogPath } = await startProxy('off');

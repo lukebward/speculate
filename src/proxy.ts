@@ -29,6 +29,7 @@ import { TransitionLearner } from './learner.js';
 import { SpeculationExecutor } from './executor.js';
 import { builtinProfiles, profileCanonicalizer } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
+import { StateStore } from './persistence.js';
 import { canonicalKey } from './keys.js';
 import { Upstream } from './upstream.js';
 import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
@@ -60,8 +61,15 @@ export class SpeculateProxy {
   private routes = new Map<string, Route>();
   private sweeper: NodeJS.Timeout | null = null;
   private initialized = false;
+  private readonly learner: TransitionLearner;
+  private readonly store: StateStore | null;
+  private saveTimer: NodeJS.Timeout | null = null;
+  private savedRevision = -1;
 
-  constructor(config: SpeculateConfig, opts: { now?: () => number } = {}) {
+  constructor(
+    config: SpeculateConfig,
+    opts: { now?: () => number; statePath?: string | null } = {},
+  ) {
     this.config = config;
     this.now = opts.now ?? Date.now;
     const now = this.now;
@@ -122,6 +130,20 @@ export class SpeculateProxy {
       if (sc.rules?.length) extraRules[name] = compileConfigRules(name, sc.rules);
     }
 
+    // §13.6 persistence: learned transitions + rule feedback survive
+    // restarts. Tool results never touch disk (§6.4). Every load failure is
+    // a cold start, never an error.
+    this.learner = new TransitionLearner({ now });
+    this.store = opts.statePath ? new StateStore(opts.statePath, now) : null;
+    if (this.store) {
+      const state = this.store.load();
+      if (state) {
+        this.learner.importState(state.learner);
+        this.metrics.importRuleFeedback(state.ruleFeedback);
+      }
+      this.savedRevision = this.learner.revision;
+    }
+
     this.predictor = new Predictor({
       profiles: this.profiles,
       maxPerTrigger: config.maxPredictionsPerTrigger,
@@ -129,7 +151,7 @@ export class SpeculateProxy {
       extraRules,
       // §5.3 Tier 2 (server-agnostic): learns tool-call transitions from the
       // session itself, so unprofiled servers gain speculation over time.
-      learner: new TransitionLearner({ now }),
+      learner: this.learner,
     });
     this.executor = new SpeculationExecutor({
       upstreams: this.upstreams,
@@ -228,8 +250,35 @@ export class SpeculateProxy {
 
   async close(): Promise<void> {
     if (this.sweeper) clearInterval(this.sweeper);
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveState(); // best-effort final flush
     await Promise.all([...this.upstreams.values()].map((u) => u.close()));
     await this.server.close();
+  }
+
+  /** Debounced dirty-flag save: fires ~1s after the learner last changed. */
+  private scheduleSave(): void {
+    if (!this.store || this.saveTimer || this.learner.revision === this.savedRevision) {
+      return;
+    }
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this.saveState();
+    }, 1_000);
+    this.saveTimer.unref();
+  }
+
+  private saveState(): void {
+    if (!this.store) return;
+    if (this.learner.revision === this.savedRevision) return;
+    if (
+      this.store.save({
+        learner: this.learner.exportState(),
+        ruleFeedback: this.metrics.exportRuleFeedback(),
+      })
+    ) {
+      this.savedRevision = this.learner.revision;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -503,6 +552,7 @@ export class SpeculateProxy {
           if (this.config.mode !== 'off' && predictions.length > 0) {
             this.executor.submit(predictions);
           }
+          this.scheduleSave(); // §13.6: persist newly learned transitions
         } catch (err) {
           process.stderr.write(`[speculate] prediction error: ${(err as Error).message}\n`);
         }

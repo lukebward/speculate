@@ -35,6 +35,35 @@ const DEFAULT_MAX_GAP_MS = 120_000;
 const DEFAULT_MIN_OBSERVATIONS = 2;
 const DEFAULT_MAX_PREDICTIONS_PER_TRIGGER = 3;
 const DEFAULT_MAX_TRANSITIONS = 500;
+/** Persisted observation counts are clamped here on import (sanity bound). */
+const MAX_IMPORTED_COUNT = 10_000;
+
+// -- persistence shapes (DESIGN.md §13.6) --------------------------------------
+//
+// What persists: transition structure — tool names and argument TEMPLATES
+// (including constant argument values via their canonical repr). What never
+// persists: tool results, the per-server chain heads (session-local), and
+// LRU clocks (recency resets on load).
+
+export interface SerializedSource {
+  kind: 'arg' | 'parsed' | 'const';
+  key?: string;
+  path?: string[];
+  /** For 'const': the stableStringify repr; the value is rebuilt from it. */
+  repr?: string;
+}
+
+export interface SerializedTransition {
+  server: string;
+  prevTool: string;
+  nextTool: string;
+  count: number;
+  templates: Array<{ name: string; underivable: boolean; sources: SerializedSource[] }>;
+}
+
+export interface SerializedLearner {
+  transitions: SerializedTransition[];
+}
 
 /**
  * Where a next-call argument value came from, relative to the previous
@@ -89,6 +118,8 @@ export class TransitionLearner {
 
   /** Most recent observed call per server — the head of that server's chain. */
   private readonly lastCallByServer = new Map<string, PrevCall>();
+  /** Bumped on every transition create/update/import (dirty tracking). */
+  private mutations = 0;
   /**
    * Tracked transitions keyed by `<server> <prevTool> <nextTool>` (labels
    * and tool names never contain spaces). Map insertion order is LRU
@@ -123,6 +154,64 @@ export class TransitionLearner {
     }
   }
 
+  /** Increments whenever tracked transitions change (dirty tracking). */
+  get revision(): number {
+    return this.mutations;
+  }
+
+  /**
+   * Snapshot of learned transitions for persistence (LRU order, oldest
+   * first, so importing re-establishes the same eviction order). Chain
+   * heads and recency clocks are session-local and excluded.
+   */
+  exportState(): SerializedLearner {
+    const transitions: SerializedTransition[] = [];
+    for (const state of this.transitions.values()) {
+      transitions.push({
+        server: state.server,
+        prevTool: state.prevTool,
+        nextTool: state.nextTool,
+        count: state.count,
+        templates: [...state.templates.entries()].map(([name, tpl]) => ({
+          name,
+          underivable: tpl.underivable,
+          sources: tpl.sources.map(serializeSource),
+        })),
+      });
+    }
+    return { transitions };
+  }
+
+  /**
+   * Load a prior snapshot into this (fresh) learner. Defensive by design:
+   * every malformed transition/template/source is skipped, never thrown —
+   * a corrupt or stale state file can only cost learned knowledge, not
+   * correctness or uptime.
+   */
+  importState(data: unknown): void {
+    try {
+      const root = data as { transitions?: unknown };
+      if (!root || !Array.isArray(root.transitions)) return;
+      for (const raw of root.transitions) {
+        const t = deserializeTransition(raw);
+        if (!t) continue;
+        const key = `${t.server} ${t.prevTool} ${t.nextTool}`;
+        this.transitions.set(key, {
+          ...t,
+          lastUpdated: this.now(),
+        });
+        while (this.transitions.size > this.maxTransitions) {
+          const oldest = this.transitions.keys().next();
+          if (oldest.done) break;
+          this.transitions.delete(oldest.value);
+        }
+      }
+      this.mutations++;
+    } catch {
+      // Fail closed: partial import is fine, corruption is not contagious.
+    }
+  }
+
   // -- observation ----------------------------------------------------------
 
   private observeInner(call: ObservedCall): void {
@@ -142,6 +231,7 @@ export class TransitionLearner {
     if (gap < 0 || gap > this.maxGapMs) return;
 
     const key = `${call.server} ${prev.tool} ${call.tool}`;
+    this.mutations++;
     let state = this.transitions.get(key);
     if (state) {
       this.transitions.delete(key); // refresh LRU position on re-set below
@@ -200,6 +290,95 @@ export class TransitionLearner {
       ruleId: c.ruleId,
     }));
   }
+}
+
+// -- (de)serialization ----------------------------------------------------------
+
+function serializeSource(s: Source): SerializedSource {
+  switch (s.kind) {
+    case 'arg':
+      return { kind: 'arg', key: s.key };
+    case 'parsed':
+      return { kind: 'parsed', path: [...s.path] };
+    case 'const':
+      return { kind: 'const', repr: s.repr };
+  }
+}
+
+function deserializeSource(raw: unknown): Source | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const s = raw as SerializedSource;
+  if (s.kind === 'arg' && typeof s.key === 'string') {
+    return { kind: 'arg', key: s.key };
+  }
+  if (
+    s.kind === 'parsed' &&
+    Array.isArray(s.path) &&
+    s.path.every((seg) => typeof seg === 'string')
+  ) {
+    return { kind: 'parsed', path: [...s.path] };
+  }
+  if (s.kind === 'const' && typeof s.repr === 'string') {
+    try {
+      // repr is the value's stableStringify form, so it round-trips via JSON.
+      return { kind: 'const', value: JSON.parse(s.repr) as unknown, repr: s.repr };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function deserializeTransition(
+  raw: unknown,
+): Omit<TransitionState, 'lastUpdated'> | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const t = raw as SerializedTransition;
+  if (
+    typeof t.server !== 'string' ||
+    t.server.length === 0 ||
+    t.server.includes(' ') ||
+    typeof t.prevTool !== 'string' ||
+    t.prevTool.length === 0 ||
+    t.prevTool.includes(' ') ||
+    typeof t.nextTool !== 'string' ||
+    t.nextTool.length === 0 ||
+    t.nextTool.includes(' ') ||
+    typeof t.count !== 'number' ||
+    !Number.isFinite(t.count) ||
+    t.count < 1 ||
+    !Array.isArray(t.templates)
+  ) {
+    return null;
+  }
+  const templates = new Map<string, ArgTemplate>();
+  for (const rawTpl of t.templates) {
+    if (rawTpl === null || typeof rawTpl !== 'object') return null;
+    const tpl = rawTpl as { name?: unknown; underivable?: unknown; sources?: unknown };
+    if (typeof tpl.name !== 'string' || typeof tpl.underivable !== 'boolean') {
+      return null;
+    }
+    if (tpl.underivable) {
+      templates.set(tpl.name, { underivable: true, sources: [] });
+      continue;
+    }
+    if (!Array.isArray(tpl.sources)) return null;
+    const sources: Source[] = [];
+    for (const rawSrc of tpl.sources) {
+      const s = deserializeSource(rawSrc);
+      if (s) sources.push(s); // malformed sources are dropped, not fatal
+    }
+    // A derivable template that lost all its sources is poisoned, matching
+    // the live invariant (empty sources ⇒ underivable).
+    templates.set(tpl.name, { underivable: sources.length === 0, sources });
+  }
+  return {
+    server: t.server,
+    prevTool: t.prevTool,
+    nextTool: t.nextTool,
+    count: Math.min(Math.floor(t.count), MAX_IMPORTED_COUNT),
+    templates,
+  };
 }
 
 // -- argument templates -------------------------------------------------------

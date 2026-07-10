@@ -74,6 +74,7 @@ async function runSession(mode: 'strict' | 'off', latencyMs: number): Promise<Ru
     JSON.stringify({
       mode,
       log: 'off',
+      persistence: { enabled: false }, // keep benchmark runs cold and hermetic
       servers: {
         github: {
           command: TSX,

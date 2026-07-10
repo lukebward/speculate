@@ -6,6 +6,7 @@
  * to stderr).
  */
 import { loadConfig } from './config.js';
+import { defaultStatePath } from './persistence.js';
 import { SpeculateProxy } from './proxy.js';
 
 function usage(): never {
@@ -36,7 +37,13 @@ async function main(): Promise<void> {
     config.mode = modeOverride as typeof config.mode;
   }
 
-  const proxy = new SpeculateProxy(config);
+  // §13.6: learned state persists per config file unless disabled.
+  const statePath =
+    config.persistence?.enabled === false
+      ? null
+      : (config.persistence?.path ?? defaultStatePath(configPath));
+
+  const proxy = new SpeculateProxy(config, { statePath });
   const shutdown = async (): Promise<void> => {
     try {
       await proxy.close();

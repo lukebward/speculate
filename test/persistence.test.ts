@@ -1,0 +1,161 @@
+/**
+ * Persistence layer (DESIGN.md §13.6): StateStore durability semantics,
+ * learner export/import round-trip, and rule-feedback priors with decay.
+ */
+import { describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
+import { StateStore, defaultStatePath } from '../src/persistence.js';
+import { TransitionLearner } from '../src/learner.js';
+import { Metrics } from '../src/metrics.js';
+import type { ObservedCall } from '../src/types.js';
+
+const dir = () => mkdtempSync(join(tmpdir(), 'speculate-persist-'));
+
+function call(
+  server: string,
+  tool: string,
+  args: Record<string, unknown>,
+  parsed: unknown,
+  timestamp: number,
+): ObservedCall {
+  return { server, tool, args, result: { content: [] }, parsed, timestamp, latencyMs: 10 };
+}
+
+describe('StateStore', () => {
+  it('round-trips state atomically and owner-only', () => {
+    const path = join(dir(), 'nested', 'deeper', 'state.json');
+    const store = new StateStore(path, () => 1234);
+    expect(store.load()).toBeNull(); // first run: cold start
+    expect(store.save({ learner: { transitions: [] }, ruleFeedback: { r: { hits: 1, wasted: 0, speculated: 2 } } })).toBe(true);
+    expect(existsSync(`${path}.tmp`)).toBe(false); // renamed, not left behind
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+
+    const loaded = store.load();
+    expect(loaded?.version).toBe(1);
+    expect(loaded?.savedAt).toBe(1234);
+    expect(loaded?.ruleFeedback['r']).toEqual({ hits: 1, wasted: 0, speculated: 2 });
+  });
+
+  it('treats corrupt and version-mismatched files as cold starts', () => {
+    const path = join(dir(), 'state.json');
+    const store = new StateStore(path);
+    writeFileSync(path, '{not json');
+    expect(store.load()).toBeNull();
+    writeFileSync(path, JSON.stringify({ version: 999, ruleFeedback: {} }));
+    expect(store.load()).toBeNull();
+    writeFileSync(path, JSON.stringify({ version: 1 })); // missing ruleFeedback
+    expect(store.load()).toBeNull();
+  });
+
+  it('reports save failure without throwing', () => {
+    const base = dir();
+    // Occupy the would-be parent directory with a FILE so mkdir fails.
+    const blocker = join(base, 'state.json');
+    writeFileSync(blocker, 'occupied');
+    const bad = new StateStore(join(blocker, 'child.json'));
+    expect(bad.save({ learner: {}, ruleFeedback: {} })).toBe(false);
+  });
+});
+
+describe('TransitionLearner export/import', () => {
+  it('a fresh learner with imported state predicts immediately', () => {
+    const a = new TransitionLearner({ now: () => 0 });
+    a.observe(call('srv', 'list', { q: 'x' }, [{ id: 7 }], 0));
+    a.observe(call('srv', 'get', { id: 7, q: 'x' }, null, 100));
+    a.observe(call('srv', 'list', { q: 'y' }, [{ id: 9 }], 200));
+    a.observe(call('srv', 'get', { id: 9, q: 'y' }, null, 300));
+
+    const exported = a.exportState();
+    // Simulate a real restart: state travels through JSON.
+    const b = new TransitionLearner({ now: () => 0 });
+    b.importState(JSON.parse(JSON.stringify(exported)));
+
+    const out = b.predict(call('srv', 'list', { q: 'z' }, [{ id: 42 }], 400));
+    expect(out).toHaveLength(1);
+    expect(out[0]!.tool).toBe('get');
+    expect(out[0]!.args).toEqual({ id: 42, q: 'z' }); // parsed-path + arg-copy survive the trip
+    expect(out[0]!.ruleId).toBe('learned:list→get');
+  });
+
+  it('revision changes when transitions change (dirty tracking)', () => {
+    const l = new TransitionLearner({ now: () => 0 });
+    const r0 = l.revision;
+    l.observe(call('srv', 'a', {}, null, 0));
+    expect(l.revision).toBe(r0); // chain head only — nothing learned yet
+    l.observe(call('srv', 'b', {}, null, 50));
+    expect(l.revision).toBeGreaterThan(r0); // transition recorded
+  });
+
+  it('skips malformed transitions without failing the import', () => {
+    const l = new TransitionLearner({ now: () => 0 });
+    l.importState({
+      transitions: [
+        'garbage',
+        { server: 'has space', prevTool: 'a', nextTool: 'b', count: 2, templates: [] },
+        { server: 's', prevTool: 'a', nextTool: 'b', count: -1, templates: [] },
+        {
+          server: 's',
+          prevTool: 'a',
+          nextTool: 'b',
+          count: 3,
+          templates: [{ name: 'x', underivable: false, sources: [{ kind: 'const', repr: '"v"' }] }],
+        },
+      ],
+    });
+    const out = l.predict(call('s', 'a', {}, null, 0));
+    expect(out).toHaveLength(1); // only the one valid transition survived
+    expect(out[0]!.args).toEqual({ x: 'v' });
+  });
+
+  it('importState never throws on hostile input', () => {
+    const l = new TransitionLearner();
+    for (const junk of [null, 42, 'x', { transitions: 'no' }, { transitions: [{}] }]) {
+      expect(() => l.importState(junk)).not.toThrow();
+    }
+  });
+});
+
+describe('Metrics feedback priors', () => {
+  it('halves imported counts and folds them into ruleFeedback only', () => {
+    const m = new Metrics({ mode: 'strict', log: 'off', now: () => 0 });
+    m.importRuleFeedback({ r1: { hits: 10, wasted: 4, speculated: 20 } });
+    expect(m.ruleFeedback('r1')).toEqual({ hits: 5, wasted: 2, speculated: 10 });
+    // Session-only reporting stays clean: no per-rule entry until events land.
+    expect(m.statsSnapshot().perRule.find((r) => r.ruleId === 'r1')).toBeUndefined();
+  });
+
+  it('exports combined prior + session counts and skips malformed priors', () => {
+    const m = new Metrics({ mode: 'strict', log: 'off', now: () => 0 });
+    m.importRuleFeedback({
+      r1: { hits: 4, wasted: 0, speculated: 8 },
+      bad: 'nope',
+      alsoBad: { hits: Infinity, wasted: -3, speculated: 'x' },
+    });
+    m.record({ type: 'speculated', server: 's', tool: 't', ruleId: 'r1' });
+    m.record({ type: 'hit', server: 's', tool: 't', ruleId: 'r1', savedMs: 100 });
+    const out = m.exportRuleFeedback();
+    expect(out['r1']).toEqual({ hits: 3, wasted: 0, speculated: 5 }); // 2+1, 4+1
+    expect(out['bad']).toBeUndefined();
+    expect(out['alsoBad']).toBeUndefined();
+  });
+});
+
+describe('defaultStatePath', () => {
+  it('is stable per config path and respects XDG_STATE_HOME', () => {
+    const prev = process.env.XDG_STATE_HOME;
+    try {
+      process.env.XDG_STATE_HOME = `${sep}xdg-state`;
+      const a = defaultStatePath('/proj/speculate.config.json');
+      const b = defaultStatePath('/proj/speculate.config.json');
+      const c = defaultStatePath('/other/speculate.config.json');
+      expect(a).toBe(b);
+      expect(a).not.toBe(c);
+      expect(a.startsWith(`${sep}xdg-state${sep}speculate${sep}state-`)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = prev;
+    }
+  });
+});

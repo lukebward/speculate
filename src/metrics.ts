@@ -49,6 +49,15 @@ export class Metrics {
 
   private readonly perServer = new Map<string, PerServerCounters>();
   private readonly perRule = new Map<string, PerRuleCounters>();
+  /**
+   * Prior-session feedback (§13.6): folded into ruleFeedback() so the
+   * suppression loop remembers across restarts, but kept out of
+   * statsSnapshot(), which reports this session only.
+   */
+  private readonly priorFeedback = new Map<
+    string,
+    { hits: number; wasted: number; speculated: number }
+  >();
 
   constructor(opts: {
     mode: SpeculationMode;
@@ -59,6 +68,45 @@ export class Metrics {
     this.log = opts.log;
     this.now = opts.now ?? Date.now;
     this.startedAt = this.now();
+  }
+
+  /**
+   * Load prior-session feedback. Counts are HALVED on import (floor) and
+   * capped: decay lets evidence age out across restarts, so a rule
+   * suppressed by ancient waste eventually earns a retrial instead of
+   * being muted forever (suppressed rules never speculate, so they could
+   * otherwise never redeem themselves). Malformed entries are skipped.
+   */
+  importRuleFeedback(priors: unknown): void {
+    if (priors === null || typeof priors !== 'object') return;
+    const CAP = 500;
+    for (const [ruleId, raw] of Object.entries(priors as Record<string, unknown>)) {
+      if (raw === null || typeof raw !== 'object') continue;
+      const r = raw as { hits?: unknown; wasted?: unknown; speculated?: unknown };
+      const clean = (v: unknown): number =>
+        typeof v === 'number' && Number.isFinite(v) && v > 0
+          ? Math.min(Math.floor(v / 2), CAP)
+          : 0;
+      const entry = {
+        hits: clean(r.hits),
+        wasted: clean(r.wasted),
+        speculated: clean(r.speculated),
+      };
+      if (entry.hits + entry.wasted + entry.speculated > 0) {
+        this.priorFeedback.set(ruleId, entry);
+      }
+    }
+  }
+
+  /** Combined (prior + session) feedback for persistence. */
+  exportRuleFeedback(): Record<string, { hits: number; wasted: number; speculated: number }> {
+    const out: Record<string, { hits: number; wasted: number; speculated: number }> = {};
+    const ids = new Set([...this.priorFeedback.keys(), ...this.perRule.keys()]);
+    for (const id of ids) {
+      const fb = this.ruleFeedback(id);
+      if (fb.hits + fb.wasted + fb.speculated > 0) out[id] = fb;
+    }
+    return out;
   }
 
   record(ev: DecisionEvent): void {
@@ -119,17 +167,21 @@ export class Metrics {
     }
   }
 
-  /** Per-rule feedback for the predictor's suppression loop (§5.6). */
+  /**
+   * Per-rule feedback for the predictor's suppression loop (§5.6):
+   * this session's counters plus decayed prior-session counters.
+   */
   ruleFeedback(ruleId: string): {
     hits: number;
     wasted: number;
     speculated: number;
   } {
     const r = this.perRule.get(ruleId);
+    const p = this.priorFeedback.get(ruleId);
     return {
-      hits: r?.hits ?? 0,
-      wasted: r?.wasted ?? 0,
-      speculated: r?.speculated ?? 0,
+      hits: (r?.hits ?? 0) + (p?.hits ?? 0),
+      wasted: (r?.wasted ?? 0) + (p?.wasted ?? 0),
+      speculated: (r?.speculated ?? 0) + (p?.speculated ?? 0),
     };
   }
 

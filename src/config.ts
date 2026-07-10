@@ -35,6 +35,14 @@ const configSchema = z.object({
   maxPredictionsPerTrigger: z.number().int().positive().max(16).default(3),
   servers: z.record(z.string().regex(/^[A-Za-z0-9_-]+$/), serverSchema),
   log: z.enum(['stderr', 'off']).default('stderr'),
+  /** §13.6: learned-state persistence. Enabled by default; results never persist. */
+  persistence: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Override the state-file location (default: XDG state dir, per config file). */
+      path: z.string().optional(),
+    })
+    .optional(),
 });
 
 export function parseConfig(raw: unknown): SpeculateConfig {

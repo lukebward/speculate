@@ -233,6 +233,11 @@ export interface SpeculateConfig {
   servers: Record<string, ServerConfig>;
   /** Decision-log destination: 'stderr' (JSONL) or 'off'. Default 'stderr'. */
   log: 'stderr' | 'off';
+  /**
+   * Learned-state persistence (§13.6): transition model + rule feedback.
+   * Tool results are never persisted. Default: enabled, XDG state dir.
+   */
+  persistence?: { enabled?: boolean; path?: string };
 }
 
 /** Annotations subset Speculate reads (untrusted hints — §4). */
