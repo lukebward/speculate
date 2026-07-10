@@ -31,6 +31,19 @@ interface QueuedPrediction {
   queuedAt: number;
 }
 
+/**
+ * The server structurally cannot serve this tool. SDK-based servers reject a
+ * vanished/unknown tool with InvalidParams ("Tool X not found", per the MCP
+ * spec's example); MethodNotFound means tools/call itself is unsupported.
+ */
+function isToolUnavailable(err: McpError): boolean {
+  if (err.code === ErrorCode.MethodNotFound) return true;
+  return (
+    err.code === ErrorCode.InvalidParams &&
+    /\btool\b.{0,40}\bnot found\b|\bunknown tool\b/i.test(err.message)
+  );
+}
+
 export class SpeculationExecutor {
   private readonly pending = new Map<string, QueuedPrediction[]>();
 
@@ -155,10 +168,11 @@ export class SpeculationExecutor {
       .catch((err: unknown) => {
         if (looksLikeAuthError({ message: (err as Error)?.message })) {
           policy.suspend(p.server, p.tool, 'auth');
-        } else if (err instanceof McpError && err.code === ErrorCode.MethodNotFound) {
+        } else if (err instanceof McpError && isToolUnavailable(err)) {
           // Structurally un-callable (tool vanished, server can't serve it):
           // stop speculating it rather than re-burning budget every trigger.
-          policy.suspend(p.server, p.tool, 'method-not-found');
+          // A real call succeeding later resets this (§4).
+          policy.suspend(p.server, p.tool, 'tool-unavailable');
         }
         throw err;
       })

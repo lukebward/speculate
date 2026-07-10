@@ -233,11 +233,15 @@ export class SpeculateProxy {
       if (!up?.connected) continue;
       for (const tool of up.tools) {
         let exposed = tool.name;
+        let renamable = true;
         while (routes.has(exposed) || BUILTIN_TOOLS.has(exposed)) {
+          if (exposed.length > 512) {
+            renamable = false; // pathological name; never overwrite a route
+            break;
+          }
           exposed = `${name}__${exposed}`;
-          if (exposed.length > 512) break; // pathological upstream names
         }
-        routes.set(exposed, { server: name, tool });
+        if (renamable) routes.set(exposed, { server: name, tool });
       }
     }
     this.routes = routes;

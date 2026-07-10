@@ -69,11 +69,3 @@ export function argsDistance(
   }
   return d;
 }
-
-/** Convenience form of argsDistance over raw keys. Infinity when unparseable. */
-export function keyDistance(a: CacheKey, b: CacheKey): number {
-  const argsA = parseKeyArgs(a);
-  const argsB = parseKeyArgs(b);
-  if (argsA === null || argsB === null) return Infinity;
-  return argsDistance(argsA, argsB);
-}

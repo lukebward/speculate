@@ -82,7 +82,15 @@ export class Upstream {
       }
       this.onToolsChanged?.();
     });
-    await this.refreshTools();
+    try {
+      await this.refreshTools();
+    } catch (err) {
+      // A half-connected upstream (handshake ok, first listTools failed) must
+      // not linger: tear down so capabilities() reads undefined and the child
+      // process dies now rather than at proxy shutdown.
+      await this.close();
+      throw err;
+    }
     this.connected = true;
   }
 
