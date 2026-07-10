@@ -85,6 +85,36 @@ Everything the client sees is standard MCP: same tools, same results — some of
 3. **Prefetch** — predictions that pass the safety policy and budgets are executed speculatively. Over-budget predictions wait briefly in a confidence-ordered queue and fire when a slot frees; stale ones expire unfired.
 4. **Serve** — a real call matching a fresh cached entry returns in ~2 ms. A call matching a *still-in-flight* prefetch joins it and waits only for the remainder. Everything else passes through live. Cache entries are single-use, short-TTL (default 30 s), and flushed whenever a mutation goes through the proxy.
 
+## Works with any MCP server
+
+Proxying already works for every MCP server — Speculate forwards anything it doesn't understand. *Speculation* works on any server through three mechanisms, layered from zero-config to hand-tuned:
+
+1. **Zero config: the transition learner.** Speculate watches the session and learns `previous tool → next tool` patterns *and how arguments flow between them*. Once it has seen a transition twice consistently, it starts prefetching it — with arguments that track the new call (learn on `get_ticket(41) → get_ticket_comments(41)`, prefetch for ticket 7 when the agent opens ticket 7). Works on literally any server; the feedback loop suppresses transitions that stop paying.
+2. **Declarative rules in your config.** Teach Speculate a server's workflow shape in JSON — no code:
+
+   ```jsonc
+   "jira": {
+     "command": "jira-mcp-server",
+     "rules": [{
+       "trigger": "search_issues",
+       "predict": [{
+         "tool": "get_issue",
+         "args": { "issue_key": "$item.key" },
+         "forEach": "$parsed.issues",   // prefetch the first N results
+         "limit": 2,
+         "confidence": 0.6
+       }]
+     }]
+   }
+   ```
+
+   Selectors pull arguments from the trigger call (`$args.…`), its parsed result (`$parsed.…`), or each element of a result array (`$item.…` with `forEach`); anything unresolvable fails closed to "no prefetch".
+3. **Vetted profiles** (like the bundled GitHub one) for popular servers: reviewed allowlists, tuned rules, per-tool TTLs, and result parsers pinned to server versions.
+
+Result parsing is server-agnostic too: Speculate uses the server's `structuredContent` when provided, else tries JSON-in-text (how most servers respond), else predicts nothing — never guessing.
+
+**Safety on unprofiled servers** is the same default-deny policy: use `"mode": "annotated"` for servers you trust to label their read-only tools honestly (`readOnlyHint: true`), or stay in `strict` and list the read-only tools yourself with `"allowTools": [...]`. Unknown tools are never speculated, in any mode.
+
 ## Safety model
 
 Speculate **never speculates on anything that can mutate state.**

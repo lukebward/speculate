@@ -3,6 +3,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
+import { configRuleSpecSchema } from './configRules.js';
 import type { SpeculateConfig } from './types.js';
 
 const serverSchema = z
@@ -12,6 +13,9 @@ const serverSchema = z
     env: z.record(z.string(), z.string()).optional(),
     url: z.string().url().optional(),
     profile: z.string().optional(),
+    /** Declarative prediction rules (see src/configRules.ts) — teach
+     * Speculate any server's workflow shape straight from the config. */
+    rules: z.array(configRuleSpecSchema).optional(),
     allowTools: z.array(z.string()).optional(),
     denyTools: z.array(z.string()).optional(),
     speculation: z

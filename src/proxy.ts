@@ -28,9 +28,10 @@ import { Predictor } from './predictor.js';
 import { TransitionLearner } from './learner.js';
 import { SpeculationExecutor } from './executor.js';
 import { builtinProfiles, profileCanonicalizer } from './profiles/index.js';
+import { compileConfigRules } from './configRules.js';
 import { canonicalKey } from './keys.js';
 import { Upstream } from './upstream.js';
-import type { ServerProfile, SpeculateConfig } from './types.js';
+import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
 
 const STATS_TOOL = 'speculate__stats';
 /** Names the proxy itself serves; upstream tools may never claim them. */
@@ -114,10 +115,18 @@ export class SpeculateProxy {
       ),
       { now },
     );
+    // Declarative config rules: any server gets speculation straight from
+    // the config file, no vetted profile required.
+    const extraRules: Record<string, Rule[]> = {};
+    for (const [name, sc] of Object.entries(config.servers)) {
+      if (sc.rules?.length) extraRules[name] = compileConfigRules(name, sc.rules);
+    }
+
     this.predictor = new Predictor({
       profiles: this.profiles,
       maxPerTrigger: config.maxPredictionsPerTrigger,
       metrics: this.metrics,
+      extraRules,
       // §5.3 Tier 2 (server-agnostic): learns tool-call transitions from the
       // session itself, so unprofiled servers gain speculation over time.
       learner: new TransitionLearner({ now }),

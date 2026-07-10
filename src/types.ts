@@ -210,6 +210,11 @@ export interface ServerConfig {
   url?: string;
   /** Built-in profile name (e.g. 'github'). */
   profile?: string;
+  /**
+   * Declarative prediction rules (validated by configRules.ts) so ANY
+   * server gets speculation without a vetted profile.
+   */
+  rules?: import('./configRules.js').ConfigRuleSpec[];
   /** Extra allowlist entries beyond the profile's. */
   allowTools?: string[];
   /** Denylist: never speculate on these, regardless of mode/profile. */

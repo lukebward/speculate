@@ -5,14 +5,43 @@
   "servers": {
     "github": {
       "command": "npx",
-      "args": ["tsx", "mock/mock-github.ts"],
-      "env": { "SPECULATE_MOCK_LATENCY_MS": "400" },
+      "args": [
+        "tsx",
+        "mock/mock-github.ts"
+      ],
+      "env": {
+        "SPECULATE_MOCK_LATENCY_MS": "400"
+      },
       "profile": "github",
       "speculation": {
         "defaultTtlMs": 30000,
         "maxPerMinute": 30,
         "maxConcurrent": 2
       }
+    },
+    "any-other-server": {
+      "command": "your-mcp-server",
+      "args": [],
+      "rules": [
+        {
+          "trigger": "search_things",
+          "predict": [
+            {
+              "tool": "get_thing",
+              "args": {
+                "id": "$item.id"
+              },
+              "forEach": "$parsed.results",
+              "limit": 2,
+              "confidence": 0.6
+            }
+          ]
+        }
+      ],
+      "allowTools": [
+        "search_things",
+        "get_thing"
+      ]
     }
   }
 }

@@ -144,9 +144,13 @@ Hand-written, per-profile rules: *"after call X with args A (and parsed result R
 
 Deterministic, auditable, zero added latency. Expected to capture the bulk of the win for workflow-shaped servers.
 
-### 5.3 Tier 2 — Learned transition model (post-MVP)
+### 5.2b Tier 1.5 — Declarative config rules (v0.2: implemented)
 
-A per-user/per-project Markov-style model over normalized call n-grams: `P(next_call | last_k_calls)`, learned from the session log. Catches user-specific and project-specific patterns static rules miss. Argument prediction via templates learned from co-occurring argument values (same `repo` propagates; entity IDs flow from parsed results to subsequent args). Cold-start: falls back to Tier 1.
+Tier-1-shaped rules authored by the operator in `speculate.config.json` rather than in code — the "works with any connector" workhorse. A small selector language (`$args.<path>`, `$parsed.<path>`, `$item.<path>` with `forEach` over result arrays, `$$` escaping) maps trigger args and parsed results into predicted args; anything unresolvable fails closed. Compiled into the same `Rule` interface as profile rules and run through the identical validation/feedback/dedupe/cap pipeline.
+
+### 5.3 Tier 2 — Learned transition model (v0.2: session-scoped version implemented)
+
+A per-server bigram model over observed transitions: `P(next_tool | prev_tool)`, learned live from the session. Argument prediction via templates mined per transition — for each argument of the follow-up call, candidate sources (same-named trigger arg, path into the trigger's parsed result, constant) are intersected across observations; a transition predicts only when every argument remains derivable, with arguments resolved against the *current* call. Two consistent observations arm a transition; confidence ramps with count (capped at 0.55, below hand-written rules); the §5.6 feedback loop suppresses transitions that stop hitting. v0.2 scope: in-memory, per-session, LRU-bounded. Cross-session persistence (per-user/per-project priors) remains post-MVP.
 
 ### 5.4 Tier 3 — Small-LLM predictor (post-MVP, optional)
 
@@ -321,6 +325,18 @@ Caveats exactly as §10 predicted: the scripted workflow is workflow-shaped (thi
 - **HTTP upstream auth is env/config-based only** (no OAuth flows yet), so the §6.4 scope-change flush has no trigger; the §6.4 **restart flush is implemented** via transport-close detection — a dead upstream is delisted, its cache flushed, and it stays delisted until proxy restart (no auto-reconnect in v0.1).
 - **The GitHub profile is validated against the bundled mock** (which mirrors github-mcp-server's classic tool names and JSON-in-text payloads). Validating against the real `github-mcp-server` — and pinning the profile to its release per §5.1 — is the first v0.2 work item.
 - **Known debt:** transport policy (serial-ness, concurrency, queueable-denial reasons) is spread across budget/executor/proxy rather than one policy object; near-miss telemetry is a linear scan per miss (memoized parses; fine at MVP cache sizes, revisit if caches grow).
+
+### 13.5 v0.2 — server-agnostic speculation (2026-07-10)
+
+Follow-up to the question "how does this work for servers other than GitHub?" — answered in three shipped mechanisms (all through the existing safety pipeline; nothing about eligibility, budgets, or the cache changed):
+
+1. **Generic result access.** Without a vetted parser, the predictor now uses `structuredContent` when present, else best-effort JSON-in-text extraction (fail closed, no `parser_miss` noise for genuinely-text results). This unlocks result-derived prediction on unprofiled servers, since most real servers serialize JSON into text blocks.
+2. **Declarative config rules (§5.2b).** Per-server `rules` in the config file, compiled to the standard `Rule` interface. Schema-validated at startup (unknown `$` directives, `$item` without `forEach`, and dead `forEach` literals are rejected with pointered errors).
+3. **Transition learner (§5.3).** Session-scoped, zero-config: two consistent observations of a transition arm it; argument templates (arg-copy / parsed-path / const, intersected across observations, fail-closed) generalize across argument values. Verified end-to-end: an unprofiled server in `annotated` mode reaches its first prefetch hit on the third occurrence of a repeated workflow step.
+
+Safety posture for unprofiled servers is unchanged and now documented user-facing: `annotated` mode (trust `readOnlyHint`) or `strict` + per-server `allowTools`. Test suite: 216 tests (learner 30, config rules 30, plus two new end-to-end tests); the GitHub benchmark is unchanged (71% / −66% / 0 waste — learner transitions need two sightings, and the benchmark's workflow has none repeated).
+
+Known limits recorded for v0.3: learner state is per-session (no persistence across restarts); predictions never cross servers (a GitHub issue mentioning a Slack thread won't prefetch Slack); config-rule selectors don't interpolate inside nested object literals; profile-quality vetted rules still beat both generic tiers on cold sessions — community profiles remain worth shipping.
 
 ---
 
