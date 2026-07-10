@@ -31,7 +31,7 @@ If the agent just fetched a GitHub issue, there's a good chance the next call is
 
 Speculate **never speculates on anything that can mutate state.**
 
-- Only tools that are explicitly known to be read-only are eligible for prefetching, based on MCP [tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-annotations) (`readOnlyHint: true`) plus an operator-controlled allowlist.
+- Only tools that are explicitly known to be read-only are eligible for prefetching, based on MCP [tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-annotations) (`readOnlyHint: true`) **and, by default, an operator-controlled allowlist** (annotations are untrusted hints per the MCP spec; an opt-in mode exists to trust annotations alone for servers you control).
 - Unannotated or ambiguous tools are **never** speculated — they pass through normally, always.
 - Real (non-speculative) calls of any kind are always forwarded verbatim. Speculate is a pure pass-through for everything it doesn't understand.
 - Cached results have short TTLs and are invalidated when a mutating call touches the same server.

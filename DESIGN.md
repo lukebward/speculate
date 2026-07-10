@@ -1,15 +1,15 @@
 # Speculate — Design Document
 
-**Status:** Draft for review
+**Status:** Draft for review (v2 — revised after adversarial design review)
 **Last updated:** 2026-07-10
 
-Speculate is a transparent MCP proxy that reduces perceived agent latency by *speculatively prefetching read-only tool calls* — predicting what the agent will ask for next and having the answer cached before it asks.
+Speculate is a transparent MCP proxy that reduces perceived agent latency by *speculatively prefetching read-only tool calls* — predicting what the agent will ask for next and having the answer cached (or already in flight) before it asks.
 
 ---
 
 ## 1. Problem
 
-Agentic loops are dominated by two kinds of waiting: model generation and tool round-trips. Tool round-trips are pure dead weight from the user's perspective — a GitHub API call costs 300–800 ms, a Slack search or warehouse query can cost seconds, and a single agent turn commonly chains 3–10 such calls sequentially. The model cannot reason about results it doesn't have, so these latencies stack up serially even in otherwise fast harnesses. Published measurements back this up: serving-system studies attribute [35–61% of agent request time](https://www.arxiv.org/pdf/2510.16276) to tool execution, and for web-search-heavy research agents tool time averages [73% of end-to-end latency](https://arxiv.org/abs/2605.21965) (see §11 for the full survey).
+Agentic loops are dominated by two kinds of waiting: model generation and tool round-trips. Tool round-trips are pure dead weight from the user's perspective — a GitHub API call costs 300–800 ms, a Slack search or warehouse query can cost seconds, and a single agent turn commonly chains 3–10 such calls sequentially. The model cannot reason about results it doesn't have, so these latencies stack up serially even in otherwise fast harnesses. Published measurements back this up: serving-system studies attribute [35–61% of agent request time](https://www.arxiv.org/pdf/2510.16276) to tool execution, and for web-search-heavy research agents tool time averages [73% of end-to-end latency](https://arxiv.org/abs/2605.21965).
 
 At the same time, an agent session is full of idle windows in which the upstream servers sit unused:
 
@@ -19,22 +19,22 @@ At the same time, an agent session is full of idle windows in which the upstream
 | Model is generating reasoning/text before a tool call | 1–10 s | Nothing. Servers idle. |
 | Between chained tool calls in one turn | per-call | Only one call in flight. |
 
-Tool-call sequences are also highly predictable. Agent workflows are workflow-shaped: `get_issue` → `list_pull_requests`; `list_*` → `get_*` on a returned item; read a file → read its siblings or its test file. This combination — serial latency, idle capacity, predictable next actions — is exactly the setup in which speculative prefetching pays for itself (CPUs, browsers, and Gmail all exploit the same structure).
+Tool-call sequences are also highly predictable. Agent workflows are workflow-shaped: `get_issue` → `list_pull_requests`; `list_*` → `get_*` on a returned item; read a file → read its siblings or its test file. This combination — serial latency, idle capacity, predictable next actions — is exactly the setup in which speculative prefetching pays for itself. CPUs, browsers, and Gmail all exploit the same structure, and a 2025–2026 wave of research systems has validated speculation on agent actions specifically (reported 20–50% latency cuts) — but all of it lives inside agent runtimes or inference engines; no shipping MCP proxy or gateway does it. **Appendix A** has the full market survey; the short version is that the mechanism is proven and the protocol-middleware layer is unoccupied.
 
 ## 2. Goals and non-goals
 
 ### Goals
 
-1. **Cut perceived tool-call latency** for read-only calls that Speculate correctly predicted — a cache hit should return in ≤10 ms proxy overhead instead of the upstream round-trip.
-2. **Work with any MCP client and any MCP server, unmodified.** The proxy speaks standard MCP on both sides. No SDK, no harness plugin, no server changes.
-3. **Be provably harmless.** A wrong prediction must never change any system's state, never corrupt a result, and never make a real call slower in any meaningful way.
+1. **Cut perceived tool-call latency** for read-only calls that Speculate correctly predicted. Latency budgets: a completed-prefetch cache hit returns in **≤10 ms**; pass-through adds **≤5 ms p99** to real calls. (These two budgets are the only overhead numbers in this doc; §3, §8 and §10 reuse them.)
+2. **Work with any MCP client and any MCP server, unmodified.** The proxy speaks standard MCP on both sides. No SDK, no harness plugin, no server changes. (What *is* client-visible — e.g. tool naming under aggregation — is enumerated honestly in §3.4.)
+3. **Never invoke a state-mutating tool speculatively — enforced by default-deny eligibility, not prediction quality.** Residual risks that remain even with read-only speculation (server-side read side effects, intent disclosure, quota contention, transport-level queuing) are explicitly bounded, configured, and surfaced — see §4, §7, and the risk register (§11).
 4. **Be observable.** Operators must be able to see hit rate, wasted-call rate, latency saved, and upstream quota consumed by speculation.
 
 ### Non-goals
 
 1. **Speculating on state-mutating tools — permanently out of scope.** Speculation is only ever safe for reads. This is not an MVP restriction to relax later; executing a `create_*`/`update_*`/`delete_*` call the agent never made is unacceptable regardless of how confident the prediction is. (Serving *cached reads* is a freshness trade-off; *executing writes* speculatively is a correctness violation.)
 2. **Reducing token usage.** The model still reads the same results; the win is wall-clock, not tokens.
-3. **Auth ownership.** Speculate forwards the session's existing credentials to upstream servers; it does not mint, store, or broker credentials beyond what a normal MCP proxy holds in memory for the session.
+3. **Auth ownership beyond what any MCP client holds.** For HTTP upstreams Speculate necessarily *is* the MCP client (including OAuth flows — §6.4); it does not mint or broker credentials beyond that, and for stdio upstreams it never even sees them.
 4. **General-purpose response caching for correctness-sensitive reads.** Speculate's cache is a short-lived speculation buffer, not a CDN. When in doubt it misses.
 5. **Multi-tenant cache sharing.** Cache entries are strictly per-session (see §6.4, security).
 
@@ -60,75 +60,106 @@ Tool-call sequences are also highly predictable. Agent workflows are workflow-sh
 
 ### 3.1 Components
 
-**Router.** Terminates the client's MCP connection, aggregates one or more upstream servers behind a single endpoint (namespacing tools as `server__tool` when aggregating), and forwards every request. For `tools/call`: check cache → on fresh hit, return cached result; on miss, forward upstream and return the live result. Everything that is not a cacheable `tools/call` (initialization, resources, prompts, notifications, sampling, unannotated tools) passes through untouched.
+**Router.** Terminates the client's MCP connection, aggregates one or more upstream servers behind a single endpoint (naming rules in §3.4), and forwards every request. For `tools/call`, three cases:
 
-**Prediction engine.** Consumes the stream of observed calls (tool name, normalized arguments, timestamps, results metadata) and emits *predictions*: `(tool, concrete_args, confidence)` triples. Pluggable, with three built-in tiers (§5).
+1. **Completed hit** — a fresh cache entry matches: return it (≤10 ms).
+2. **In-flight join** — the matching speculative call is still executing upstream: the router *joins* it (awaits the same in-flight request) rather than firing a duplicate. The agent waits only for the remaining upstream time, and no extra quota is spent. This is the common case for intra-turn chains, where the prefetch head start is only the model's think time.
+3. **Miss** — forward upstream and return the live result.
 
-**Speculation executor.** Takes predictions, filters them through the safety policy (§4), deduplicates against the cache and in-flight speculative calls, applies budgets (§7), and executes survivors against upstream servers, writing results into the cache. Speculative traffic is strictly lower priority than real traffic: real calls are never queued behind speculative ones, and in-flight speculation yields connection-pool capacity to real calls.
+Everything that is not a cacheable `tools/call` (initialization, resources, prompts, notifications, sampling, unannotated tools) passes through untouched.
 
-**Cache.** Per-session, in-memory, keyed by `(server, tool, canonical_json(args))` with per-tool TTLs and event-based invalidation (§6).
+**Prediction engine.** Consumes the stream of observed calls (tool name, normalized arguments, timestamps, parsed results — §5.1) and emits *predictions*: `(tool, concrete_args, confidence)` triples. Pluggable, with three built-in tiers (§5).
 
-### 3.2 Deployment shapes
+**Speculation executor.** Takes predictions, filters them through the safety policy (§4), deduplicates against the cache and in-flight speculative calls, applies budgets (§7), and executes survivors against upstream servers, writing results into the cache. Speculative traffic is strictly lower priority than real traffic, with transport-specific enforcement:
 
-- **Local sidecar (MVP):** a single binary/process on the developer's machine. Client config points at Speculate over stdio or streamable HTTP; Speculate's config lists upstream servers exactly the way the client's config used to.
-- **Shared gateway (later):** one Speculate instance in front of an organization's MCP servers. Requires per-session identity plumbing and stricter cache isolation; out of MVP scope.
+- **HTTP upstreams:** real calls always get connection capacity first; speculative calls use spare concurrency only.
+- **stdio upstreams:** a single child process on one pipe, and many community servers handle requests serially — an in-flight speculative call *cannot* be preempted (`notifications/cancelled` is advisory). So for stdio upstreams the executor issues a speculative call **only when no real request is pending or in flight for that server, at most one at a time**. Worst case, a real call arriving mid-speculation waits for one upstream call to drain; this bounded delay is the price of speculating on serial transports, it is measured (§9), and per-server `off` removes it entirely.
 
-### 3.3 What flows through where
+**Cache.** Per-session, in-memory, keyed by `(server, tool, canonical_args)` with per-tool TTLs and event-based invalidation (§6).
 
-A key property: **Speculate degrades to a plain transparent proxy.** If the prediction engine is disabled, crashes, or has no opinion, every call behaves exactly as if the proxy weren't there (plus sub-millisecond forwarding overhead). Speculation is purely additive on the read path.
+### 3.2 Deployment shapes and session identity
 
-## 4. Safety policy: read-only, provably
+- **Local sidecar (MVP):** a single binary/process on the developer's machine, spawned or connected by **exactly one client** — Speculate-instance-per-client is the MVP deployment model, stated as an assumption rather than enforced multi-tenancy. The *session* is the lifetime of that client connection/process. Client config points at Speculate over stdio or streamable HTTP; Speculate's config lists upstream servers exactly the way the client's config used to.
+- **Shared gateway (later):** one Speculate instance in front of an organization's MCP servers, multiple clients. Requires a real session-identity layer (the 2026-07-28 stateless protocol removes `Mcp-Session-Id`, so identity must come from auth context) and strict per-identity cache isolation. Also note: multiple clients sharing one *spawned stdio upstream* would share that upstream's credentials — a second reason multi-client is deferred, not just unimplemented.
 
-The single most important design rule: **a speculative call may only be issued if Speculate has affirmative evidence the tool is read-only.** The failure mode being prevented — speculatively firing a mutation the agent never requested — is unrecoverable, so the policy is default-deny.
+### 3.3 Degradation property
 
-Eligibility is the conjunction of:
+A key property: **Speculate degrades to a plain transparent proxy.** If the prediction engine is disabled, crashes, or has no opinion, every call behaves exactly as a proxied call — the only cost is the pass-through budget (≤5 ms p99, §2). Speculation is purely additive on the read path.
 
-1. **MCP annotation check.** The tool's declared annotations must include `readOnlyHint: true`. Tools with no annotations, or with `readOnlyHint` absent/false, are ineligible. (Annotations are untrusted *hints* per the MCP spec, which is why this check alone is insufficient — hence layer 2.)
-2. **Operator policy.** A config-level allowlist/denylist with three modes:
-   - `strict` (default): only tools that are both annotated `readOnlyHint: true` **and** explicitly allowlisted by the operator are eligible.
-   - `annotated`: any tool annotated `readOnlyHint: true` is eligible unless denylisted. For servers the operator trusts to annotate honestly.
+### 3.4 Protocol plumbing (the unglamorous load-bearing part)
+
+What a builder hits in week one, specified up front:
+
+- **Tool naming.** With a **single upstream** (common sidecar case), tool names pass through **unchanged**. With multiple upstreams, names stay unprefixed until they collide; colliding names get `server__tool` (operators can opt into always-prefix for stability). Honest client-visible caveat: any proxy changes the *server identity* the client sees — e.g. Claude Code permission rules keyed `mcp__github__*` become `mcp__speculate__*` once GitHub sits behind Speculate. That's inherent to proxying, unavoidable, and goes in user-facing docs and the migration guide.
+- **Initialization & capability merging.** Speculate initializes with each upstream independently and negotiates with the client the protocol version it can actually translate for every upstream. Advertised capabilities are the union of upstream capabilities (tools, resources, prompts, logging, subscriptions), routed per-server; client capabilities (sampling, elicitation, roots) are forwarded to each upstream. Upstream `instructions` are concatenated with server labels.
+- **Server-initiated traffic.** Notifications (`tools/list_changed`, resource updates, log messages) are fanned in, renamed per the naming rules, and forwarded. A `tools/list_changed` from server S flushes S's cache entries and re-runs eligibility (§4) against the new tool list. Server→client *requests* (sampling, elicitation) pass through transparently for real calls; for **speculative** calls they cause the call to be **aborted, never surfaced** (the client never asked, so nothing may reach it), and the tool is suspended from speculation (§4).
+- **Progress/streaming.** Progress notifications for real calls pass through. Cached hits return final results without intermediate progress events — believed benign (progress is optional in the spec) but verified against real clients (Claude Code, Cursor) in MVP testing.
+- **Unavailable upstreams.** An upstream that's down at client-initialize time simply contributes no tools; when it comes up, `tools/list_changed` announces its tools. No client-visible failure for servers the turn never touches.
+
+## 4. Safety policy: read-only, default-deny
+
+The single most important design rule: **a speculative call may only be issued if Speculate affirmatively classifies the tool as read-only.** The failure mode being prevented — speculatively firing a mutation the agent never requested — is unrecoverable, so the policy is default-deny: unknown means no.
+
+A tool is **eligible** only if both conditions hold:
+
+1. **Annotation check.** The tool's declared annotations include `readOnlyHint: true`. Tools with no annotations, or with `readOnlyHint` absent/false, are ineligible. (Annotations are formally *untrusted hints* per the MCP spec — the official guidance is explicit about this — which is why this check alone is insufficient; hence condition 2.)
+2. **Operator policy**, one of three modes:
+   - `strict` (default): the tool must **also** be on an explicit operator allowlist.
+   - `annotated`: annotation alone suffices unless the tool is denylisted. For servers the operator trusts to annotate honestly. (Caveat: in this mode a *falsely* annotated tool is doubly dangerous — it becomes speculation-eligible *and* stops triggering cache invalidation (§6.2). This compounding is why `strict` is the default.)
    - `off`: no speculation; pure pass-through proxy.
-3. **Ships with vetted profiles.** Speculate bundles reviewed allowlist profiles for popular servers (GitHub, filesystem, Slack, web-fetch/search…) so `strict` mode is usable out of the box.
 
-Additional hard rules, regardless of mode:
+To make `strict` usable out of the box, Speculate ships **vetted profiles** — reviewed allowlists + rules + TTLs for popular servers (GitHub first; filesystem, Slack, web-search to follow). Profile contributions follow a documented reviewer checklist.
 
-- **Real calls are never blocked, transformed, or reordered** — including mutations. Speculate is a proxy first.
+Hard rules, regardless of mode:
+
+- **Real calls are never blocked, transformed, or reordered** — including mutations. Speculate is a proxy first. (Transport-level queuing on serial stdio upstreams is bounded and mitigated per §3.1 — this is the one qualified exception, and it is a delay bound, not a semantic change.)
 - **Speculative results are never fabricated or merged.** A cache hit returns exactly the bytes the upstream server returned earlier; a miss goes upstream. Speculate never synthesizes tool output.
-- **Tool-side effects we can't see:** even a "read" can have side effects (audit-log entries, read receipts, usage-based billing, rate-limit consumption). This is exactly why `strict` mode requires human allowlisting and why per-server budgets exist. Vetted profiles must exclude reads with user-visible side effects (e.g. anything that marks messages as read).
-- **Speculation reveals intent.** A speculative call discloses to the upstream service — before the agent commits to anything — what the user is *probably* about to do. "Read-only" bounds state mutation, not information disclosure; recent work formalizes this as issue-time privacy leakage of speculative tool calls ([Ghost Tool Calls, 2026](https://arxiv.org/abs/2606.02483)). Speculate's position: speculation only targets servers the session is already sending real traffic to (never a server the agent hasn't touched), and privacy-sensitive deployments should use per-server denylists or `off`. Documented, not solved.
-- **Error results are cacheable only briefly and never for auth errors.** A speculative call that fails with an auth/permission error is dropped (not cached) and that tool is circuit-broken for the session, so speculation can't mask or amplify permission problems.
+- **Tool-side effects we can't see:** even a "read" can have side effects (audit-log entries, read receipts, usage-based billing, rate-limit consumption). This is exactly why `strict` mode requires human allowlisting and why per-server budgets exist. Vetted profiles must exclude reads with user-visible side effects (e.g. anything that marks messages as read). Gmail's own prefetching produces 1–6% "false opens" in email analytics — the cautionary example.
+- **Speculation reveals intent.** A speculative call discloses to the upstream service — before the agent commits to anything — what the user is *probably* about to do. "Read-only" bounds state mutation, not information disclosure; recent work formalizes this as issue-time privacy leakage ([Ghost Tool Calls, 2026](https://arxiv.org/abs/2606.02483)). Speculate's position: speculation only targets servers the session is already sending real traffic to (never a server the agent hasn't touched), and privacy-sensitive deployments should use per-server denylists or `off`. Documented, not solved.
+- **Auth errors suspend, successes reset.** A speculative call failing with an auth/permission error is dropped (not cached) and that tool is suspended from speculation — **until a subsequent real call to the same tool succeeds**, which resets the breaker. (Permanent suspension would let one expired token during an idle window disable speculation for the rest of the session, even though the very next real call would have triggered a routine re-auth.)
+- **Server→client requests from speculative calls are aborted, never surfaced** (§3.4), and the tool is suspended from speculation for the session — a tool that needs user interaction is by definition not prefetchable.
 
 ## 5. Prediction engine
 
-Predictions must name a tool **and concrete arguments** — "the agent will probably look at PRs" is useless unless it becomes `github__list_pull_requests({repo: "acme/api", state: "open"})` that byte-matches (after canonicalization) the agent's eventual call. Argument prediction is the hard part, and hit rate lives or dies on it. Three tiers, composable and pluggable:
+Predictions must name a tool **and concrete arguments** — "the agent will probably look at PRs" is useless unless it becomes `list_pull_requests({repo: "acme/api", state: "open"})` that matches (after canonicalization) the agent's eventual call. Argument prediction is the hard part, and hit rate lives or dies on it.
 
-### Tier 1 — Static co-occurrence rules (MVP)
+### 5.1 Result access — the prerequisite nobody else states
 
-Hand-written, per-server-profile rules of the form *"after call X with args A, predict calls Y₁…Yₙ with args derived from A and X's result."* Examples from the GitHub profile:
+The most powerful rules derive arguments from the *result* of the trigger call ("the PR numbers that came back"). But MCP `tools/call` results are content blocks — overwhelmingly free-form text whose shape is server- and version-specific. Structured access cannot be assumed; it must be engineered:
+
+1. **`structuredContent` first.** Where a server declares `outputSchema` and returns `structuredContent` (in the spec since 2025-06), rules consume it directly. This is the durable path and will grow with server adoption.
+2. **Profile parsers otherwise.** For servers that return text (including JSON-serialized-as-text, the GitHub MCP server's common shape), the vetted profile ships **per-tool result parsers**, pinned to upstream server versions and covered by contract tests in CI (parse fixtures recorded from each supported server release; a parser that fails fixtures blocks the profile release).
+3. **Fail closed to "no prediction."** If parsing fails at runtime, result-derived rules simply emit nothing (arg-independent rules still fire); a `parser_miss` metric is logged. A parse failure can cost a prefetch opportunity — never correctness.
+
+Parser fragility is a top-3 risk (§11 risk 1a): it is the MVP's main maintenance burden and the reason profiles are versioned artifacts, not static config.
+
+### 5.2 Tier 1 — Static co-occurrence rules (MVP)
+
+Hand-written, per-profile rules: *"after call X with args A (and parsed result R), predict calls Y₁…Yₙ with args derived from A and R."* Examples from the GitHub profile:
 
 - `get_issue(owner, repo, n)` → `list_pull_requests(owner, repo, state: open)`, `issue_read(comments)(owner, repo, n)`
-- `list_pull_requests(...)` → `pull_request_read(get)(...)` for the first K PRs in the result
+- `list_pull_requests(...)` → `pull_request_read(get)(...)` for the first K PRs in the parsed result
 - `get_file_contents(path)` → `get_file_contents(dir(path))` sibling listing
 
-Rules may reference the *result* of the trigger call (e.g. "the PR numbers that came back"), which is where much of the argument-prediction power comes from. Deterministic, auditable, zero added latency. Expected to capture the bulk of the win for workflow-shaped servers.
+Deterministic, auditable, zero added latency. Expected to capture the bulk of the win for workflow-shaped servers.
 
-### Tier 2 — Learned transition model (post-MVP)
+### 5.3 Tier 2 — Learned transition model (post-MVP)
 
-A per-user/per-project Markov-style model over normalized call n-grams: `P(next_call | last_k_calls)`, learned from the session log. Catches user-specific and project-specific patterns static rules miss. Argument prediction via templates learned from co-occurring argument values (same `repo` propagates; entity IDs flow from results to subsequent args). Cold-start: falls back to Tier 1.
+A per-user/per-project Markov-style model over normalized call n-grams: `P(next_call | last_k_calls)`, learned from the session log. Catches user-specific and project-specific patterns static rules miss. Argument prediction via templates learned from co-occurring argument values (same `repo` propagates; entity IDs flow from parsed results to subsequent args). Cold-start: falls back to Tier 1.
 
-### Tier 3 — Small-LLM predictor (post-MVP, optional)
+### 5.4 Tier 3 — Small-LLM predictor (post-MVP, optional)
 
-On idle (user typing) or after each turn, ship the recent conversation window + available read-only tool list to a small fast model (e.g. Haiku-class) prompted to emit the 1–3 most likely next calls with full arguments. Highest ceiling (it can read intent, not just call patterns), highest cost, and it adds its own latency/token spend — so it runs only in idle windows, never on the critical path. Requires an API key and an explicit opt-in, since it exfiltrates conversation traffic to a model provider the upstream servers didn't know about.
+On idle or after each turn, ship the recent conversation window + available read-only tool list to a small fast model prompted to emit the 1–3 most likely next calls with full arguments. Highest ceiling (it can read intent, not just call patterns), highest cost — runs only in idle windows, never on the critical path. Requires an API key and an explicit opt-in, since it exfiltrates conversation traffic to a model provider the upstream servers didn't know about.
 
-### 5.1 When prediction runs
+### 5.5 When prediction runs
 
-- **On each completed real call** (the main trigger; predict follow-ups from the call+result).
-- **On turn boundaries** — when the client goes quiet after a burst of calls, predict the *next turn's* opening reads (Tier 2/3 territory).
+- **On each completed real call** (the main trigger; predict follow-ups from the call + parsed result). This also covers turn boundaries in the MVP: the follow-ups of a turn's *last* call are frequently the next turn's opening reads, and they stay useful for one TTL (§6.2) into the idle gap.
+- **On turn-boundary quiescence** (no requests for T ms) — Tier 2/3 territory, post-MVP: predicting the next turn's opening reads from more than the last call.
 - Never on the critical path of a real call. Prediction work is async and yields to real traffic.
 
-### 5.2 Confidence and ranking
+### 5.6 Confidence, ranking, and how many to fire
 
-Each predictor emits confidence scores; the executor takes predictions in descending confidence until the budget (§7) is exhausted. Observed hit/waste rates per rule feed back into scores (a rule that never hits gets suppressed) — this feedback loop is in-scope for MVP in its simplest form (per-rule hit counters).
+Each predictor emits confidence scores; the executor takes predictions in descending confidence until budgets (§7) are exhausted. The default per-trigger cap is **3 predictions per observed real call** — derived from the waste target (§10 accepts ≤2 wasted calls per hit, i.e. speculative calls must hit ≥⅓ of the time; firing fewer, higher-confidence predictions is the main lever for staying above that line, and published top-1/top-3 next-action accuracies of ~28–55% in systems with *more* context than a proxy suggest 3 is already generous). Observed per-rule hit/waste rates feed back into scores — a rule that never hits gets suppressed. This feedback loop is in-scope for MVP in its simplest form (per-rule hit counters).
 
 ## 6. Cache semantics
 
@@ -136,84 +167,125 @@ The cache is a **speculation buffer**, not a general cache: small, short-lived, 
 
 ### 6.1 Keying and canonicalization
 
-Key = `(server, tool, canonical_args)`. Canonicalization: JSON with sorted keys, defaults materialized from the tool's input schema (so `{state: "open"}` and omitted-but-default `state` collide correctly), obvious normalizations (case-insensitive enum values where the schema says so). No fuzzy matching in MVP — near-miss args are a miss. Fuzzy/subsumption matching (e.g. a cached `limit: 50` list serving a `limit: 10` request) is a possible later optimization with real correctness pitfalls; explicitly deferred.
+Key = `(server, tool, canonical_args)`. Canonicalization: JSON with sorted keys, plus **profile-supplied normalizations** — default-materialization maps (so `{state: "open"}` and omitted-`state` collide when the profile says the server defaults to open) and case-folding for enums the profile marks case-insensitive. These live in the profile because JSON Schema generally *doesn't* carry them: most real servers apply defaults server-side and invisibly, and the schema has no case-insensitivity vocabulary. No fuzzy matching in MVP — near-miss args are a miss, but **near-miss key distance is logged from day one** (§9) to size the fuzzy-matching opportunity (e.g. a cached `limit: 50` list serving a `limit: 10` request) before building it.
 
-### 6.2 Freshness
+### 6.2 Freshness and invalidation
 
-- **Per-tool TTL** from the server profile, defaulting to **30 s**, capped at a few minutes. The prefetch-to-use gap is typically seconds, so short TTLs retain most of the win while bounding staleness.
-- **Spec alignment:** the MCP spec's [draft caching metadata](https://modelcontextprotocol.io/specification/draft/server/utilities/caching) (`ttlMs`, `cacheScope`; SEP-2549, slated for the 2026-07-28 release) explicitly contemplates caching intermediaries — but it applies to list/read operations (`tools/list`, `resources/read`, …), **not** `tools/call` results. Speculate honors it where it applies (list caching) and its tool-result speculation buffer operates outside — though not against — spec vocabulary. That's one more reason the buffer stays conservative (short TTLs, per-session, single-use). Note Speculate also respects the spec's caveat that TTL is not a polling license: prefetch is prediction-triggered, never TTL-expiry-triggered background refresh. If cacheability metadata is later extended to tool results, server-declared TTLs will take precedence over profile defaults (bounded by the operator cap).
-- **Session-scoped mutation invalidation:** any *real* mutating call through the proxy to server S invalidates all cached entries for S (coarse by design; per-resource invalidation is a profile-level refinement later). This gives read-your-own-writes within the session for everything the agent does *through the proxy*.
-- **External writes are invisible.** Someone else can merge the PR between prefetch and use; the agent then sees a ≤TTL-stale snapshot. This is the core freshness trade-off and it's bounded by the TTL. It is identical in kind to the race that already exists between a live tool call and the model acting on it — the TTL just widens that window slightly. Per-tool TTLs let operators set 0 (never speculate) for reads where even seconds of staleness matter.
-- **A cache hit consumes the entry** (single-use). If the agent asks the same thing twice, the second ask goes upstream (unless re-prefetched). This keeps semantics close to "you got the answer a bit early" rather than "you got a cached worldview." Single-use is deliberately conservative for the MVP; relaxing to TTL-bounded multi-use per tool profile is a later option — an idempotent read within its TTL is semantically the same answer, so the conservatism buys simplicity more than correctness.
+- **Per-tool TTL** from the server profile, defaulting to **30 s**, capped at a few minutes. The prefetch-to-use gap for intra-turn chains is seconds, so short TTLs retain most of the win while bounding staleness.
+- **Mutation invalidation, conservatively classified:** any real call **not affirmatively classified read-only** (same classification machinery as §4 — allowlist/annotation) invalidates all cached entries for its server. Unknown tools are treated as writes. Coarse per-server invalidation is deliberate; per-resource invalidation is a profile-level refinement later.
+- **Writes outside the proxy are invisible — and for coding agents they're the common case.** An agent that runs `git push` in a shell and then reads the repo through a cached entry can see a pre-push snapshot up to one TTL old. The proxy cannot see non-MCP tools (shell, file edits, other harness tools). This is the sharpest staleness caveat in the design; it is bounded by the TTL, called out in user-facing docs, and per-tool TTL=0 exists for reads where even that is unacceptable.
+- **External writes are likewise invisible.** Someone else can merge the PR between prefetch and use; the agent sees a ≤TTL-stale snapshot. Same bound, same mitigations. Both cases are identical *in kind* to the race that already exists between a live tool call and the model acting on its result — the TTL widens that window, bounded and configurably to zero.
+- **A cache hit consumes the entry** (single-use). If the agent asks the same thing twice, the second ask goes upstream (unless re-prefetched). This keeps semantics close to "you got the answer a bit early" rather than "you got a cached worldview." Deliberately conservative for MVP; TTL-bounded multi-use per tool profile is a later option.
+- **Spec alignment:** the MCP spec's [draft caching metadata](https://modelcontextprotocol.io/specification/draft/server/utilities/caching) (`ttlMs`, `cacheScope`; SEP-2549, slated for the 2026-07-28 release) explicitly contemplates caching intermediaries — but it applies to list/read operations, **not** `tools/call` results. Speculate honors it where it applies (list caching); the tool-result speculation buffer operates outside — though not against — spec vocabulary, one more reason it stays conservative. Prefetch is prediction-triggered, never TTL-expiry-triggered background polling (which the spec explicitly discourages). If cacheability metadata is later extended to tool results, server-declared TTLs take precedence over profile defaults (bounded by the operator cap).
 
 ### 6.3 Consistency stance (explicit)
 
-Speculate provides, per session: **read-your-own-writes** (via mutation invalidation) and **bounded staleness** (≤ TTL) for external changes. It does not provide cross-session consistency or monotonic reads across different tools. This stance is documented user-facing, per server profile.
+Per session, Speculate provides: **read-your-own-writes for writes issued through the proxy** (via mutation invalidation) and **bounded staleness** (≤ TTL) for everything else — external writers *and the agent's own non-MCP side channels* (§6.2). It does not provide cross-session consistency or monotonic reads across tools. This stance is documented user-facing, per server profile.
 
-### 6.4 Security properties of the cache
+### 6.4 Credentials and cache security
 
-- Per-session only; two clients never share entries even if arguments match, because upstream authorization may differ.
-- In-memory only; no persistence of tool results to disk.
-- Results are stored with the identity/credential fingerprint they were fetched under; a credential change (re-auth, token refresh with scope change) flushes the session cache.
+Per transport:
+
+- **stdio upstreams:** credentials live in the child process's environment; Speculate never sees a token. Isolation is process-level: each Speculate instance spawns its own upstreams for its one client (§3.2). Cache entries for a stdio server are flushed if its process restarts (new process ⇒ possibly new identity/config).
+- **HTTP upstreams:** Speculate *is* the MCP client, which means it owns the client side of OAuth — discovery, authorization, token refresh, and re-auth on 401, surfacing auth prompts to the user exactly as a directly-connected client would. Tokens are held in memory for the session only. A token refresh that changes scope/identity flushes that server's cache entries.
+- Cache entries are per-session only and in-memory only; no persistence of tool results to disk. Two clients never share entries (enforced trivially in MVP by one-client-per-instance; a real isolation layer is the price of the shared-gateway deployment, which is deferred).
 
 ## 7. Budgets, rate limits, and backpressure
 
 Speculation spends someone's quota. It must be visibly and configurably bounded:
 
-- **Per-server concurrency cap** for speculative calls (default: 2) and **per-turn call cap** (default: 5 speculative calls per observed real call, across all rules).
-- **Rate-limit awareness:** profiles declare how to read the server's rate-limit state where the API exposes it in a way that passes through MCP responses; otherwise operators can set a hard speculative-calls-per-minute budget per server (default when unknown: conservative, e.g. 30/min). When remaining quota falls below a floor (default 20%), speculation for that server stops entirely — real calls get the quota.
-- **Cost accounting:** every speculative call is logged as such. The dashboard (§9) shows waste explicitly. Nothing about speculation is silent.
+- **Per-server concurrency cap** for speculative calls (default: 2 for HTTP; hard-fixed at 1, idle-only, for stdio — §3.1) and **per-trigger cap** (default: 3 predictions per observed real call — derivation in §5.6).
+- **Rate-limit awareness where quota is visible; honest fallback where it isn't.** Profiles declare how to read rate-limit state when the server exposes it through MCP responses; when remaining quota falls below a floor (default 20%), speculation for that server stops entirely. **Caveat for the MVP profile: the GitHub MCP server does not currently pass rate-limit state through tool results, so the quota floor is inoperative there** — the operative guard for GitHub is the per-minute budget (default: 30 speculative calls/min per server), plus the waste metrics that make overspend visible.
+- **Cost accounting:** every speculative call is logged as such. Nothing about speculation is silent.
 - **Kill switch:** `off` mode at runtime (config reload or admin endpoint) instantly reverts to pass-through.
 
 ## 8. Latency model (why this wins)
 
-Let a turn contain `n` sequential eligible reads with mean upstream latency `L`. Perceived tool time ≈ `n·L`. With hit rate `h` on those reads, perceived time ≈ `n·(1−h)·L + n·h·ε` where `ε` ≈ cache-read + proxy overhead (target ≤10 ms).
+Let a turn contain `n` sequential eligible reads with mean upstream latency `L`. Perceived tool time ≈ `n·L`.
 
-Illustrative (not measured): GitHub-backed code-review turn, `n = 6`, `L = 500 ms` → 3.0 s of tool waiting. Tier-1 rules hitting half the reads (`h = 0.5`) cut that to ≈ 1.5 s per turn, every turn. The MVP ships with a benchmark harness (§10) precisely so real numbers replace this arithmetic.
+What a hit saves depends on the **head start** — the gap between prefetch issuance and the agent's ask:
 
-Two structural notes:
+- **Completed prefetch** (gap ≥ L): the agent waits ~ε (≤10 ms). Saves ≈ L.
+- **In-flight join** (gap < L): the router joins the in-flight call (§3.1); the agent waits L − gap. Saves ≈ gap.
 
-- The **between-turn window** (user typing/reading) is seconds-to-minutes long — far longer than any prefetch needs — and is invisible to the user. Speculation that lands there is effectively free latency-wise; its only cost is upstream quota.
-- As harnesses get better at *parallelizing* the calls the model already knows it wants, the marginal win shrinks for intra-turn chains but not for the between-turn window: the harness cannot parallelize a call the model hasn't emitted yet. Speculation and parallelization are complementary, and both remain serial-bounded by result-dependent chains (can't fetch PR #42's diff until something returns "42" — unless a rule predicted it from an earlier result, which is exactly what Tier 1 does).
+So per-hit savings = **min(gap, L)**, and perceived tool time ≈ `n·(1−h)·L + n·h·(L − E[min(gap, L)])`. For intra-turn chains the head start is the model's think time between calls (typically 1–10 s against sub-second L, so most intra-turn hits complete); for the first calls of a *new* turn, prefetches issued at the end of the previous turn have had the whole user gap to complete — if they haven't expired.
+
+Illustrative (not measured — the benchmark harness in §10 exists to replace this arithmetic): a GitHub-backed review turn with `n = 6`, `L = 500 ms` → 3.0 s of tool waiting; at `h = 0.5` with fully-completed prefetches, ≈ 1.5 s. If half those hits are instead mid-flight joins with 250 ms remaining, ≈ 1.9 s. Directionally large either way.
+
+Structural notes, stated honestly:
+
+- **The between-turn window is real but TTL-bounded in the MVP.** Prefetches triggered by a turn's last call survive one TTL (~30 s) into the idle gap — enough for quick follow-up turns ("yeah, show me those PRs"), which is exactly the interaction pattern that motivated this design. For minutes-long idles the entries expire before the next turn; exploiting long idles properly needs either boundary-specific TTL policies (a staleness trade-off) or a host-side "user is typing" signal, both post-MVP (§11 risk 8). The window is structurally durable — no harness improvement removes it — but the MVP only harvests its first 30 seconds.
+- **Speculation composes with parallelization rather than competing.** Harness-level parallel tool dispatch accelerates calls the model has *already emitted*; speculation covers calls it hasn't emitted yet, including result-dependent chains a harness cannot parallelize (can't fetch PR #42's diff until something returns "42" — unless a rule predicted it from a parsed earlier result, which is exactly what Tier 1 does).
 
 ## 9. Observability
 
 MVP ships with:
 
-- **Structured log** of every speculative decision: prediction source, confidence, executed or suppressed (and why), hit/expired/invalidated/wasted outcome.
-- **Session summary + `/stats`:** hit rate, wasted calls, estimated wall-clock saved (sum of upstream latencies of hits), speculative quota consumed per server.
+- **Structured log** of every speculative decision: prediction source, confidence, executed or suppressed (and why), outcome (hit / joined-in-flight / expired / invalidated / wasted), and per-hit head start.
+- **Near-miss logging:** on cache misses, key distance to the nearest cached entry (to size fuzzy matching — §6.1). **Parser-miss logging** for §5.1 failures.
+- **Session summary + `/stats`:** hit rate, wasted calls, estimated wall-clock saved (Σ min(gap, L) over hits), speculative quota consumed per server, bounded-delay events on stdio upstreams (§3.1).
 - **Standard MCP-level logs** for the proxy function itself.
 
-The honest metric to watch is **estimated seconds saved per wasted call** — it prices the trade-off directly and decides whether a rule (or the whole tool, for a given workload) is worth it. Hit rate has no universal target; a 20%-hit rule that saves 2 s per hit at trivial quota cost is worth keeping, and the per-rule feedback loop (§5.2) suppresses rules that don't pay.
+The honest metric to watch is **estimated seconds saved per wasted call** — it prices the trade-off directly. Hit rate has no universal target; a 20%-hit rule that saves 2 s per hit at trivial quota cost is worth keeping, and the per-rule feedback loop (§5.6) suppresses rules that don't pay.
 
 ## 10. MVP scope
 
 **In (v0.1):**
 
-1. Single-binary local proxy (Go or TypeScript — decision pending; Go favored for single-static-binary distribution and concurrency ergonomics, TS favored for MCP SDK maturity), stdio + streamable-HTTP client transport, N upstream servers (stdio + HTTP), tool namespacing.
-2. Safety policy: `strict` / `annotated` / `off`; annotation check; allowlist/denylist config.
-3. Tier-1 static rule engine with result-referencing rules; simplest per-rule hit-rate feedback (§5.2).
-4. **One vetted profile: GitHub** (rules + read-only allowlist + TTLs) — chosen because its workflows are the most predictable and it's the demo everyone understands. Filesystem/Slack profiles follow post-MVP.
-5. Per-session in-memory cache: canonical keying, TTL, single-use hits, mutation invalidation, credential-change flush.
-6. Budgets: concurrency cap, per-turn cap, per-minute per-server budget, quota floor where visible, kill switch.
-7. Observability: decision log, `/stats`, session summary.
-8. Benchmark harness: scripted agent sessions replayed with speculation on/off, reporting per-turn wall-clock, hit rate, waste. (Predictability of the benchmark's scripted workflows will overstate real-world hit rate; the harness should include at least one adversarial/low-predictability script so the floor is measured too, and real-world numbers come from §9 telemetry.)
+1. Single-binary local proxy (Go or TypeScript — decision pending; Go favored for single-static-binary distribution and concurrency ergonomics, TS favored for MCP SDK maturity), stdio + streamable-HTTP on both sides, protocol plumbing per §3.4.
+2. Safety policy: `strict` / `annotated` / `off`; annotation check; allowlist/denylist config; auth-error breaker with real-call reset.
+3. Tier-1 rule engine with §5.1 result access (structuredContent + profile parsers + contract tests); per-rule hit-rate feedback.
+4. **One vetted profile: GitHub** (rules + read-only allowlist + TTLs + result parsers) — chosen because its workflows are the most predictable and it's the demo everyone understands.
+5. Per-session in-memory cache: profile-driven canonicalization, TTL, single-use hits, in-flight join, conservative mutation invalidation, restart/re-auth flush.
+6. Budgets: per §7, including the stdio idle-only rule.
+7. Observability: decision log, near-miss/parser-miss metrics, `/stats`, session summary.
+8. Benchmark harness: scripted agent sessions replayed with speculation on/off, reporting per-turn wall-clock, hit rate, head-start distribution, waste. Scripted workflows overstate real-world predictability, so the harness includes at least one adversarial/low-predictability script to measure the floor; real-world numbers come from §9 telemetry.
 
 **Out (explicitly):**
 
-- Tier-2/Tier-3 predictors; shared/multi-tenant deployment; fuzzy cache matching; resource/prompt prefetching (MCP resources with subscriptions are arguably *better* suited to prefetching than tools — deliberately deferred, tools first); persistence; per-resource invalidation; any speculation on non-read-only tools (permanent).
+- Tier-2/Tier-3 predictors; shared/multi-tenant deployment; fuzzy cache matching; resource/prompt prefetching (MCP resources with subscriptions are arguably *better* suited to prefetching than tools — deliberately deferred, tools first); persistence; per-resource invalidation; boundary-specific TTL policies; any speculation on non-read-only tools (permanent).
 
-**MVP success criteria:**
+**MVP success criteria and thresholds:**
 
-- On the benchmark's GitHub workflows: ≥40% hit rate on eligible reads, ≥30% reduction in per-turn tool wall-clock, waste ≤2 speculative calls per hit — measured against the harness's optimistic bias (see §10.8), with real-world validation via §9 telemetry.
-- Zero mutations ever issued speculatively (asserted by test suite: a mock server that fails the run if any non-allowlisted tool is called speculatively).
-- Pass-through overhead ≤ 5 ms p99 on real calls.
+- On the benchmark's GitHub workflows: **≥40% hit rate** on eligible reads (target) and **≥30% reduction** in per-turn tool wall-clock. The wall-clock criterion assumes eligible reads dominate benchmark tool time and most hits complete before the ask — both measured by the harness (item 8), not assumed silently.
+- **Waste ≤2 speculative calls per hit** — the constraint the per-trigger cap (§5.6) is derived from.
+- **Kill threshold:** if after rule iteration on the GitHub proving ground the hit rate can't clear **30%**, the core hypothesis fails *at the proxy layer* (see §11 risk 1 — a proxy sees strictly less than the research systems that hit 40%+), and the project revisits approach (Tier 2/3, host-signal integration) before building further. Between 30–40%: keep iterating rules, don't scale scope.
+- **Zero non-eligible tools ever invoked speculatively** — asserted by test suite: a mock server that fails the run if any non-allowlisted tool is called speculatively.
+- Pass-through overhead ≤ 5 ms p99; completed-hit response ≤ 10 ms (§2 budgets).
 
-## 11. Market research & prior art
+## 11. Risks and open questions
+
+| # | Risk / question | Current position |
+|---|---|---|
+| 1 | **Low hit rate in the wild** — real usage is less workflow-shaped than benchmarks, **and a protocol-layer proxy sees strictly less than the research systems reporting 40–55% next-action accuracy** (they read model state/plans; Speculate reads only traffic). Expect lower. | Benchmark honestly (incl. adversarial scripts), measure real-world via §9, explicit 30%/40% thresholds in §10. |
+| 1a | **Result-parser fragility** (§5.1) — Tier-1's best rules depend on parsing server-specific text formats that can change under us. | `structuredContent` when available; versioned parsers with contract-test fixtures gating profile releases; runtime fail-closed to no-prediction; `parser_miss` telemetry. Main ongoing maintenance cost — accepted. |
+| 2 | **Argument mismatch** — agent asks with slightly different args than predicted. | Profile-driven canonicalization in MVP; near-miss key-distance logging from day one to size the fuzzy-matching opportunity before building it. |
+| 3 | **Stale reads mislead the agent** — external writers *and the agent's own non-MCP writes* (shell/`git push`) are invisible to invalidation. | Short TTLs, single-use hits, conservative mutation invalidation, per-tool TTL=0 opt-out, §6.3 documented stance. Bounded, not eliminated. |
+| 4 | **Quota/cost blowup on busy servers** — worsened where rate-limit state is invisible (incl. the MVP GitHub profile, §7). | Default-conservative budgets (3 per trigger), per-minute caps, waste metrics, kill switch. |
+| 5 | **Reads with side effects** (read receipts, audit noise, metered billing). | `strict` mode + vetted profiles exclude them; documented reviewer checklist for profile contributions. |
+| 6 | **Dishonest/wrong `readOnlyHint` annotations** — in `annotated` mode a false annotation both enables speculation *and* silently breaks mutation invalidation (§4, §6.2). | `strict` default requires human allowlisting; `annotated` is opt-in per deployment with the compounding risk documented. |
+| 7 | **Client-visible protocol differences** — cached hits lack progress notifications; tool naming changes under aggregation (§3.4). | Believed benign / inherent to proxying respectively; both verified against real clients (Claude Code, Cursor) in MVP testing and documented in the migration guide. |
+| 8 | **Long idle windows are unharvested in MVP** — no "user is typing" signal exists in MCP; TTLs expire prefetches during minutes-long gaps (§8). | MVP harvests the first TTL-worth of each gap via last-call follow-up rules; quiescence-triggered Tier 2/3 prediction and boundary TTL policies are post-MVP; true typing signals need host cooperation (out of scope). |
+| 9 | **Language/runtime choice** (Go vs TypeScript). | Decide at MVP kickoff; §10 item 1 lists the trade-off. Leaning Go. |
+| 10 | **stdio serialization** — speculation can delay a real call by up to one upstream call on serial servers. | Idle-only, ≤1 in-flight rule (§3.1); bounded-delay events measured (§9); per-server `off` available. |
+| 11 | **Intent leakage** — speculative calls disclose predicted user intent to upstream services before the user acts ([Ghost Tool Calls](https://arxiv.org/abs/2606.02483)). | Speculation restricted to servers already receiving real session traffic; per-server denylist / `off` for sensitive deployments; called out in user-facing docs. Not fully solvable at the proxy layer. |
+
+## 12. Review checklist (what "this design makes sense" means)
+
+- [ ] A wrong prediction can never invoke a non-read-only tool — enforced by default-deny eligibility, not by prediction quality.
+- [ ] A disabled/failed speculation subsystem leaves a correct transparent proxy.
+- [ ] Staleness is bounded, documented (including the non-MCP-writes caveat), and per-tool tunable to zero.
+- [ ] Speculation cost is capped, measured, and visible — including its one bounded latency cost (stdio queuing).
+- [ ] The proxy-layer mechanics that differentiate this from research systems have actual designs: result access (§5.1), per-transport concurrency (§3.1), auth per transport (§6.4), handshake/naming aggregation (§3.4).
+- [ ] The MVP is small enough to build and honest enough to falsify the core hypothesis (explicit 30%/40% hit-rate thresholds).
+
+---
+
+## Appendix A. Market research & prior art
 
 *Survey conducted July 2026 via web research. Quantitative figures below are as reported in the cited papers' abstracts and project pages; several full texts were not independently verified — spot-check any number before quoting it externally.*
 
-### 11.1 The MCP gateway landscape — nobody competes on latency
+### A.1 The MCP gateway landscape — nobody competes on latency
 
 The MCP proxy/gateway space is crowded, but every incumbent competes on **security, governance, and aggregation** — auth/RBAC (MCPJungle, TrueFoundry, Portkey, Obot, ToolHive), guardrails and PII scrubbing (Lasso mcp-gateway, Docker MCP Gateway interceptors), zero-trust portals (Cloudflare), federation/registry (IBM ContextForge, agentgateway), transport bridging (sparfenyuk/mcp-proxy, TBXark/mcp-proxy), K8s lifecycle (Microsoft mcp-gateway), or REST→MCP conversion (Unla). **None of them advertises speculative or predictive prefetching of tool calls**; latency, as of this survey, is an unclaimed differentiator in gateway marketing.
 
@@ -223,63 +295,39 @@ The closest existing things:
 - **`tools/list` caching** is common in SDKs and gateways (e.g. the OpenAI Agents SDK caches `list_tools()`), and industry guidance ([Gravitee](https://www.gravitee.io/blog/mcp-api-gateway-explained-protocols-caching-and-remote-server-integration), [fast.io](https://fast.io/resources/mcp-server-caching/)) explicitly recommends *against* caching `tools/call` results except for deterministic tools — consistent with Speculate's short-TTL, conservative buffer design.
 - GitHub searches for "MCP speculative prefetch" return zero repositories. The only speculative-tool-execution open-source artifact found at all is [joelvarun/speculative-tools](https://github.com/joelvarun/speculative-tools) — a 0-star Python library (n-gram next-tool prediction + async execution + 30 s TTL cache) bound to one agent framework, not protocol middleware.
 
-### 11.2 Academic validation — speculating agent actions works
+### A.2 Academic validation — speculating agent actions works
 
 Speculative execution of agent actions became an active research area between late 2024 and mid-2026. Key reported results:
 
 | System | Layer | Reported result |
 |---|---|---|
-| [PASTE / "Act While Thinking"](https://arxiv.org/abs/2603.18897) (Microsoft, 2026) | Serving layer | Pattern-mined tool-sequence prediction; **−48.5% avg task latency, −67% tool-wait time**; 27.8% top-1 / 43.9% top-3 predictor recall compounding to ~94% system hit rate on workflow-shaped loops |
+| [PASTE / "Act While Thinking"](https://arxiv.org/abs/2603.18897) (Microsoft, 2026) | Serving layer | Pattern-mined tool-sequence prediction; **−48.5% avg task latency, −67% tool-wait time**; 27.8% top-1 / 43.9% top-3 predictor recall (a compounded ~94% system hit rate is reported on repetitive workflow loops — treat as best-case, not typical) |
 | [Speculative Actions](https://arxiv.org/abs/2510.04371) (ICLR 2026) | Agent framework | Fast model predicts next action, executes in parallel, slow model verifies; ~55% next-action accuracy → 10–20% latency cut |
 | [SPAgent](https://arxiv.org/abs/2511.20048) (2025) | Inference engine | Adaptive speculation for search agents; **1.65× end-to-end speedup** at ~40% action-buffer hit rate |
 | [IdleSpec](https://arxiv.org/abs/2605.22154) (2026) | Agent framework | Uses tool-wait idle time for speculative planning; >50% perceived-latency cut on GAIA/FRAMES |
 | [DSP](https://arxiv.org/abs/2509.01920) (2025) | Agent framework | Online RL tunes speculation depth against dollar cost; −30% total cost, −60% wasted-speculation cost |
 | [Accio](https://arxiv.org/html/2605.16565v1) (2026) | Web agents | Structural-regularity speculation; −33% latency, −1.9× cost, accuracy preserved |
 | [SpecHop](https://arxiv.org/abs/2605.21965) (2026) | Retrieval agents | Continuous speculation with commit/rollback; −40% latency; measures tool time at 73% avg of E2E latency |
-| [Ghost Tool Calls](https://arxiv.org/abs/2606.02483) (2026) | Analysis | Speculative calls leak inferred intent to external services at issue time — read-only ≠ disclosure-free (addressed in §4, §12.11) |
+| [Ghost Tool Calls](https://arxiv.org/abs/2606.02483) (2026) | Analysis | Speculative calls leak inferred intent to external services at issue time — read-only ≠ disclosure-free (addressed in §4 and §11 risk 11) |
 
-Three things follow from this table. First, **the core hypothesis is validated externally**: agent tool-call sequences are predictable enough (40–94% hit rates depending on workload shape) to buy 20–50% latency reductions. Second, **every one of these systems lives inside the agent runtime, the serving stack, or the inference engine** — each requires adopting a framework or modifying infrastructure. None is deployable as protocol middleware. Third, the field has already mapped the failure modes (waste cost, staleness, intent leakage), which this design addresses in §4, §6, §7, §12 rather than discovering them in production.
+Three things follow. First, the mechanism works: reported next-action accuracies of **~28–55%** buy 20–50% latency reductions in these systems. An important asymmetry, though: every cited system sees *more* than a proxy does (model state, plans, sometimes the prompt itself); Speculate sees only protocol traffic, so its achievable hit rate should be assumed lower until measured (§10's thresholds encode this). Second, **every one of these systems lives inside the agent runtime, the serving stack, or the inference engine** — each requires adopting a framework or modifying infrastructure; none is deployable as protocol middleware. Third, the field has already mapped the failure modes (waste cost, staleness, intent leakage), which this design addresses in §4, §6, §7, §11 rather than discovering in production.
 
 Also relevant: a [TDCommons defensive publication (June 2026)](https://www.tdcommons.org/dpubs_series/10773/) describes intent-predicted prefetching of agent retrieval backends with probability-×-value-÷-cost scoring. As deliberately published prior art it forecloses patenting the broad idea (by anyone), which is fine for an open-source project; it is a disclosure, not a product.
 
 Complementary (not competing) lines of work: parallel/async function calling ([LLMCompiler](https://arxiv.org/abs/2312.04511), [AsyncLM](https://arxiv.org/abs/2412.07017)) accelerates calls the model has *already emitted*, while speculation covers calls it hasn't — the two compose (§8). Speculative retrieval ([Speculative RAG](https://arxiv.org/abs/2407.08223), [predictive RAG prefetching](https://arxiv.org/abs/2605.17989), [SpeQL](https://arxiv.org/abs/2503.00714) — which precomputes predicted SQL while the user is still typing, the closest "predict-then-precompute at an intermediary" analogy) shows the same trick working at other layers of the stack.
 
-### 11.3 Precedents outside AI — the pattern is proven at planet scale
+### A.3 Precedents outside AI — the pattern is proven at planet scale
 
 - **Browsers** are the strongest analogy: Chrome's [Speculation Rules API](https://developer.chrome.com/blog/search-speculation-rules) is declarative, confidence-tiered, side-effect-constrained prefetch/prerender at the platform layer — Google Search prerendering cut LCP measurably, and [Ray-Ban's deployment](https://web.dev/case-studies/rayban-speculation-rules) cut mobile LCP ~43%. Speculate is the same shape: policy-driven speculation at a shared layer, with the "safe to speculate" boundary drawn by the platform, not the app.
 - **CPUs** have rested the entire modern performance model on speculative execution behind branch predictors for three decades — predict, execute, cheap rollback.
-- **Gmail** prefetches message images so opens render instantly; its known side effect — 1–6% "false opens" polluting email-open analytics — is a neat concrete example of why even "harmless reads" need vetting (§4) and why speculation must be observable (§9).
+- **Gmail** prefetches message images so opens render instantly; its known side effect — 1–6% "false opens" polluting email-open analytics — is the concrete cautionary example behind §4's side-effect rules.
 
-### 11.4 Spec trajectory — the ground is shifting in Speculate's favor
+### A.4 Spec trajectory — the ground is shifting in Speculate's favor
 
-- **Tool annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) are ratified spec, and the MCP blog's ["Tool Annotations as Risk Vocabulary"](https://blog.modelcontextprotocol.io/posts/2026-03-16-tool-annotations/) is explicit that they are **untrusted hints** — which §4 already assumes (annotation alone is insufficient in `strict` mode). Precedent for acting on `readOnlyHint` exists: Claude Code uses it for parallel dispatch and plan-mode auto-permitting. Notably, the official annotations guidance never mentions caching/prefetching as a use case — the space is open.
+- **Tool annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) are ratified spec, and the MCP blog's ["Tool Annotations as Risk Vocabulary"](https://blog.modelcontextprotocol.io/posts/2026-03-16-tool-annotations/) is explicit that they are **untrusted hints** — which §4 already assumes. Precedent for acting on `readOnlyHint` exists: Claude Code uses it for parallel dispatch and plan-mode auto-permitting. Notably, the official annotations guidance never mentions caching/prefetching as a use case — the space is open.
 - **SEP-2549 caching metadata** (`ttlMs`, `cacheScope`; final spec expected 2026-07-28) formally acknowledges caching intermediaries — `cacheScope: "public"` is defined so that "any client or intermediary (e.g., shared gateway, caching proxy) MAY cache" — but deliberately excludes `tools/call` results (§6.2 covers how Speculate relates to this).
-- The 2026-07-28 RC also makes the protocol **stateless** (no `initialize` handshake, no session pinning), which materially lowers the cost of building and operating MCP intermediaries like Speculate.
+- The 2026-07-28 RC also makes the protocol **stateless** (no `initialize` handshake, no session pinning), which lowers the cost of building MCP intermediaries — while making session *identity* the deployer's problem, which is why the shared-gateway shape is deferred (§3.2).
 
-### 11.5 Verdict
+### A.5 Verdict
 
-**The mechanism is validated; the layer is unoccupied.** Speculative tool execution is demonstrably effective in research systems, and no shipping MCP proxy/gateway/middleware does it. Speculate's defensible position is precisely the deployment model: *drop-in, protocol-native, agent-agnostic, and model-agnostic* — the browser's speculative-loading trick, placed at the one layer of the agent stack every harness already passes through. The differentiation to maintain is the deployment layer and the safety/observability envelope, **not** prediction-technique novelty (PASTE has already published the pattern-mining approach Tier 1/2 resemble). Main market risks: incumbent gateways could add this as a feature (mitigant: none has, their roadmaps center on governance, and a focused OSS tool can move faster), and harness-level parallelization eroding part of the intra-turn win (mitigant: the between-turn window is structural — §8).
-
-## 12. Risks and open questions
-
-| # | Risk / question | Current position |
-|---|---|---|
-| 1 | **Low hit rate in the wild** — real usage may be less workflow-shaped than benchmarks. | Benchmark honestly (incl. adversarial scripts), ship per-rule feedback, treat GitHub profile as the proving ground. If Tier 1 can't clear ~30% there, revisit before building Tier 2/3. |
-| 2 | **Argument mismatch** — agent asks with slightly different args than predicted. | Canonicalization + defaults materialization in MVP; measure near-miss rate explicitly (log key distance on misses) to size the fuzzy-matching opportunity before building it. |
-| 3 | **Stale reads mislead the agent.** | Short TTLs, single-use hits, mutation invalidation, per-tool TTL=0 opt-out. Staleness is bounded and documented; identical in kind to pre-existing read-then-act races. |
-| 4 | **Quota/cost blowup on busy servers.** | Default-conservative budgets, quota floor, waste metrics on the dashboard, kill switch. |
-| 5 | **Reads with side effects** (read receipts, audit noise, metered billing). | `strict` mode + vetted profiles exclude them; documented reviewer checklist for profile contributions. |
-| 6 | **Dishonest/wrong `readOnlyHint` annotations.** | `strict` mode doesn't trust annotations alone (allowlist required); `annotated` mode is opt-in per deployment. |
-| 7 | **Client-visible protocol quirks** — MCP progress notifications for calls that were prefetched can't be replayed meaningfully. | Cached hits return final results without intermediate progress events; believed benign (clients must handle absent progress anyway — it's optional in the spec) but needs verification against real clients in MVP testing (Claude Code, Cursor at minimum). |
-| 8 | **Where does turn-boundary detection come from?** MCP has no "user is typing" signal. | MVP proxies infer idle from traffic quiescence (no requests for T ms). Good enough for between-turn prefetch triggered by the *last* call of a turn; true typing signals would need host cooperation (out of scope). |
-| 9 | **Language/runtime choice** (Go vs TypeScript). | Decide at MVP kickoff; §10.1 lists the trade-off. Leaning Go. |
-| 10 | **Sampling/elicitation pass-through** — MCP server→client requests (sampling, elicitation) must traverse the proxy correctly, including for speculative calls. | Speculative calls that trigger server→client requests are **aborted, not surfaced** (the client never asked, so nothing may reach it); such tools get circuit-broken for the session. Pass-through for real calls is table stakes and in MVP tests. |
-| 11 | **Intent leakage** — speculative calls disclose predicted user intent to upstream services before the user acts ([Ghost Tool Calls](https://arxiv.org/abs/2606.02483)). | Speculation restricted to servers already receiving real session traffic; per-server denylist / `off` for sensitive deployments; called out in user-facing docs. Not fully solvable at the proxy layer. |
-
-## 13. Review checklist (what "this design makes sense" means)
-
-- [ ] A wrong prediction can never mutate state — enforced by default-deny eligibility, not by prediction quality.
-- [ ] A disabled/failed speculation subsystem leaves a correct transparent proxy.
-- [ ] Staleness is bounded, documented, and per-tool tunable to zero.
-- [ ] Speculation cost is capped, measured, and visible.
-- [ ] The MVP is small enough to build and honest enough to falsify the core hypothesis (hit rate ≥ ~40% on workflow-shaped servers).
+**The mechanism is validated; the layer is unoccupied.** Speculative tool execution is demonstrably effective in research systems, and no shipping MCP proxy/gateway/middleware does it. Speculate's defensible position is precisely the deployment model: *drop-in, protocol-native, agent-agnostic, and model-agnostic* — the browser's speculative-loading trick, placed at the one layer of the agent stack every harness already passes through. The differentiation to maintain is the deployment layer and the safety/observability envelope, **not** prediction-technique novelty (PASTE has already published the pattern-mining approach Tiers 1–2 resemble). Main market risks: incumbent gateways could add this as a feature (mitigant: none has, their roadmaps center on governance, and a focused OSS tool can move faster), and harness-level parallelization eroding part of the intra-turn win (mitigant: parallelization can't touch un-emitted or result-dependent calls, and the TTL-bounded slice of the between-turn window it harvests — §8).
