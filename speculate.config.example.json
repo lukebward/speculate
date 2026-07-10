@@ -1,0 +1,18 @@
+{
+  "mode": "strict",
+  "maxPredictionsPerTrigger": 3,
+  "log": "stderr",
+  "servers": {
+    "github": {
+      "command": "npx",
+      "args": ["tsx", "mock/mock-github.ts"],
+      "env": { "SPECULATE_MOCK_LATENCY_MS": "400" },
+      "profile": "github",
+      "speculation": {
+        "defaultTtlMs": 30000,
+        "maxPerMinute": 30,
+        "maxConcurrent": 2
+      }
+    }
+  }
+}
