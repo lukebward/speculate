@@ -113,6 +113,13 @@ Proxying already works for every MCP server — Speculate forwards anything it d
 
 Result parsing is server-agnostic too: Speculate uses the server's `structuredContent` when provided, else tries JSON-in-text (how most servers respond), else predicts nothing — never guessing.
 
+**Learning persists across restarts.** What the learner knows — transition patterns and argument templates, plus per-rule effectiveness stats — is saved to a state file (atomic writes, owner-only permissions, one file per config under `~/.local/state/speculate/` or `$XDG_STATE_HOME`), so a restarted proxy prefetches your workflows from its very first trigger instead of relearning them. **Tool results are never written to disk** — the speculation cache is memory-only by design; the state file contains tool names, argument-shape templates (including constant argument values), and counters, nothing else. A corrupt or stale state file is silently discarded (cold start, never a crash). Opt out or relocate it:
+
+```jsonc
+"persistence": { "enabled": false }          // or
+"persistence": { "path": "/somewhere/speculate-state.json" }
+```
+
 **Safety on unprofiled servers** is the same default-deny policy: use `"mode": "annotated"` for servers you trust to label their read-only tools honestly (`readOnlyHint: true`), or stay in `strict` and list the read-only tools yourself with `"allowTools": [...]`. Unknown tools are never speculated, in any mode.
 
 ## Safety model

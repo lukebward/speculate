@@ -336,7 +336,27 @@ Follow-up to the question "how does this work for servers other than GitHub?" �
 
 Safety posture for unprofiled servers is unchanged and now documented user-facing: `annotated` mode (trust `readOnlyHint`) or `strict` + per-server `allowTools`. Test suite: 216 tests (learner 30, config rules 30, plus two new end-to-end tests); the GitHub benchmark is unchanged (71% / −66% / 0 waste — learner transitions need two sightings, and the benchmark's workflow has none repeated).
 
-Known limits recorded for v0.3: learner state is per-session (no persistence across restarts); predictions never cross servers (a GitHub issue mentioning a Slack thread won't prefetch Slack); config-rule selectors don't interpolate inside nested object literals; profile-quality vetted rules still beat both generic tiers on cold sessions — community profiles remain worth shipping.
+Known limits recorded for v0.3: ~~learner state is per-session~~ (addressed in §13.6); predictions never cross servers (a GitHub issue mentioning a Slack thread won't prefetch Slack); config-rule selectors don't interpolate inside nested object literals; profile-quality vetted rules still beat both generic tiers on cold sessions — community profiles remain worth shipping.
+
+### 13.6 v0.3 — learned-state persistence (2026-07-10)
+
+The learner's model and per-rule feedback now survive restarts, so a proxy that has seen your workflows prefetches from its first trigger of a new session (verified end-to-end: session 2 hits on its first repeated-workflow trigger with no relearning).
+
+**What persists** — two things, in one versioned JSON state file:
+1. The transition model: (server, prevTool → nextTool) entries with observation counts and argument templates. Templates reference argument *provenance* (copy-this-arg, this-path-into-the-parsed-result) plus constant argument values by canonical repr. Chain heads and LRU recency are session-local and excluded.
+2. Per-rule feedback counters (hits/wasted/speculated), so suppression knowledge survives too.
+
+**What never persists:** tool results. The §6.4 memory-only cache promise is untouched — the state file contains tool names, argument-shape templates (including constant *argument* values, which is why the file is 0600 under a 0700 dir), and counters.
+
+**Durability semantics (state is an optimization, never a liability):**
+- Atomic writes (same-directory tmp + rename); a crash mid-save leaves the previous state intact.
+- Load failures of every kind — missing, corrupt, version-mismatched, hostile — are a cold start, never an error; malformed transitions inside an otherwise-valid file are skipped individually.
+- Saves are debounced (~1 s after the learner changes) with a final flush on shutdown; a failed save warns once on stderr and the proxy carries on.
+- **Feedback decays on load** (counts halve per restart, capped): without decay, a rule suppressed by ancient waste could never redeem itself, since suppressed rules never speculate and so never regain hits. Halving lets old evidence age out over a few restarts.
+
+**Location & control:** one state file per config file (≈ per project), keyed by config-path hash, under `$XDG_STATE_HOME/speculate/` (default `~/.local/state/speculate/`). Config: `persistence.enabled` (default true) and `persistence.path`. The benchmark and test harnesses run persistence-off/hermetic so measurements stay cold-start comparable.
+
+**Known limits (v0.4 candidates):** concurrent proxies sharing one state file are last-writer-wins (lost updates, never corruption — rename is atomic); a save that fails with no subsequent learning is not retried until the next learner change; learned state is per-config, not shared across projects or machines.
 
 ---
 
