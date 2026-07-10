@@ -7,6 +7,7 @@
  * the StatsReport served by `/stats` and the session summary, including the
  * honest metric: estimated ms saved vs. wasted calls per hit.
  */
+import process from 'node:process';
 import type {
   DecisionEvent,
   RuleStats,

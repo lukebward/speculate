@@ -1,3 +1,4 @@
+import process from 'node:process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Metrics } from '../src/metrics.js';
 import type { DecisionEvent, StatsReport } from '../src/types.js';
