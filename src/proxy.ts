@@ -25,6 +25,7 @@ import { SafetyPolicy } from './policy.js';
 import { BudgetManager } from './budget.js';
 import { Metrics } from './metrics.js';
 import { Predictor } from './predictor.js';
+import { TransitionLearner } from './learner.js';
 import { SpeculationExecutor } from './executor.js';
 import { builtinProfiles, profileCanonicalizer } from './profiles/index.js';
 import { canonicalKey } from './keys.js';
@@ -117,6 +118,9 @@ export class SpeculateProxy {
       profiles: this.profiles,
       maxPerTrigger: config.maxPredictionsPerTrigger,
       metrics: this.metrics,
+      // §5.3 Tier 2 (server-agnostic): learns tool-call transitions from the
+      // session itself, so unprofiled servers gain speculation over time.
+      learner: new TransitionLearner({ now }),
     });
     this.executor = new SpeculationExecutor({
       upstreams: this.upstreams,

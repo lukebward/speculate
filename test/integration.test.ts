@@ -27,7 +27,10 @@ interface Harness {
 
 const harnesses: Harness[] = [];
 
-async function startProxy(mode: 'strict' | 'off'): Promise<Harness> {
+async function startProxy(
+  mode: 'strict' | 'annotated' | 'off',
+  opts: { profile?: boolean; rules?: unknown[] } = {},
+): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'speculate-itest-'));
   const callLogPath = join(dir, 'calls.jsonl');
   const configPath = join(dir, 'config.json');
@@ -44,7 +47,8 @@ async function startProxy(mode: 'strict' | 'off'): Promise<Harness> {
             SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
           },
-          profile: 'github',
+          ...(opts.profile === false ? {} : { profile: 'github' }),
+          ...(opts.rules ? { rules: opts.rules } : {}),
         },
       },
     }),
@@ -207,6 +211,78 @@ describe('speculate end-to-end', () => {
     const stats = await readStats(client);
     expect(stats.invalidated).toBeGreaterThanOrEqual(1);
   }, 30_000);
+
+  it('unprofiled server + annotated mode: the learner earns speculation from repetition', async () => {
+    const { client } = await startProxy('annotated', { profile: false });
+    // Two observations of the get_issue → get_issue_comments transition…
+    for (const n of [41, 42]) {
+      await timedCall(client, 'get_issue', { ...REPO, issue_number: n });
+      await timedCall(client, 'get_issue_comments', { ...REPO, issue_number: n });
+    }
+    // …and the third trigger is prefetched with args tracking the NEW call.
+    await timedCall(client, 'get_issue', { ...REPO, issue_number: 43 });
+    await sleep(LATENCY_MS * 3 + 200);
+    const learned = await timedCall(client, 'get_issue_comments', {
+      ...REPO,
+      issue_number: 43,
+    });
+    expect(learned.ms).toBeLessThan(LATENCY_MS * 0.5);
+
+    const stats = await readStats(client);
+    expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(1);
+    expect(stats.perRule.some((r) => r.ruleId.startsWith('learned:'))).toBe(true);
+  }, 40_000);
+
+  it('unprofiled server + config rules: declarative speculation, including forEach', async () => {
+    const { client } = await startProxy('annotated', {
+      profile: false,
+      rules: [
+        {
+          trigger: 'get_issue',
+          predict: [
+            {
+              tool: 'get_issue_comments',
+              args: {
+                owner: '$args.owner',
+                repo: '$args.repo',
+                issue_number: '$args.issue_number',
+              },
+              confidence: 0.8,
+            },
+          ],
+        },
+        {
+          trigger: 'list_pull_requests',
+          predict: [
+            {
+              tool: 'get_pull_request',
+              args: { owner: '$args.owner', repo: '$args.repo', pull_number: '$item.number' },
+              forEach: '$parsed',
+              limit: 1,
+              confidence: 0.6,
+            },
+          ],
+        },
+      ],
+    });
+
+    await timedCall(client, 'get_issue', { ...REPO, issue_number: 42 });
+    await sleep(LATENCY_MS * 3 + 200);
+    const comments = await timedCall(client, 'get_issue_comments', {
+      ...REPO,
+      issue_number: 42,
+    });
+    expect(comments.ms).toBeLessThan(LATENCY_MS * 0.5);
+
+    // forEach over the generic JSON-parsed result (no profile parser).
+    await timedCall(client, 'list_pull_requests', { ...REPO, state: 'open' });
+    await sleep(LATENCY_MS * 3 + 200);
+    const pr = await timedCall(client, 'get_pull_request', { ...REPO, pull_number: 7 });
+    expect(pr.ms).toBeLessThan(LATENCY_MS * 0.5);
+
+    const stats = await readStats(client);
+    expect(stats.perRule.some((r) => r.ruleId.startsWith('config:'))).toBe(true);
+  }, 40_000);
 
   it('off mode is a pure pass-through: zero speculation', async () => {
     const { client, callLogPath } = await startProxy('off');
