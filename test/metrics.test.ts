@@ -122,12 +122,13 @@ describe('Metrics — counter accumulation', () => {
     });
   });
 
-  it('stdio_delay events are logged but roll into no counter', () => {
+  it('stdio_delay events increment the stdioDelays counter and nothing else', () => {
     const before = recorded().statsSnapshot();
     const m = recorded();
     m.record({ type: 'stdio_delay', server: 'fs', tool: 'read_file', latencyMs: 90 });
     const after = m.statsSnapshot();
-    expect(after).toEqual({ ...before, uptimeMs: after.uptimeMs });
+    expect(after.stdioDelays).toBe(before.stdioDelays + 1);
+    expect(after).toEqual({ ...before, stdioDelays: before.stdioDelays + 1, uptimeMs: after.uptimeMs });
   });
 });
 
@@ -250,6 +251,7 @@ describe('Metrics — statsSnapshot shape', () => {
         'invalidated',
         'wasted',
         'parserMisses',
+        'stdioDelays',
         'estimatedSavedMs',
         'wastePerHit',
         'perServer',
