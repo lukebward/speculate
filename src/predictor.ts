@@ -267,6 +267,6 @@ function dedupeKey(profile: ServerProfile, p: Prediction, order: number): string
     return canonicalKey(p.server, p.tool, p.args);
   } catch {
     // Unkeyable args (e.g. circular): opt this prediction out of dedupe.
-    return ` unkeyable:${order}`;
+    return `\x00unkeyable:${order}`;
   }
 }
