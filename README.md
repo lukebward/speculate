@@ -14,38 +14,107 @@ Think of it like Gmail preloading your inbox while you type your password — ap
                       └───────────────────┘        └─────────────────┘
 ```
 
-## Why
+## Status: working MVP
 
-Agentic loops spend a surprising amount of wall-clock time waiting on tool round-trips: a GitHub API call is hundreds of milliseconds, a warehouse query can be seconds, and agents chain many of these per turn. Meanwhile there is dead time everywhere — while the user types, while the model streams reasoning, between chained calls. Speculate overlaps tool I/O with that dead time.
+Benchmark (bundled mock GitHub upstream at 400 ms latency, 7-call scripted agent session):
 
-If the agent just fetched a GitHub issue, there's a good chance the next call is for the linked PRs. Speculate fetches them *before* the agent asks. On a hit, a 500 ms round-trip becomes a cache read.
+```
+  tool call                    off       on   outcome
+  ─────────────────────────────────────────────────────
+  get_issue                 409 ms   408 ms   miss (live call)
+  get_issue_comments        405 ms     2 ms   prefetched ✓ 167×
+  list_pull_requests        405 ms     2 ms   prefetched ✓ 216×
+  get_pull_request          405 ms     2 ms   prefetched ✓ 255×
+  get_pull_request_diff     404 ms   153 ms   joined in flight ~ 3×
+  list_issues               406 ms   404 ms   miss (live call)
+  get_issue                 405 ms     2 ms   prefetched ✓ 247×
+  ─────────────────────────────────────────────────────
+  total tool wait           2.84 s   972 ms   −66%
+
+  hits/joins 5 of 7 eligible reads (71%) · wasted speculative calls: 0
+```
+
+All three MVP success criteria from [DESIGN.md](DESIGN.md) §10 pass: hit rate ≥ 40%, tool-wait reduction ≥ 30%, waste ≤ 2 calls per hit. Reproduce with `npm run bench`, or watch the recorded demo: [`demo/speculate-demo.cast`](demo/speculate-demo.cast) (`asciinema play demo/speculate-demo.cast`).
+
+## Quickstart
+
+```bash
+git clone https://github.com/lukebward/speculate && cd speculate
+npm install
+npm test        # 150+ unit + end-to-end tests
+npm run bench   # the demo: same session with speculation off vs on
+```
+
+Point Speculate at your real MCP servers with a config file:
+
+```jsonc
+// speculate.config.json
+{
+  "mode": "strict",              // strict | annotated | off
+  "servers": {
+    "github": {
+      "command": "github-mcp-server",
+      "args": ["stdio"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." },
+      "profile": "github",       // built-in vetted profile: rules + allowlist + TTLs
+      "speculation": { "defaultTtlMs": 30000, "maxPerMinute": 30 }
+    }
+  }
+}
+```
+
+Then point your MCP client at Speculate instead of the server. For Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["tsx", "/path/to/speculate/src/cli.ts", "--config", "/path/to/speculate.config.json"]
+    }
+  }
+}
+```
+
+Everything the client sees is standard MCP: same tools, same results — some of them just arrive ~200× faster. Ask the agent to call `speculate__stats` to see hit rate, wasted calls, and estimated time saved, live.
 
 ## How it works
 
-1. **Proxy** — Speculate speaks MCP on both sides. Point your client at Speculate instead of your real servers; it aggregates and forwards everything transparently. No changes to your orchestrator or servers.
-2. **Predict** — after each real tool call (and during idle windows), a prediction engine proposes the next likely calls with concrete arguments. Predictors are pluggable and layered: static co-occurrence rules → learned per-session transition patterns → optional small-LLM prediction from conversation context.
-3. **Prefetch** — predicted calls that are provably **read-only** are executed speculatively against the upstream servers, subject to a per-server budget and rate-limit awareness.
-4. **Serve** — when the agent makes a call that matches a fresh cache entry (normalized tool + arguments), Speculate returns it immediately. Misses pass through untouched.
+1. **Proxy** — Speculate speaks MCP on both sides and forwards everything transparently. With a single upstream, tool names pass through unchanged; resources and prompts pass through too. Disabled speculation (`mode: "off"`) leaves a plain, correct proxy.
+2. **Predict** — after each served tool call, profile rules propose likely follow-ups with concrete arguments (`get_issue #42` → `get_issue_comments #42`, `list_pull_requests open`), including arguments extracted from the *result* of the trigger call (structured content when the server provides it, a vetted per-tool parser otherwise — parse failures fail closed to "no prediction").
+3. **Prefetch** — predictions that pass the safety policy and budgets are executed speculatively. Over-budget predictions wait briefly in a confidence-ordered queue and fire when a slot frees; stale ones expire unfired.
+4. **Serve** — a real call matching a fresh cached entry returns in ~2 ms. A call matching a *still-in-flight* prefetch joins it and waits only for the remainder. Everything else passes through live. Cache entries are single-use, short-TTL (default 30 s), and flushed whenever a mutation goes through the proxy.
 
 ## Safety model
 
 Speculate **never speculates on anything that can mutate state.**
 
-- Only tools that are explicitly known to be read-only are eligible for prefetching, based on MCP [tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-annotations) (`readOnlyHint: true`) **and, by default, an operator-controlled allowlist** (annotations are untrusted hints per the MCP spec; an opt-in mode exists to trust annotations alone for servers you control).
-- Unannotated or ambiguous tools are **never** speculated — they pass through normally, always.
-- Real (non-speculative) calls of any kind are always forwarded verbatim. Speculate is a pure pass-through for everything it doesn't understand.
-- Cached results have short TTLs and are invalidated when a mutating call touches the same server.
+- Only tools that are affirmatively read-only are eligible: MCP [tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-annotations) (`readOnlyHint: true`) **and, by default, an operator-controlled allowlist** (annotations are untrusted hints per the MCP spec; the opt-in `annotated` mode trusts annotations alone for servers you control).
+- Unknown or unannotated tools are never speculated — default-deny.
+- Real calls — including writes — are always forwarded verbatim; cached results are byte-identical to what the upstream returned; speculative *error* results are never cached, and auth failures suspend speculation for that tool until a real call succeeds again.
+- The integration suite asserts the invariant end-to-end: a logging mock upstream fails the run if any non-allowlisted tool is ever called speculatively.
 
-## Status
+Two honest caveats (see DESIGN.md §6, §4): results can be up to one TTL stale relative to *external* writers and to writes made outside MCP (e.g. `git push` in a shell), and a speculative read discloses predicted intent to the upstream server. Both are bounded and configurable (`ttlMsByTool: 0`, per-server `denyTools`, `mode: "off"`).
 
-🚧 **Design phase.** See [DESIGN.md](DESIGN.md) for the full architecture, speculation policy, cache semantics, market research, and MVP scope. No installable release yet.
+## Development
+
+```bash
+npm test              # vitest: unit + end-to-end (proxy ↔ mock upstream over real stdio MCP)
+npm run bench         # latency benchmark, speculation off vs on
+npm run mock-github   # run the mock upstream standalone
+npx tsc --noEmit      # typecheck
+```
+
+Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation executor + drain queue), `src/predictor.ts` + `src/profiles/github.ts` (Tier-1 rules), `src/cache.ts` (single-use TTL buffer with in-flight join), `src/policy.ts` (default-deny eligibility), `src/budget.ts` (rate/concurrency caps, stdio idle-only rule), `mock/` (latency-injectable mock GitHub server), `bench/` (the demo).
+
+The full architecture, market research, and roadmap live in [DESIGN.md](DESIGN.md). MVP deviations from the original design are listed in DESIGN.md §13 (Implementation notes).
 
 ## Non-goals
 
 - Speculating destructive or state-mutating tool calls. Not now, not later.
-- Replacing your MCP servers' own auth — Speculate forwards credentials, it doesn't own them.
-- Token savings. Speculate cuts *wall-clock latency*, not model token usage; the model still reads the same results.
+- Replacing your MCP servers' auth — Speculate forwards credentials, it doesn't own them.
+- Token savings. Speculate cuts *wall-clock latency*, not model token usage.
 
 ## License
 
-TBD.
+MIT
