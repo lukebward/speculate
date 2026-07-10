@@ -67,14 +67,18 @@ function observe(tool: string, args: Record<string, unknown>, result: CallToolRe
       ruleFeedback: () => ({ hits: 0, wasted: 0, speculated: 0 }),
     },
   });
-  const predictions = predictor.observe({
-    server: 'github',
-    tool,
-    args,
-    result,
-    latencyMs: 40,
-    timestamp: 1_720_000_000_000,
-  });
+  const predictions = predictor
+    .observe({
+      server: 'github',
+      tool,
+      args,
+      result,
+      latencyMs: 40,
+      timestamp: 1_720_000_000_000,
+    })
+    // The stamped canonical `key` is an executor-facing optimization detail;
+    // these tests assert rule semantics, so compare without it.
+    .map(({ key: _key, ...rest }) => rest);
   return { predictions, events };
 }
 
@@ -292,15 +296,23 @@ describe('githubProfile parsers', () => {
 
 describe('githubProfile canonicalizers', () => {
   for (const tool of ['list_issues', 'list_pull_requests'] as const) {
-    it(`${tool}: defaults state to open and folds case, so keys collide`, () => {
+    it(`${tool}: defaults state to open, so omitted and explicit keys collide`, () => {
       const canon = githubProfile.canonicalizers[tool]!;
       const bare = { owner: 'octo', repo: 'hello' };
-      const upper = { owner: 'octo', repo: 'hello', state: 'OPEN' };
+      const explicit = { owner: 'octo', repo: 'hello', state: 'open' };
 
       expect(canonicalKey('github', tool, bare, canon)).toBe(
-        canonicalKey('github', tool, upper, canon),
+        canonicalKey('github', tool, explicit, canon),
       );
       expect(canon(bare)).toEqual({ owner: 'octo', repo: 'hello', state: 'open' });
+    });
+
+    it(`${tool}: does NOT case-fold — the server is case-sensitive, and a fold
+        would let a cache hit succeed where the live call errors`, () => {
+      const canon = githubProfile.canonicalizers[tool]!;
+      expect(
+        canonicalKey('github', tool, { owner: 'o', repo: 'r', state: 'OPEN' }, canon),
+      ).not.toBe(canonicalKey('github', tool, { owner: 'o', repo: 'r', state: 'open' }, canon));
     });
 
     it(`${tool}: does not mutate its input args`, () => {

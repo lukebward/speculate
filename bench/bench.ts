@@ -12,6 +12,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { resultText } from '../src/upstream.js';
 import type { StatsReport } from '../src/types.js';
 
 const ROOT = new URL('..', import.meta.url).pathname;
@@ -107,10 +109,11 @@ async function runSession(mode: 'strict' | 'off', latencyMs: number): Promise<Ru
 
   let stats: StatsReport | null = null;
   if (mode !== 'off') {
-    const res = (await client.callTool({ name: 'speculate__stats', arguments: {} })) as {
-      content: { type: string; text?: string }[];
-    };
-    const text = res.content.find((c) => c.type === 'text')?.text;
+    const res = (await client.callTool({
+      name: 'speculate__stats',
+      arguments: {},
+    })) as CallToolResult;
+    const text = resultText(res);
     stats = text ? (JSON.parse(text) as StatsReport) : null;
   }
 
@@ -125,7 +128,8 @@ async function runSession(mode: 'strict' | 'off', latencyMs: number): Promise<Ru
 
 async function main(): Promise<void> {
   const latencyArg = process.argv.indexOf('--latency');
-  const latencyMs = latencyArg !== -1 ? Number(process.argv[latencyArg + 1]) : 400;
+  const parsed = latencyArg !== -1 ? Number(process.argv[latencyArg + 1]) : 400;
+  const latencyMs = Number.isFinite(parsed) && parsed >= 0 ? parsed : 400;
 
   console.log();
   console.log(bold('  Speculate benchmark — scripted agent session, mock GitHub upstream'));

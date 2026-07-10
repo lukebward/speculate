@@ -148,10 +148,13 @@ export class Predictor {
       }
     }
 
-    // Batch dedupe on canonical cache key, keeping the higher-scored prediction.
+    // Batch dedupe on canonical cache key, keeping the higher-scored
+    // prediction. The key is stamped onto the prediction so the executor
+    // reuses it instead of recomputing (and possibly diverging).
     const byKey = new Map<string, ScoredPrediction>();
     for (const cand of candidates) {
       const key = dedupeKey(profile, cand.prediction, cand.order);
+      if (!key.startsWith('\x00unkeyable:')) cand.prediction.key = key;
       const existing = byKey.get(key);
       if (!existing || cand.score > existing.score) byKey.set(key, cand);
     }

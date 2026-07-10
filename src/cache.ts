@@ -7,7 +7,7 @@
  * sweep(); there are no internal timers.
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { keyDistance, keyServer, keyTool } from './keys.js';
+import { argsDistance, keyServer, keyTool, parseKeyArgs } from './keys.js';
 import type { CacheEntryMeta, CacheKey, CacheLookup } from './types.js';
 
 /**
@@ -47,6 +47,11 @@ interface EntryBase {
    * settlement stores nothing and emits no events.
    */
   claimed: boolean;
+  /**
+   * Canonical args parsed from the key, memoized on first near-miss scan
+   * (undefined = not yet parsed; null = unparseable).
+   */
+  parsedArgs?: Record<string, unknown> | null;
 }
 
 interface InFlightEntry extends EntryBase {
@@ -248,14 +253,23 @@ export class SpeculationCache {
     return affected;
   }
 
-  /** Near-miss telemetry over remaining same-(server, tool) entries (§6.1). */
+  /**
+   * Near-miss telemetry over remaining same-(server, tool) entries (§6.1).
+   * Runs on the real-call hot path, so the probe key is parsed exactly once
+   * and each entry's parsed args are memoized on the entry.
+   */
   private miss(key: CacheKey): CacheLookup {
     const server = keyServer(key);
     const tool = keyTool(key);
+    let probeArgs: Record<string, unknown> | null | undefined;
     let nearMissDistance: number | undefined;
     for (const [otherKey, other] of this.entries) {
       if (other.server !== server || other.tool !== tool) continue;
-      const d = keyDistance(key, otherKey);
+      if (probeArgs === undefined) probeArgs = parseKeyArgs(key);
+      if (probeArgs === null) break;
+      if (other.parsedArgs === undefined) other.parsedArgs = parseKeyArgs(otherKey);
+      if (other.parsedArgs === null) continue;
+      const d = argsDistance(probeArgs, other.parsedArgs);
       if (nearMissDistance === undefined || d < nearMissDistance) {
         nearMissDistance = d;
       }

@@ -13,7 +13,9 @@ import type { SafetyPolicy } from './policy.js';
 import type { BudgetManager } from './budget.js';
 import type { Metrics } from './metrics.js';
 import { canonicalKey } from './keys.js';
+import { profileCanonicalizer, profileTtlMs } from './profiles/index.js';
 import { looksLikeAuthError, resultText, type Upstream } from './upstream.js';
+import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import type {
   Prediction,
   ServerProfile,
@@ -108,7 +110,9 @@ export class SpeculationExecutor {
     }
 
     const profile = profiles[p.server];
-    const key = canonicalKey(p.server, p.tool, p.args, profile?.canonicalizers[p.tool]);
+    const key =
+      p.key ??
+      canonicalKey(p.server, p.tool, p.args, profileCanonicalizer(profile, p.tool));
     if (cache.has(key)) {
       this.suppress(p, 'dedup');
       return 'dropped';
@@ -151,6 +155,10 @@ export class SpeculationExecutor {
       .catch((err: unknown) => {
         if (looksLikeAuthError({ message: (err as Error)?.message })) {
           policy.suspend(p.server, p.tool, 'auth');
+        } else if (err instanceof McpError && err.code === ErrorCode.MethodNotFound) {
+          // Structurally un-callable (tool vanished, server can't serve it):
+          // stop speculating it rather than re-burning budget every trigger.
+          policy.suspend(p.server, p.tool, 'method-not-found');
         }
         throw err;
       })
@@ -205,7 +213,7 @@ export class SpeculationExecutor {
     const serverCfg = config.servers[server];
     const profile = profiles[server];
     return (
-      profile?.ttlMsByTool[tool] ??
+      profileTtlMs(profile, tool) ??
       serverCfg?.speculation?.defaultTtlMs ??
       profile?.defaultTtlMs ??
       30_000

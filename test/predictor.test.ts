@@ -81,7 +81,11 @@ function setup(
     metrics,
   });
   const observe = (tool: string, args: Record<string, unknown>, result: CallToolResult) =>
-    predictor.observe({ server: SERVER, tool, args, result, latencyMs: 25, timestamp: 1_000 });
+    predictor
+      .observe({ server: SERVER, tool, args, result, latencyMs: 25, timestamp: 1_000 })
+      // The stamped canonical `key` is an executor-facing detail; these tests
+      // assert pipeline semantics, so compare without it.
+      .map(({ key: _key, ...rest }) => rest);
   return { predictor, metrics, observe };
 }
 

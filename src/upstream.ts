@@ -2,7 +2,10 @@
  * Upstream MCP server connection (DESIGN.md §3.1 connection pool).
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import {
+  StdioClientTransport,
+  getDefaultEnvironment,
+} from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   CallToolResultSchema,
@@ -14,6 +17,8 @@ import type { ServerConfig, UpstreamTransport } from './types.js';
 
 export interface CallOptions {
   timeoutMs?: number;
+  /** Restart the timeout clock on each progress notification (long tools). */
+  resetTimeoutOnProgress?: boolean;
   onprogress?: (progress: { progress: number; total?: number; message?: string }) => void;
 }
 
@@ -27,6 +32,7 @@ export class Upstream {
   private client: Client | null = null;
   private readonly config: ServerConfig;
   private onToolsChanged: (() => void) | null = null;
+  private onDisconnect: (() => void) | null = null;
 
   constructor(name: string, config: ServerConfig) {
     this.name = name;
@@ -36,6 +42,11 @@ export class Upstream {
 
   setToolsChangedHandler(fn: () => void): void {
     this.onToolsChanged = fn;
+  }
+
+  /** Fired when the upstream connection dies (child exit, transport close). */
+  setDisconnectHandler(fn: () => void): void {
+    this.onDisconnect = fn;
   }
 
   async connect(): Promise<void> {
@@ -48,12 +59,21 @@ export class Upstream {
       : new StdioClientTransport({
           command: this.config.command!,
           args: this.config.args ?? [],
-          env: { ...getDefaultEnv(), ...(this.config.env ?? {}) },
+          env: { ...getDefaultEnvironment(), ...(this.config.env ?? {}) },
           stderr: 'inherit',
         });
     await client.connect(transport);
     this.client = client;
     this.instructions = client.getInstructions?.();
+    client.onclose = () => {
+      // A dead upstream must stop routing/speculation immediately; cached
+      // entries fetched over the old connection are flushed by the proxy
+      // (§6.4 restart flush).
+      if (this.connected) {
+        this.connected = false;
+        this.onDisconnect?.();
+      }
+    };
     client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
       try {
         await this.refreshTools();
@@ -83,10 +103,16 @@ export class Upstream {
       CallToolResultSchema,
       {
         timeout: opts.timeoutMs ?? 60_000,
+        resetTimeoutOnProgress: opts.resetTimeoutOnProgress ?? false,
         onprogress: opts.onprogress,
       },
     );
     return result as CallToolResult;
+  }
+
+  /** Upstream-declared capabilities (available after connect). */
+  capabilities(): Record<string, unknown> | undefined {
+    return this.client?.getServerCapabilities() as Record<string, unknown> | undefined;
   }
 
   // Typed pass-through for non-tool traffic (single-upstream mode, §10).
@@ -120,17 +146,6 @@ export class Upstream {
     }
     this.client = null;
   }
-}
-
-/** Minimal inherited env for stdio children (PATH etc.), mirroring SDK defaults. */
-function getDefaultEnv(): Record<string, string> {
-  const keep = ['HOME', 'LOGNAME', 'PATH', 'SHELL', 'TERM', 'USER'];
-  const env: Record<string, string> = {};
-  for (const k of keep) {
-    const v = process.env[k];
-    if (v !== undefined) env[k] = v;
-  }
-  return env;
 }
 
 /** Heuristic auth/permission failure detection for the §4 breaker. */

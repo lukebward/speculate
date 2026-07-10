@@ -33,23 +33,11 @@ export function keyTool(key: CacheKey): string {
 }
 
 /**
- * Near-miss telemetry (§6.1, §9): number of top-level argument entries that
- * differ between two keys' canonical args (symmetric difference of key/value
- * pairs). Returns Infinity when either key's args fail to parse.
+ * Recover the canonical args object from a key. Null when unparseable.
+ * Callers on hot paths should call this once per key and reuse the result
+ * (see SpeculationCache near-miss telemetry).
  */
-export function keyDistance(a: CacheKey, b: CacheKey): number {
-  const argsA = parseArgs(a);
-  const argsB = parseArgs(b);
-  if (argsA === null || argsB === null) return Infinity;
-  const keys = new Set([...Object.keys(argsA), ...Object.keys(argsB)]);
-  let d = 0;
-  for (const k of keys) {
-    if (stableStringify(argsA[k]) !== stableStringify(argsB[k])) d++;
-  }
-  return d;
-}
-
-function parseArgs(key: CacheKey): Record<string, unknown> | null {
+export function parseKeyArgs(key: CacheKey): Record<string, unknown> | null {
   // Key layout: "<server> <tool> <json>"; server/tool never contain spaces,
   // but the JSON may (string values), so split at the first two spaces only.
   const first = key.indexOf(' ');
@@ -63,4 +51,29 @@ function parseArgs(key: CacheKey): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Near-miss telemetry (§6.1, §9): number of top-level argument entries that
+ * differ between two already-parsed canonical arg objects (symmetric
+ * difference of key/value pairs).
+ */
+export function argsDistance(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+): number {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  let d = 0;
+  for (const k of keys) {
+    if (stableStringify(a[k]) !== stableStringify(b[k])) d++;
+  }
+  return d;
+}
+
+/** Convenience form of argsDistance over raw keys. Infinity when unparseable. */
+export function keyDistance(a: CacheKey, b: CacheKey): number {
+  const argsA = parseKeyArgs(a);
+  const argsB = parseKeyArgs(b);
+  if (argsA === null || argsB === null) return Infinity;
+  return argsDistance(argsA, argsB);
 }

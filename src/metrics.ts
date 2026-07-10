@@ -113,9 +113,8 @@ export class Metrics {
         }
         break;
       default:
-        // 'wasted' and 'stdio_delay' are logged but roll into no counter:
-        // waste is derived from its terminal causes (expired / invalidated /
-        // spec_error) to avoid double counting.
+        // 'stdio_delay' is logged but rolls into no counter; waste is derived
+        // from its terminal causes (expired / invalidated / spec_error).
         break;
     }
   }

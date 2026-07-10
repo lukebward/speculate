@@ -49,16 +49,16 @@ const parseJsonText: ResultParser = (result) => {
 };
 
 /**
- * §6.1: the server defaults `state` to "open" and treats it case-insensitively,
- * so `{owner, repo}` and `{owner, repo, state: 'OPEN'}` must share a cache key.
- * Returns a new object; never mutates the input.
+ * §6.1: the server defaults `state` to "open", so `{owner, repo}` and
+ * `{owner, repo, state: 'open'}` must share a cache key. No case folding:
+ * the validated-against server rejects `state: 'OPEN'` with a validation
+ * error, and folding would let a cache hit fabricate a success the live
+ * call would never produce. Returns a new object; never mutates the input.
  */
 const canonicalizeListState: ArgsCanonicalizer = (args) => {
   const out: Record<string, unknown> = { ...args };
   if (out['state'] === undefined) {
     out['state'] = 'open';
-  } else if (typeof out['state'] === 'string') {
-    out['state'] = out['state'].toLowerCase();
   }
   return out;
 };

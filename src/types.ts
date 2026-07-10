@@ -47,6 +47,12 @@ export interface Prediction {
   /** Static prior confidence in [0,1] assigned by the rule. */
   confidence: number;
   ruleId: string;
+  /**
+   * Canonical cache key, stamped by the predictor so the executor never
+   * recomputes (or diverges from) the dedupe key. Optional: the executor
+   * falls back to computing it.
+   */
+  key?: CacheKey;
 }
 
 /** A Tier-1 co-occurrence rule (DESIGN.md §5.2). */
@@ -141,11 +147,10 @@ export type DecisionEventType =
   | 'miss' // real call had no matching entry
   | 'expired' // entry aged out unused
   | 'invalidated' // entry dropped by mutation/flush
-  | 'wasted' // speculative call completed but was never used (terminal)
-  | 'spec_error' // speculative call failed upstream
+  | 'spec_error' // speculative call failed upstream (incl. a failed join)
   | 'parser_miss' // profile parser failed on a result (§5.1)
   | 'stdio_delay' // a real call waited behind an in-flight speculative call
-  | 'real_call'; // any real tools/call forwarded (bookkeeping)
+  | 'real_call'; // a tools/call actually forwarded upstream (bookkeeping)
 
 export interface DecisionEvent {
   type: DecisionEventType;
