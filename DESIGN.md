@@ -74,6 +74,7 @@ Everything that is not a cacheable `tools/call` (initialization, resources, prom
 
 - **HTTP upstreams:** real calls always get connection capacity first; speculative calls use spare concurrency only.
 - **stdio upstreams:** a single child process on one pipe, and many community servers handle requests serially — an in-flight speculative call *cannot* be preempted (`notifications/cancelled` is advisory). So for stdio upstreams the executor issues a speculative call **only when no real request is pending or in flight for that server, at most one at a time**. Worst case, a real call arriving mid-speculation waits for one upstream call to drain; this bounded delay is the price of speculating on serial transports, it is measured (§9), and per-server `off` removes it entirely.
+- **Drain queue (added during MVP benchmarking — §13):** predictions denied *only* by a busy slot are not dropped; they wait in a small per-server queue ordered by confidence and fire when the slot frees (a speculative call settles, or a real call completes — after mutation invalidation, never before). Queued predictions expire unfired after 5 s rather than firing stale, and are re-checked against policy/dedup at fire time. Without this, the idle-only rule silently discarded every prediction after the first on serial upstreams — measured cost: 14 points of hit rate on the benchmark workload.
 
 **Cache.** Per-session, in-memory, keyed by `(server, tool, canonical_args)` with per-tool TTLs and event-based invalidation (§6).
 
@@ -278,6 +279,48 @@ The honest metric to watch is **estimated seconds saved per wasted call** — it
 - [ ] Speculation cost is capped, measured, and visible — including its one bounded latency cost (stdio queuing).
 - [ ] The proxy-layer mechanics that differentiate this from research systems have actual designs: result access (§5.1), per-transport concurrency (§3.1), auth per transport (§6.4), handshake/naming aggregation (§3.4).
 - [ ] The MVP is small enough to build and honest enough to falsify the core hypothesis (explicit 30%/40% hit-rate thresholds).
+
+---
+
+## 13. Implementation notes — MVP v0.1 (2026-07-10)
+
+What actually got built, what it measured, and where reality amended the design. The code is the reference; this section records the deltas.
+
+### 13.1 Decisions
+
+- **Language: TypeScript** on the official `@modelcontextprotocol/sdk` (1.29). The §10 trade-off resolved in favor of SDK maturity — the protocol plumbing (§3.4) is exactly where an immature SDK would bleed, and `npx`-style install is the MCP-ecosystem norm. A Go single-binary port remains open for v1 if distribution demands it.
+- **Test strategy:** 154 tests — unit suites per module (cache single-use/join/doom semantics, policy mode matrix, budget windows and the stdio idle rule, predictor pipeline incl. fail-closed parsing and feedback suppression, per-rule GitHub profile tests) plus an end-to-end suite that runs a real MCP client against the proxy against a latency-injectable **mock GitHub server** over actual stdio transports. The mutation-safety invariant is asserted end-to-end: the mock logs every call it receives, and the test fails if anything not client-requested and not allowlisted ever reaches it.
+
+### 13.2 Measured results (benchmark harness, §10 item 8)
+
+Scripted 7-call review session, mock upstream at 400 ms, think-time gaps of 0.25–2.5 s:
+
+| Criterion (§10) | Target | Measured |
+|---|---|---|
+| Hit rate on eligible reads | ≥ 40% | **71%** (4 hits + 1 in-flight join of 7) |
+| Per-turn tool-wait reduction | ≥ 30% | **66%** (2.84 s → 0.97 s) |
+| Waste per hit | ≤ 2 | **0.0** |
+| Pass-through / hit overhead | ≤5 ms / ≤10 ms | ~1 ms / ~2 ms observed |
+
+Caveats exactly as §10 predicted: the scripted workflow is workflow-shaped (this is the optimistic ceiling, not the wild-traffic estimate), and the remaining misses are structural — the session's first call and a `list_issues` no rule predicts.
+
+### 13.3 Design refinements the implementation forced
+
+1. **The drain queue (§3.1).** The stdio idle-only rule as originally written silently dropped every prediction beyond the first per trigger; benchmarking exposed it immediately (57% hit rate, `list_pull_requests` never prefetched). Queuing busy-denied predictions (confidence-ordered, 5 s max age, re-validated at fire time) recovered 14 points of hit rate at zero added waste. Rate-limit denials are still dropped, not queued — queuing them would defeat the budget.
+2. **Invalidation ordering is settle-then-flush-then-drain.** A mutation that *throws* (e.g. timeout) may still have applied server-side, so the completion-side flush moved into the call's `finally`; and the flush must precede the drain hook or queued speculation fires into the pre-flush window / gets issued-then-instantly-doomed.
+3. **Joined-speculation failures are the joiner's to report.** The cache stays silent for claimed entries (the joiner owns the outcome), so the proxy must emit the `spec_error` — otherwise the §5.6 feedback loop is blind to a failing rule whenever the agent asks before the speculation settles.
+4. **Canonicalize only what the server provably normalizes.** The GitHub profile originally case-folded `state`; the server validates it case-sensitively, so a fold lets a cache hit fabricate a success the live call would reject with an error. General profile-authoring rule now: default-materialization yes, lossy normalization only with server-behavior evidence.
+5. **Builtin tool names are reserved in routing.** `speculate__stats` is claimed before upstream tools; a colliding upstream tool gets collision-prefixed instead of silently shadowed (§4 "real calls are never blocked").
+
+### 13.4 Deviations from §10 / deferred to v0.2+
+
+- **Client-side transport is stdio only.** Every target host launches local sidecars via stdio; streamable-HTTP on the client side moves to the shared-gateway milestone.
+- **Sampling/elicitation pass-through is not implemented.** The proxy's upstream client declares no sampling/elicitation capabilities, so a tool that requires them fails behind the proxy (works when directly connected) — documented limitation; neither the GitHub server nor the mock uses them. Until relay exists, the §4 speculative-abort rule is moot in practice; speculative `MethodNotFound` failures do suspend the tool.
+- **Resources/prompts pass through only in single-upstream mode**, and only when the upstream actually advertises the capability (multi-upstream aggregation of resource URIs remains out of scope).
+- **The §7 quota floor is unimplemented** — as §7 itself noted, it would be inoperative for the only shipped profile anyway; the per-minute budget (default 30/min) is the operative guard.
+- **HTTP upstream auth is env/config-based only** (no OAuth flows yet), so the §6.4 scope-change flush has no trigger; the §6.4 **restart flush is implemented** via transport-close detection — a dead upstream is delisted, its cache flushed, and it stays delisted until proxy restart (no auto-reconnect in v0.1).
+- **The GitHub profile is validated against the bundled mock** (which mirrors github-mcp-server's classic tool names and JSON-in-text payloads). Validating against the real `github-mcp-server` — and pinning the profile to its release per §5.1 — is the first v0.2 work item.
+- **Known debt:** transport policy (serial-ness, concurrency, queueable-denial reasons) is spread across budget/executor/proxy rather than one policy object; near-miss telemetry is a linear scan per miss (memoized parses; fine at MVP cache sizes, revisit if caches grow).
 
 ---
 
