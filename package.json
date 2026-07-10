@@ -9,7 +9,7 @@
     "bench": "tsx bench/bench.ts",
     "mock-github": "tsx mock/mock-github.ts",
     "start": "tsx src/cli.ts",
-    "prepare": "tsc"
+    "prepare": "node scripts/prepare.cjs"
   },
   "repository": {
     "type": "git",

@@ -32,7 +32,7 @@ import { compileConfigRules } from './configRules.js';
 import { StateStore } from './persistence.js';
 import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
-import { Upstream } from './upstream.js';
+import { Upstream, friendlySpawnError } from './upstream.js';
 import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
 
 const STATS_TOOL = 'speculate__stats';
@@ -234,11 +234,18 @@ export class SpeculateProxy {
     };
     // A host that dies or just closes the pipes (no signal) must not leave
     // an orphaned proxy + upstream process tree behind — and the final
-    // state flush must still run.
-    this.server.onclose = () => {
+    // state flush must still run. The SDK's stdio transport fires onclose
+    // only from its own close(), NOT on stdin EOF (verified against SDK
+    // 1.29), so watch stdin directly; keep onclose for protocol-level
+    // closes.
+    const exitOnHostGone = (): void => {
       if (this.closing) return;
+      process.stderr.write('[speculate] host closed the connection — shutting down\n');
       void this.close().finally(() => process.exit(0));
     };
+    this.server.onclose = exitOnHostGone;
+    process.stdin.once('end', exitOnHostGone);
+    process.stdin.once('close', exitOnHostGone);
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
   }
@@ -623,16 +630,4 @@ export class SpeculateProxy {
 
     return finalResult;
   }
-}
-
-/** ENOENT and friends deserve a human sentence, not a raw errno. */
-function friendlySpawnError(err: unknown, up: Upstream): string {
-  const msg = (err as Error).message ?? String(err);
-  if (/ENOENT/.test(msg) && up.transport === 'stdio') {
-    return `command not found (is it installed and on PATH?): ${msg}`;
-  }
-  if (/ECONNREFUSED|fetch failed/i.test(msg) && up.transport === 'http') {
-    return `server unreachable (is it running?): ${msg}`;
-  }
-  return msg;
 }

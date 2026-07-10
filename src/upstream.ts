@@ -157,6 +157,18 @@ export class Upstream {
   }
 }
 
+/** ENOENT and friends deserve a human sentence, not a raw errno. */
+export function friendlySpawnError(err: unknown, up: Upstream): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/ENOENT/.test(msg) && up.transport === 'stdio') {
+    return `command not found (is it installed and on PATH?): ${msg}`;
+  }
+  if (/ECONNREFUSED|fetch failed/i.test(msg) && up.transport === 'http') {
+    return `server unreachable (is it running?): ${msg}`;
+  }
+  return msg;
+}
+
 /** Heuristic auth/permission failure detection for the §4 breaker. */
 export function looksLikeAuthError(input: { message?: string; resultText?: string }): boolean {
   const text = `${input.message ?? ''} ${input.resultText ?? ''}`;

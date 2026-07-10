@@ -8,7 +8,7 @@
  * speculation is enabled but zero tools are eligible).
  */
 import { SafetyPolicy } from './policy.js';
-import { Upstream } from './upstream.js';
+import { Upstream, friendlySpawnError } from './upstream.js';
 import { builtinProfiles } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
 import { StateStore } from './persistence.js';
@@ -54,7 +54,7 @@ export async function runDoctor(
     try {
       await withTimeout(upstream.connect(), CONNECT_TIMEOUT_MS, `connect to '${name}'`);
     } catch (err) {
-      out(bad(`connection failed: ${(err as Error).message}`));
+      out(bad(`connection failed: ${friendlySpawnError(err, upstream)}`));
       healthy = false;
       continue;
     }
