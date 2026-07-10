@@ -62,6 +62,7 @@ export class SpeculateProxy {
   private routes = new Map<string, Route>();
   private sweeper: NodeJS.Timeout | null = null;
   private initialized = false;
+  private closing = false;
   private readonly learner: TransitionLearner;
   private readonly store: StateStore | null;
   private saveTimer: NodeJS.Timeout | null = null;
@@ -231,6 +232,13 @@ export class SpeculateProxy {
     this.server.oninitialized = () => {
       this.initialized = true;
     };
+    // A host that dies or just closes the pipes (no signal) must not leave
+    // an orphaned proxy + upstream process tree behind — and the final
+    // state flush must still run.
+    this.server.onclose = () => {
+      if (this.closing) return;
+      void this.close().finally(() => process.exit(0));
+    };
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
   }
@@ -246,7 +254,7 @@ export class SpeculateProxy {
           up.setDisconnectHandler(() => this.handleUpstreamDisconnect(up));
         } catch (err) {
           process.stderr.write(
-            `[speculate] upstream '${up.name}' failed to connect: ${(err as Error).message}\n`,
+            `[speculate] upstream '${up.name}' failed to connect: ${friendlySpawnError(err, up)}\n`,
           );
         }
       }),
@@ -254,7 +262,14 @@ export class SpeculateProxy {
     this.rebuildRoutes();
   }
 
+  /** True when at least one upstream is serving. */
+  anyUpstreamConnected(): boolean {
+    return [...this.upstreams.values()].some((u) => u.connected);
+  }
+
   async close(): Promise<void> {
+    if (this.closing) return;
+    this.closing = true;
     if (this.sweeper) clearInterval(this.sweeper);
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveState(); // best-effort final flush
@@ -329,8 +344,36 @@ export class SpeculateProxy {
     out.push({
       name: STATS_TOOL,
       description:
-        'Speculate proxy statistics: hit rate, wasted speculative calls, estimated time saved, per-rule effectiveness.',
+        'Speculate proxy statistics: hit rate, wasted speculative calls, estimated time saved, suppression reasons, cache occupancy, per-rule effectiveness.',
       inputSchema: { type: 'object', properties: {} },
+      outputSchema: {
+        type: 'object',
+        properties: {
+          mode: { type: 'string', enum: ['strict', 'annotated', 'off'] },
+          uptimeMs: { type: 'number' },
+          realCalls: { type: 'number', description: 'tools/calls forwarded upstream' },
+          speculativeCalls: { type: 'number' },
+          hits: { type: 'number' },
+          joins: { type: 'number', description: 'real calls that joined an in-flight prefetch' },
+          misses: { type: 'number' },
+          expired: { type: 'number' },
+          invalidated: { type: 'number' },
+          wasted: { type: 'number' },
+          parserMisses: { type: 'number' },
+          stdioDelays: { type: 'number' },
+          suppressed: { type: 'object', additionalProperties: { type: 'number' } },
+          estimatedSavedMs: { type: 'number' },
+          wastePerHit: { type: ['number', 'null'] },
+          perServer: { type: 'object' },
+          perRule: { type: 'array' },
+          cache: {
+            type: 'object',
+            properties: { ready: { type: 'number' }, inFlight: { type: 'number' } },
+          },
+          persistence: { type: 'object' },
+        },
+        required: ['mode', 'hits', 'joins', 'misses', 'estimatedSavedMs'],
+      },
       annotations: { readOnlyHint: true },
     });
     return out;
@@ -553,8 +596,11 @@ export class SpeculateProxy {
     }
 
     // §5.5: prediction runs off the critical path, on every served call.
+    // In 'off' mode the ENTIRE pipeline is skipped — no prediction, no
+    // learning, no state persistence. Off means off (§13.7): a disabled
+    // proxy must not accumulate learned argument data on disk.
     const finalResult = result;
-    if (!finalResult.isError) {
+    if (!finalResult.isError && this.config.mode !== 'off') {
       setImmediate(() => {
         try {
           const predictions = this.predictor.observe({
@@ -565,7 +611,7 @@ export class SpeculateProxy {
             latencyMs,
             timestamp: this.now(),
           });
-          if (this.config.mode !== 'off' && predictions.length > 0) {
+          if (predictions.length > 0) {
             this.executor.submit(predictions);
           }
           this.scheduleSave(); // §13.6: persist newly learned transitions
@@ -577,4 +623,16 @@ export class SpeculateProxy {
 
     return finalResult;
   }
+}
+
+/** ENOENT and friends deserve a human sentence, not a raw errno. */
+function friendlySpawnError(err: unknown, up: Upstream): string {
+  const msg = (err as Error).message ?? String(err);
+  if (/ENOENT/.test(msg) && up.transport === 'stdio') {
+    return `command not found (is it installed and on PATH?): ${msg}`;
+  }
+  if (/ECONNREFUSED|fetch failed/i.test(msg) && up.transport === 'http') {
+    return `server unreachable (is it running?): ${msg}`;
+  }
+  return msg;
 }

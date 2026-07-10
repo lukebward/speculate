@@ -190,6 +190,8 @@ export interface StatsReport {
   parserMisses: number;
   /** Real calls that may have queued behind speculation on a serial upstream (§3.1). */
   stdioDelays: number;
+  /** Prediction suppressions by reason (policy:/budget:/dedup/feedback/…). */
+  suppressed: Record<string, number>;
   estimatedSavedMs: number;
   wastePerHit: number | null;
   perServer: Record<

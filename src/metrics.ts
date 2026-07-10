@@ -47,6 +47,7 @@ export class Metrics {
   private parserMisses = 0;
   private stdioDelays = 0;
   private estimatedSavedMs = 0;
+  private readonly suppressedByReason = new Map<string, number>();
 
   private readonly perServer = new Map<string, PerServerCounters>();
   private readonly perRule = new Map<string, PerRuleCounters>();
@@ -168,11 +169,14 @@ export class Metrics {
       case 'predicted':
         if (event.ruleId !== undefined) this.rule(event.ruleId).predicted++;
         break;
-      case 'suppressed':
+      case 'suppressed': {
         if (event.reason === 'feedback' && event.ruleId !== undefined) {
           this.rule(event.ruleId).suppressedByFeedback++;
         }
+        const reason = event.reason ?? 'unknown';
+        this.suppressedByReason.set(reason, (this.suppressedByReason.get(reason) ?? 0) + 1);
         break;
+      }
       default:
         // Waste is derived from its terminal causes (expired / invalidated /
         // spec_error); remaining event types carry no counters.
@@ -220,6 +224,9 @@ export class Metrics {
       wasted: this.wasted,
       parserMisses: this.parserMisses,
       stdioDelays: this.stdioDelays,
+      suppressed: Object.fromEntries(
+        [...this.suppressedByReason.entries()].sort((a, b) => b[1] - a[1]),
+      ),
       estimatedSavedMs: this.estimatedSavedMs,
       wastePerHit: used === 0 ? null : this.wasted / used,
       perServer,

@@ -356,7 +356,7 @@ The learner's model and per-rule feedback now survive restarts, so a proxy that 
 
 **Location & control:** one state file per config file (≈ per project), keyed by config-path hash, under `$XDG_STATE_HOME/speculate/` (default `~/.local/state/speculate/`). Config: `persistence.enabled` (default true) and `persistence.path`. The benchmark and test harnesses run persistence-off/hermetic so measurements stay cold-start comparable.
 
-**Known limits (v0.4 candidates):** concurrent proxies sharing one state file are last-writer-wins (lost updates, never corruption — rename is atomic); a save that fails with no subsequent learning is not retried until the next learner change; learned state is per-config, not shared across projects or machines.
+**Known limits (v0.4 candidates):** concurrent proxies sharing one state file are last-writer-wins (lost updates, never corruption — rename is atomic); a save that fails with no subsequent learning is not retried until the next learner change; learned state is per-config, not shared across projects or machines; on Windows the 0600/0700 POSIX modes are no-ops (Node ignores them there) — the file lands under `%LOCALAPPDATA%\speculate`, which is per-user, but ACL hardening is not applied.
 
 ---
 

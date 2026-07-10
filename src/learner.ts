@@ -37,6 +37,11 @@ const DEFAULT_MAX_PREDICTIONS_PER_TRIGGER = 3;
 const DEFAULT_MAX_TRANSITIONS = 500;
 /** Persisted observation counts are clamped here on import (sanity bound). */
 const MAX_IMPORTED_COUNT = 10_000;
+/** Wide-result guards: a huge JSON map must not explode template state. */
+const MAX_PARSED_KEYS_PER_LEVEL = 32;
+const MAX_PARSED_PATHS = 256;
+/** Per-arg candidate-source cap (arg-copies + parsed-paths; const always kept). */
+const MAX_SOURCES_PER_ARG = 12;
 
 // -- persistence shapes (DESIGN.md §13.6) --------------------------------------
 //
@@ -272,7 +277,9 @@ export class TransitionLearner {
       if (args === null) continue; // fail closed — never partial args
       candidates.push({
         state,
-        ruleId: `learned:${state.prevTool}→${state.nextTool}`,
+        // Server label is part of the id: feedback must never bleed between
+        // servers that happen to share tool names (review finding, §13.7).
+        ruleId: `learned:${state.server}:${state.prevTool}→${state.nextTool}`,
         args,
       });
     }
@@ -285,7 +292,9 @@ export class TransitionLearner {
     return candidates.slice(0, this.maxPredictionsPerTrigger).map((c) => ({
       server: call.server,
       tool: c.state.nextTool,
-      args: c.args,
+      // Fresh, JSON-shaped copy: emitted args must never alias the stored
+      // const templates or the current call's args/parsed subtrees.
+      args: jsonCopyRecord(c.args),
       confidence: Math.min(0.55, 0.25 + 0.1 * c.state.count),
       ruleId: c.ruleId,
     }));
@@ -441,13 +450,17 @@ function candidateSources(
   const sources: Source[] = [];
   // Priority order is baked into storage order: arg-copy, parsed-path, const.
   for (const [k, v] of Object.entries(prev.args)) {
+    if (sources.length >= MAX_SOURCES_PER_ARG) break;
     if (safeStringify(v) === repr) sources.push({ kind: 'arg', key: k });
   }
   for (const p of parsedPaths) {
+    if (sources.length >= MAX_SOURCES_PER_ARG) break;
     if (safeStringify(p.value) === repr) {
       sources.push({ kind: 'parsed', path: p.segs });
     }
   }
+  // The const fallback always survives the cap: it is the source of last
+  // resort that keeps a stable-valued arg derivable.
   sources.push({ kind: 'const', value, repr });
   return sources;
 }
@@ -527,10 +540,14 @@ function enumerateParsedPaths(parsed: unknown): ParsedPath[] {
   const out: ParsedPath[] = [];
   try {
     if (isPlainObject(parsed)) {
+      let topSeen = 0;
       for (const [k, v] of Object.entries(parsed)) {
+        if (++topSeen > MAX_PARSED_KEYS_PER_LEVEL || out.length >= MAX_PARSED_PATHS) break;
         out.push({ segs: [k], value: v });
         if (isPlainObject(v)) {
+          let nestedSeen = 0;
           for (const [k2, v2] of Object.entries(v)) {
+            if (++nestedSeen > MAX_PARSED_KEYS_PER_LEVEL || out.length >= MAX_PARSED_PATHS) break;
             out.push({ segs: [k, k2], value: v2 });
           }
         } else if (Array.isArray(v)) {
@@ -549,10 +566,13 @@ function enumerateParsedPaths(parsed: unknown): ParsedPath[] {
 function pushArrayPaths(out: ParsedPath[], prefix: string[], arr: unknown[]): void {
   const n = Math.min(arr.length, 3);
   for (let i = 0; i < n; i++) {
+    if (out.length >= MAX_PARSED_PATHS) return;
     const el = arr[i];
     out.push({ segs: [...prefix, String(i)], value: el });
     if (isPlainObject(el)) {
+      let seen = 0;
       for (const [k, v] of Object.entries(el)) {
+        if (++seen > MAX_PARSED_KEYS_PER_LEVEL || out.length >= MAX_PARSED_PATHS) break;
         out.push({ segs: [...prefix, String(i), k], value: v });
       }
     }
@@ -587,6 +607,30 @@ function resolvePath(root: unknown, path: readonly string[]): Resolution {
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Fresh JSON-shaped deep copy of an args record. Uses defineProperty so an
+ * own '__proto__' key copies as an own property instead of reparenting the
+ * object (JSON.parse can produce such keys).
+ */
+export function jsonCopyRecord(args: Record<string, unknown>): Record<string, unknown> {
+  return jsonCopy(args) as Record<string, unknown>;
+}
+
+function jsonCopy(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(jsonCopy);
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    Object.defineProperty(out, key, {
+      value: jsonCopy((value as Record<string, unknown>)[key]),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return out;
 }
 
 /**

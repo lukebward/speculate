@@ -180,10 +180,10 @@ describe('compileConfigRules', () => {
     ];
     const rules = compileConfigRules(SERVER, specs);
     expect(rules.map((r) => r.id)).toEqual([
-      'config:list_pull_requests→get_pull_request#0',
-      'config:list_pull_requests→get_pull_request#1',
-      'config:list_pull_requests→list_issues#2',
-      'config:get_issue→get_issue_comments#0',
+      'config:gh:list_pull_requests→get_pull_request#0',
+      'config:gh:list_pull_requests→get_pull_request#1',
+      'config:gh:list_pull_requests→list_issues#2',
+      'config:gh:get_issue→get_issue_comments#0',
     ]);
     expect(new Set(rules.map((r) => r.id)).size).toBe(4);
     expect(rules.map((r) => r.trigger)).toEqual([
@@ -219,7 +219,7 @@ describe('predict without forEach', () => {
     expect(preds[0].server).toBe(SERVER);
     expect(preds[0].tool).toBe('search');
     expect(preds[0].confidence).toBe(0.9);
-    expect(preds[0].ruleId).toBe('config:list_pull_requests→search#0');
+    expect(preds[0].ruleId).toBe('config:gh:list_pull_requests→search#0');
     expect(preds[0].args).toEqual({
       q: 'is:open',
       page: 1,
@@ -349,7 +349,7 @@ describe('predict with forEach', () => {
     expect(preds.map((p) => p.confidence)).toEqual([0.5, 0.35, 0.245]); // rounded to 4 decimals
     for (const p of preds) {
       expect(p.server).toBe(SERVER);
-      expect(p.ruleId).toBe('config:list_pull_requests→get_pull_request#0');
+      expect(p.ruleId).toBe('config:gh:list_pull_requests→get_pull_request#0');
       expect(p.key).toBeUndefined();
     }
   });

@@ -103,6 +103,12 @@ async function main(): Promise<void> {
   const proxy = new SpeculateProxy(config, { statePath });
   const shutdown = async (): Promise<void> => {
     try {
+      const s = proxy.metrics.statsSnapshot();
+      process.stderr.write(
+        `[speculate] session summary: ${s.hits + s.joins} prefetch hits, ` +
+          `${(s.estimatedSavedMs / 1000).toFixed(1)}s saved, ` +
+          `${s.wasted} wasted speculative call(s), ${s.realCalls} upstream call(s)\n`,
+      );
       await proxy.close();
     } finally {
       process.exit(0);
@@ -112,6 +118,14 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown());
 
   await proxy.start();
+  if (!proxy.anyUpstreamConnected()) {
+    process.stderr.write(
+      `[speculate] fatal: no upstream connected (0 of ${Object.keys(config.servers).length}) — nothing to proxy.\n` +
+        `[speculate] run 'speculate doctor --config ${args.configPath}' to diagnose.\n`,
+    );
+    await proxy.close();
+    process.exit(1);
+  }
   // Startup summary: enough to answer "is it working?" from the host's logs.
   for (const [name, up] of proxy.upstreams) {
     if (!up.connected) {

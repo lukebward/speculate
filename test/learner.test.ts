@@ -116,7 +116,7 @@ describe('arg-copy templates', () => {
     expect(preds[0]!.tool).toBe('get_comments');
     expect(preds[0]!.args).toEqual({ owner: 'a', repo: 'r', issue_number: 7 });
     expect(preds[0]!.server).toBe('gh');
-    expect(preds[0]!.ruleId).toBe('learned:get_issue→get_comments');
+    expect(preds[0]!.ruleId).toBe('learned:gh:get_issue→get_comments');
     expect(preds[0]!.confidence).toBeCloseTo(0.45); // 0.25 + 0.1 * 2
     expect(preds[0]!.key).toBeUndefined(); // predictor stamps keys, not the learner
   });
@@ -415,7 +415,7 @@ describe('ranking and cap', () => {
     observePair(learner, 'srv', { tool: 'a' }, { tool: 'b' });
 
     const preds = learner.predict(mkCall('srv', 'a'));
-    expect(preds.map((p) => p.ruleId)).toEqual(['learned:a→b', 'learned:a→c']);
+    expect(preds.map((p) => p.ruleId)).toEqual(['learned:srv:a→b', 'learned:srv:a→c']);
   });
 });
 
@@ -514,7 +514,7 @@ describe('self-transitions', () => {
     const preds = learner.predict(mkCall('srv', 'list', { q: 'y' }));
     expect(preds).toHaveLength(1);
     expect(preds[0]!.tool).toBe('list');
-    expect(preds[0]!.ruleId).toBe('learned:list→list');
+    expect(preds[0]!.ruleId).toBe('learned:srv:list→list');
     expect(preds[0]!.args).toEqual({ q: 'y' }); // arg-copy tracks the current call
   });
 });

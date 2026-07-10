@@ -40,8 +40,8 @@ All three MVP success criteria from [DESIGN.md](DESIGN.md) §10 pass: hit rate �
 
 ```bash
 git clone https://github.com/lukebward/speculate && cd speculate
-npm install
-npm test        # 150+ unit + end-to-end tests
+npm install     # also builds dist/ (prepare hook)
+npm test        # 220+ unit + end-to-end tests
 npm run bench   # the demo: same session with speculation off vs on
 ```
 
@@ -69,14 +69,23 @@ Then point your MCP client at Speculate instead of the server. For Claude Code:
 {
   "mcpServers": {
     "github": {
-      "command": "npx",
-      "args": ["tsx", "/path/to/speculate/src/cli.ts", "--config", "/path/to/speculate.config.json"]
+      "command": "node",
+      "args": ["/path/to/speculate/dist/src/cli.js", "--config", "/path/to/speculate.config.json"]
     }
   }
 }
 ```
 
-Everything the client sees is standard MCP: same tools, same results — some of them just arrive ~200× faster. Ask the agent to call `speculate__stats` to see hit rate, wasted calls, and estimated time saved, live.
+Everything the client sees is standard MCP: same tools, same results — some of them just arrive ~200× faster. Ask the agent to call `speculate__stats` to see hit rate, time saved, wasted calls, and per-reason suppression counts, live.
+
+## Diagnosing
+
+```bash
+node dist/src/cli.js validate --config speculate.config.json   # config sanity (schema, profile names)
+node dist/src/cli.js doctor --config speculate.config.json     # the full picture
+```
+
+`doctor` connects each upstream and answers the question you'll actually have — *why isn't it speculating?* For every tool it prints eligible/blocked with the reason (not annotated read-only, not allowlisted in strict mode, denylisted), shows which prediction rules are armed vs orphaned, and reports what the learner has persisted so far. At runtime, the proxy logs a startup summary (per-server tool/eligible counts), a JSONL decision log on stderr, and a session summary with time saved on shutdown.
 
 ## How it works
 

@@ -76,7 +76,7 @@ describe('TransitionLearner export/import', () => {
     expect(out).toHaveLength(1);
     expect(out[0]!.tool).toBe('get');
     expect(out[0]!.args).toEqual({ id: 42, q: 'z' }); // parsed-path + arg-copy survive the trip
-    expect(out[0]!.ruleId).toBe('learned:list→get');
+    expect(out[0]!.ruleId).toBe('learned:srv:list→get');
   });
 
   it('revision changes when transitions change (dirty tracking)', () => {

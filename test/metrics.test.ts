@@ -252,6 +252,7 @@ describe('Metrics — statsSnapshot shape', () => {
         'wasted',
         'parserMisses',
         'stdioDelays',
+        'suppressed',
         'estimatedSavedMs',
         'wastePerHit',
         'perServer',

@@ -4,6 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { configRuleSpecSchema } from './configRules.js';
+import { builtinProfiles } from './profiles/index.js';
 import type { SpeculateConfig } from './types.js';
 
 const serverSchema = z
@@ -74,6 +75,14 @@ export function loadConfig(path: string): SpeculateConfig {
   const cfg = parseConfig(json);
   if (Object.keys(cfg.servers).length === 0) {
     throw new Error(`config ${path}: at least one upstream server is required`);
+  }
+  // Catch typo'd profile names here so `validate` catches them, not just run.
+  for (const [name, sc] of Object.entries(cfg.servers)) {
+    if (sc.profile && !Object.hasOwn(builtinProfiles, sc.profile)) {
+      throw new Error(
+        `config ${path}: server '${name}' references unknown profile '${sc.profile}' (available: ${Object.keys(builtinProfiles).join(', ')})`,
+      );
+    }
   }
   return cfg;
 }

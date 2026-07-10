@@ -241,6 +241,9 @@ function resolveSelector(selector: Selector, ctx: ResolveContext): unknown | Unr
     if (current === null || typeof current !== 'object' || !Object.hasOwn(current, segment)) {
       return UNRESOLVED;
     }
+    if (Array.isArray(current) && !/^\d+$/.test(segment)) {
+      return UNRESOLVED; // arrays traverse by numeric index only (no 'length')
+    }
     current = (current as Record<string, unknown>)[segment];
   }
   // `undefined` anywhere along the path (including as a final own value)
@@ -262,7 +265,16 @@ function materialize(value: unknown): unknown {
     const proto: unknown = Object.getPrototypeOf(value);
     if (proto === Object.prototype || proto === null) {
       const out: Record<string, unknown> = {};
-      for (const [key, entry] of Object.entries(value)) out[key] = materialize(entry);
+      for (const [key, entry] of Object.entries(value)) {
+        // defineProperty keeps an own '__proto__' key (JSON.parse can
+        // produce one) an own property instead of reparenting `out`.
+        Object.defineProperty(out, key, {
+          value: materialize(entry),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
       return out;
     }
   }
@@ -312,8 +324,10 @@ function round4(value: number): number {
 // Compilation
 // ---------------------------------------------------------------------------
 
-function compileEntry(trigger: string, entry: PredictEntry, index: number): Rule {
-  const id = `config:${trigger}→${entry.tool}#${index}`;
+function compileEntry(server: string, trigger: string, entry: PredictEntry, index: number): Rule {
+  // Server label in the id: feedback must never bleed between servers
+  // that share rule shapes (review finding, §13.7).
+  const id = `config:${server}:${trigger}→${entry.tool}#${index}`;
   return {
     id,
     trigger,
@@ -371,11 +385,10 @@ function compileEntry(trigger: string, entry: PredictEntry, index: number): Rule
  * closed at runtime rather than throwing).
  */
 export function compileConfigRules(server: string, specs: ConfigRuleSpec[]): Rule[] {
-  void server;
   const rules: Rule[] = [];
   for (const spec of specs) {
     spec.predict.forEach((entry, index) => {
-      rules.push(compileEntry(spec.trigger, entry, index));
+      rules.push(compileEntry(server, spec.trigger, entry, index));
     });
   }
   return rules;
