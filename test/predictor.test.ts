@@ -192,7 +192,9 @@ describe('Predictor.observe', () => {
 
     observe('list', {}, textResult('{"valid":"json"}'));
 
-    expect(seen).toEqual([null]);
+    // No vetted parser: the server-agnostic JSON-in-text fallback applies
+    // (and a genuinely non-JSON result is normal, so still no parser_miss).
+    expect(seen).toEqual([{ valid: 'json' }]);
     expect(metrics.events).toHaveLength(0);
   });
 
@@ -472,7 +474,11 @@ describe('parseResult', () => {
     expect(parseResult(profile, 'list', textResult('{nope'))).toBeNull();
   });
 
-  it('returns null with no parser and no structuredContent', () => {
-    expect(parseResult(profile, 'unknown_tool', textResult('{"a":1}'))).toBeNull();
+  it('falls back to generic JSON-in-text parsing with no vetted parser', () => {
+    expect(parseResult(profile, 'unknown_tool', textResult('{"a":1}'))).toEqual({ a: 1 });
+    expect(parseResult(profile, 'unknown_tool', textResult('plain prose'))).toBeNull();
+    expect(
+      parseResult(profile, 'unknown_tool', { content: [{ type: 'text', text: '{"a":1}' }], isError: true }),
+    ).toBeNull();
   });
 });

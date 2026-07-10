@@ -12,6 +12,7 @@ import type {
   DecisionEvent,
   ObservedCall,
   Prediction,
+  Rule,
   ServerProfile,
 } from './types.js';
 
@@ -34,6 +35,21 @@ export interface PredictorOptions {
   /** Per-trigger prediction cap (§5.6). */
   maxPerTrigger: number;
   metrics: PredictorMetrics;
+  /**
+   * Extra rules per server label (compiled from config `rules`), run
+   * alongside profile rules. Lets any server get predictions without a
+   * vetted profile.
+   */
+  extraRules?: Record<string, Rule[]>;
+  /**
+   * Server-agnostic learned-transition predictor (§5.3 Tier 2). Observes
+   * every served call; its predictions join the same validate/feedback/
+   * dedupe/cap pipeline as rule output.
+   */
+  learner?: {
+    observe(call: ObservedCall): void;
+    predict(call: ObservedCall): Prediction[];
+  };
 }
 
 /** A completed real call, as reported by the proxy core. */
@@ -59,24 +75,45 @@ interface ScoredPrediction {
   order: number;
 }
 
+/**
+ * Stand-in profile for servers with no vetted profile: no rules or parsers
+ * of its own, but result access still works via structuredContent and the
+ * generic JSON-in-text fallback, and config rules / the learner still fire.
+ */
+const GENERIC_PROFILE: ServerProfile = {
+  name: 'generic',
+  validatedAgainst: 'n/a',
+  readOnlyAllowlist: [],
+  defaultTtlMs: 30_000,
+  ttlMsByTool: {},
+  parsers: {},
+  canonicalizers: {},
+  rules: [],
+};
+
 export class Predictor {
   private readonly profiles: Map<string, ServerProfile>;
+  private readonly extraRules: Map<string, Rule[]>;
+  private readonly learner: PredictorOptions['learner'];
   private readonly maxPerTrigger: number;
   private readonly metrics: PredictorMetrics;
 
   constructor(opts: PredictorOptions) {
     // A Map avoids Object.prototype lookups for hostile server labels.
     this.profiles = new Map(Object.entries(opts.profiles));
+    this.extraRules = new Map(Object.entries(opts.extraRules ?? {}));
+    this.learner = opts.learner;
     this.maxPerTrigger = opts.maxPerTrigger;
     this.metrics = opts.metrics;
   }
 
   observe(call: CompletedCall): Prediction[] {
-    const profile = this.profiles.get(call.server);
-    if (!profile) return [];
+    const profile = this.profiles.get(call.server) ?? GENERIC_PROFILE;
 
     // §5.1 result access: structuredContent first, profile parser second,
-    // fail closed to null. A parse failure costs a prefetch, never correctness.
+    // generic JSON-in-text sniffing last (most servers serialize JSON into a
+    // text block), fail closed to null. A parse failure costs a prefetch,
+    // never correctness.
     const { parsed, parserMiss } = parseResultDetail(profile, call.tool, call.result);
     if (parserMiss) {
       this.metrics.record({
@@ -97,10 +134,12 @@ export class Predictor {
       latencyMs: call.latencyMs,
     };
 
-    // §5.2 run every matching rule (contained), §5.6 feedback-weight the output.
+    // §5.2 run every matching rule (contained), §5.6 feedback-weight the
+    // output. Profile rules and config-authored rules share one pipeline.
+    const rules: Rule[] = [...profile.rules, ...(this.extraRules.get(call.server) ?? [])];
     const candidates: ScoredPrediction[] = [];
     let order = 0;
-    for (const rule of profile.rules) {
+    for (const rule of rules) {
       if (rule.trigger !== call.tool) continue;
 
       let emitted: readonly unknown[];
@@ -145,6 +184,40 @@ export class Predictor {
       }
       for (const p of valid) {
         candidates.push({ prediction: p, score: p.confidence * eff, order: order++ });
+      }
+    }
+
+    // §5.3 Tier 2: the learner sees every served call and proposes learned
+    // transitions through the same validation/feedback/dedupe/cap pipeline.
+    // It is best-effort — a learner failure never costs a real call.
+    if (this.learner) {
+      try {
+        this.learner.observe(observed);
+        for (const raw of this.learner.predict(observed)) {
+          const learnedId =
+            typeof (raw as { ruleId?: unknown }).ruleId === 'string'
+              ? (raw as { ruleId: string }).ruleId
+              : 'learned:unknown';
+          const p = validatePrediction(raw, call.server, learnedId);
+          if (!p) continue;
+          const fb = this.metrics.ruleFeedback(p.ruleId);
+          const eff = effectiveness(fb);
+          if (fb.speculated >= FEEDBACK_MIN_SPECULATED && eff < FEEDBACK_EFFECTIVENESS_FLOOR) {
+            this.metrics.record({
+              type: 'suppressed',
+              server: call.server,
+              tool: p.tool,
+              ruleId: p.ruleId,
+              reason: 'feedback',
+              confidence: p.confidence,
+              timestamp: call.timestamp,
+            });
+            continue;
+          }
+          candidates.push({ prediction: p, score: p.confidence * eff, order: order++ });
+        }
+      } catch {
+        // Learner errors are contained; rule-based prediction continues.
       }
     }
 
@@ -215,7 +288,11 @@ function parseResultDetail(
   const parser = Object.prototype.hasOwnProperty.call(profile.parsers, tool)
     ? profile.parsers[tool]
     : undefined;
-  if (!parser) return { parsed: null, parserMiss: false }; // nothing to miss
+  if (!parser) {
+    // Generic fallback (server-agnostic): most servers serialize JSON into a
+    // text block. A non-JSON result is normal here, so no parser_miss.
+    return { parsed: genericJsonText(result), parserMiss: false };
+  }
   try {
     const parsed = parser(result);
     if (parsed === null || parsed === undefined) {
@@ -225,6 +302,24 @@ function parseResultDetail(
   } catch {
     return { parsed: null, parserMiss: true };
   }
+}
+
+/** Best-effort JSON extraction from the first text block; null otherwise. */
+function genericJsonText(result: CallToolResult): unknown | null {
+  if (result.isError) return null;
+  for (const block of result.content ?? []) {
+    if (block.type !== 'text') continue;
+    if (typeof block.text !== 'string') return null;
+    const t = block.text.trimStart();
+    // Cheap sniff: only attempt JSON.parse on something JSON-shaped.
+    if (!t.startsWith('{') && !t.startsWith('[')) return null;
+    try {
+      return JSON.parse(t) as unknown;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 /** Laplace-smoothed per-rule hit rate (§5.6): (hits + 1) / (hits + wasted + 2). */
