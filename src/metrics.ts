@@ -58,6 +58,12 @@ export class Metrics {
     string,
     { hits: number; wasted: number; speculated: number }
   >();
+  /** Bumped whenever a counter feeding ruleFeedback() changes (§13.6 dirty gate). */
+  private feedbackMutations = 0;
+
+  get feedbackRevision(): number {
+    return this.feedbackMutations;
+  }
 
   constructor(opts: {
     mode: SpeculationMode;
@@ -124,7 +130,10 @@ export class Metrics {
       case 'speculated':
         this.speculativeCalls++;
         this.server(event.server).speculativeCalls++;
-        if (event.ruleId !== undefined) this.rule(event.ruleId).speculated++;
+        if (event.ruleId !== undefined) {
+          this.rule(event.ruleId).speculated++;
+          this.feedbackMutations++;
+        }
         break;
       case 'hit':
         this.hits++;
@@ -217,14 +226,20 @@ export class Metrics {
   private recordUse(event: DecisionEvent): void {
     this.estimatedSavedMs += event.savedMs ?? 0;
     this.server(event.server).hits++;
-    if (event.ruleId !== undefined) this.rule(event.ruleId).hits++;
+    if (event.ruleId !== undefined) {
+      this.rule(event.ruleId).hits++;
+      this.feedbackMutations++;
+    }
   }
 
   /** Shared bookkeeping for 'expired' / 'invalidated' / 'spec_error'. */
   private recordWaste(event: DecisionEvent): void {
     this.wasted++;
     this.server(event.server).wasted++;
-    if (event.ruleId !== undefined) this.rule(event.ruleId).wasted++;
+    if (event.ruleId !== undefined) {
+      this.rule(event.ruleId).wasted++;
+      this.feedbackMutations++;
+    }
   }
 
   private server(name: string): PerServerCounters {

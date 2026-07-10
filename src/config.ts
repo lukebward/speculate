@@ -39,8 +39,9 @@ const configSchema = z.object({
   persistence: z
     .object({
       enabled: z.boolean().default(true),
-      /** Override the state-file location (default: XDG state dir, per config file). */
-      path: z.string().optional(),
+      /** Override the state-file location (default: XDG state dir, per
+       * config file). Relative paths resolve against the proxy's cwd. */
+      path: z.string().min(1).optional(),
     })
     .optional(),
 });

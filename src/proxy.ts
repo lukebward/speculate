@@ -64,7 +64,7 @@ export class SpeculateProxy {
   private readonly learner: TransitionLearner;
   private readonly store: StateStore | null;
   private saveTimer: NodeJS.Timeout | null = null;
-  private savedRevision = -1;
+  private savedStamp = '';
 
   constructor(
     config: SpeculateConfig,
@@ -141,7 +141,7 @@ export class SpeculateProxy {
         this.learner.importState(state.learner);
         this.metrics.importRuleFeedback(state.ruleFeedback);
       }
-      this.savedRevision = this.learner.revision;
+      this.savedStamp = this.dirtyStamp();
     }
 
     this.predictor = new Predictor({
@@ -220,7 +220,12 @@ export class SpeculateProxy {
       }
     }
 
-    this.sweeper = setInterval(() => this.cache.sweep(), 5_000);
+    // Sweeps can expire entries (waste events → feedback changes), so they
+    // also nudge the dirty-gated save.
+    this.sweeper = setInterval(() => {
+      this.cache.sweep();
+      this.scheduleSave();
+    }, 5_000);
     this.sweeper.unref();
     this.server.oninitialized = () => {
       this.initialized = true;
@@ -256,9 +261,14 @@ export class SpeculateProxy {
     await this.server.close();
   }
 
-  /** Debounced dirty-flag save: fires ~1s after the learner last changed. */
+  /** Learner + feedback state fingerprint for the dirty gate (§13.6). */
+  private dirtyStamp(): string {
+    return `${this.learner.revision}:${this.metrics.feedbackRevision}`;
+  }
+
+  /** Debounced dirty-flag save: fires ~1s after the FIRST unsaved change. */
   private scheduleSave(): void {
-    if (!this.store || this.saveTimer || this.learner.revision === this.savedRevision) {
+    if (!this.store || this.saveTimer || this.dirtyStamp() === this.savedStamp) {
       return;
     }
     this.saveTimer = setTimeout(() => {
@@ -270,14 +280,15 @@ export class SpeculateProxy {
 
   private saveState(): void {
     if (!this.store) return;
-    if (this.learner.revision === this.savedRevision) return;
+    const stamp = this.dirtyStamp();
+    if (stamp === this.savedStamp) return;
     if (
       this.store.save({
         learner: this.learner.exportState(),
         ruleFeedback: this.metrics.exportRuleFeedback(),
       })
     ) {
-      this.savedRevision = this.learner.revision;
+      this.savedStamp = stamp;
     }
   }
 
