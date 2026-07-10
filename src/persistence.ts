@@ -103,9 +103,12 @@ export class StateStore {
 export function defaultStatePath(configPath: string): string {
   const abs = isAbsolute(configPath) ? configPath : resolve(configPath);
   const hash = createHash('sha256').update(abs).digest('hex').slice(0, 16);
+  const xdg = process.env.XDG_STATE_HOME;
   const stateHome =
-    process.env.XDG_STATE_HOME && process.env.XDG_STATE_HOME.length > 0
-      ? process.env.XDG_STATE_HOME
-      : join(homedir(), '.local', 'state');
+    xdg && xdg.length > 0 && isAbsolute(xdg)
+      ? xdg // XDG spec: relative values are to be ignored
+      : process.platform === 'win32' && process.env.LOCALAPPDATA
+        ? process.env.LOCALAPPDATA
+        : join(homedir(), '.local', 'state');
   return join(stateHome, 'speculate', `state-${hash}.json`);
 }

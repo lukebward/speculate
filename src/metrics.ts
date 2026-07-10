@@ -45,6 +45,7 @@ export class Metrics {
   private invalidated = 0;
   private wasted = 0;
   private parserMisses = 0;
+  private stdioDelays = 0;
   private estimatedSavedMs = 0;
 
   private readonly perServer = new Map<string, PerServerCounters>();
@@ -161,6 +162,9 @@ export class Metrics {
       case 'parser_miss':
         this.parserMisses++;
         break;
+      case 'stdio_delay':
+        this.stdioDelays++;
+        break;
       case 'predicted':
         if (event.ruleId !== undefined) this.rule(event.ruleId).predicted++;
         break;
@@ -170,8 +174,8 @@ export class Metrics {
         }
         break;
       default:
-        // 'stdio_delay' is logged but rolls into no counter; waste is derived
-        // from its terminal causes (expired / invalidated / spec_error).
+        // Waste is derived from its terminal causes (expired / invalidated /
+        // spec_error); remaining event types carry no counters.
         break;
     }
   }
@@ -215,6 +219,7 @@ export class Metrics {
       invalidated: this.invalidated,
       wasted: this.wasted,
       parserMisses: this.parserMisses,
+      stdioDelays: this.stdioDelays,
       estimatedSavedMs: this.estimatedSavedMs,
       wastePerHit: used === 0 ? null : this.wasted / used,
       perServer,

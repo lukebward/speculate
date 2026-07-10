@@ -47,7 +47,15 @@ const configSchema = z.object({
 });
 
 export function parseConfig(raw: unknown): SpeculateConfig {
-  return configSchema.parse(raw) as SpeculateConfig;
+  const result = configSchema.safeParse(raw);
+  if (!result.success) {
+    // Pretty, pointered messages instead of a raw ZodError dump.
+    const lines = result.error.issues.map(
+      (issue) => `  ${issue.path.length ? issue.path.join('.') : '(root)'}: ${issue.message}`,
+    );
+    throw new Error(`invalid config:\n${lines.join('\n')}`);
+  }
+  return result.data as SpeculateConfig;
 }
 
 export function loadConfig(path: string): SpeculateConfig {

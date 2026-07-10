@@ -30,6 +30,7 @@ import { SpeculationExecutor } from './executor.js';
 import { builtinProfiles, profileCanonicalizer } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
 import { StateStore } from './persistence.js';
+import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream } from './upstream.js';
 import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
@@ -171,7 +172,7 @@ export class SpeculateProxy {
     // Constructor declares tools; resources/prompts are registered in start()
     // once the sole upstream's actual capabilities are known.
     this.server = new Server(
-      { name: 'speculate', version: '0.1.0' },
+      { name: 'speculate', version: VERSION },
       { capabilities: { tools: { listChanged: true } } },
     );
     this.registerHandlers();
@@ -382,10 +383,14 @@ export class SpeculateProxy {
     this.server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       const name = req.params.name;
       if (name === STATS_TOOL) {
+        const payload = {
+          ...this.metrics.statsSnapshot(),
+          cache: this.cache.size(),
+          persistence: this.store ? { path: this.store.path } : { enabled: false },
+        };
         return {
-          content: [
-            { type: 'text', text: JSON.stringify(this.metrics.statsSnapshot(), null, 2) },
-          ],
+          content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+          structuredContent: payload,
         };
       }
       const route = this.routes.get(name);

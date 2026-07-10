@@ -13,6 +13,7 @@ import {
   type CallToolResult,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
+import { VERSION } from './version.js';
 import type { ServerConfig, UpstreamTransport } from './types.js';
 
 export interface CallOptions {
@@ -51,7 +52,7 @@ export class Upstream {
 
   async connect(): Promise<void> {
     const client = new Client(
-      { name: 'speculate', version: '0.1.0' },
+      { name: 'speculate', version: VERSION },
       { capabilities: {} },
     );
     const transport = this.config.url

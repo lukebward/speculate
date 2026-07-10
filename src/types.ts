@@ -188,6 +188,8 @@ export interface StatsReport {
   invalidated: number;
   wasted: number;
   parserMisses: number;
+  /** Real calls that may have queued behind speculation on a serial upstream (§3.1). */
+  stdioDelays: number;
   estimatedSavedMs: number;
   wastePerHit: number | null;
   perServer: Record<
