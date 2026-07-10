@@ -129,7 +129,7 @@ async function main(): Promise<void> {
 
   console.log();
   console.log(bold('  Speculate benchmark — scripted agent session, mock GitHub upstream'));
-  console.log(dim(`  upstream latency ${latencyMs} ms · 8 tool calls across 3 user turns\n`));
+  console.log(dim(`  upstream latency ${latencyMs} ms · 7 tool calls across 3 user turns\n`));
 
   console.log(dim('  running with speculation off…'));
   const off = await runSession('off', latencyMs);

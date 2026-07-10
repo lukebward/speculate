@@ -392,6 +392,8 @@ export class SpeculateProxy {
         result = await upstream.callTool(tool, args, { onprogress: opts.onprogress });
       } finally {
         this.budget.realFinished(server);
+        // A freed serial upstream may unblock queued speculation (§3.1).
+        this.executor.drainServer(server);
       }
       latencyMs = now() - t0;
       this.metrics.record({ type: 'real_call', server, tool, latencyMs });

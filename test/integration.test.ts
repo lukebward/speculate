@@ -142,9 +142,17 @@ describe('speculate end-to-end', () => {
     const comments = textPayload<{ id: number }[]>(followUp.result);
     expect(comments.length).toBeGreaterThan(0);
 
+    // The second prediction from the same trigger was queued behind the
+    // stdio idle-only slot and drained when it freed (§3.1) — also a hit.
+    const queued = await timedCall(client, 'list_pull_requests', {
+      ...REPO,
+      state: 'open',
+    });
+    expect(queued.ms).toBeLessThan(LATENCY_MS * 0.5);
+
     const stats = await readStats(client);
-    expect(stats.speculativeCalls).toBeGreaterThanOrEqual(1);
-    expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(1);
+    expect(stats.speculativeCalls).toBeGreaterThanOrEqual(2);
+    expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(2);
     expect(stats.estimatedSavedMs).toBeGreaterThan(0);
   }, 30_000);
 
