@@ -41,20 +41,6 @@ export class SafetyPolicy {
   }
 
   /**
-   * Merge additional vetted read-only tools into a server's allowlist —
-   * used by profile fingerprinting (§13.11) when a profile is recognized
-   * from the live tool list rather than configured.
-   */
-  addToAllowlist(server: string, tools: string[]): void {
-    let set = this.allowlists.get(server);
-    if (!set) {
-      set = new Set();
-      this.allowlists.set(server, set);
-    }
-    for (const t of tools) set.add(t);
-  }
-
-  /**
    * Record the server's current tool set and annotations. Called on connect
    * and on tools/list_changed (§3.4); replaces the previous set entirely, so
    * a tool that disappears from the list reverts to unknown (default-deny).

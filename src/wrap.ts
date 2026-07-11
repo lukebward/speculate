@@ -30,6 +30,8 @@ export interface WrapArgs {
   workspace: string | null;
   /** Custom command registry file for --workspace mode (§13.10). */
   commands: string | null;
+  /** Disable the §13.11 workspace catalog in --workspace mode. */
+  noAuto: boolean;
   command: string[];
 }
 
@@ -40,7 +42,7 @@ const PROFILE_AUTODETECT: [string, string][] = [
 ];
 
 export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
-  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], workspace: null, commands: null, command: [] };
+  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], workspace: null, commands: null, noAuto: false, command: [] };
   let i = 0;
   for (; i < argv.length; i++) {
     const a = argv[i]!;
@@ -70,6 +72,8 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       const c = argv[++i];
       if (!c) return { error: '--commands requires a file path' };
       out.commands = resolve(c);
+    } else if (a === '--no-auto') {
+      out.noAuto = true;
     } else {
       return { error: `unknown wrap argument '${a}' (flags go before '--', the wrapped command after)` };
     }
@@ -128,6 +132,7 @@ export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stat
               '--cwd',
               args.workspace,
               ...(args.commands ? ['--commands', args.commands] : []),
+              ...(args.noAuto ? ['--no-auto'] : []),
             ],
             profile: 'shell',
             ...(args.allow.length ? { allowTools: args.allow } : {}),

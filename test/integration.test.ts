@@ -29,7 +29,7 @@ const harnesses: Harness[] = [];
 
 async function startProxy(
   mode: 'strict' | 'annotated' | 'off',
-  opts: { profile?: boolean; rules?: unknown[]; statePath?: string } = {},
+  opts: { profile?: boolean | 'omit'; rules?: unknown[]; statePath?: string } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'speculate-itest-'));
   const callLogPath = join(dir, 'calls.jsonl');
@@ -49,9 +49,13 @@ async function startProxy(
             SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
           },
-          // 'none' opts out of profiles AND §13.11 fingerprinting — these
-          // tests exercise truly profile-less behavior (learner only).
-          ...(opts.profile === false ? { profile: 'none' } : { profile: 'github' }),
+          // 'none' opts out of profiles AND §13.11 fingerprinting; 'omit'
+          // leaves the field absent so fingerprinting can run.
+          ...(opts.profile === false
+            ? { profile: 'none' }
+            : opts.profile === 'omit'
+              ? {}
+              : { profile: 'github' }),
           ...(opts.rules ? { rules: opts.rules } : {}),
         },
       },
@@ -326,6 +330,35 @@ describe('speculate end-to-end', () => {
     // the wiring: stats still work and nothing crashed with the store off.
     const stats = await readStats(client);
     expect(stats.realCalls).toBeGreaterThanOrEqual(2);
+  }, 30_000);
+
+  it('fingerprinting: an unconfigured server is recognized in annotated mode', async () => {
+    const { client } = await startProxy('annotated', { profile: 'omit' });
+    await timedCall(client, 'get_issue', { ...REPO, issue_number: 42 });
+    await sleep(LATENCY_MS * 3 + 200);
+    const followUp = await timedCall(client, 'get_issue_comments', {
+      ...REPO,
+      issue_number: 42,
+    });
+    expect(followUp.ms).toBeLessThan(LATENCY_MS * 0.5); // profile rule prefetched it
+    const stats = await readStats(client);
+    expect(stats.perRule.some((r) => r.ruleId === 'gh:issue→comments')).toBe(true);
+  }, 30_000);
+
+  it('fingerprinting: strict mode only suggests, never auto-applies', async () => {
+    const { client, callLogPath } = await startProxy('strict', { profile: 'omit' });
+    await timedCall(client, 'get_issue', { ...REPO, issue_number: 42 });
+    await sleep(LATENCY_MS * 3 + 200);
+    const followUp = await timedCall(client, 'get_issue_comments', {
+      ...REPO,
+      issue_number: 42,
+    });
+    // No allowlist means nothing is eligible in strict: live call, no
+    // speculation anywhere.
+    expect(followUp.ms).toBeGreaterThanOrEqual(LATENCY_MS * 0.8);
+    const stats = await readStats(client);
+    expect(stats.speculativeCalls).toBe(0);
+    expect(loggedTools(callLogPath)).toEqual(['get_issue', 'get_issue_comments']);
   }, 30_000);
 
   it('off mode is a pure pass-through: zero speculation', async () => {

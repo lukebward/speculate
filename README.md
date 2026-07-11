@@ -48,7 +48,7 @@ The client sees standard MCP — same tools, same results, some just arrive ~200
 
 No configuration is required for any of this:
 
-- **Servers are recognized by their tools, not their launch command.** If an upstream serves the GitHub tool set, the vetted GitHub profile (rules, allowlist, TTLs) applies automatically — dockerized or renamed servers included. Opt out with `"profile": "none"`.
+- **Servers are recognized by their tools, not their launch command.** If an upstream serves the GitHub tool set, the vetted GitHub profile (rules, TTLs, priors) applies automatically — dockerized or renamed servers included. In `strict` mode recognition is only a logged suggestion: strict always means explicit operator consent. Opt out entirely with `"profile": "none"`.
 - **Workspaces configure themselves.** The bundled shell server probes the repo: git tools when `.git` exists, `gh` tools when there's a GitHub remote, `npm` tools next to a `package.json`, kubectl/docker/pip when their binaries and markers are present. All read-only, all curated.
 - **Predictions ship pre-loaded and adapt to you.** Profiles carry curated workflow priors, and lister→getter tool names (`list_issues`→`get_issue`) are paired on any server. A primed pair starts prefetching after one sighting in your own traffic. From there the learner takes over: it watches which call follows which and how arguments flow, suppresses what doesn't match your habits, and persists per config — a restarted proxy prefetches your workflows from its first trigger.
 - **Unknown servers still work.** Results parse via `structuredContent` or JSON-in-text, and the learner needs no profile at all.

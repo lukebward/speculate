@@ -43,6 +43,7 @@ describe('parseWrapArgs', () => {
       allow: ['a', 'b'],
       workspace: null,
       commands: null,
+      noAuto: false,
       command: ['github-mcp-server', 'stdio'],
     });
   });

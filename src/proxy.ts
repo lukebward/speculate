@@ -27,7 +27,7 @@ import { Metrics } from './metrics.js';
 import { Predictor } from './predictor.js';
 import { TransitionLearner } from './learner.js';
 import { SpeculationExecutor } from './executor.js';
-import { builtinProfiles, profileCanonicalizer } from './profiles/index.js';
+import { builtinProfiles, detectProfile, profileCanonicalizer } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
 import { morphologicalPairs } from './priming.js';
 import { StateStore } from './persistence.js';
@@ -413,28 +413,26 @@ export class SpeculateProxy {
    */
   private fingerprintProfile(up: Upstream): void {
     if (this.profiles[up.name] || this.noProfile.has(up.name)) return;
-    const names = new Set(up.tools.map((t) => t.name));
-    let best: ServerProfile | null = null;
-    let bestScore = 0;
-    for (const profile of Object.values(builtinProfiles)) {
-      const list = profile.readOnlyAllowlist;
-      if (list.length === 0) continue;
-      const hits = list.filter((t) => names.has(t)).length;
-      const score = hits / list.length;
-      if (score > bestScore) {
-        bestScore = score;
-        best = profile;
-      }
-    }
-    if (best && bestScore >= 0.6) {
-      this.profiles[up.name] = best; // shared record: executor/router see it
-      this.policy.addToAllowlist(up.name, best.readOnlyAllowlist);
-      this.predictor.setProfile(up.name, best);
+    const match = detectProfile(up.tools.map((t) => t.name));
+    if (!match) return;
+    if (this.config.mode === 'strict') {
+      // Strict means EXPLICIT operator consent: recognition is only a hint,
+      // never an allowlist. (Auto-applying here would let a server earn
+      // strict-mode speculation by naming its tools like a known profile.)
       process.stderr.write(
-        `[speculate] ${up.name}: recognized as '${best.name}' (${Math.round(bestScore * 100)}% tool match) — profile applied
-`,
+        `[speculate] ${up.name}: looks like '${match.profile.name}' (${Math.round(match.score * 100)}% tool match) — add "profile": "${match.profile.name}" to enable its rules in strict mode\n`,
       );
+      this.noProfile.add(up.name); // don't repeat the hint on tools_changed
+      return;
     }
+    // Annotated/off: apply rules, TTLs, canonicalizers, and primes. NOT the
+    // allowlist — eligibility stays annotation-based, and a name-colliding
+    // unannotated write must keep triggering §6.2 mutation invalidation.
+    this.profiles[up.name] = match.profile; // shared record: executor/router see it
+    this.predictor.setProfile(up.name, match.profile);
+    process.stderr.write(
+      `[speculate] ${up.name}: recognized as '${match.profile.name}' (${Math.round(match.score * 100)}% tool match) — profile applied\n`,
+    );
   }
 
   /**

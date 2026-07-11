@@ -28,9 +28,13 @@ const GETTER_SUFFIX = /^(.*?)[_-](get|show|read|fetch|view|describe)$/;
  */
 function stemCandidates(raw: string): Set<string> {
   const s = raw.toLowerCase().replace(/[_-]/g, '');
-  const out = new Set([s]);
-  if (s.endsWith('s')) out.add(s.slice(0, -1));
-  if (s.endsWith('es')) out.add(s.slice(0, -2));
+  const out = new Set<string>();
+  const add = (c: string) => {
+    if (c.length > 0) out.add(c); // '' would pair everything with everything
+  };
+  add(s);
+  if (s.endsWith('s')) add(s.slice(0, -1));
+  if (s.endsWith('es')) add(s.slice(0, -2));
   return out;
 }
 

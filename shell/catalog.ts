@@ -7,7 +7,10 @@
  * files, git remote shape). `gh` tools appear only in a repo with a GitHub
  * remote; `npm` tools only next to a package.json; and so on. Zero
  * configuration; `--no-auto` disables, a user registry (--commands) always
- * wins name collisions.
+ * wins name collisions. Note: some reads return secret-adjacent data by
+ * nature (kubectl pod specs include plaintext env values) — within the
+ * capability baseline (the agent already has shell access), but curators
+ * must never add tools whose PURPOSE is credential output.
  *
  * Every entry has been reviewed as read-only. The same execution hardening
  * as user-declared commands applies (execFile, typed params, no

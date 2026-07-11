@@ -141,7 +141,11 @@ function run(
       (err, stdout, stderr) => {
         const anyErr = err as (Error & { code?: number | string; killed?: boolean }) | null;
         if (anyErr && (anyErr.killed || anyErr.code === 'ETIMEDOUT')) {
-          resolvePromise({ stdout: '', stderr: `timed out after ${EXEC_TIMEOUT_MS} ms`, code: 124 });
+          resolvePromise({
+            stdout: '',
+            stderr: `killed: exceeded ${EXEC_TIMEOUT_MS} ms or ${MAX_OUTPUT_BYTES} output bytes`,
+            code: 124,
+          });
           return;
         }
         const code = typeof anyErr?.code === 'number' ? anyErr.code : anyErr ? 1 : 0;
