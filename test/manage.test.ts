@@ -1,0 +1,216 @@
+/**
+ * §13.12 `speculate on`/`off`/`status`: every mutation goes through the
+ * host front door (`claude mcp …`). The fake runner below implements just
+ * enough of `claude mcp add-json`/`remove` semantics against the fixture
+ * config files to verify the full on → off round trip, including the
+ * shadow-don't-touch rule for .mcp.json and the state-less unwrap net.
+ */
+import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { speculateOff, speculateOn, speculateStatus, type CmdRunner } from '../src/manage.js';
+import { WORKSPACE_SERVER_NAME } from '../src/hostConfig.js';
+
+const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
+
+let home: string;
+let cwd: string;
+let statePath: string;
+let calls: string[][];
+let logs: string[];
+
+beforeEach(() => {
+  home = mkdtempSync(join(tmpdir(), 'speculate-mhome-'));
+  cwd = mkdtempSync(join(tmpdir(), 'speculate-mproj-'));
+  statePath = join(home, 'managed.json');
+  calls = [];
+  logs = [];
+});
+afterEach(() => {
+  rmSync(home, { recursive: true, force: true });
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+type AnyRecord = Record<string, any>;
+
+function readClaudeJson(): AnyRecord {
+  try {
+    return JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+function writeClaudeJson(data: AnyRecord): void {
+  writeFileSync(join(home, '.claude.json'), JSON.stringify(data));
+}
+
+/** Just enough `claude mcp` to test against: add-json / remove / --help. */
+const fakeRunner: CmdRunner = async (cmd, args) => {
+  calls.push([cmd, ...args]);
+  if (args[0] !== 'mcp') return { code: 2, stdout: '', stderr: 'unknown command' };
+  if (args[1] === 'list') return { code: 0, stdout: 'usage', stderr: '' };
+  const config = readClaudeJson();
+  if (args[1] === 'add-json') {
+    const [name, json] = [args[2]!, args[3]!];
+    const scope = args[args.indexOf('-s') + 1];
+    const entry = JSON.parse(json);
+    if (scope === 'user') {
+      config.mcpServers = { ...config.mcpServers, [name]: entry };
+    } else if (scope === 'local') {
+      config.projects ??= {};
+      config.projects[cwd] ??= {};
+      config.projects[cwd].mcpServers = { ...config.projects[cwd].mcpServers, [name]: entry };
+    } else {
+      return { code: 1, stdout: '', stderr: `unsupported scope ${scope}` };
+    }
+    writeClaudeJson(config);
+    return { code: 0, stdout: `Added ${name}`, stderr: '' };
+  }
+  if (args[1] === 'remove') {
+    const name = args[2]!;
+    const scope = args[args.indexOf('-s') + 1];
+    const map =
+      scope === 'user' ? config.mcpServers : config.projects?.[cwd]?.mcpServers;
+    if (!map || !(name in map)) return { code: 1, stdout: '', stderr: `No server ${name}` };
+    delete map[name];
+    writeClaudeJson(config);
+    return { code: 0, stdout: `Removed ${name}`, stderr: '' };
+  }
+  return { code: 2, stdout: '', stderr: 'unknown mcp subcommand' };
+};
+
+const opts = () => ({
+  home,
+  cwd,
+  self: SELF,
+  runner: fakeRunner,
+  claudeBin: 'claude',
+  statePath,
+  log: (l: string) => logs.push(l),
+});
+
+describe('speculate on', () => {
+  it('wraps user-scope servers in place and adds the workspace server', async () => {
+    writeClaudeJson({
+      mcpServers: { github: { command: 'gh-server', args: ['stdio'], env: { T: '1' } } },
+    });
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+
+    const config = readClaudeJson();
+    const wrapped = config.mcpServers.github;
+    expect(wrapped.command).toBe(SELF.command);
+    expect(wrapped.args).toContain('wrap');
+    expect(wrapped.args.slice(-2)).toEqual(['gh-server', 'stdio']);
+    expect(wrapped.env).toEqual({ T: '1' });
+    // Workspace server registered at local scope for this project.
+    const local = config.projects[cwd].mcpServers;
+    expect(local[WORKSPACE_SERVER_NAME].args).toContain('--workspace');
+    // State file records both.
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    const actions = Object.fromEntries(
+      state.projects[cwd].entries.map((e: AnyRecord) => [e.name, e.action]),
+    );
+    expect(actions).toEqual({ github: 'rewrote', [WORKSPACE_SERVER_NAME]: 'added' });
+  });
+
+  it('shadows approved .mcp.json servers at local scope, never touching the file', async () => {
+    const mcpJson = { mcpServers: { team: { command: 'team-server', args: [] } } };
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify(mcpJson));
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+    // .mcp.json byte-identical.
+    expect(JSON.parse(readFileSync(join(cwd, '.mcp.json'), 'utf8'))).toEqual(mcpJson);
+    // Wrapped shadow lives at local scope.
+    const local = readClaudeJson().projects[cwd].mcpServers;
+    expect(local.team.command).toBe(SELF.command);
+    expect(local.team.args.slice(-1)).toEqual(['team-server']);
+  });
+
+  it('skips unapproved .mcp.json servers', async () => {
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: { team: { command: 't' } } }));
+    writeClaudeJson({ projects: { [cwd]: { enabledMcpjsonServers: ['other'] } } });
+    await speculateOn(opts());
+    expect(readClaudeJson().projects[cwd].mcpServers?.team).toBeUndefined();
+    expect(logs.join('\n')).toContain('not approved');
+  });
+
+  it('is idempotent: a second run changes nothing further', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    const after1 = readClaudeJson();
+    calls = [];
+    await speculateOn(opts());
+    expect(readClaudeJson()).toEqual(after1);
+    // Only the availability probe ran — no add/remove.
+    expect(calls.filter((c) => c[1] === 'add-json' || c[1] === 'remove')).toEqual([]);
+  });
+
+  it('passes http servers through untouched', async () => {
+    writeClaudeJson({ mcpServers: { sentry: { url: 'https://mcp.sentry.dev', type: 'http' } } });
+    await speculateOn(opts());
+    expect(readClaudeJson().mcpServers.sentry).toEqual({
+      url: 'https://mcp.sentry.dev',
+      type: 'http',
+    });
+  });
+});
+
+describe('speculate off', () => {
+  it('restores the exact original config (on → off round trip)', async () => {
+    const original = {
+      mcpServers: { github: { command: 'gh-server', args: ['stdio'], env: { T: '1' } } },
+    };
+    writeClaudeJson(original);
+    await speculateOn(opts());
+    const code = await speculateOff(opts());
+    expect(code).toBe(0);
+
+    const config = readClaudeJson();
+    expect(config.mcpServers).toEqual(original.mcpServers);
+    expect(config.projects?.[cwd]?.mcpServers ?? {}).toEqual({});
+    // State record cleared.
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.projects[cwd]).toBeUndefined();
+  });
+
+  it('unwraps in place even with no state file (self-describing entries)', async () => {
+    writeClaudeJson({
+      mcpServers: {
+        github: {
+          command: SELF.command,
+          args: [...SELF.args, 'wrap', '--', 'gh-server', 'stdio'],
+          env: { T: '1' },
+        },
+      },
+    });
+    const code = await speculateOff(opts()); // statePath never written
+    expect(code).toBe(0);
+    expect(readClaudeJson().mcpServers.github).toEqual({
+      command: 'gh-server',
+      args: ['stdio'],
+      env: { T: '1' },
+    });
+  });
+});
+
+describe('speculate status', () => {
+  it('reports wrapped, unwrapped, and drift since on', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    // A server added after `on` ran:
+    const config = readClaudeJson();
+    config.mcpServers.linear = { command: 'linear-server' };
+    writeClaudeJson(config);
+
+    logs = [];
+    await speculateStatus(opts());
+    const text = logs.join('\n');
+    expect(text).toContain('github (user): wrapped (managed)');
+    expect(text).toContain('linear (user): NOT wrapped');
+    expect(text).toContain("run it again");
+  });
+});

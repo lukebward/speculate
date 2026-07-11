@@ -26,6 +26,7 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
     allow: over.allow ?? [],
     workspace: over.workspace ?? null,
     commands: over.commands ?? null,
+    sniff: over.sniff ?? false,
     command: over.command ?? [],
   };
 }
@@ -44,8 +45,16 @@ describe('parseWrapArgs', () => {
       workspace: null,
       commands: null,
       noAuto: false,
+      sniff: false,
       command: ['github-mcp-server', 'stdio'],
     });
+  });
+
+  it('parses --sniff for wrapped commands and rejects it with --workspace', () => {
+    expect(ok(parseWrapArgs(['--sniff', '--', 'srv'])).sniff).toBe(true);
+    expect(err(parseWrapArgs(['--sniff', '--workspace', '.']))).toContain(
+      '--sniff applies only when wrapping a command',
+    );
   });
 
   it('defaults mode to annotated', () => {

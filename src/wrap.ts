@@ -32,6 +32,12 @@ export interface WrapArgs {
   commands: string | null;
   /** Disable the §13.11 workspace catalog in --workspace mode. */
   noAuto: boolean;
+  /**
+   * §13.12 protocol sniffing: engage the proxy only if the first client
+   * line is an MCP initialize; otherwise degrade to a transparent pipe.
+   * This is what makes blind wrapping (launcher shims) safe.
+   */
+  sniff: boolean;
   command: string[];
 }
 
@@ -42,7 +48,7 @@ const PROFILE_AUTODETECT: [string, string][] = [
 ];
 
 export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
-  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], workspace: null, commands: null, noAuto: false, command: [] };
+  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], workspace: null, commands: null, noAuto: false, sniff: false, command: [] };
   let i = 0;
   for (; i < argv.length; i++) {
     const a = argv[i]!;
@@ -74,12 +80,17 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       out.commands = resolve(c);
     } else if (a === '--no-auto') {
       out.noAuto = true;
+    } else if (a === '--sniff') {
+      out.sniff = true;
     } else {
       return { error: `unknown wrap argument '${a}' (flags go before '--', the wrapped command after)` };
     }
   }
   if (out.workspace && out.command.length > 0) {
     return { error: '--workspace and a wrapped command are mutually exclusive' };
+  }
+  if (out.sniff && out.workspace) {
+    return { error: '--sniff applies only when wrapping a command' };
   }
   if (out.commands && !out.workspace) {
     return { error: '--commands requires --workspace (it feeds the bundled shell server)' };

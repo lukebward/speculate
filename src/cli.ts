@@ -15,11 +15,32 @@ import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
 import { SpeculateProxy } from './proxy.js';
 import { runDoctor } from './doctor.js';
 import { buildWrapConfig, parseWrapArgs } from './wrap.js';
+import { runPipe, sniffFirstLine } from './sniff.js';
+import { selfCommand } from './hostConfig.js';
+import { parseTryArgs, runTry } from './tryRun.js';
+import { speculateOff, speculateOn, speculateStatus } from './manage.js';
+import { parseExecArgs, runExec } from './execClient.js';
+import {
+  DaemonAlreadyRunningError,
+  parseDaemonArgs,
+  startExecDaemon,
+} from './execDaemon.js';
+import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { VERSION } from './version.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
-usage:
+install-and-it-works (no config files edited by hand):
+  speculate try [-- <claude args...>]      zero-write trial: launch Claude Code with every
+                                           MCP server wrapped + CLI speculation, this session only
+  speculate on [--mode <mode>]             wrap this project's servers persistently, via
+                                           'claude mcp' (the host's own CLI); adds CLI speculation
+  speculate off                            undo everything 'on' did (exact restore)
+  speculate status                         what's wrapped here, and what drifted since 'on'
+  speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
+                                           server any client launches, even ones added later
+
+manual wrapping:
   speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
   speculate wrap --workspace <dir>                           zero config: CLI speculation for a repo
   speculate --config <path> [--mode strict|annotated|off]    run the proxy from a config file
@@ -28,11 +49,17 @@ usage:
                                                              per-tool speculation eligibility
   speculate validate --config <path>                         validate the config and exit
 
+CLI speculation (used by the Claude Code plugin's Bash hook):
+  speculate exec [--cwd <dir>] -- <command...>   serve a vetted read-only command from the
+                                                 per-workspace daemon cache (fail-open)
+  speculate exec --stats                         daemon hit-rate for this workspace
+
 wrap flags (before the '--'):
   --mode <mode>       strict|annotated|off (default for wrap: annotated)
   --profile <name>    force a vetted profile (auto-detected for known servers)
   --allow <t1,t2>     extra read-only allowlist entries
   --workspace <dir>   speculate the bundled read-only shell server for <dir>
+  --sniff             engage only if the client speaks MCP; else byte-transparent pipe
 
 options:
   --config <path>   path to speculate config (JSON with comments allowed)
@@ -59,11 +86,35 @@ const STARTER_CONFIG = `{
 `;
 
 interface Args {
-  command: 'run' | 'doctor' | 'validate' | 'init' | 'wrap';
+  command:
+    | 'run'
+    | 'doctor'
+    | 'validate'
+    | 'init'
+    | 'wrap'
+    | 'try'
+    | 'on'
+    | 'off'
+    | 'status'
+    | 'exec'
+    | 'exec-daemon'
+    | 'shims';
   configPath: string;
   modeOverride: 'strict' | 'annotated' | 'off' | null;
   rest: string[];
 }
+
+/** Subcommands that own their whole argv (flags parsed by their module). */
+const REST_COMMANDS = new Set([
+  'wrap',
+  'try',
+  'on',
+  'off',
+  'status',
+  'exec',
+  'exec-daemon',
+  'shims',
+] as const);
 
 function fail(message: string): never {
   process.stderr.write(`speculate: ${message}\nRun 'speculate --help' for usage.\n`);
@@ -75,12 +126,17 @@ function parseArgs(argv: string[]): Args {
   let configPath: string | null = null;
   let modeOverride: Args['modeOverride'] = null;
   let i = 0;
-  if (argv[0] === 'doctor' || argv[0] === 'validate' || argv[0] === 'init' || argv[0] === 'wrap') {
-    command = argv[0];
+  if (
+    argv[0] === 'doctor' ||
+    argv[0] === 'validate' ||
+    argv[0] === 'init' ||
+    (REST_COMMANDS as Set<string>).has(argv[0] ?? '')
+  ) {
+    command = argv[0] as Args['command'];
     i = 1;
   }
-  if (command === 'wrap') {
-    // wrap owns its own flag grammar (flags, then '--', then the command).
+  if ((REST_COMMANDS as Set<string>).has(command)) {
+    // These own their own flag grammar; everything after the name is theirs.
     return { command, configPath: '', modeOverride: null, rest: argv.slice(1) };
   }
   if (command === 'init') {
@@ -127,9 +183,88 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args.command === 'try') {
+    const tryArgs = parseTryArgs(args.rest);
+    if ('error' in tryArgs) fail(`try: ${tryArgs.error}`);
+    process.exit(await runTry(tryArgs));
+  }
+
+  if (args.command === 'exec') {
+    const execArgs = parseExecArgs(args.rest);
+    if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
+    process.exit(await runExec(execArgs));
+  }
+
+  if (args.command === 'exec-daemon') {
+    const daemonArgs = parseDaemonArgs(args.rest);
+    if ('error' in daemonArgs) fail(`exec-daemon: ${daemonArgs.error}`);
+    try {
+      await startExecDaemon({ ...daemonArgs, onIdle: () => process.exit(0) });
+    } catch (err) {
+      if (err instanceof DaemonAlreadyRunningError) return; // rendezvous won
+      throw err;
+    }
+    return; // stays alive serving the socket
+  }
+
+  if (args.command === 'shims') {
+    const shimsArgs = parseShimsArgs(args.rest);
+    if ('error' in shimsArgs) fail(`shims: ${shimsArgs.error}`);
+    const opts = { rcPath: shimsArgs.rcPath, noRc: shimsArgs.noRc };
+    const code =
+      shimsArgs.action === 'install'
+        ? installShims(opts)
+        : shimsArgs.action === 'uninstall'
+          ? uninstallShims(opts)
+          : shimsStatus(opts);
+    process.exit(code);
+  }
+
+  if (args.command === 'on' || args.command === 'off' || args.command === 'status') {
+    let mode: 'strict' | 'annotated' | 'off' | null = null;
+    for (let i = 0; i < args.rest.length; i++) {
+      if (args.rest[i] === '--mode' && args.command === 'on') {
+        const m = args.rest[++i];
+        if (m !== 'strict' && m !== 'annotated' && m !== 'off') {
+          fail(`--mode must be strict|annotated|off (got '${m ?? ''}')`);
+        }
+        mode = m;
+      } else {
+        fail(`unknown ${args.command} argument '${args.rest[i]}'`);
+      }
+    }
+    const manageOpts = { self: selfCommand(), mode };
+    const code =
+      args.command === 'on'
+        ? await speculateOn(manageOpts)
+        : args.command === 'off'
+          ? await speculateOff(manageOpts)
+          : await speculateStatus(manageOpts);
+    process.exit(code);
+  }
+
   if (args.command === 'wrap') {
     const wrapArgs = parseWrapArgs(args.rest);
     if ('error' in wrapArgs) fail(`wrap: ${wrapArgs.error}`);
+    if (wrapArgs.sniff) {
+      // §13.12: decide from the first client line whether this is MCP at
+      // all. Non-MCP degrades to a transparent pipe — same command, same
+      // bytes, same exit code — so blind wrapping is always safe.
+      const decision = await sniffFirstLine(process.stdin);
+      if (!decision.mcp) {
+        process.exit(await runPipe(wrapArgs.command, decision.buffered, decision.ended));
+      }
+      // Re-inject the sniffed bytes so the proxy's transport sees the
+      // stream from its true beginning (initialize included).
+      if (decision.buffered.length > 0) process.stdin.unshift(decision.buffered);
+      const { config: wrapConfig, stateKey } = buildWrapConfig(wrapArgs);
+      await runProxy(wrapConfig, defaultStatePathForKey(stateKey), '(wrap)');
+      // Sniffing left stdin explicitly paused; an explicit pause is not
+      // undone by the transport attaching its 'data' listener. Resume only
+      // now that the listener exists, so no byte can flow into the void.
+      process.stdin.resume();
+      return;
+    }
     const { config: wrapConfig, stateKey } = buildWrapConfig(wrapArgs);
     await runProxy(wrapConfig, defaultStatePathForKey(stateKey), '(wrap)');
     return;
