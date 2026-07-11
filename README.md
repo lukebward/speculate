@@ -131,7 +131,7 @@ Architecture, measured results, and the full design history live in [DESIGN.md](
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 320+ unit and end-to-end tests
+npm test        # 430 unit and end-to-end tests
 npm run bench   # speculation off vs on
 npm run demo:svg
 ```
