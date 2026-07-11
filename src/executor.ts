@@ -226,7 +226,11 @@ export class SpeculationExecutor {
     const { profiles, config } = this.deps;
     const serverCfg = config.servers[server];
     const profile = profiles[server];
+    const cfgByTool = serverCfg?.speculation?.ttlMsByTool;
+    const operatorTtl =
+      cfgByTool && Object.hasOwn(cfgByTool, tool) ? cfgByTool[tool] : undefined;
     return (
+      operatorTtl ?? // operator per-tool beats everything (incl. 0 = never)
       profileTtlMs(profile, tool) ??
       serverCfg?.speculation?.defaultTtlMs ??
       profile?.defaultTtlMs ??

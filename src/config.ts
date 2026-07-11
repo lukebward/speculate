@@ -23,6 +23,7 @@ const serverSchema = z
     speculation: z
       .object({
         defaultTtlMs: z.number().int().nonnegative().optional(),
+        ttlMsByTool: z.record(z.string(), z.number().int().nonnegative()).optional(),
         maxPerMinute: z.number().int().positive().optional(),
         maxConcurrent: z.number().int().positive().optional(),
       })

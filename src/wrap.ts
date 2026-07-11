@@ -28,6 +28,8 @@ export interface WrapArgs {
   profile: string | null;
   allow: string[];
   workspace: string | null;
+  /** Custom command registry file for --workspace mode (§13.10). */
+  commands: string | null;
   command: string[];
 }
 
@@ -38,7 +40,7 @@ const PROFILE_AUTODETECT: [string, string][] = [
 ];
 
 export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
-  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], workspace: null, command: [] };
+  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], workspace: null, commands: null, command: [] };
   let i = 0;
   for (; i < argv.length; i++) {
     const a = argv[i]!;
@@ -64,12 +66,19 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       const w = argv[++i];
       if (!w) return { error: '--workspace requires a directory' };
       out.workspace = resolve(w);
+    } else if (a === '--commands') {
+      const c = argv[++i];
+      if (!c) return { error: '--commands requires a file path' };
+      out.commands = resolve(c);
     } else {
       return { error: `unknown wrap argument '${a}' (flags go before '--', the wrapped command after)` };
     }
   }
   if (out.workspace && out.command.length > 0) {
     return { error: '--workspace and a wrapped command are mutually exclusive' };
+  }
+  if (out.commands && !out.workspace) {
+    return { error: '--commands requires --workspace (it feeds the bundled shell server)' };
   }
   if (!out.workspace && out.command.length === 0) {
     return { error: "wrap needs a server command after '--' (or --workspace <dir>)" };
@@ -114,7 +123,12 @@ export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stat
         servers: {
           workspace: {
             command: shell.command,
-            args: [...shell.args, '--cwd', args.workspace],
+            args: [
+              ...shell.args,
+              '--cwd',
+              args.workspace,
+              ...(args.commands ? ['--commands', args.commands] : []),
+            ],
             profile: 'shell',
             ...(args.allow.length ? { allowTools: args.allow } : {}),
           },

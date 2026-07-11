@@ -37,6 +37,14 @@ import { isAbsolute, join, resolve, sep } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import {
+  ParamError,
+  TOOL_NAME_RE,
+  buildArgv,
+  inputShapeFor,
+  loadCommandRegistry,
+  type CommandRegistry,
+} from './commands.js';
 
 const EXEC_TIMEOUT_MS = 10_000;
 const MAX_OUTPUT_BYTES = 512 * 1024;
@@ -236,9 +244,10 @@ function parseRgLines(out: string, cap: number): Payload {
 // Server
 // ---------------------------------------------------------------------------
 
-function parseCliArgs(argv: string[]): { cwd: string; watch: boolean } {
+function parseCliArgs(argv: string[]): { cwd: string; watch: boolean; commandsPath: string | null } {
   let cwd = process.cwd();
   let watchFs = true;
+  let commandsPath: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--cwd') {
       const v = argv[++i];
@@ -246,10 +255,14 @@ function parseCliArgs(argv: string[]): { cwd: string; watch: boolean } {
       cwd = resolve(v);
     } else if (argv[i] === '--no-watch') {
       watchFs = false;
+    } else if (argv[i] === '--commands') {
+      const v = argv[++i];
+      if (!v) throw new Error('--commands requires a path');
+      commandsPath = resolve(v);
     }
   }
   if (!existsSync(cwd)) throw new Error(`workspace does not exist: ${cwd}`);
-  return { cwd, watch: watchFs };
+  return { cwd, watch: watchFs, commandsPath };
 }
 
 async function main(): Promise<void> {
@@ -447,6 +460,61 @@ async function main(): Promise<void> {
     );
   }
 
+  // §13.10 custom read-only command registry: any CLI tool the agent uses,
+  // declared once, becomes a predictable MCP tool. Declaring a command
+  // asserts it is read-only (author's trust boundary); model-supplied
+  // params are typed/validated and can never become flags.
+  let customCommands: CommandRegistry = {};
+  if (opts.commandsPath) {
+    customCommands = loadCommandRegistry(opts.commandsPath); // throws loudly on bad specs
+    const reserved = new Set([
+      'git_status', 'git_diff', 'git_log', 'git_show', 'git_branch', 'list_dir', 'search',
+    ]);
+    for (const [name, spec] of Object.entries(customCommands)) {
+      if (reserved.has(name)) {
+        process.stderr.write(`[speculate-shell] skipping custom command '${name}': name reserved by a built-in\n`);
+        continue;
+      }
+      if (!TOOL_NAME_RE.test(name)) continue; // schema enforces; belt and braces
+      server.registerTool(
+        name,
+        {
+          description:
+            spec.description ?? `Custom read-only command: ${spec.command.join(' ')}`,
+          inputSchema: inputShapeFor(spec),
+          annotations: { readOnlyHint: true },
+        },
+        guarded(async (a) => {
+          let bin: string;
+          let argv: string[];
+          try {
+            ({ bin, argv } = buildArgv(spec, a));
+          } catch (err) {
+            if (err instanceof ParamError) return errResult(err.message);
+            throw err;
+          }
+          const r = await run(root, bin, argv);
+          if (r.code !== 0) {
+            return errResult(
+              `exit ${r.code}: ${r.stderr.trim().slice(0, 2000) || '(no stderr)'}`,
+            );
+          }
+          const trimmed = r.stdout.trimStart();
+          // JSON stdout flows through as structure so the prediction stack
+          // can mine it; anything else is passed as capped text.
+          if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            try {
+              return okResult({ exitCode: 0, output: JSON.parse(trimmed) as unknown });
+            } catch {
+              // fall through to text
+            }
+          }
+          return okResult({ exitCode: 0, output: r.stdout.slice(0, MAX_OUTPUT_BYTES) });
+        }),
+      );
+    }
+  }
+
   // Freshness: workspace changes flush Speculate's buffer for this server
   // (tools/list_changed → §3.4 invalidation), debounced so edit bursts cost
   // one flush. Failures degrade to TTL-only freshness — never fatal.
@@ -471,8 +539,9 @@ async function main(): Promise<void> {
   }
 
   await server.connect(new StdioServerTransport());
+  const customCount = Object.keys(customCommands).length;
   process.stderr.write(
-    `[speculate-shell] serving ${root} (git: ${isGitRepo ? 'yes' : 'no'}, rg: ${hasRg ? 'yes' : 'no'}, watch: ${opts.watch ? 'on' : 'off'})\n`,
+    `[speculate-shell] serving ${root} (git: ${isGitRepo ? 'yes' : 'no'}, rg: ${hasRg ? 'yes' : 'no'}, watch: ${opts.watch ? 'on' : 'off'}${customCount ? `, custom commands: ${customCount}` : ''})\n`,
   );
 }
 

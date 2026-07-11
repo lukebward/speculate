@@ -157,6 +157,24 @@ The same machinery works on the agent's *command-line* workflows via the bundled
 
 `git status` → the diff is already prefetched by the time the agent asks for it; `git log` → the newest commit's patch is warm. Freshness comes from the filesystem itself: a watcher on the workspace flushes the speculation buffer within ~300 ms of any file change, so the agent never sees a diff from before its own edit (short TTLs backstop it).
 
+**Any CLI tool your agent uses can join.** Declare read-only commands once in a registry file and each becomes a predictable, speculated MCP tool — `kubectl get pods`, `gh pr list`, `npm outdated`, anything:
+
+```jsonc
+// speculate.commands.jsonc — passed via --commands (or wrap --workspace . --commands <file>)
+{
+  "gh_pr_list": {
+    "command": ["gh", "pr", "list", "--json", "number,title"],
+    "params": { "limit": { "type": "number", "flag": "--limit", "min": 1, "max": 50 } }
+  },
+  "kubectl_pods": {
+    "command": ["kubectl", "get", "pods", "-o", "json"],
+    "params": { "namespace": { "type": "string", "flag": "-n", "pattern": "[a-z0-9-]{1,63}" } }
+  }
+}
+```
+
+Declaring a command asserts it's read-only (your trust boundary, same as your own shell); what the registry guarantees is that *model-supplied* parameters are typed, bounded, and structurally incapable of becoming flags or shell syntax. JSON stdout flows through as structure, so the learner can mine result fields, and lister→getter name morphology primes pairs like `gh_pr_list`→`gh_pr_view` automatically. See [`speculate.commands.example.jsonc`](speculate.commands.example.jsonc).
+
 Safety notes, because this server executes real commands with model-controlled arguments: every tool runs a **fixed binary via execFile** (no shell — strings can't become syntax); refs and globs are strictly validated and can never become flags (`git log --output=…` writes files — a ref like `--output=x` is rejected); paths are contained to the workspace; and git's config-driven code-execution paths (hooks, fsmonitor, external diff drivers, pagers) are disabled per invocation, with `GIT_OPTIONAL_LOCKS=0` so even `git status` truly writes nothing. The server grants the agent no capability its own shell lacks — the hardening is about making *speculative* execution safe.
 
 **Learning persists across restarts.** What the learner knows — transition patterns and argument templates, plus per-rule effectiveness stats — is saved to a state file (atomic writes, owner-only permissions, one file per config under `~/.local/state/speculate/` or `$XDG_STATE_HOME`), so a restarted proxy prefetches your workflows from its very first trigger instead of relearning them. **Tool results are never written to disk** — the speculation cache is memory-only by design; the state file contains tool names, argument-shape templates (including constant argument values), and counters, nothing else. A corrupt or stale state file is silently discarded (cold start, never a crash). Opt out or relocate it:

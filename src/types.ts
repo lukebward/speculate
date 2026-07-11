@@ -232,6 +232,8 @@ export interface ServerConfig {
   denyTools?: string[];
   speculation?: {
     defaultTtlMs?: number;
+    /** Per-tool TTL overrides (operator wins over profile); 0 disables. */
+    ttlMsByTool?: Record<string, number>;
     maxPerMinute?: number;
     maxConcurrent?: number;
   };

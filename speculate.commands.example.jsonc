@@ -1,0 +1,28 @@
+// Custom read-only command registry for speculate-shell (--commands <this file>).
+// DECLARING A COMMAND ASSERTS IT IS READ-ONLY — same trust boundary as your
+// own shell. Model-supplied params are typed and can never become flags.
+{
+  // Zero-parameter commands are the simplest: fixed argv, run as-is.
+  "npm_outdated": {
+    "description": "List outdated npm dependencies (JSON).",
+    "command": ["npm", "outdated", "--json"],
+  },
+
+  // Typed parameters: numbers are bounded, enums closed, strings validated.
+  "gh_pr_list": {
+    "description": "List open pull requests via the GitHub CLI.",
+    "command": ["gh", "pr", "list", "--json", "number,title,author"],
+    "params": {
+      "limit": { "type": "number", "flag": "--limit", "min": 1, "max": 50 },
+      "state": { "type": "enum", "values": ["open", "closed", "merged"], "flag": "--state" },
+    },
+  },
+
+  "kubectl_pods": {
+    "description": "List pods in a namespace (JSON).",
+    "command": ["kubectl", "get", "pods", "-o", "json"],
+    "params": {
+      "namespace": { "type": "string", "flag": "-n", "pattern": "[a-z0-9-]{1,63}" },
+    },
+  },
+}
