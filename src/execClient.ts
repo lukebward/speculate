@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import { connect, type Socket } from 'node:net';
 import { resolve } from 'node:path';
 import { selfCommand } from './hostConfig.js';
-import { execSocketPath } from './execDaemon.js';
+import { execSocketPath, socketDirTrust } from './execDaemon.js';
 import { classify } from './execTable.js';
 
 const CONNECT_TIMEOUT_MS = 250;
@@ -57,9 +57,9 @@ export function parseExecArgs(argv: string[]): ExecCliArgs | { error: string } {
 }
 
 /** Run the command directly, exactly as the shell would have. */
-function passthrough(argv: string[]): Promise<number> {
+function passthrough(argv: string[], cwd?: string): Promise<number> {
   return new Promise((resolvePromise) => {
-    const child = spawn(argv[0]!, argv.slice(1), { stdio: 'inherit' });
+    const child = spawn(argv[0]!, argv.slice(1), { stdio: 'inherit', ...(cwd ? { cwd } : {}) });
     child.on('error', (err) => {
       process.stderr.write(`speculate exec: ${argv[0]}: ${err.message}\n`);
       resolvePromise(127);
@@ -167,13 +167,18 @@ export async function runExec(args: ExecCliArgs): Promise<number> {
   }
 
   const argv = args.argv;
-  if (process.env.SPECULATE_EXEC_OFF === '1') return passthrough(argv);
-  if (!classify(argv, root)) return passthrough(argv); // not ours: run as-is
+  // Passthrough must run in the SAME directory the daemon would have used
+  // (root = resolved --cwd), or a hit and its fallback could disagree.
+  if (process.env.SPECULATE_EXEC_OFF === '1') return passthrough(argv, root);
+  if (!classify(argv, root)) return passthrough(argv, root); // not ours: run as-is
+  // A tampered rendezvous directory means someone may be squatting our
+  // socket path; never trust it — run the command ourselves.
+  if (socketDirTrust(execSocketPath(root)) === 'unsafe') return passthrough(argv, root);
 
   const sock = await connectOrSpawn(root);
-  if (!sock) return passthrough(argv);
+  if (!sock) return passthrough(argv, root);
   const res = await request(sock, { id: 1, op: 'exec', argv });
-  if (!res || res.ok !== true) return passthrough(argv);
+  if (!res || res.ok !== true) return passthrough(argv, root);
 
   const stdout = Buffer.from(String(res.stdoutB64 ?? ''), 'base64');
   const stderr = Buffer.from(String(res.stderrB64 ?? ''), 'base64');

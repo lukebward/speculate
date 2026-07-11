@@ -189,6 +189,12 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
 
   for (const [name, scoped] of effectiveServers(view.servers)) {
     if (name === WORKSPACE_SERVER_NAME) continue;
+    if (name.startsWith('-')) {
+      // `claude mcp remove/add-json` take the name positionally; a leading
+      // dash would be parsed as an option. Leave such servers untouched.
+      ctx.log(`[speculate] ${name}: skipped (name starts with '-')`);
+      continue;
+    }
     if (isWrappedEntry(scoped.entry)) {
       ctx.log(`[speculate] ${name}: already wrapped — skipping`);
       continue;
@@ -200,8 +206,14 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
     const wrapped = wrapEntry(scoped.entry, ctx.self, { mode: opts.mode ?? undefined });
 
     if (scoped.scope === 'project') {
-      // Never touch the checked-in file; shadow at local scope instead.
-      if (!view.approvedProjectServers.has(name) && view.projectApprovalKnown) {
+      // Never touch the checked-in file; shadow at local scope instead —
+      // but only for servers the user has already approved in Claude Code.
+      // When approval state is unknown (a fresh clone, or the host's
+      // enabled/disabled lists are empty — the COMMON case), the safe
+      // default is to leave it pending, exactly as `try` does. Wrapping it
+      // would register it at local scope, where it runs with no approval
+      // gate at all: that would widen consent, which Speculate never does.
+      if (!view.approvedProjectServers.has(name)) {
         ctx.log(`[speculate] ${name}: .mcp.json server not approved in Claude Code — skipping`);
         continue;
       }
@@ -327,6 +339,9 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   // Safety net for a lost state file: wrapped entries are self-describing,
   // so anything still wrapped in user/local scope unwraps in place.
   const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
+  const projectScopeNames = new Set(
+    view.servers.filter((s) => s.scope === 'project').map((s) => s.name),
+  );
   for (const scoped of view.servers) {
     if (handled.has(scoped.name) || scoped.scope === 'project') continue;
     if (!isWrappedEntry(scoped.entry)) continue;
@@ -335,6 +350,19 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     if (removed.code !== 0) {
       ctx.log(`[speculate] ${scoped.name}: remove failed: ${(removed.stderr || removed.stdout).trim()}`);
       failed++;
+      continue;
+    }
+    // A wrapped LOCAL entry that shadows a same-named .mcp.json server was a
+    // shadow, not an in-place rewrite: removing the local copy lets the
+    // project entry take effect again. Re-adding the unwrapped original at
+    // local scope would leak a permanent shadow that never existed before
+    // `on` — and, worse, bypass the .mcp.json approval gate forever. So for
+    // shadows we stop at the remove. (State-file `off` distinguishes these
+    // precisely via the recorded action; this heuristic is only the no-state
+    // fallback, where a same-named local+project pair is genuinely ambiguous
+    // and consent-preservation is the safer resolution.)
+    if (scoped.scope === 'local' && projectScopeNames.has(scoped.name)) {
+      ctx.log(`[speculate] ${scoped.name}: shadow removed (.mcp.json entry back in effect)`);
       continue;
     }
     if (original) {

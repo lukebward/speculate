@@ -34,9 +34,9 @@ describe('classify accepts vetted read-only command lines', () => {
     [['git', 'show', '--stat', 'abc1234'], 'git_show'],
     [['git', 'branch', '-a', '-v'], 'git_branch'],
     [['git', 'rev-parse', '--abbrev-ref', 'HEAD'], 'git_rev_parse'],
-    [['rg', '-n', 'needle'], 'rg'],
+    [['rg', '-n', 'needle', '.'], 'rg'],
     [['rg', '-n', '-g', '*.ts', 'needle', 'src'], 'rg'],
-    [['rg', '--fixed-strings', '--', '-dash-pattern'], 'rg'],
+    [['rg', '--fixed-strings', '--', '-dash-pattern', '.'], 'rg'],
     [['ls', '-la', 'src'], 'ls'],
     [['ls'], 'ls'],
   ])('%j → %s', (argv, tool) => {
@@ -71,6 +71,9 @@ describe('classify fails closed on anything outside the table', () => {
     // Unknown rg flags (e.g. --pre executes a command).
     [['rg', '--pre', 'sh', 'x']],
     [['rg', '-e']],
+    // Path-less rg would search stdin, not the tree — left to passthrough.
+    [['rg', 'needle']],
+    [['rg', '-n', 'needle']],
     // Bare git diff rev args are ambiguous with paths: not ours.
     [['git', 'diff', 'HEAD~1']],
     [['rm', '-rf', '.']],

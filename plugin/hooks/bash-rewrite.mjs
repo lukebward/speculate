@@ -27,7 +27,7 @@
  * add an allow rule for `speculate exec:*` if you use fine-grained
  * Bash permissions.
  */
-import { accessSync, constants } from 'node:fs';
+import { statSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 /** Semantics-changing shell syntax: never rewrite around these. */
@@ -46,18 +46,28 @@ const REWRITABLE_PREFIXES = [
   'ls',
 ];
 
-function speculateOnPath() {
+/**
+ * Absolute path to the `speculate` executable on this process's PATH, or
+ * null. We rewrite to the ABSOLUTE path, not the bare name: the rewritten
+ * command runs in the host's persistent Bash shell, whose PATH can differ
+ * from this hook's — resolving here and emitting the full path keeps a
+ * PATH mismatch from turning a read-only command into an exit-127 failure
+ * (which would breach fail-open). Must be a regular file, not a directory
+ * named `speculate`.
+ */
+function speculateBin() {
   const path = process.env.PATH ?? '';
   for (const dir of path.split(delimiter)) {
     if (!dir) continue;
+    const candidate = join(dir, 'speculate');
     try {
-      accessSync(join(dir, 'speculate'), constants.X_OK);
-      return true;
+      const st = statSync(candidate);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
     } catch {
       // keep looking
     }
   }
-  return false;
+  return null;
 }
 
 function rewritable(command) {
@@ -65,7 +75,8 @@ function rewritable(command) {
   const trimmed = command.trim();
   if (trimmed.length === 0 || trimmed.length > 1500) return false;
   if (UNSAFE_CHARS.test(trimmed)) return false;
-  if (trimmed.startsWith('speculate')) return false; // already routed
+  // Already routed (bare name or absolute path): never double-wrap.
+  if (/(^|\/)speculate(\s|$)/.test(trimmed)) return false;
   return REWRITABLE_PREFIXES.some(
     (p) => trimmed === p.trim() || trimmed.startsWith(p.endsWith(' ') ? p : `${p} `),
   );
@@ -81,7 +92,8 @@ async function main() {
   if (input.tool_name !== 'Bash') return;
   const command = input.tool_input?.command;
   if (!rewritable(command)) return;
-  if (!speculateOnPath()) return;
+  const bin = speculateBin();
+  if (!bin) return;
 
   process.stdout.write(
     JSON.stringify({
@@ -89,7 +101,7 @@ async function main() {
         hookEventName: 'PreToolUse',
         updatedInput: {
           ...input.tool_input,
-          command: `speculate exec -- ${command.trim()}`,
+          command: `${bin} exec -- ${command.trim()}`,
         },
       },
     }),

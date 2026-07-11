@@ -39,6 +39,19 @@ speculate off      # exact restore of everything `on` did
 
 `on` goes through the host's own front door (`claude mcp remove`/`add-json`): user- and local-scope servers are re-registered wrapped in place; checked-in `.mcp.json` servers are never touched — a wrapped copy at local scope shadows them (local wins; the host may print a benign scope-overlap note). Unapproved `.mcp.json` servers stay unapproved: Speculate never widens consent.
 
+> **Installing globally from git?** npm builds the package from source on install (it needs `git`, network, and its dev toolchain), and some npm versions leave a broken symlink behind — a later reinstall then fails with `ENOTDIR … rename … node_modules/speculate-mcp`. If that happens, clear the stale entry and retry, or install a prebuilt tarball:
+>
+> ```bash
+> npm uninstall -g speculate-mcp 2>/dev/null
+> rm -rf "$(npm root -g)/speculate-mcp" "$(npm root -g)/".speculate-mcp-*   # sudo if /usr/local needs it
+>
+> # reliable prebuilt install (no build-on-install):
+> git clone https://github.com/lukebward/speculate && cd speculate
+> npm install && npm pack && npm install -g ./speculate-mcp-*.tgz
+> ```
+>
+> The zero-install `npx … try` above never touches your global modules and is unaffected. A published npm release is the planned durable path.
+
 For the agent's **native shell commands** (`git status`, `rg`, …), install the plugin:
 
 ```bash

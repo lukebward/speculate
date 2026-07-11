@@ -21,9 +21,9 @@
  * 'unsupported' and infra failures make the CLIENT run the command
  * itself — the daemon never executes anything outside the table.
  */
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, unlinkSync, watch } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, unlinkSync, watch } from 'node:fs';
 import { createServer, connect, type Server, type Socket } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -56,6 +56,36 @@ export function execSocketPath(root: string): string {
   return join(base, 'speculate', `exec-${hash}.sock`);
 }
 
+/**
+ * The socket path is deterministic from (workspace, uid) and, absent
+ * XDG_RUNTIME_DIR, lives under a world-writable /tmp. Before we bind or
+ * connect there, the directory holding the socket must be a real directory
+ * (not a symlink), owned by us, with no group/other access — otherwise
+ * another local user could plant a socket at our path and feed forged
+ * command output to the agent. Returns 'absent' when nothing exists yet
+ * (fine: the daemon will create it 0700), 'unsafe' when it exists but
+ * fails the check, 'ok' otherwise.
+ */
+export function socketDirTrust(socketPath: string): 'ok' | 'unsafe' | 'absent' {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  // The directory that DIRECTLY holds the socket is the load-bearing guard:
+  // if it's a real directory (lstat catches a symlinked leaf), owned by us,
+  // with no group/other bits, another user cannot write into it to plant a
+  // socket at our path — regardless of the (sticky, world-writable) /tmp
+  // above it. mkdirSync(0700) creates it safely; this rejects a leaf an
+  // attacker pre-created loosely.
+  let st;
+  try {
+    st = lstatSync(dirname(socketPath));
+  } catch {
+    return 'absent'; // nothing there yet — the daemon creates it 0700
+  }
+  if (!st.isDirectory()) return 'unsafe';
+  if (uid !== null && st.uid !== uid) return 'unsafe';
+  if ((st.mode & 0o077) !== 0) return 'unsafe';
+  return 'ok';
+}
+
 // -- hardened execution ---------------------------------------------------------
 
 let emptyHooksDir: string | null = null;
@@ -69,6 +99,43 @@ const GIT_ENV = {
   GIT_TERMINAL_PROMPT: '0',
   GIT_PAGER: 'cat',
 };
+
+/** The git worktree top for `root`, or null if `root` is not in a repo. */
+function gitToplevel(root: string): string | null {
+  try {
+    const out = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2_000,
+    }).trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does this workspace configure a custom diff driver? Our hardening injects
+ * `--no-ext-diff`, so if the user has `diff.external`/`GIT_EXTERNAL_DIFF`
+ * set (e.g. difftastic), served diff/show output would NOT match what a raw
+ * shell run produces. Detect it once at startup and force those commands to
+ * passthrough, keeping byte fidelity where it matters most.
+ */
+function hasExternalDiff(root: string): boolean {
+  if (process.env.GIT_EXTERNAL_DIFF) return true;
+  try {
+    const out = execFileSync('git', ['config', '--get', 'diff.external'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2_000,
+    }).trim();
+    return out.length > 0;
+  } catch {
+    return false; // unset → git exits 1
+  }
+}
 
 /**
  * The command we actually run. Hardening must hold for real serves AND
@@ -101,7 +168,7 @@ function runCommand(cls: ClassifiedCommand, root: string): Promise<ExecOutcome> 
   const { bin, args } = hardenedArgv(cls);
   const started = Date.now();
   return new Promise((resolvePromise, reject) => {
-    execFile(
+    const child = execFile(
       bin,
       args,
       {
@@ -130,6 +197,11 @@ function runCommand(cls: ClassifiedCommand, root: string): Promise<ExecOutcome> 
         });
       },
     );
+    // These are non-interactive reads. Leaving stdin an open pipe makes
+    // tools that fall back to stdin when given no path (ripgrep: `rg PAT`
+    // with no file) block until the 10 s timeout — turning a fast search
+    // into a guaranteed stall. Close it so they scan the tree as intended.
+    child.stdin?.end();
   });
 }
 
@@ -200,6 +272,11 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
   const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
+  if (socketDirTrust(socketPath) === 'unsafe') {
+    throw new Error(
+      `refusing to bind: ${dirname(socketPath)} is not a private (0700, owned-by-you) directory`,
+    );
+  }
   if (existsSync(socketPath)) {
     if (await probeSocket(socketPath)) throw new DaemonAlreadyRunningError(socketPath);
     unlinkSync(socketPath); // stale socket from a dead daemon
@@ -245,8 +322,13 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
   let watcher: ReturnType<typeof watch> | null = null;
   if (opts.watch !== false) {
     try {
+      // Watch the git worktree top (which contains .git and the whole tree),
+      // not just the spawn cwd: when the daemon runs for a subdirectory, a
+      // change elsewhere in the repo — or to the index above `root` — must
+      // still flush, or a cached status/diff is served stale.
+      const watchRoot = gitToplevel(root) ?? root;
       let timer: NodeJS.Timeout | null = null;
-      watcher = watch(root, { recursive: true }, () => {
+      watcher = watch(watchRoot, { recursive: true }, () => {
         if (timer) return;
         timer = setTimeout(() => {
           timer = null;
@@ -295,11 +377,19 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
     argv?: unknown;
   }
 
+  const externalDiff = hasExternalDiff(root);
+
   const handleExec = async (
     argv: string[],
   ): Promise<Record<string, unknown>> => {
     const cls = classify(argv, root);
     if (!cls) {
+      stats.unsupported++;
+      return { ok: false, error: 'unsupported' };
+    }
+    if (externalDiff && (cls.tool === 'git_diff' || cls.tool === 'git_show')) {
+      // A custom diff driver's bytes wouldn't match our hardened run; let
+      // the client pass it through so the agent sees the real driver.
       stats.unsupported++;
       return { ok: false, error: 'unsupported' };
     }
@@ -397,6 +487,11 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
     server.once('error', reject);
     server.listen(socketPath, () => resolvePromise());
   });
+  try {
+    chmodSync(socketPath, 0o600); // defense in depth beyond the 0700 dir
+  } catch {
+    // best effort; the private directory is the real guard
+  }
 
   const sweeper = setInterval(() => cache.sweep(), 5_000);
   sweeper.unref();

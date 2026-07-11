@@ -349,6 +349,12 @@ function classifyRg(tokens: string[], root: string, argv: string[]): ClassifiedC
     }
   }
   if (pattern === null || pattern.length > 512) return null;
+  // A path-less `rg PATTERN` searches stdin, not the tree, when stdin isn't
+  // a terminal — which is exactly how we'd have to run it. Rather than
+  // guess the caller's stdin (and risk serving an empty-stdin "no match"
+  // where the real shell would search files), leave it to passthrough. Only
+  // rg WITH an explicit path is unambiguous and stdin-independent.
+  if (paths.length === 0) return null;
   return {
     tool: 'rg',
     // The full argv also rides along (ARG_SEP-joined) so predictions can

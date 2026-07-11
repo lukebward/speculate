@@ -83,13 +83,24 @@ function serverMap(raw: unknown): Record<string, McpServerEntry> {
   return out;
 }
 
+/**
+ * Where Claude Code keeps `.claude.json`. `CLAUDE_CONFIG_DIR` relocates the
+ * host's whole config directory; when it's set the file is NOT under $HOME,
+ * so reading `<home>/.claude.json` would miss every user/local server and
+ * all approval state. Honor the same override the host does.
+ */
+export function claudeJsonPath(home: string): string {
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  return dir && dir.length > 0 ? resolve(dir, '.claude.json') : resolve(home, '.claude.json');
+}
+
 /** Discover every MCP server Claude Code would see for `cwd`. Read-only. */
 export function readClaudeServers(opts: { home: string; cwd: string }): ClaudeConfigView {
   const warnings: string[] = [];
   const servers: ScopedServer[] = [];
   const cwd = resolve(opts.cwd);
 
-  const claudeJson = readJsonFile(resolve(opts.home, '.claude.json'), warnings);
+  const claudeJson = readJsonFile(claudeJsonPath(opts.home), warnings);
   for (const [name, entry] of Object.entries(serverMap(claudeJson?.mcpServers))) {
     servers.push({ name, scope: 'user', entry });
   }

@@ -194,6 +194,29 @@ describe('exec daemon end to end', () => {
     expect(stats.speculated).toBeGreaterThanOrEqual(1);
   });
 
+  it('serves rg WITH a path quickly and byte-faithfully (stdin never consulted)', async () => {
+    // rg given an explicit path searches files, not stdin, so it is
+    // unambiguous to serve — and must not hang on the daemon's closed stdin.
+    const started = Date.now();
+    const res = await exec(['rg', '--line-number', 'dirty-line-92c1', '.']);
+    const elapsed = Date.now() - started;
+    expect(res.ok).toBe(true);
+    expect(res.code).toBe(0);
+    expect(elapsed).toBeLessThan(5_000); // nowhere near the 10 s stdin timeout
+    const got = Buffer.from(String(res.stdoutB64), 'base64').toString();
+    expect(got).toContain('notes.txt');
+    expect(got).toContain('dirty-line-92c1');
+  });
+
+  it('leaves path-less rg to passthrough (stdin semantics are the shell’s job)', async () => {
+    // A bare `rg PATTERN` would search stdin, not the tree; serving it could
+    // yield a wrong "no match". The table declines it so the real shell runs
+    // it with the caller's own stdin.
+    const res = await exec(['rg', 'dirty-line-92c1']);
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('unsupported');
+  });
+
   it('answers stats and ping', async () => {
     const ping = await send({ id: 9, op: 'ping' });
     expect(ping.ok).toBe(true);

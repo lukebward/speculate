@@ -130,9 +130,21 @@ export async function runTry(args: TryArgs): Promise<number> {
     .join('; ');
   process.stderr.write(`[speculate] try: ${summary} — nothing on disk is modified\n`);
 
-  const dir = mkdtempSync(join(tmpdir(), 'speculate-try-'));
+  const dir = mkdtempSync(join(tmpdir(), 'speculate-try-'), { mode: 0o700 } as never);
   const configPath = join(dir, 'mcp-config.json');
-  writeFileSync(configPath, JSON.stringify({ mcpServers: plan.mcpServers }, null, 2));
+  // The generated file contains every wrapped server's env block (tokens).
+  // 0600 + guaranteed cleanup, even on Ctrl-C, so it never lingers on disk.
+  writeFileSync(configPath, JSON.stringify({ mcpServers: plan.mcpServers }, null, 2), {
+    mode: 0o600,
+  });
+
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    rmSync(dir, { recursive: true, force: true });
+  };
+  process.on('exit', cleanup);
 
   const clientBin = process.env.SPECULATE_CLAUDE_BIN || 'claude';
   const child = spawn(
@@ -140,18 +152,48 @@ export async function runTry(args: TryArgs): Promise<number> {
     [...args.clientArgs, '--mcp-config', configPath, '--strict-mcp-config'],
     { stdio: 'inherit' },
   );
+
+  // Claude Code runs its own TUI and traps SIGINT; forward terminal signals
+  // so the child controls shutdown, but never die before it does (and never
+  // leave the temp file behind if we're killed first).
+  const forward = (sig: NodeJS.Signals): void => {
+    try {
+      child.kill(sig);
+    } catch {
+      // child already gone
+    }
+  };
+  const onSigint = (): void => forward('SIGINT');
+  const onSigterm = (): void => forward('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+
   return new Promise((resolve) => {
     child.on('error', (err) => {
       process.stderr.write(
         `[speculate] cannot launch '${clientBin}': ${err.message}\n` +
           `[speculate] is Claude Code installed and on PATH?\n`,
       );
-      rmSync(dir, { recursive: true, force: true });
+      cleanup();
       resolve(127);
     });
     child.on('exit', (code, signal) => {
-      rmSync(dir, { recursive: true, force: true });
-      resolve(signal ? 1 : (code ?? 0));
+      process.off('SIGINT', onSigint);
+      process.off('SIGTERM', onSigterm);
+      cleanup();
+      resolve(signal ? 128 + (nodeSignalNumber(signal) ?? 1) : (code ?? 0));
     });
   });
+}
+
+/** Best-effort signal-name → number for conventional 128+n exit codes. */
+function nodeSignalNumber(sig: NodeJS.Signals): number | null {
+  const map: Partial<Record<NodeJS.Signals, number>> = {
+    SIGHUP: 1,
+    SIGINT: 2,
+    SIGQUIT: 3,
+    SIGKILL: 9,
+    SIGTERM: 15,
+  };
+  return map[sig] ?? null;
 }

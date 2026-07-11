@@ -5,7 +5,7 @@
  */
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,23 +44,30 @@ const bash = (command: string) => ({
 });
 
 describe('bash-rewrite hook', () => {
+  // The hook rewrites to the ABSOLUTE path it resolved on PATH (so a
+  // differing shell PATH can't turn the command into exit 127), not the
+  // bare name.
+  const bin = () => join(binDir, 'speculate');
+
   it('rewrites a table-shaped read-only command, preserving other input fields', async () => {
     const { code, stdout } = await runHook(bash('git status'));
     expect(code).toBe(0);
     const res = JSON.parse(stdout);
     expect(res.hookSpecificOutput.hookEventName).toBe('PreToolUse');
-    expect(res.hookSpecificOutput.updatedInput.command).toBe('speculate exec -- git status');
+    expect(res.hookSpecificOutput.updatedInput.command).toBe(`${bin()} exec -- git status`);
     expect(res.hookSpecificOutput.updatedInput.description).toBe('test');
   });
 
   it.each([
-    ['git diff --cached', 'speculate exec -- git diff --cached'],
-    ['rg -n needle src', 'speculate exec -- rg -n needle src'],
-    ['ls -la', 'speculate exec -- ls -la'],
-    ['git log --oneline -n 5', 'speculate exec -- git log --oneline -n 5'],
-  ])('%s → %s', async (command, rewritten) => {
+    ['git diff --cached', 'git diff --cached'],
+    ['rg -n needle src', 'rg -n needle src'],
+    ['ls -la', 'ls -la'],
+    ['git log --oneline -n 5', 'git log --oneline -n 5'],
+  ])('%s → exec', async (command, tail) => {
     const { stdout } = await runHook(bash(command));
-    expect(JSON.parse(stdout).hookSpecificOutput.updatedInput.command).toBe(rewritten);
+    expect(JSON.parse(stdout).hookSpecificOutput.updatedInput.command).toBe(
+      `${bin()} exec -- ${tail}`,
+    );
   });
 
   it('stays silent for commands with shell syntax that a prefix would break', async () => {
@@ -91,6 +98,19 @@ describe('bash-rewrite hook', () => {
   it('stays silent when the CLI is not on PATH or the kill switch is set', async () => {
     expect((await runHook(bash('git status'), { PATH: '/nonexistent' })).stdout).toBe('');
     expect((await runHook(bash('git status'), { SPECULATE_HOOK_OFF: '1' })).stdout).toBe('');
+  });
+
+  it('does not treat a directory named speculate as the CLI', async () => {
+    const dirOnly = mkdtempSync(join(tmpdir(), 'speculate-dironly-'));
+    mkdirSync(join(dirOnly, 'speculate')); // a directory, not an executable
+    const { stdout } = await runHook(bash('git status'), { PATH: dirOnly });
+    expect(stdout).toBe('');
+    rmSync(dirOnly, { recursive: true, force: true });
+  });
+
+  it('does not double-wrap an already-absolute speculate exec command', async () => {
+    const { stdout } = await runHook(bash(`${join(binDir, 'speculate')} exec -- git status`));
+    expect(stdout).toBe('');
   });
 
   it('never crashes on malformed input', async () => {

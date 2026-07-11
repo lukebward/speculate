@@ -138,6 +138,22 @@ describe('speculate on', () => {
     expect(logs.join('\n')).toContain('not approved');
   });
 
+  it('skips .mcp.json servers when approval state is unknown (never widens consent)', async () => {
+    // Fresh clone: .mcp.json exists but the host has no approval record at
+    // all (the common case). Wrapping it would register it at local scope,
+    // where it runs with no approval gate — consent-widening. Must skip.
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { team: { command: 't', args: [] } } }),
+    );
+    writeClaudeJson({}); // no projects[cwd] record → projectApprovalKnown is false
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+    // The pending server was NOT registered at local scope.
+    expect(readClaudeJson().projects?.[cwd]?.mcpServers?.team).toBeUndefined();
+    expect(logs.join('\n')).toContain('not approved');
+  });
+
   it('is idempotent: a second run changes nothing further', async () => {
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     await speculateOn(opts());
@@ -194,6 +210,30 @@ describe('speculate off', () => {
       args: ['stdio'],
       env: { T: '1' },
     });
+  });
+
+  it('with no state file, removes a .mcp.json shadow instead of leaking a local copy', async () => {
+    // A wrapped LOCAL entry shadowing a same-named .mcp.json (project) server.
+    // Losing the state file must not turn the shadow into a permanent
+    // unwrapped local copy — that would leak an approval-free server.
+    const mcpJson = { mcpServers: { team: { command: 'team-server', args: [] } } };
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify(mcpJson));
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            team: { command: SELF.command, args: [...SELF.args, 'wrap', '--', 'team-server'] },
+          },
+        },
+      },
+    });
+    const code = await speculateOff(opts()); // statePath never written
+    expect(code).toBe(0);
+    // The local shadow is gone entirely — no unwrapped copy left behind.
+    expect(readClaudeJson().projects[cwd].mcpServers?.team).toBeUndefined();
+    // .mcp.json untouched; the project entry is back in effect.
+    expect(JSON.parse(readFileSync(join(cwd, '.mcp.json'), 'utf8'))).toEqual(mcpJson);
+    expect(logs.join('\n')).toContain('shadow removed');
   });
 });
 
