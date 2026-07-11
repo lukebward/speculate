@@ -14,6 +14,9 @@ Think of it like Gmail preloading your inbox while you type your password — ap
                       └───────────────────┘        └─────────────────┘
 ```
 
+![Speculate benchmark demo: the same 7-call agent session with speculation off vs on — total tool wait drops 66%](demo/speculate-demo.svg)
+
+
 ## Status: working MVP
 
 Benchmark (bundled mock GitHub upstream at 400 ms latency, 7-call scripted agent session):
@@ -36,19 +39,48 @@ Benchmark (bundled mock GitHub upstream at 400 ms latency, 7-call scripted agent
 
 All three MVP success criteria from [DESIGN.md](DESIGN.md) §10 pass: hit rate ≥ 40%, tool-wait reduction ≥ 30%, waste ≤ 2 calls per hit. Reproduce with `npm run bench`, or watch the recorded demo: [`demo/speculate-demo.cast`](demo/speculate-demo.cast) (`asciinema play demo/speculate-demo.cast`).
 
-## Quickstart
+## Quickstart — zero config
+
+No clone, no config file. In your MCP client's config, prefix the server command you already have with `speculate wrap`:
+
+```jsonc
+// before
+"github": { "command": "github-mcp-server", "args": ["stdio"] }
+
+// after — same server, now speculated
+"github": {
+  "command": "npx",
+  "args": ["-y", "github:lukebward/speculate", "wrap", "--",
+           "github-mcp-server", "stdio"]
+}
+```
+
+That's the whole setup: npx fetches and builds Speculate, `wrap` spawns your server behind the proxy, auto-detects known servers to apply vetted profiles (github here), trusts `readOnlyHint` annotations (`--mode strict --allow t1,t2` if you'd rather allowlist), and persists what it learns per command line. CLI speculation for a repo is one flag:
+
+```jsonc
+"workspace": {
+  "command": "npx",
+  "args": ["-y", "github:lukebward/speculate", "wrap", "--workspace", "."]
+}
+```
+
+Everything the client sees is standard MCP: same tools, same results — some of them just arrive ~200× faster. Ask the agent to call `speculate__stats` to see hit rate, time saved, wasted calls, and per-reason suppression counts, live.
+
+## With a config file (more control)
 
 ```bash
 git clone https://github.com/lukebward/speculate && cd speculate
 npm install     # also builds dist/ (prepare hook)
-npm test        # 220+ unit + end-to-end tests
-npm run bench   # the demo: same session with speculation off vs on
+npm test        # 260+ unit + end-to-end tests
+npm run bench   # the demo above: same session, speculation off vs on
+
+node dist/src/cli.js init                # writes a starter speculate.config.json
+node dist/src/cli.js doctor --config speculate.config.json
 ```
 
-Point Speculate at your real MCP servers with a config file:
+Configs are JSON with comments and trailing commas allowed:
 
 ```jsonc
-// speculate.config.json
 {
   "mode": "strict",              // strict | annotated | off
   "servers": {
@@ -57,26 +89,13 @@ Point Speculate at your real MCP servers with a config file:
       "args": ["stdio"],
       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." },
       "profile": "github",       // built-in vetted profile: rules + allowlist + TTLs
-      "speculation": { "defaultTtlMs": 30000, "maxPerMinute": 30 }
-    }
-  }
+      "speculation": { "defaultTtlMs": 30000, "maxPerMinute": 30 },
+    },
+  },
 }
 ```
 
-Then point your MCP client at Speculate instead of the server. For Claude Code:
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "command": "node",
-      "args": ["/path/to/speculate/dist/src/cli.js", "--config", "/path/to/speculate.config.json"]
-    }
-  }
-}
-```
-
-Everything the client sees is standard MCP: same tools, same results — some of them just arrive ~200× faster. Ask the agent to call `speculate__stats` to see hit rate, time saved, wasted calls, and per-reason suppression counts, live.
+Then point your MCP client at Speculate: `"command": "node", "args": ["/path/to/speculate/dist/src/cli.js", "--config", "/path/to/speculate.config.json"]`.
 
 ## Diagnosing
 
@@ -121,6 +140,8 @@ Proxying already works for every MCP server — Speculate forwards anything it d
 3. **Vetted profiles** (like the bundled GitHub one) for popular servers: reviewed allowlists, tuned rules, per-tool TTLs, and result parsers pinned to server versions.
 
 Result parsing is server-agnostic too: Speculate uses the server's `structuredContent` when provided, else tries JSON-in-text (how most servers respond), else predicts nothing — never guessing.
+
+**Predictions come pre-loaded — and adapt to you.** Speculate ships with priors: vetted profiles carry curated workflow pairs, and on connect it recognizes lister→getter tool shapes by name (`list_issues`→`get_issue`, `search_users`→`get_user`) on *any* server. Primed pairs start predicting after a **single** sighting in your own traffic instead of two — and from there they're yours: counts grow with use, the feedback loop suppresses priors that don't match how *you* work, and everything persists per config. Priors never invent arguments (those are always learned from your real calls) and never point at a non-read-only tool.
 
 ## Speculating on CLI workflows
 

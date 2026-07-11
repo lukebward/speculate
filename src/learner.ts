@@ -123,6 +123,15 @@ export class TransitionLearner {
 
   /** Most recent observed call per server — the head of that server's chain. */
   private readonly lastCallByServer = new Map<string, PrevCall>();
+  /**
+   * Primed transitions (§13.9): (server, prev, next) pairs shipped as
+   * product knowledge or derived from tool-name morphology. A primed
+   * transition reaches the prediction threshold on its FIRST sighting
+   * instead of the usual minObservations — pre-loaded priors that then
+   * grow, get suppressed, and persist exactly like organically learned
+   * ones. Never persisted itself (recomputed per session from tool lists).
+   */
+  private readonly primed = new Set<string>();
   /** Bumped on every transition create/update/import (dirty tracking). */
   private mutations = 0;
   /**
@@ -162,6 +171,22 @@ export class TransitionLearner {
   /** Increments whenever tracked transitions change (dirty tracking). */
   get revision(): number {
     return this.mutations;
+  }
+
+  /**
+   * Pre-load a transition prior: the first observed instance of
+   * (prevTool → nextTool) on `server` becomes immediately predictable,
+   * with argument templates taken from that instance. No-op if the
+   * transition is already tracked (real evidence wins over priors).
+   */
+  prime(server: string, prevTool: string, nextTool: string): void {
+    if (server.includes(' ') || prevTool.includes(' ') || nextTool.includes(' ')) return;
+    this.primed.add(`${server} ${prevTool} ${nextTool}`);
+  }
+
+  /** Number of primed (not yet observed) transition priors. */
+  get primedCount(): number {
+    return this.primed.size;
   }
 
   /**
@@ -248,7 +273,9 @@ export class TransitionLearner {
         server: call.server,
         prevTool: prev.tool,
         nextTool: call.tool,
-        count: 1,
+        // A primed pair arms on first sight (§13.9); templates still come
+        // from real traffic, so a prior can never invent arguments.
+        count: this.primed.has(key) ? this.minObservations : 1,
         lastUpdated: this.now(),
         templates: initialTemplates(prev, call.args),
       };

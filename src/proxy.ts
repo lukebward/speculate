@@ -29,6 +29,7 @@ import { TransitionLearner } from './learner.js';
 import { SpeculationExecutor } from './executor.js';
 import { builtinProfiles, profileCanonicalizer } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
+import { morphologicalPairs } from './priming.js';
 import { StateStore } from './persistence.js';
 import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
@@ -257,6 +258,7 @@ export class SpeculateProxy {
         try {
           await up.connect();
           this.policy.updateTools(up.name, up.tools);
+          this.primeLearner(up);
           up.setToolsChangedHandler(() => this.handleUpstreamToolsChanged(up));
           up.setDisconnectHandler(() => this.handleUpstreamDisconnect(up));
         } catch (err) {
@@ -390,8 +392,29 @@ export class SpeculateProxy {
     // §3.4: flush that server's entries and re-run eligibility on new tools.
     this.policy.updateTools(up.name, up.tools);
     this.cache.invalidateServer(up.name);
+    this.primeLearner(up);
     this.rebuildRoutes();
     this.notifyToolListChanged();
+  }
+
+  /**
+   * §13.9 pre-loaded priors: profile-curated pairs plus lister→getter
+   * tool-name morphology, primed only toward speculation-ELIGIBLE targets
+   * so a prior can never point at a write.
+   */
+  private primeLearner(up: Upstream): void {
+    const names = up.tools.map((t) => t.name);
+    const present = new Set(names);
+    const eligibleTarget = (tool: string): boolean =>
+      this.policy.eligibility(up.name, tool).eligible;
+    for (const [prev, next] of this.profiles[up.name]?.primes ?? []) {
+      if (present.has(prev) && present.has(next) && eligibleTarget(next)) {
+        this.learner.prime(up.name, prev, next);
+      }
+    }
+    for (const [prev, next] of morphologicalPairs(names)) {
+      if (eligibleTarget(next)) this.learner.prime(up.name, prev, next);
+    }
   }
 
   private handleUpstreamDisconnect(up: Upstream): void {

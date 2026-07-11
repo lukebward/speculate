@@ -9,31 +9,60 @@
  * When running the proxy, stdout carries the MCP protocol; all diagnostics
  * go to stderr. `doctor` and `validate` are human-facing and use stdout.
  */
+import { writeFileSync, existsSync } from 'node:fs';
 import { loadConfig } from './config.js';
-import { defaultStatePath } from './persistence.js';
+import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
 import { SpeculateProxy } from './proxy.js';
 import { runDoctor } from './doctor.js';
+import { buildWrapConfig, parseWrapArgs } from './wrap.js';
 import { VERSION } from './version.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
 usage:
-  speculate --config <path> [--mode strict|annotated|off]   run the proxy (stdio MCP)
-  speculate doctor --config <path>                          connect upstreams, explain
-                                                            per-tool speculation eligibility
-  speculate validate --config <path>                        validate the config and exit
+  speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
+  speculate wrap --workspace <dir>                           zero config: CLI speculation for a repo
+  speculate --config <path> [--mode strict|annotated|off]    run the proxy from a config file
+  speculate init [path]                                      write a starter config
+  speculate doctor --config <path>                           connect upstreams, explain
+                                                             per-tool speculation eligibility
+  speculate validate --config <path>                         validate the config and exit
+
+wrap flags (before the '--'):
+  --mode <mode>       strict|annotated|off (default for wrap: annotated)
+  --profile <name>    force a vetted profile (auto-detected for known servers)
+  --allow <t1,t2>     extra read-only allowlist entries
+  --workspace <dir>   speculate the bundled read-only shell server for <dir>
 
 options:
-  --config <path>   path to speculate.config.json (required)
+  --config <path>   path to speculate config (JSON with comments allowed)
   --mode <mode>     override the config's speculation mode for this run
   --version         print version and exit
   --help            show this help
 `;
 
+const STARTER_CONFIG = `{
+  // strict: annotated read-only AND allowlisted · annotated: trust readOnlyHint · off: pass-through
+  "mode": "strict",
+  "servers": {
+    "github": {
+      "command": "github-mcp-server",
+      "args": ["stdio"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." },
+      "profile": "github",
+    },
+    // CLI speculation for a repo (git status/diff/log, ls, ripgrep):
+    // "workspace": { "command": "speculate-shell", "args": ["--cwd", "/path/to/repo"], "profile": "shell" },
+  },
+  // "persistence": { "enabled": false },
+}
+`;
+
 interface Args {
-  command: 'run' | 'doctor' | 'validate';
+  command: 'run' | 'doctor' | 'validate' | 'init' | 'wrap';
   configPath: string;
   modeOverride: 'strict' | 'annotated' | 'off' | null;
+  rest: string[];
 }
 
 function fail(message: string): never {
@@ -46,9 +75,16 @@ function parseArgs(argv: string[]): Args {
   let configPath: string | null = null;
   let modeOverride: Args['modeOverride'] = null;
   let i = 0;
-  if (argv[0] === 'doctor' || argv[0] === 'validate') {
+  if (argv[0] === 'doctor' || argv[0] === 'validate' || argv[0] === 'init' || argv[0] === 'wrap') {
     command = argv[0];
     i = 1;
+  }
+  if (command === 'wrap') {
+    // wrap owns its own flag grammar (flags, then '--', then the command).
+    return { command, configPath: '', modeOverride: null, rest: argv.slice(1) };
+  }
+  if (command === 'init') {
+    return { command, configPath: argv[1] ?? 'speculate.config.json', modeOverride: null, rest: [] };
   }
   for (; i < argv.length; i++) {
     const a = argv[i]!;
@@ -72,11 +108,30 @@ function parseArgs(argv: string[]): Args {
     }
   }
   if (!configPath) fail('--config is required');
-  return { command, configPath, modeOverride };
+  return { command, configPath, modeOverride, rest: [] };
 }
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.command === 'init') {
+    if (existsSync(args.configPath)) {
+      fail(`${args.configPath} already exists — not overwriting`);
+    }
+    writeFileSync(args.configPath, STARTER_CONFIG);
+    process.stdout.write(
+      `wrote ${args.configPath}\nnext: edit it, then 'speculate doctor --config ${args.configPath}'\n`,
+    );
+    return;
+  }
+
+  if (args.command === 'wrap') {
+    const wrapArgs = parseWrapArgs(args.rest);
+    if ('error' in wrapArgs) fail(`wrap: ${wrapArgs.error}`);
+    const { config: wrapConfig, stateKey } = buildWrapConfig(wrapArgs);
+    await runProxy(wrapConfig, defaultStatePathForKey(stateKey), '(wrap)');
+    return;
+  }
 
   // loadConfig throws with pretty, pointered messages (see config.ts).
   const config = loadConfig(args.configPath);
@@ -100,6 +155,14 @@ async function main(): Promise<void> {
     process.exit(ok ? 0 : 1);
   }
 
+  await runProxy(config, statePath, args.configPath);
+}
+
+async function runProxy(
+  config: import('./types.js').SpeculateConfig,
+  statePath: string | null,
+  configLabel: string,
+): Promise<void> {
   const proxy = new SpeculateProxy(config, { statePath });
   const shutdown = async (): Promise<void> => {
     try {
@@ -121,7 +184,7 @@ async function main(): Promise<void> {
   if (!proxy.anyUpstreamConnected()) {
     process.stderr.write(
       `[speculate] fatal: no upstream connected (0 of ${Object.keys(config.servers).length}) — nothing to proxy.\n` +
-        `[speculate] run 'speculate doctor --config ${args.configPath}' to diagnose.\n`,
+        `[speculate] run 'speculate doctor --config ${configLabel}' to diagnose.\n`,
     );
     await proxy.close();
     process.exit(1);

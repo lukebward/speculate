@@ -8,6 +8,7 @@
  * speculation is enabled but zero tools are eligible).
  */
 import { SafetyPolicy } from './policy.js';
+import { morphologicalPairs } from './priming.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
 import { builtinProfiles } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
@@ -96,7 +97,22 @@ export async function runDoctor(
         out(dim(`rule '${r.id}' never fires: server has no tool '${r.trigger}'`));
       }
     } else {
-      out(dim('no profile/config rules — relying on the transition learner (needs 2 sightings per pattern)'));
+      out(dim('no profile/config rules — relying on the transition learner'));
+    }
+
+    // §13.9 pre-loaded priors: what will predict after a single sighting.
+    const toolNamesAll = upstream.tools.map((t) => t.name);
+    const primes = new Set<string>();
+    for (const [prev, next] of profile?.primes ?? []) {
+      if (toolNames.has(prev) && toolNames.has(next) && policy.eligibility(name, next).eligible) {
+        primes.add(`${prev}→${next}`);
+      }
+    }
+    for (const [prev, next] of morphologicalPairs(toolNamesAll)) {
+      if (policy.eligibility(name, next).eligible) primes.add(`${prev}→${next}`);
+    }
+    if (primes.size > 0) {
+      out(ok(`${primes.size} pre-loaded prior(s) — predict after one sighting: ${[...primes].slice(0, 6).join(', ')}${primes.size > 6 ? ', …' : ''}`));
     }
 
     await upstream.close();

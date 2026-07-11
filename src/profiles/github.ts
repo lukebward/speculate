@@ -212,4 +212,10 @@ export const githubProfile: ServerProfile = {
     list_pull_requests: canonicalizeListState,
   },
   rules,
+  // Review-flow priors beyond the static rules (§13.9): armed on first
+  // sighting, then adapted per user by the normal learn/suppress loop.
+  primes: [
+    ['get_pull_request_diff', 'get_file_contents'],
+    ['get_issue_comments', 'get_pull_request'],
+  ],
 };

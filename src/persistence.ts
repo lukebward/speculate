@@ -102,7 +102,15 @@ export class StateStore {
  */
 export function defaultStatePath(configPath: string): string {
   const abs = isAbsolute(configPath) ? configPath : resolve(configPath);
-  const hash = createHash('sha256').update(abs).digest('hex').slice(0, 16);
+  return defaultStatePathForKey(abs);
+}
+
+/**
+ * State path for config-less runs (`speculate wrap`): keyed by whatever
+ * stable identity string the caller derives (e.g. the wrapped command line).
+ */
+export function defaultStatePathForKey(key: string): string {
+  const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
   const xdg = process.env.XDG_STATE_HOME;
   const stateHome =
     xdg && xdg.length > 0 && isAbsolute(xdg)

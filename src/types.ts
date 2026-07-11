@@ -98,6 +98,13 @@ export interface ServerProfile {
   /** Per-tool argument canonicalizers (§6.1). */
   canonicalizers: Record<string, ArgsCanonicalizer>;
   rules: Rule[];
+  /**
+   * Pre-loaded transition priors (§13.9): (prevTool, nextTool) pairs the
+   * learner arms after a SINGLE sighting instead of two. Curated product
+   * knowledge that then adapts to the individual user via the normal
+   * learn/suppress/persist loop.
+   */
+  primes?: Array<[string, string]>;
 }
 
 // ---------------------------------------------------------------------------

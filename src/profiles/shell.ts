@@ -108,4 +108,9 @@ export const shellProfile: ServerProfile = {
     git_log: canonicalizeLog,
   },
   rules: [statusToDiff, statusToStagedDiff, statusToLog, logToShow, branchToLog],
+  // Review-flow priors the static rules don't cover; armed on first sighting.
+  primes: [
+    ['git_diff', 'git_log'],
+    ['search', 'list_dir'],
+  ],
 };

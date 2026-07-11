@@ -3,6 +3,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
+import { parseJsonc } from './jsonc.js';
 import { configRuleSpecSchema } from './configRules.js';
 import { builtinProfiles } from './profiles/index.js';
 import type { SpeculateConfig } from './types.js';
@@ -68,7 +69,8 @@ export function loadConfig(path: string): SpeculateConfig {
   }
   let json: unknown;
   try {
-    json = JSON.parse(text);
+    // Tolerant parse: comments and trailing commas are allowed in configs.
+    json = parseJsonc(text);
   } catch (err) {
     throw new Error(`config ${path} is not valid JSON: ${(err as Error).message}`);
   }
