@@ -8,6 +8,7 @@
  * speculation is enabled but zero tools are eligible).
  */
 import { SafetyPolicy } from './policy.js';
+import { detectProfile } from './profiles/index.js';
 import { morphologicalPairs } from './priming.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
 import { builtinProfiles } from './profiles/index.js';
@@ -61,6 +62,26 @@ export async function runDoctor(
 
     policy.updateTools(name, upstream.tools);
     out(ok(`connected — ${upstream.tools.length} tools`));
+
+    // Mirror runtime fingerprinting (§13.11) so this report matches reality.
+    if (!profile && sc.profile !== 'none') {
+      const match = detectProfile(upstream.tools.map((t) => t.name));
+      if (match) {
+        if (config.mode === 'strict') {
+          out(
+            dim(
+              `looks like '${match.profile.name}' (${Math.round(match.score * 100)}% tool match) — add "profile": "${match.profile.name}" to enable its rules in strict mode`,
+            ),
+          );
+        } else {
+          out(
+            ok(
+              `will be recognized as '${match.profile.name}' at runtime (${Math.round(match.score * 100)}% tool match) — rules and priors apply automatically`,
+            ),
+          );
+        }
+      }
+    }
 
     const eligible: string[] = [];
     const blocked: { tool: string; reason: string }[] = [];
