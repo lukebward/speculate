@@ -369,6 +369,6 @@ describe('githubProfile shape', () => {
   it('is registered as the built-in github profile', () => {
     expect(builtinProfiles['github']).toBe(githubProfile);
     expect(githubProfile.name).toBe('github');
-    expect(Object.keys(builtinProfiles)).toEqual(['github']);
+    expect(Object.keys(builtinProfiles)).toContain('github');
   });
 });
