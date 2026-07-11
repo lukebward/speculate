@@ -358,6 +358,18 @@ The learner's model and per-rule feedback now survive restarts, so a proxy that 
 
 **Known limits (v0.4 candidates):** concurrent proxies sharing one state file are last-writer-wins (lost updates, never corruption — rename is atomic); a save that fails with no subsequent learning is not retried until the next learner change; learned state is per-config, not shared across projects or machines; on Windows the 0600/0700 POSIX modes are no-ops (Node ignores them there) — the file lands under `%LOCALAPPDATA%\speculate`, which is per-user, but ACL hardening is not applied.
 
+### 13.8 v0.5 — CLI speculation, Tier A (2026-07-10)
+
+The prediction stack (learner, rules, feedback, budgets, persistence) never knew it was speaking MCP — what's protocol-specific is the interception seam and the safety signal. v0.5 extends speculation to command-line workflows by giving them both: **speculate-shell**, a bundled MCP server exposing an allowlisted, hardened, read-only command surface (git status/diff/log/show/branch, list_dir, ripgrep search), plus a vetted `shell` profile. Everything upstream of the seam — prediction, caching, stats, persistence — applies unchanged.
+
+**Safety model (arguments are attacker-controlled — the calling model can be prompt-injected):** fixed binary per tool via execFile (no shell); user strings either strictly regex-validated with no leading `-` (refs, globs) or passed only after `--` (search patterns) so nothing becomes a flag — this specifically blocks write-capable flag smuggling like `git log --output=<file>`; workspace path containment; git's config-driven execution paths disabled per invocation (hooksPath override, fsmonitor off, `--no-ext-diff`, pager off, `GIT_TERMINAL_PROMPT=0`) and `GIT_OPTIONAL_LOCKS=0` so the readOnlyHint annotations are literally true; 10 s timeouts and 512 KB output caps. Capability baseline: nothing beyond what the agent's own shell already grants — the hardening makes *speculative* execution safe, it is not a read sandbox.
+
+**Freshness — better than MCP-land:** locally, the dominant invalidator (the agent's own edits) is observable. The server watches the workspace (debounced 300 ms) and emits `tools/list_changed`, which the proxy already answers with a full buffer flush for that server (§3.4). Short TTLs (15 s default; longer for sha-addressed `git_show`) backstop the watcher.
+
+**Roadmap sketched, deliberately not built (Tier B/C):**
+- **Tier B — `speculate-sh`, a PATH-shim + daemon:** intercept allowlisted binaries directly (no MCP detour), same prediction core, cache keyed by command + canonical args + cwd + fs fingerprint, invalidation by file watching. Safety would come from OS-level sandboxing of speculative runs (Landlock/bubblewrap; read-only fs view, no network) — the commit/rollback model — because arbitrary CLI has no annotation to trust. Known gaps: shims miss absolute-path invocations and shell builtins. Prior art: sccache/bazel (caching), watchman (invalidation).
+- **Tier C — cache warming without serving:** pre-execute likely commands purely for their cache side effects (page cache, incremental compilers, test caches) — zero correctness risk since real commands still run. The standout: **speculative test execution** — pre-run affected tests in a sandbox on each edit so "run the tests" returns seconds-old results. Likely the highest-value CLI play; needs its own design round.
+
 ---
 
 ## Appendix A. Market research & prior art
