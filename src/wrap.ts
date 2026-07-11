@@ -83,9 +83,9 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
   if (!out.workspace && out.command.length === 0) {
     return { error: "wrap needs a server command after '--' (or --workspace <dir>)" };
   }
-  if (out.profile && !Object.hasOwn(builtinProfiles, out.profile)) {
+  if (out.profile && out.profile !== 'none' && !Object.hasOwn(builtinProfiles, out.profile)) {
     return {
-      error: `unknown profile '${out.profile}' (available: ${Object.keys(builtinProfiles).join(', ')})`,
+      error: `unknown profile '${out.profile}' (available: ${Object.keys(builtinProfiles).join(', ')}, none)`,
     };
   }
   return out;

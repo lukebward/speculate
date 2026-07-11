@@ -84,7 +84,9 @@ function parseArgs(argv: string[]): Args {
     return { command, configPath: '', modeOverride: null, rest: argv.slice(1) };
   }
   if (command === 'init') {
-    return { command, configPath: argv[1] ?? 'speculate.config.json', modeOverride: null, rest: [] };
+    const target = argv[1] ?? 'speculate.config.json';
+    if (target.startsWith('-')) fail(`init takes a file path, not flags (got '${target}')`);
+    return { command, configPath: target, modeOverride: null, rest: [] };
   }
   for (; i < argv.length; i++) {
     const a = argv[i]!;

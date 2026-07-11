@@ -31,7 +31,8 @@ describe('// line comments', () => {
 
 describe('/* block */ comments', () => {
   it('strips an inline block comment', () => {
-    expect(stripJsonComments('{"a": /*x*/ 1}')).toBe('{"a":  1}');
+    // A block comment becomes whitespace (never glue): one space remains.
+    expect(stripJsonComments('{"a": /*x*/ 1}')).toBe('{"a":   1}');
     expect(parseJsonc('{"a": /*x*/ 1}')).toEqual({ a: 1 });
   });
 
@@ -41,7 +42,7 @@ describe('/* block */ comments', () => {
   });
 
   it('terminates on an unterminated block comment at EOF (no hang, comment dropped)', () => {
-    expect(stripJsonComments('{"a":1} /* never closed')).toBe('{"a":1} ');
+    expect(stripJsonComments('{"a":1} /* never closed')).toBe('{"a":1}  ');
     expect(parseJsonc('{"a":1} /* never closed')).toEqual({ a: 1 });
   });
 });

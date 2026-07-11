@@ -80,8 +80,9 @@ export function loadConfig(path: string): SpeculateConfig {
     throw new Error(`config ${path}: at least one upstream server is required`);
   }
   // Catch typo'd profile names here so `validate` catches them, not just run.
+  // 'none' is the explicit opt-out from profiles AND fingerprinting (§13.11).
   for (const [name, sc] of Object.entries(cfg.servers)) {
-    if (sc.profile && !Object.hasOwn(builtinProfiles, sc.profile)) {
+    if (sc.profile && sc.profile !== 'none' && !Object.hasOwn(builtinProfiles, sc.profile)) {
       throw new Error(
         `config ${path}: server '${name}' references unknown profile '${sc.profile}' (available: ${Object.keys(builtinProfiles).join(', ')})`,
       );

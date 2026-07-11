@@ -388,6 +388,18 @@ Trust model, stated in the file format itself: declaring a command asserts read-
 
 What remains for "native harness tools" (the agent's own Bash/Read, not routed through MCP): the Tier B PATH-shim + sandbox design from §13.8 — still the roadmap item, unchanged.
 
+### 13.11 v0.7 — dynamic by default (2026-07-11)
+
+User directive: no manual configuration as the default. Three mechanisms replace the remaining config knobs; every one is opt-out-able, none is opt-in:
+
+1. **Profile fingerprinting by live tool lists.** When a server has no configured profile, its `tools/list` is scored against builtin profiles' allowlists; ≥60% overlap applies the profile (allowlist, rules, TTLs, canonicalizers, primes) with a stderr notice. Supersedes command-string autodetect for correctness (dockerized/renamed servers fingerprint; `/tmp/github-mcp-server-logs/x` false positives don't survive a tool-list check). Late binding required small hooks: `Predictor.setProfile`, `SafetyPolicy.addToAllowlist`. `"profile": "none"` opts a server out of both profiles and fingerprinting (also the test seam for exercising profile-less behavior).
+2. **Workspace-probed CLI catalog (shell/catalog.ts).** Curated read-only command templates ship in the product; relevance probes (binary on PATH, marker files, git-remote shape) decide per workspace which register as tools: gh (github remote), npm (package.json), kubectl/docker (binaries), pip (python project markers). `--no-auto` disables; a user registry (`--commands`) wins name collisions. Curation rules: nothing that mutates, bills surprisingly, or reads secrets. `okExitCodes` supports read-only commands with non-zero success conventions (npm outdated).
+3. **Composition is the payoff:** auto-exposed tools are morphology-primed automatically (`gh_pr_list`→`gh_pr_view`; 'view'/'describe' added to getter suffixes), the learner fills in argument flow from real usage, and persistence keeps all of it per config.
+
+Also from the v0.6 verification pass: JSONC block comments now strip to whitespace (`[1/* */2]` stays invalid; newline counts preserved for error positions); the plural stemmer uses candidate-set intersection (issues/issue, releases/release, statuses/status all pair); `init` rejects flag-like paths; `npm run demo:svg` regenerates the README demo. Documented, not changed: wrap's state key ignores env/cwd (identical wrapped command lines share learning — waste-bounded, read-only-gated), and wrap's command-string profile hint remains as a pre-connect fast path that fingerprinting corrects.
+
+Still roadmap: observing the agent's NATIVE harness tools (Bash/Read) via host hooks — cross-host design + privacy story needed (§13.8 Tier B/C).
+
 ---
 
 ## Appendix A. Market research & prior art

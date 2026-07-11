@@ -44,7 +44,9 @@ import {
   inputShapeFor,
   loadCommandRegistry,
   type CommandRegistry,
+  type CommandSpec,
 } from './commands.js';
+import { CATALOG, probePasses } from './catalog.js';
 
 const EXEC_TIMEOUT_MS = 10_000;
 const MAX_OUTPUT_BYTES = 512 * 1024;
@@ -244,9 +246,15 @@ function parseRgLines(out: string, cap: number): Payload {
 // Server
 // ---------------------------------------------------------------------------
 
-function parseCliArgs(argv: string[]): { cwd: string; watch: boolean; commandsPath: string | null } {
+function parseCliArgs(argv: string[]): {
+  cwd: string;
+  watch: boolean;
+  commandsPath: string | null;
+  auto: boolean;
+} {
   let cwd = process.cwd();
   let watchFs = true;
+  let auto = true;
   let commandsPath: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--cwd') {
@@ -255,6 +263,8 @@ function parseCliArgs(argv: string[]): { cwd: string; watch: boolean; commandsPa
       cwd = resolve(v);
     } else if (argv[i] === '--no-watch') {
       watchFs = false;
+    } else if (argv[i] === '--no-auto') {
+      auto = false;
     } else if (argv[i] === '--commands') {
       const v = argv[++i];
       if (!v) throw new Error('--commands requires a path');
@@ -262,7 +272,7 @@ function parseCliArgs(argv: string[]): { cwd: string; watch: boolean; commandsPa
     }
   }
   if (!existsSync(cwd)) throw new Error(`workspace does not exist: ${cwd}`);
-  return { cwd, watch: watchFs, commandsPath };
+  return { cwd, watch: watchFs, commandsPath, auto };
 }
 
 async function main(): Promise<void> {
@@ -460,58 +470,81 @@ async function main(): Promise<void> {
     );
   }
 
-  // §13.10 custom read-only command registry: any CLI tool the agent uses,
-  // declared once, becomes a predictable MCP tool. Declaring a command
-  // asserts it is read-only (author's trust boundary); model-supplied
-  // params are typed/validated and can never become flags.
+  // Shared registration for declared commands (§13.10) and the built-in
+  // catalog (§13.11). Declaring/curating a command asserts it is read-only;
+  // model-supplied params are typed/validated and can never become flags.
+  const takenNames = new Set<string>([
+    ...(isGitRepo ? ['git_status', 'git_diff', 'git_log', 'git_show', 'git_branch'] : []),
+    'list_dir',
+    ...(hasRg ? ['search'] : []),
+  ]);
+  const registerCommand = (name: string, spec: CommandSpec, origin: string): boolean => {
+    if (takenNames.has(name)) {
+      process.stderr.write(
+        `[speculate-shell] skipping ${origin} command '${name}': name already taken\n`,
+      );
+      return false;
+    }
+    if (!TOOL_NAME_RE.test(name)) return false; // schemas enforce; belt and braces
+    takenNames.add(name);
+    server.registerTool(
+      name,
+      {
+        description: spec.description ?? `Read-only command: ${spec.command.join(' ')}`,
+        inputSchema: inputShapeFor(spec),
+        annotations: { readOnlyHint: true },
+      },
+      guarded(async (a) => {
+        let bin: string;
+        let argv: string[];
+        try {
+          ({ bin, argv } = buildArgv(spec, a));
+        } catch (err) {
+          if (err instanceof ParamError) return errResult(err.message);
+          throw err;
+        }
+        const r = await run(root, bin, argv);
+        if (!(spec.okExitCodes ?? [0]).includes(r.code)) {
+          return errResult(`exit ${r.code}: ${r.stderr.trim().slice(0, 2000) || '(no stderr)'}`);
+        }
+        const trimmed = r.stdout.trimStart();
+        // JSON stdout flows through as structure so the prediction stack
+        // can mine it; anything else is passed as capped text.
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+          try {
+            return okResult({ exitCode: r.code, output: JSON.parse(trimmed) as unknown });
+          } catch {
+            // fall through to text
+          }
+        }
+        return okResult({ exitCode: r.code, output: r.stdout.slice(0, MAX_OUTPUT_BYTES) });
+      }),
+    );
+    return true;
+  };
+
+  // User registry first: explicit declarations win name collisions.
   let customCommands: CommandRegistry = {};
   if (opts.commandsPath) {
     customCommands = loadCommandRegistry(opts.commandsPath); // throws loudly on bad specs
-    const reserved = new Set([
-      'git_status', 'git_diff', 'git_log', 'git_show', 'git_branch', 'list_dir', 'search',
-    ]);
     for (const [name, spec] of Object.entries(customCommands)) {
-      if (reserved.has(name)) {
-        process.stderr.write(`[speculate-shell] skipping custom command '${name}': name reserved by a built-in\n`);
-        continue;
-      }
-      if (!TOOL_NAME_RE.test(name)) continue; // schema enforces; belt and braces
-      server.registerTool(
-        name,
-        {
-          description:
-            spec.description ?? `Custom read-only command: ${spec.command.join(' ')}`,
-          inputSchema: inputShapeFor(spec),
-          annotations: { readOnlyHint: true },
-        },
-        guarded(async (a) => {
-          let bin: string;
-          let argv: string[];
-          try {
-            ({ bin, argv } = buildArgv(spec, a));
-          } catch (err) {
-            if (err instanceof ParamError) return errResult(err.message);
-            throw err;
-          }
-          const r = await run(root, bin, argv);
-          if (r.code !== 0) {
-            return errResult(
-              `exit ${r.code}: ${r.stderr.trim().slice(0, 2000) || '(no stderr)'}`,
-            );
-          }
-          const trimmed = r.stdout.trimStart();
-          // JSON stdout flows through as structure so the prediction stack
-          // can mine it; anything else is passed as capped text.
-          if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-            try {
-              return okResult({ exitCode: 0, output: JSON.parse(trimmed) as unknown });
-            } catch {
-              // fall through to text
-            }
-          }
-          return okResult({ exitCode: 0, output: r.stdout.slice(0, MAX_OUTPUT_BYTES) });
-        }),
-      );
+      registerCommand(name, spec, 'custom');
+    }
+  }
+
+  // §13.11 dynamic catalog: the workspace decides which curated read-only
+  // tools are relevant (binary on PATH + marker files + git remote shape).
+  let autoCount = 0;
+  if (opts.auto) {
+    let gitRemoteUrl: string | null = null;
+    if (isGitRepo) {
+      const r = await git(['config', '--get', 'remote.origin.url']);
+      if (r.code === 0) gitRemoteUrl = r.stdout.trim() || null;
+    }
+    const ctx = { root, gitRemoteUrl };
+    for (const entry of CATALOG) {
+      if (!probePasses(entry.probe, ctx)) continue;
+      if (registerCommand(entry.name, entry.spec, 'catalog')) autoCount++;
     }
   }
 
@@ -541,7 +574,7 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
   const customCount = Object.keys(customCommands).length;
   process.stderr.write(
-    `[speculate-shell] serving ${root} (git: ${isGitRepo ? 'yes' : 'no'}, rg: ${hasRg ? 'yes' : 'no'}, watch: ${opts.watch ? 'on' : 'off'}${customCount ? `, custom commands: ${customCount}` : ''})\n`,
+    `[speculate-shell] serving ${root} (git: ${isGitRepo ? 'yes' : 'no'}, rg: ${hasRg ? 'yes' : 'no'}, watch: ${opts.watch ? 'on' : 'off'}${customCount ? `, custom: ${customCount}` : ''}${autoCount ? `, auto-detected: ${autoCount}` : ''})\n`,
   );
 }
 

@@ -68,6 +68,8 @@ const commandSpecSchema = z.object({
   command: z.array(z.string().min(1).max(512)).min(1).max(32),
   /** Model-facing parameters, appended after the fixed argv. */
   params: z.record(z.string().regex(/^[a-z][a-z0-9_]{0,31}$/), paramSchema).optional(),
+  /** Exit codes treated as success (default [0]; npm outdated exits 1). */
+  okExitCodes: z.array(z.number().int().min(0).max(255)).max(8).optional(),
 });
 
 export const commandRegistrySchema = z

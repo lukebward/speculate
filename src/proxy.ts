@@ -65,6 +65,7 @@ export class SpeculateProxy {
   private initialized = false;
   private closing = false;
   private readonly learner: TransitionLearner;
+  private readonly noProfile = new Set<string>();
   private readonly store: StateStore | null;
   private saveTimer: NodeJS.Timeout | null = null;
   private savedStamp = '';
@@ -78,8 +79,11 @@ export class SpeculateProxy {
     const now = this.now;
 
     // Per-server profile resolution (config profile name -> builtin profile).
+    // 'none' explicitly opts a server out of profiles and fingerprinting.
     for (const [name, sc] of Object.entries(config.servers)) {
-      if (sc.profile) {
+      if (sc.profile === 'none') {
+        this.noProfile.add(name);
+      } else if (sc.profile) {
         const profile = builtinProfiles[sc.profile];
         if (!profile) throw new Error(`unknown profile '${sc.profile}' for server '${name}'`);
         this.profiles[name] = profile;
@@ -258,6 +262,7 @@ export class SpeculateProxy {
         try {
           await up.connect();
           this.policy.updateTools(up.name, up.tools);
+          this.fingerprintProfile(up);
           this.primeLearner(up);
           up.setToolsChangedHandler(() => this.handleUpstreamToolsChanged(up));
           up.setDisconnectHandler(() => this.handleUpstreamDisconnect(up));
@@ -392,9 +397,44 @@ export class SpeculateProxy {
     // §3.4: flush that server's entries and re-run eligibility on new tools.
     this.policy.updateTools(up.name, up.tools);
     this.cache.invalidateServer(up.name);
+    this.fingerprintProfile(up);
     this.primeLearner(up);
     this.rebuildRoutes();
     this.notifyToolListChanged();
+  }
+
+  /**
+   * §13.11 dynamic profile detection: when no profile is configured, match
+   * the LIVE tool list against builtin profiles' allowlists — a server is
+   * recognized by what it serves, not by how it was launched (dockerized
+   * or renamed github-mcp-server still fingerprints). Applying a profile
+   * only ever adds vetted read-only knowledge: allowlist entries, rules,
+   * TTLs, canonicalizers, primes.
+   */
+  private fingerprintProfile(up: Upstream): void {
+    if (this.profiles[up.name] || this.noProfile.has(up.name)) return;
+    const names = new Set(up.tools.map((t) => t.name));
+    let best: ServerProfile | null = null;
+    let bestScore = 0;
+    for (const profile of Object.values(builtinProfiles)) {
+      const list = profile.readOnlyAllowlist;
+      if (list.length === 0) continue;
+      const hits = list.filter((t) => names.has(t)).length;
+      const score = hits / list.length;
+      if (score > bestScore) {
+        bestScore = score;
+        best = profile;
+      }
+    }
+    if (best && bestScore >= 0.6) {
+      this.profiles[up.name] = best; // shared record: executor/router see it
+      this.policy.addToAllowlist(up.name, best.readOnlyAllowlist);
+      this.predictor.setProfile(up.name, best);
+      process.stderr.write(
+        `[speculate] ${up.name}: recognized as '${best.name}' (${Math.round(bestScore * 100)}% tool match) — profile applied
+`,
+      );
+    }
   }
 
   /**

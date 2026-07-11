@@ -18,52 +18,60 @@
 const LISTER_PREFIX = /^(list|search|find|query|browse|enumerate)[_-]?(.*)$/;
 const GETTER_PREFIX = /^(get|show|read|fetch|describe|view)[_-]?(.*)$/;
 const LISTER_SUFFIX = /^(.*?)[_-](list|search)$/;
-const GETTER_SUFFIX = /^(.*?)[_-](get|show|read|fetch)$/;
+const GETTER_SUFFIX = /^(.*?)[_-](get|show|read|fetch|view|describe)$/;
 
-/** Normalize a stem: case/punctuation-insensitive, singular/plural-tolerant. */
-function stem(raw: string): string {
-  let s = raw.toLowerCase().replace(/[_-]/g, '');
-  // Strip 'es' only where English pluralization adds it (sibilant stems:
-  // boxes, branches, statuses, searches); elsewhere 'es' is vowel+s
-  // (issues, files) and stripping both letters would mangle the stem.
-  if (/(?:s|x|z|ch|sh)es$/.test(s)) s = s.slice(0, -2);
-  else if (s.endsWith('s')) s = s.slice(0, -1);
-  return s;
+/**
+ * Candidate stems for a noun: raw, minus trailing 's', minus trailing 'es'.
+ * Pairing on candidate-set intersection is plural-tolerant in BOTH
+ * directions — issues/issue, branches/branch, releases/release,
+ * statuses/status — without a full stemming algorithm.
+ */
+function stemCandidates(raw: string): Set<string> {
+  const s = raw.toLowerCase().replace(/[_-]/g, '');
+  const out = new Set([s]);
+  if (s.endsWith('s')) out.add(s.slice(0, -1));
+  if (s.endsWith('es')) out.add(s.slice(0, -2));
+  return out;
 }
 
-function listerStem(tool: string): string | null {
+function listerStems(tool: string): Set<string> | null {
   const pre = LISTER_PREFIX.exec(tool);
-  if (pre && pre[2]) return stem(pre[2]);
+  if (pre && pre[2]) return stemCandidates(pre[2]);
   const suf = LISTER_SUFFIX.exec(tool);
-  if (suf && suf[1]) return stem(suf[1]);
+  if (suf && suf[1]) return stemCandidates(suf[1]);
   return null;
 }
 
-function getterStem(tool: string): string | null {
+function getterStems(tool: string): Set<string> | null {
   const pre = GETTER_PREFIX.exec(tool);
-  if (pre && pre[2]) return stem(pre[2]);
+  if (pre && pre[2]) return stemCandidates(pre[2]);
   const suf = GETTER_SUFFIX.exec(tool);
-  if (suf && suf[1]) return stem(suf[1]);
+  if (suf && suf[1]) return stemCandidates(suf[1]);
   return null;
+}
+
+function intersects(a: Set<string>, b: Set<string>): boolean {
+  for (const x of a) if (b.has(x)) return true;
+  return false;
 }
 
 /**
- * Lister → getter pairs among the given tool names, matched on normalized
- * stems: ['list_issues','get_issue'] → [['list_issues','get_issue']].
+ * Lister → getter pairs among the given tool names, matched on stem
+ * candidates: ['list_issues','get_issue'] → [['list_issues','get_issue']].
  * Deterministic order (input order, listers outer).
  */
 export function morphologicalPairs(toolNames: string[]): Array<[string, string]> {
-  const getters: Array<{ tool: string; stem: string }> = [];
+  const getters: Array<{ tool: string; stems: Set<string> }> = [];
   for (const t of toolNames) {
-    const s = getterStem(t);
-    if (s) getters.push({ tool: t, stem: s });
+    const s = getterStems(t);
+    if (s) getters.push({ tool: t, stems: s });
   }
   const pairs: Array<[string, string]> = [];
   for (const t of toolNames) {
-    const s = listerStem(t);
+    const s = listerStems(t);
     if (!s) continue;
     for (const g of getters) {
-      if (g.tool !== t && g.stem === s) pairs.push([t, g.tool]);
+      if (g.tool !== t && intersects(s, g.stems)) pairs.push([t, g.tool]);
     }
   }
   return pairs;

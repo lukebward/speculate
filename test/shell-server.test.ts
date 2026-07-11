@@ -135,6 +135,9 @@ async function connectServer(workspace: string): Promise<Client> {
       '--cwd',
       workspace,
       '--no-watch',
+      // These tests assert the FIXED tool surface; the §13.11 catalog is
+      // environment-sensitive (docker/kubectl on PATH add tools).
+      '--no-auto',
     ],
     cwd: projectRoot,
     env: isolatedEnv(),

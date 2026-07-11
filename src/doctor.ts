@@ -35,10 +35,9 @@ export async function runDoctor(
     out('');
     out(`server '${name}' (${sc.url ? `http ${sc.url}` : `stdio: ${sc.command}`})`);
 
-    const profile: ServerProfile | undefined = sc.profile
-      ? builtinProfiles[sc.profile]
-      : undefined;
-    if (sc.profile && !profile) {
+    const profile: ServerProfile | undefined =
+      sc.profile && sc.profile !== 'none' ? builtinProfiles[sc.profile] : undefined;
+    if (sc.profile && sc.profile !== 'none' && !profile) {
       out(bad(`unknown profile '${sc.profile}'`));
       healthy = false;
       continue;

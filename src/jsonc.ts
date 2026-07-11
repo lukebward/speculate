@@ -36,8 +36,15 @@ export function stripJsonComments(text: string): string {
     }
     if (ch === '/' && text[i + 1] === '*') {
       i += 2;
-      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      let contained = '';
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
+        if (text[i] === '\n') contained += '\n';
+        i++;
+      }
       i += 2;
+      // A comment is whitespace, not glue: `[1/* */2]` must stay invalid,
+      // and newlines survive so JSON.parse error positions stay honest.
+      out += contained || ' ';
       continue;
     }
     if (ch === ',') {

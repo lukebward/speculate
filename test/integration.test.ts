@@ -49,7 +49,9 @@ async function startProxy(
             SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
           },
-          ...(opts.profile === false ? {} : { profile: 'github' }),
+          // 'none' opts out of profiles AND §13.11 fingerprinting — these
+          // tests exercise truly profile-less behavior (learner only).
+          ...(opts.profile === false ? { profile: 'none' } : { profile: 'github' }),
           ...(opts.rules ? { rules: opts.rules } : {}),
         },
       },

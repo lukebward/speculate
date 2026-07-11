@@ -91,7 +91,8 @@ async function startShellProxy(
         workspace: {
           command: TSX,
           // Watcher stays ON (default) — the invalidation test exercises it.
-          args: [SHELL_SERVER, '--cwd', fixtureDir],
+          // --no-auto: assert the fixed surface; the catalog is env-sensitive.
+          args: [SHELL_SERVER, '--cwd', fixtureDir, '--no-auto'],
           ...(opts.profile === false ? {} : { profile: 'shell' }),
         },
       },

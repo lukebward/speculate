@@ -107,6 +107,11 @@ export class Predictor {
     this.metrics = opts.metrics;
   }
 
+  /** Late-bind a fingerprinted profile (§13.11). */
+  setProfile(server: string, profile: ServerProfile): void {
+    this.profiles.set(server, profile);
+  }
+
   observe(call: CompletedCall): Prediction[] {
     const profile = this.profiles.get(call.server) ?? GENERIC_PROFILE;
 
