@@ -182,9 +182,13 @@ async function runProxy(
 
   await proxy.start();
   if (!proxy.anyUpstreamConnected()) {
+    const hint =
+      configLabel === '(wrap)'
+        ? 'check the wrapped command runs on its own'
+        : `run 'speculate doctor --config ${configLabel}' to diagnose`;
     process.stderr.write(
       `[speculate] fatal: no upstream connected (0 of ${Object.keys(config.servers).length}) — nothing to proxy.\n` +
-        `[speculate] run 'speculate doctor --config ${configLabel}' to diagnose.\n`,
+        `[speculate] ${hint}.\n`,
     );
     await proxy.close();
     process.exit(1);
