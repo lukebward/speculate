@@ -25,6 +25,7 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
     profile: over.profile ?? null,
     allow: over.allow ?? [],
     workspace: over.workspace ?? null,
+    commands: over.commands ?? null,
     command: over.command ?? [],
   };
 }
@@ -41,6 +42,7 @@ describe('parseWrapArgs', () => {
       profile: 'github',
       allow: ['a', 'b'],
       workspace: null,
+      commands: null,
       command: ['github-mcp-server', 'stdio'],
     });
   });

@@ -23,7 +23,10 @@ const GETTER_SUFFIX = /^(.*?)[_-](get|show|read|fetch)$/;
 /** Normalize a stem: case/punctuation-insensitive, singular/plural-tolerant. */
 function stem(raw: string): string {
   let s = raw.toLowerCase().replace(/[_-]/g, '');
-  if (s.endsWith('es')) s = s.slice(0, -2);
+  // Strip 'es' only where English pluralization adds it (sibilant stems:
+  // boxes, branches, statuses, searches); elsewhere 'es' is vowel+s
+  // (issues, files) and stripping both letters would mangle the stem.
+  if (/(?:s|x|z|ch|sh)es$/.test(s)) s = s.slice(0, -2);
   else if (s.endsWith('s')) s = s.slice(0, -1);
   return s;
 }

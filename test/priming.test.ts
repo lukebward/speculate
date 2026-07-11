@@ -53,13 +53,7 @@ function observePair(
 // --- morphologicalPairs ---------------------------------------------------------
 
 describe('morphologicalPairs', () => {
-  // BUG: stem() strips 'es' before trying plain 's', so 'issues' stems to
-  // 'issu' while 'issue' stems to 'issue' — the pair the module's own doc
-  // comment promises ("['list_issues','get_issue'] → [['list_issues',
-  // 'get_issue']]") is never produced. Affects every noun ending in
-  // vowel+'es' (issues, files, ...). Fix: only strip 'es' when 's' alone
-  // does not already produce a match (or strip 'es' only after s/x/z/ch/sh).
-  it.skip("pairs ['list_issues','get_issue']", () => {
+  it("pairs ['list_issues','get_issue']", () => {
     expect(morphologicalPairs(['list_issues', 'get_issue'])).toEqual([
       ['list_issues', 'get_issue'],
     ]);
@@ -71,9 +65,7 @@ describe('morphologicalPairs', () => {
     ]);
   });
 
-  // BUG: same 'es'-vs-'s' stemming defect as above, via the suffix forms:
-  // 'issues_list' stems to 'issu', 'issue_get' to 'issue'.
-  it.skip("pairs suffix forms ['issues_list','issue_get']", () => {
+  it("pairs suffix forms ['issues_list','issue_get']", () => {
     expect(morphologicalPairs(['issues_list', 'issue_get'])).toEqual([
       ['issues_list', 'issue_get'],
     ]);
