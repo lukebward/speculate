@@ -121,6 +121,22 @@ function fail(message: string): never {
   process.exit(2);
 }
 
+/**
+ * process.exit() does not wait for piped stdout/stderr to drain, so a large
+ * payload (e.g. `speculate exec` replaying cached `git status` bytes) can be
+ * silently truncated — the caller sees exit 0 with empty output. Drain both
+ * streams first, with a hard cap so a stuck pipe can never wedge the CLI.
+ */
+async function exitFlushed(code: number): Promise<never> {
+  const flush = (s: NodeJS.WriteStream): Promise<void> =>
+    new Promise((resolve) => s.write('', () => resolve()));
+  await Promise.race([
+    Promise.all([flush(process.stdout), flush(process.stderr)]),
+    new Promise<void>((resolve) => setTimeout(resolve, 2_000).unref()),
+  ]);
+  process.exit(code);
+}
+
 function parseArgs(argv: string[]): Args {
   let command: Args['command'] = 'run';
   let configPath: string | null = null;
@@ -186,13 +202,13 @@ async function main(): Promise<void> {
   if (args.command === 'try') {
     const tryArgs = parseTryArgs(args.rest);
     if ('error' in tryArgs) fail(`try: ${tryArgs.error}`);
-    process.exit(await runTry(tryArgs));
+    await exitFlushed(await runTry(tryArgs));
   }
 
   if (args.command === 'exec') {
     const execArgs = parseExecArgs(args.rest);
     if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
-    process.exit(await runExec(execArgs));
+    await exitFlushed(await runExec(execArgs));
   }
 
   if (args.command === 'exec-daemon') {
@@ -217,7 +233,7 @@ async function main(): Promise<void> {
         : shimsArgs.action === 'uninstall'
           ? uninstallShims(opts)
           : shimsStatus(opts);
-    process.exit(code);
+    await exitFlushed(code);
   }
 
   if (args.command === 'on' || args.command === 'off' || args.command === 'status') {
@@ -240,7 +256,7 @@ async function main(): Promise<void> {
         : args.command === 'off'
           ? await speculateOff(manageOpts)
           : await speculateStatus(manageOpts);
-    process.exit(code);
+    await exitFlushed(code);
   }
 
   if (args.command === 'wrap') {
