@@ -53,8 +53,12 @@ async function startWrappedShell(mode: 'annotated' | 'off'): Promise<Harness> {
         workspace: {
           command: TSX,
           args: [join(ROOT, 'shell', 'speculate-shell.ts'), '--cwd', ROOT],
-          // getDefaultEnvironment() supplies PATH/HOME for gh; we add the repo.
-          env: { GH_REPO: REPO },
+          // forward token-env auth so the child matches what liveReady()'s gh-auth check validated
+          env: {
+            GH_REPO: REPO,
+            ...(process.env.GH_TOKEN ? { GH_TOKEN: process.env.GH_TOKEN } : {}),
+            ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
+          },
           profile: 'none',
         },
       },
@@ -138,9 +142,8 @@ describe.skipIf(!LIVE.ok)('live github e2e', () => {
       await timedCall(client, 'gh_pr_view', { number: n });
     }
 
-    // Measured pass: 3rd gh_pr_list arms the learned prefetch of gh_pr_view(top);
-    // the think-gap is the window it runs in. Deriving `n` from THIS list's
-    // result makes it match the learner's parsed-path prediction by construction.
+    // The gh_pr_list/gh_pr_view pair is morphologically primed, so it arms early;
+    // deriving `n` from THIS pass's list makes it match the prediction by construction.
     await sleep(THINK_GAP_MS);
     const n = await topNumber(client, 'gh_pr_list');
     await sleep(THINK_GAP_MS);
@@ -152,7 +155,7 @@ describe.skipIf(!LIVE.ok)('live github e2e', () => {
       `hits=${stats.hits} joins=${stats.joins} savedMs≈${stats.estimatedSavedMs}`);
     expect(stats.hits + stats.joins, 'a prefetch should have served gh_pr_view').toBeGreaterThanOrEqual(1);
     expect(
-      stats.perRule.some((r) => r.ruleId.startsWith('learned:') && r.ruleId.includes('gh_pr_view')),
+      stats.perRule.some((r) => r.ruleId.startsWith('learned:') && r.ruleId.endsWith('→gh_pr_view')),
       'a learned gh_pr_list→gh_pr_view rule should exist',
     ).toBe(true);
   }, 90_000);
@@ -170,6 +173,7 @@ describe.skipIf(!LIVE.ok)('live github e2e', () => {
 
     // Confirm this really came from a prefetch (not a live fallback).
     const stats = await readStats(on.client);
+    console.log(`[e2e-github-live] byte-identity: hits=${stats.hits} joins=${stats.joins}`);
     expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(1);
 
     // Direct, unwrapped: off-mode proxy is a pure pass-through to the same server.
@@ -194,9 +198,10 @@ describe.skipIf(!LIVE.ok)('live github e2e', () => {
     const stats = await readStats(client);
     console.log(`[e2e-github-live] issue gh_issue_view served in ${view.ms.toFixed(0)}ms; ` +
       `hits=${stats.hits} joins=${stats.joins} savedMs≈${stats.estimatedSavedMs}`);
-    expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(1);
+    expect(stats.hits + stats.joins, 'a prefetch should have served gh_issue_view').toBeGreaterThanOrEqual(1);
     expect(
-      stats.perRule.some((r) => r.ruleId.startsWith('learned:') && r.ruleId.includes('gh_issue_view')),
+      stats.perRule.some((r) => r.ruleId.startsWith('learned:') && r.ruleId.endsWith('→gh_issue_view')),
+      'a learned gh_issue_list→gh_issue_view rule should exist',
     ).toBe(true);
   }, 90_000);
 });
