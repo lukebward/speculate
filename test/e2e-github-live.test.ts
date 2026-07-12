@@ -156,4 +156,26 @@ describe.skipIf(!LIVE.ok)('live github e2e', () => {
       'a learned gh_pr_list→gh_pr_view rule should exist',
     ).toBe(true);
   }, 90_000);
+
+  it('speculated gh_pr_view bytes are byte-identical to a direct upstream call', async () => {
+    const on = await startWrappedShell('annotated');
+    for (let i = 0; i < 2; i++) {
+      const w = await topNumber(on.client, 'gh_pr_list');
+      await timedCall(on.client, 'gh_pr_view', { number: w });
+    }
+    await sleep(THINK_GAP_MS);
+    const n = await topNumber(on.client, 'gh_pr_list');
+    await sleep(THINK_GAP_MS);
+    const speculated = payloadText((await timedCall(on.client, 'gh_pr_view', { number: n })).result);
+
+    // Confirm this really came from a prefetch (not a live fallback).
+    const stats = await readStats(on.client);
+    expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(1);
+
+    // Direct, unwrapped: off-mode proxy is a pure pass-through to the same server.
+    const off = await startWrappedShell('off');
+    const direct = payloadText((await timedCall(off.client, 'gh_pr_view', { number: n })).result);
+
+    expect(speculated).toBe(direct);
+  }, 90_000);
 });
