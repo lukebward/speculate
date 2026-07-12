@@ -178,4 +178,25 @@ describe.skipIf(!LIVE.ok)('live github e2e', () => {
 
     expect(speculated).toBe(direct);
   }, 90_000);
+
+  it('learner prefetches gh_issue_view from a real gh_issue_list (real latency)', async () => {
+    const { client } = await startWrappedShell('annotated');
+    for (let i = 0; i < 2; i++) {
+      const n = await topNumber(client, 'gh_issue_list');
+      await timedCall(client, 'gh_issue_view', { number: n });
+    }
+    await sleep(THINK_GAP_MS);
+    const n = await topNumber(client, 'gh_issue_list');
+    await sleep(THINK_GAP_MS);
+    const view = await timedCall(client, 'gh_issue_view', { number: n });
+    expect(view.result.isError ?? false).toBe(false);
+
+    const stats = await readStats(client);
+    console.log(`[e2e-github-live] issue gh_issue_view served in ${view.ms.toFixed(0)}ms; ` +
+      `hits=${stats.hits} joins=${stats.joins} savedMs≈${stats.estimatedSavedMs}`);
+    expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(1);
+    expect(
+      stats.perRule.some((r) => r.ruleId.startsWith('learned:') && r.ruleId.includes('gh_issue_view')),
+    ).toBe(true);
+  }, 90_000);
 });
