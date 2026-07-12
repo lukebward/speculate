@@ -128,4 +128,32 @@ describe.skipIf(!LIVE.ok)('live github e2e', () => {
     const n = await topNumber(client, 'gh_pr_list');
     expect(n).toBeGreaterThan(0);
   }, 60_000);
+
+  it('learner prefetches gh_pr_view from a real gh_pr_list (real latency)', async () => {
+    const { client } = await startWrappedShell('annotated');
+
+    // Warm-up ×2: teach gh_pr_list → gh_pr_view(top-of-that-list).
+    for (let i = 0; i < 2; i++) {
+      const n = await topNumber(client, 'gh_pr_list');
+      await timedCall(client, 'gh_pr_view', { number: n });
+    }
+
+    // Measured pass: 3rd gh_pr_list arms the learned prefetch of gh_pr_view(top);
+    // the think-gap is the window it runs in. Deriving `n` from THIS list's
+    // result makes it match the learner's parsed-path prediction by construction.
+    await sleep(THINK_GAP_MS);
+    const n = await topNumber(client, 'gh_pr_list');
+    await sleep(THINK_GAP_MS);
+    const view = await timedCall(client, 'gh_pr_view', { number: n });
+    expect(view.result.isError ?? false).toBe(false);
+
+    const stats = await readStats(client);
+    console.log(`[e2e-github-live] PR gh_pr_view served in ${view.ms.toFixed(0)}ms; ` +
+      `hits=${stats.hits} joins=${stats.joins} savedMs≈${stats.estimatedSavedMs}`);
+    expect(stats.hits + stats.joins, 'a prefetch should have served gh_pr_view').toBeGreaterThanOrEqual(1);
+    expect(
+      stats.perRule.some((r) => r.ruleId.startsWith('learned:') && r.ruleId.includes('gh_pr_view')),
+      'a learned gh_pr_list→gh_pr_view rule should exist',
+    ).toBe(true);
+  }, 90_000);
 });
