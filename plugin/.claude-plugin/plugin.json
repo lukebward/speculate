@@ -1,7 +1,7 @@
 {
   "name": "speculate",
-  "version": "0.8.0",
-  "description": "Speculative prefetching for your workspace: git/ripgrep/CLI reads and MCP tool calls return in ~2 ms. Pairs with 'speculate on' to wrap existing MCP servers.",
+  "version": "0.9.0",
+  "description": "Speculative prefetching for your workspace: git/ripgrep/CLI reads and MCP tool calls return in ~2 ms. Installed automatically by 'speculate on', which also wraps existing MCP servers.",
   "author": { "name": "Luke Ward", "url": "https://github.com/lukebward" },
   "homepage": "https://github.com/lukebward/speculate",
   "mcpServers": {

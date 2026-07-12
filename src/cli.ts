@@ -33,8 +33,11 @@ const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 install-and-it-works (no config files edited by hand):
   speculate try [-- <claude args...>]      zero-write trial: launch Claude Code with every
                                            MCP server wrapped + CLI speculation, this session only
-  speculate on [--mode <mode>]             wrap this project's servers persistently, via
-                                           'claude mcp' (the host's own CLI); adds CLI speculation
+  speculate on [--mode <mode>] [--no-plugin]
+                                           the one command: wrap this project's MCP servers
+                                           (via 'claude mcp') AND install CLI speculation —
+                                           the plugin's workspace server + Bash hook
+                                           (--no-plugin: workspace server only, no hook)
   speculate off                            undo everything 'on' did (exact restore)
   speculate status                         what's wrapped here, and what drifted since 'on'
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
@@ -238,6 +241,7 @@ async function main(): Promise<void> {
 
   if (args.command === 'on' || args.command === 'off' || args.command === 'status') {
     let mode: 'strict' | 'annotated' | 'off' | null = null;
+    let plugin = true;
     for (let i = 0; i < args.rest.length; i++) {
       if (args.rest[i] === '--mode' && args.command === 'on') {
         const m = args.rest[++i];
@@ -245,11 +249,13 @@ async function main(): Promise<void> {
           fail(`--mode must be strict|annotated|off (got '${m ?? ''}')`);
         }
         mode = m;
+      } else if (args.rest[i] === '--no-plugin' && args.command === 'on') {
+        plugin = false;
       } else {
         fail(`unknown ${args.command} argument '${args.rest[i]}'`);
       }
     }
-    const manageOpts = { self: selfCommand(), mode };
+    const manageOpts = { self: selfCommand(), mode, plugin };
     const code =
       args.command === 'on'
         ? await speculateOn(manageOpts)

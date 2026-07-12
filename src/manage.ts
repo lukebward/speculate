@@ -71,13 +71,20 @@ export const execFileRunner: CmdRunner = (cmd, args, opts) =>
 export interface ManagedEntry {
   name: string;
   scope: ClaudeScope;
-  action: 'rewrote' | 'shadowed' | 'added';
+  /** 'plugin' = the Claude Code plugin `on` installed at local scope. */
+  action: 'rewrote' | 'shadowed' | 'added' | 'plugin';
   original?: McpServerEntry;
 }
 
 interface ManagedState {
   version: 1;
   projects: Record<string, { entries: ManagedEntry[]; updatedAt: number }>;
+  /**
+   * True when `on` added the speculate marketplace itself (vs it already
+   * being configured). The marketplace is host-global, so it is only
+   * removed once the LAST project's plugin record is gone.
+   */
+  marketplaceAddedByOn?: boolean;
 }
 
 /** One human-readable record of everything `on` created, all projects. */
@@ -149,6 +156,8 @@ export interface ManageOptions {
   statePath?: string;
   log?: (line: string) => void;
   mode?: 'strict' | 'annotated' | 'off' | null;
+  /** false = skip the Claude Code plugin (Bash hook); workspace server only. */
+  plugin?: boolean;
 }
 
 function makeCtx(opts: ManageOptions): Ctx {
@@ -167,6 +176,65 @@ function makeCtx(opts: ManageOptions): Ctx {
 async function frontDoorAvailable(ctx: Ctx): Promise<boolean> {
   const probe = await ctx.runner(ctx.claudeBin, ['mcp', 'list', '--help'], { cwd: ctx.cwd });
   return probe.code === 0;
+}
+
+// -- the Claude Code plugin (workspace server + Bash hook), via `claude plugin` --
+
+const PLUGIN_ID = 'speculate@speculate';
+const MARKETPLACE_SOURCE = 'lukebward/speculate';
+
+/**
+ * Is our plugin installed, per the host's own CLI? 'unavailable' means the
+ * host has no plugin CLI (older Claude Code) — callers fall back to the
+ * plain workspace server (CLI speculation without the Bash hook).
+ */
+async function pluginInstalled(ctx: Ctx): Promise<'yes' | 'no' | 'unavailable'> {
+  const res = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
+  if (res.code !== 0) return 'unavailable';
+  try {
+    const list = JSON.parse(res.stdout) as unknown;
+    if (!Array.isArray(list)) return 'unavailable';
+    const found = list.some(
+      (p) =>
+        p !== null &&
+        typeof p === 'object' &&
+        ((p as { name?: unknown }).name === 'speculate' ||
+          JSON.stringify(p).includes(PLUGIN_ID)),
+    );
+    return found ? 'yes' : 'no';
+  } catch {
+    return 'unavailable';
+  }
+}
+
+/**
+ * Install the plugin at LOCAL scope (this project only — mirrors what the
+ * rest of `on` touches). Returns whether the marketplace was added by us,
+ * so `off` can remove it once the last project lets go.
+ */
+async function installPlugin(
+  ctx: Ctx,
+): Promise<{ ok: boolean; marketplaceAdded: boolean; detail: string }> {
+  const mk = await ctx.runner(
+    ctx.claudeBin,
+    ['plugin', 'marketplace', 'add', MARKETPLACE_SOURCE],
+    { cwd: ctx.cwd },
+  );
+  const mkAlready = /already/i.test(mk.stderr + mk.stdout);
+  if (mk.code !== 0 && !mkAlready) {
+    return { ok: false, marketplaceAdded: false, detail: (mk.stderr || mk.stdout).trim() };
+  }
+  const ins = await ctx.runner(ctx.claudeBin, ['plugin', 'install', '-s', 'local', PLUGIN_ID], {
+    cwd: ctx.cwd,
+  });
+  if (ins.code !== 0 && !/already/i.test(ins.stderr + ins.stdout)) {
+    return {
+      ok: false,
+      marketplaceAdded: mk.code === 0 && !mkAlready,
+      detail: (ins.stderr || ins.stdout).trim(),
+    };
+  }
+  return { ok: true, marketplaceAdded: mk.code === 0 && !mkAlready, detail: '' };
 }
 
 // -- on ---------------------------------------------------------------------------
@@ -254,8 +322,38 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
     changed++;
   }
 
-  // CLI speculation for this project, one local-scope registration.
-  if (!effectiveServers(view.servers).has(WORKSPACE_SERVER_NAME)) {
+  // CLI speculation for this project. Preferred shape: the Claude Code
+  // plugin (workspace server + the Bash hook that serves native `git
+  // status`/`rg`/`ls` from the prefetch cache), installed at LOCAL scope
+  // through the host's own plugin CLI — one `speculate on` covers both MCP
+  // and CLI tool use. Fallback when the host has no plugin CLI or the
+  // install fails: register the plain workspace server (CLI speculation via
+  // MCP tools, no Bash hook), exactly the pre-0.9 behavior.
+  let pluginActive = false;
+  if (opts.plugin !== false) {
+    const installed = await pluginInstalled(ctx);
+    if (installed === 'yes') {
+      pluginActive = true;
+      ctx.log('[speculate] plugin: already installed — workspace server + Bash hook active');
+    } else if (installed === 'no') {
+      const res = await installPlugin(ctx);
+      if (res.marketplaceAdded) state.marketplaceAddedByOn = true;
+      if (res.ok) {
+        pluginActive = true;
+        managed.set(PLUGIN_ID, { name: PLUGIN_ID, scope: 'local', action: 'plugin' });
+        ctx.log(
+          '[speculate] plugin: installed for this project (workspace CLI speculation + Bash hook)',
+        );
+        changed++;
+      } else {
+        ctx.log(
+          `[speculate] plugin install failed (${res.detail}) — falling back to the workspace server (no Bash hook)`,
+        );
+      }
+    }
+    // 'unavailable' (older host, no plugin CLI): silent fallback below.
+  }
+  if (!pluginActive && !effectiveServers(view.servers).has(WORKSPACE_SERVER_NAME)) {
     const res = await mcpAddJson(ctx, WORKSPACE_SERVER_NAME, workspaceEntry(ctx.self, ctx.cwd), 'local');
     if (res.code === 0) {
       managed.set(WORKSPACE_SERVER_NAME, {
@@ -298,6 +396,22 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
 
   for (const entry of record?.entries ?? []) {
     handled.add(entry.name);
+    if (entry.action === 'plugin') {
+      const res = await ctx.runner(
+        ctx.claudeBin,
+        ['plugin', 'uninstall', '-s', 'local', PLUGIN_ID],
+        { cwd: ctx.cwd },
+      );
+      if (res.code !== 0) {
+        ctx.log(
+          `[speculate] plugin: uninstall failed: ${(res.stderr || res.stdout).trim()} — remove manually: ${ctx.claudeBin} plugin uninstall -s local ${PLUGIN_ID}`,
+        );
+        failed++;
+      } else {
+        ctx.log('[speculate] plugin: uninstalled (this project)');
+      }
+      continue;
+    }
     if (entry.action === 'added' || entry.action === 'shadowed') {
       const res = await mcpRemove(ctx, entry.name, entry.scope);
       if (res.code !== 0) {
@@ -380,6 +494,24 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
 
   if (record) {
     delete state.projects[ctx.cwd];
+    // The marketplace registration is host-global; drop it only when `on`
+    // added it AND no other project still records a plugin install.
+    const anyPluginLeft = Object.values(state.projects).some((p) =>
+      p.entries.some((e) => e.action === 'plugin'),
+    );
+    if (state.marketplaceAddedByOn && !anyPluginLeft) {
+      const res = await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'remove', 'speculate'], {
+        cwd: ctx.cwd,
+      });
+      if (res.code === 0) {
+        state.marketplaceAddedByOn = false;
+        ctx.log('[speculate] marketplace: removed (no project uses the plugin anymore)');
+      } else {
+        ctx.log(
+          `[speculate] marketplace: remove failed: ${(res.stderr || res.stdout).trim()} (left in place)`,
+        );
+      }
+    }
     saveManagedState(ctx.statePath, state);
   }
   ctx.log(`[speculate] off: done${failed ? ` (${failed} failure(s))` : ''}.`);
@@ -409,6 +541,18 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
       unwrapped++;
     }
     ctx.log(`[speculate]   ${name} (${scoped.scope}): ${stateLabel}`);
+  }
+  // CLI speculation: plugin (workspace server + Bash hook) or plain server?
+  const plugin = await pluginInstalled(ctx);
+  if (plugin === 'yes') {
+    const managedPlugin = (record?.entries ?? []).some((e) => e.action === 'plugin');
+    ctx.log(
+      `[speculate]   CLI speculation: plugin${managedPlugin ? ' (managed)' : ''} — workspace server + Bash hook`,
+    );
+  } else if (effective.has(WORKSPACE_SERVER_NAME)) {
+    ctx.log(
+      '[speculate]   CLI speculation: workspace server only (no Bash hook — rerun \'speculate on\' to add the plugin)',
+    );
   }
   if (unwrapped > 0 && record) {
     ctx.log(
