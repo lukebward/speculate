@@ -125,6 +125,76 @@ describe('runExec', () => {
   });
 });
 
+describe('CLI output integrity under backpressure', () => {
+  // Regression for the truncation bug family: process.exit() (or any
+  // flush-with-timeout) after writing a payload larger than the OS pipe
+  // buffer hands a slow reader exit 0 with partial bytes. The CLI must
+  // instead block until the reader has taken everything — like any
+  // ordinary command would.
+  it('delivers a >pipe-buffer payload completely to a reader that starts 3s late', async () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'speculate-execbig-'));
+    const git = (...args: string[]): void => {
+      execFileSync('git', args, { cwd: fixture, env: FIXTURE_GIT_ENV, stdio: 'pipe' });
+    };
+    git('init', '-b', 'main');
+    git('config', 'user.email', 'itest@example.invalid');
+    git('config', 'user.name', 'Speculate ITest');
+    // ~280 KB committed file so `git show HEAD` (vetted, daemon-served —
+    // the bytes come back over the socket and through OUR stdout writes)
+    // far exceeds the 64 KB pipe buffer.
+    const bigBody = Array.from({ length: 6000 }, (_, i) => `line-${i}-${'x'.repeat(40)}`).join('\n') + '\n';
+    writeFileSync(join(fixture, 'big.txt'), bigBody);
+    git('add', '-A');
+    git('commit', '-m', 'big');
+
+    const real = execFileSync('git', ['show', 'HEAD'], {
+      cwd: fixture,
+      env: FIXTURE_GIT_ENV,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    expect(real.length).toBeGreaterThan(64 * 1024); // exceeds the OS pipe buffer
+    expect(real.length).toBeLessThan(512 * 1024); // stays under the daemon output cap → daemon-served
+
+    // Run a resident daemon as a SEPARATE process at the client's socket
+    // path, so the spawned `exec` connects and is served within ~1 s — the
+    // reader's absence overlaps a flush timer, not daemon startup.
+    const daemonProc = spawn(
+      TSX,
+      [CLI, 'exec-daemon', '--cwd', fixture, '--idle-ms', '20000', '--no-persist'],
+      { stdio: ['ignore', 'ignore', 'ignore'] },
+    );
+    await new Promise((r) => setTimeout(r, 2_500)); // let it bind
+    try {
+      const child = spawn(TSX, [CLI, 'exec', '--cwd', fixture, '--', 'git', 'show', 'HEAD'], {
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      // Capture exit immediately (a buggy early exit must not be missed),
+      // but do NOT drain stdout yet: the daemon serves ~350 KB, the CLI
+      // writes it, the pipe fills at ~64 KB, and the write stalls on
+      // backpressure. A flush *timeout* (the old 2 s cap) expires here and
+      // process.exit mid-write — exit 0 with a truncated payload (proven:
+      // buggy build exits ~2.6 s having delivered only the pipe-buffer's
+      // worth). The correct build keeps the child alive until we read.
+      const exited = new Promise<number>((resolve) =>
+        child.on('exit', (c) => resolve(c ?? -1)),
+      );
+      await new Promise((r) => setTimeout(r, 5_000));
+      const chunks: Buffer[] = [];
+      child.stdout.on('data', (c: Buffer) => chunks.push(c)); // start draining now
+      const code = await exited;
+      await new Promise((r) => setTimeout(r, 500)); // let any tail bytes arrive
+      const got = Buffer.concat(chunks);
+      expect(code).toBe(0);
+      expect(got.length).toBe(real.length); // a truncating exit fails HERE
+      expect(got.equals(real)).toBe(true);
+    } finally {
+      daemonProc.kill();
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
 describe('spawn-on-demand through the real CLI', () => {
   it('starts a daemon, serves, and honors --stop', async () => {
     const fixture = makeFixtureRepo();

@@ -119,25 +119,37 @@ const REST_COMMANDS = new Set([
   'shims',
 ] as const);
 
-function fail(message: string): never {
-  process.stderr.write(`speculate: ${message}\nRun 'speculate --help' for usage.\n`);
-  process.exit(2);
+/**
+ * Exit policy: never call process.exit() while output may still be
+ * buffered — process.exit() discards it, and any flush *timeout* just
+ * converts backpressure from a slow reader into silent truncation.
+ *
+ * - Normal command paths: set process.exitCode and return (unwound via
+ *   ExitRequest where needed). Node exits once the event loop drains,
+ *   which flushes stdout/stderr completely, however slow the consumer —
+ *   the same blocking semantics as any ordinary CLI.
+ * - Paths where live handles would hold the loop open forever (proxy
+ *   transports and upstream children, the exec daemon's server, a piped
+ *   stdin): exitWhenFlushed() hands process.exit() to the streams' write
+ *   callbacks, which fire only after everything previously buffered has
+ *   reached the OS. Exact, no timer.
+ */
+class ExitRequest {
+  constructor(readonly code: number) {}
 }
 
-/**
- * process.exit() does not wait for piped stdout/stderr to drain, so a large
- * payload (e.g. `speculate exec` replaying cached `git status` bytes) can be
- * silently truncated — the caller sees exit 0 with empty output. Drain both
- * streams first, with a hard cap so a stuck pipe can never wedge the CLI.
- */
-async function exitFlushed(code: number): Promise<never> {
-  const flush = (s: NodeJS.WriteStream): Promise<void> =>
-    new Promise((resolve) => s.write('', () => resolve()));
-  await Promise.race([
-    Promise.all([flush(process.stdout), flush(process.stderr)]),
-    new Promise<void>((resolve) => setTimeout(resolve, 2_000).unref()),
-  ]);
-  process.exit(code);
+function exitWhenFlushed(code: number): void {
+  let pending = 2;
+  const done = (): void => {
+    if (--pending === 0) process.exit(code);
+  };
+  process.stdout.write('', done);
+  process.stderr.write('', done);
+}
+
+function fail(message: string): never {
+  process.stderr.write(`speculate: ${message}\nRun 'speculate --help' for usage.\n`);
+  throw new ExitRequest(2);
 }
 
 function parseArgs(argv: string[]): Args {
@@ -176,10 +188,10 @@ function parseArgs(argv: string[]): Args {
       modeOverride = m;
     } else if (a === '--version' || a === '-v') {
       process.stdout.write(`speculate ${VERSION}\n`);
-      process.exit(0);
+      throw new ExitRequest(0);
     } else if (a === '--help' || a === '-h') {
       process.stdout.write(HELP);
-      process.exit(0);
+      throw new ExitRequest(0);
     } else {
       fail(`unknown argument '${a}'`);
     }
@@ -205,20 +217,22 @@ async function main(): Promise<void> {
   if (args.command === 'try') {
     const tryArgs = parseTryArgs(args.rest);
     if ('error' in tryArgs) fail(`try: ${tryArgs.error}`);
-    await exitFlushed(await runTry(tryArgs));
+    process.exitCode = await runTry(tryArgs);
+    return; // natural exit: the loop drains, stdout flushes completely
   }
 
   if (args.command === 'exec') {
     const execArgs = parseExecArgs(args.rest);
     if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
-    await exitFlushed(await runExec(execArgs));
+    process.exitCode = await runExec(execArgs);
+    return; // natural exit — a slow reader gets every byte
   }
 
   if (args.command === 'exec-daemon') {
     const daemonArgs = parseDaemonArgs(args.rest);
     if ('error' in daemonArgs) fail(`exec-daemon: ${daemonArgs.error}`);
     try {
-      await startExecDaemon({ ...daemonArgs, onIdle: () => process.exit(0) });
+      await startExecDaemon({ ...daemonArgs, onIdle: () => exitWhenFlushed(0) });
     } catch (err) {
       if (err instanceof DaemonAlreadyRunningError) return; // rendezvous won
       throw err;
@@ -236,7 +250,8 @@ async function main(): Promise<void> {
         : shimsArgs.action === 'uninstall'
           ? uninstallShims(opts)
           : shimsStatus(opts);
-    await exitFlushed(code);
+    process.exitCode = code;
+    return;
   }
 
   if (args.command === 'on' || args.command === 'off' || args.command === 'status') {
@@ -262,7 +277,8 @@ async function main(): Promise<void> {
         : args.command === 'off'
           ? await speculateOff(manageOpts)
           : await speculateStatus(manageOpts);
-    await exitFlushed(code);
+    process.exitCode = code;
+    return;
   }
 
   if (args.command === 'wrap') {
@@ -274,7 +290,11 @@ async function main(): Promise<void> {
       // bytes, same exit code — so blind wrapping is always safe.
       const decision = await sniffFirstLine(process.stdin);
       if (!decision.mcp) {
-        process.exit(await runPipe(wrapArgs.command, decision.buffered, decision.ended));
+        // The piped stdin can hold the loop open after the child exits, so
+        // this is an exitWhenFlushed path (child output was inherited —
+        // nothing of ours is buffered — but stderr notes might be).
+        exitWhenFlushed(await runPipe(wrapArgs.command, decision.buffered, decision.ended));
+        return;
       }
       // Re-inject the sniffed bytes so the proxy's transport sees the
       // stream from its true beginning (initialize included).
@@ -310,8 +330,11 @@ async function main(): Promise<void> {
       : (config.persistence?.path ?? defaultStatePath(args.configPath));
 
   if (args.command === 'doctor') {
+    // Doctor's report can exceed the pipe buffer, and probed upstreams may
+    // leave handles alive — flush-gated exit covers both.
     const ok = await runDoctor(config, statePath);
-    process.exit(ok ? 0 : 1);
+    exitWhenFlushed(ok ? 0 : 1);
+    return;
   }
 
   await runProxy(config, statePath, args.configPath);
@@ -333,7 +356,7 @@ async function runProxy(
       );
       await proxy.close();
     } finally {
-      process.exit(0);
+      exitWhenFlushed(0);
     }
   };
   process.on('SIGINT', () => void shutdown());
@@ -350,7 +373,8 @@ async function runProxy(
         `[speculate] ${hint}.\n`,
     );
     await proxy.close();
-    process.exit(1);
+    exitWhenFlushed(1);
+    return;
   }
   // Startup summary: enough to answer "is it working?" from the host's logs.
   for (const [name, up] of proxy.upstreams) {
@@ -371,6 +395,11 @@ async function runProxy(
 }
 
 main().catch((err) => {
+  if (err instanceof ExitRequest) {
+    process.exitCode = err.code;
+    return; // help/version/usage errors: small writes, natural exit flushes
+  }
   process.stderr.write(`[speculate] fatal: ${(err as Error).message ?? err}\n`);
-  process.exit(1);
+  // A fatal can surface with proxy transports already attached (loop held).
+  exitWhenFlushed(1);
 });

@@ -81,7 +81,7 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 440+ unit and end-to-end tests
+npm test        # 444 unit and end-to-end tests
 npm run bench   # speculation off vs on
 ```
 

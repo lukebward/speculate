@@ -246,7 +246,17 @@ export class SpeculateProxy {
     const exitOnHostGone = (): void => {
       if (this.closing) return;
       process.stderr.write('[speculate] host closed the connection — shutting down\n');
-      void this.close().finally(() => process.exit(0));
+      // Transports/upstreams may hold the event loop, so a hard exit is
+      // needed — but only after stdio write callbacks confirm every
+      // buffered byte reached the OS (exact, unlike a flush timeout).
+      void this.close().finally(() => {
+        let pending = 2;
+        const done = (): void => {
+          if (--pending === 0) process.exit(0);
+        };
+        process.stdout.write('', done);
+        process.stderr.write('', done);
+      });
     };
     this.server.onclose = exitOnHostGone;
     process.stdin.once('end', exitOnHostGone);
