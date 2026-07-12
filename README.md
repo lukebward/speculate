@@ -1,12 +1,12 @@
 # Speculate
 
-Speculative prefetching for coding agents. Speculate sits between your MCP client (Claude Code, Cursor, any host) and everything the agent calls — MCP servers *and* workspace CLI commands — predicts the next read-only call, runs it early, and serves the result the moment it's asked for. Like Gmail preloading your inbox, applied to tool calls.
+Speculative prefetching for coding agents. Speculate sits between your MCP client (Claude Code, Cursor, any host) and everything the agent calls (MCP servers *and* workspace CLI commands), predicts the next read-only call, runs it early, and serves the result the moment it's asked for. Like Gmail preloading your inbox, applied to tool calls.
 
 ![Benchmark: the same 7-call agent session with speculation off vs on](demo/speculate-demo.svg)
 
 **71% hit rate, −66% tool wait, zero wasted upstream calls** on the benchmark workflow. Reproduce with `npm run bench`.
 
-## Try it — nothing installed, nothing written
+## Try it: nothing installed, nothing written
 
 ```bash
 npx -y github:lukebward/speculate try
@@ -23,12 +23,12 @@ speculate on
 
 One command, one project, everything the agent uses:
 
-- **Your MCP servers** are re-registered wrapped through `claude mcp` — the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
+- **Your MCP servers** are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
 - **CLI speculation** is installed as a Claude Code plugin (local scope, this project): a workspace MCP server for git/ripgrep/`gh`/npm tools, plus a Bash hook that serves the agent's native `git status`, `git diff`, `rg`, `ls` from the prefetch cache. On hosts without a plugin CLI it falls back to the workspace server alone (`--no-plugin` forces that).
 
-`speculate status` shows what's active and what drifted. `speculate off` restores everything exactly — even without its state file, since wrapped entries carry their original command line after the `--`.
+`speculate status` shows what's active and what drifted. `speculate off` restores everything exactly, even without its state file, since wrapped entries carry their original command line after the `--`.
 
-No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed GitHub server still gets the vetted GitHub profile), workspaces configure themselves by probing the repo, and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config — a restarted proxy prefetches your workflows from the first trigger.
+No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed GitHub server still gets the vetted GitHub profile), workspaces configure themselves by probing the repo, and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config. A restarted proxy prefetches your workflows from the first trigger.
 
 <details>
 <summary><code>npm install -g</code> from git fails with <code>ENOTDIR … node_modules/speculate-mcp</code>?</summary>
@@ -61,19 +61,19 @@ Prefix the server command already in your client's config:
 }
 ```
 
-The client sees standard MCP — same tools, same results, some just arrive ~200× faster. `wrap --workspace .` gives the same treatment to a repo's CLI tools. Ask the agent to call `speculate__stats` for live hit rate and time saved.
+The client sees standard MCP: same tools, same results, some just arrive ~200× faster. `wrap --workspace .` gives the same treatment to a repo's CLI tools. Ask the agent to call `speculate__stats` for live hit rate and time saved.
 
 ## Safety
 
-- Speculation only ever executes tools that are affirmatively read-only (`readOnlyHint` + allowlists in `strict` mode; annotations alone in `annotated`, the zero-config default). Unknown tools are never speculated; real calls — including writes — are forwarded verbatim, and any mutation flushes the cache.
+- Speculation only ever executes tools that are affirmatively read-only (`readOnlyHint` + allowlists in `strict` mode; annotations alone in `annotated`, the zero-config default). Unknown tools are never speculated; real calls, including writes, are forwarded verbatim, and any mutation flushes the cache.
 - Cached results are byte-identical, single-use, short-TTL, and never written to disk. Persisted learning contains tool names and argument templates, never results.
-- CLI commands execute only from a closed, fail-closed table (`git status/diff/log/show/branch/rev-parse`, `rg` with a path, `ls`) — fixed binaries, no shell, validated refs, workspace-contained paths, git hooks/pagers/external diff drivers disabled. Learned predictions re-vet through the same table before running. A file watcher flushes the cache within ~300 ms of any workspace change.
+- CLI commands execute only from a closed, fail-closed table (`git status/diff/log/show/branch/rev-parse`, `rg` with a path, `ls`): fixed binaries, no shell, validated refs, workspace-contained paths, git hooks/pagers/external diff drivers disabled. Learned predictions re-vet through the same table before running. A file watcher flushes the cache within ~300 ms of any workspace change.
 - The Bash hook rewrites nothing containing quoting, substitution, chaining, or redirection, and everything fails open: any doubt anywhere means your command runs directly, untouched.
 - `speculate on` mutates config only through the host's own CLIs (`claude mcp`, `claude plugin`), records what it did, and `off` restores exactly.
 
 ## More control
 
-A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules — see [`speculate.config.example.json`](speculate.config.example.json). `speculate init` writes a starter; `speculate doctor` explains per-tool eligibility ("why isn't it speculating?"). Custom CLI tools go in a [command registry](speculate.commands.example.jsonc). `speculate shims install` (opt-in) adds sniffing `npx`/`uvx` shims so MCP servers you add next year in any client wrap automatically.
+A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json). `speculate init` writes a starter; `speculate doctor` explains per-tool eligibility ("why isn't it speculating?"). Custom CLI tools go in a [command registry](speculate.commands.example.jsonc). `speculate shims install` (opt-in) adds sniffing `npx`/`uvx` shims so MCP servers you add next year in any client wrap automatically.
 
 Architecture, measured results, threat model, and design history: [DESIGN.md](DESIGN.md).
 
@@ -89,7 +89,7 @@ Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation + drain queue), 
 
 ## Non-goals
 
-Speculating writes (permanent), owning upstream auth, general response caching, token savings — the win is wall-clock latency.
+Speculating writes (permanent), owning upstream auth, general response caching, token savings. The win is wall-clock latency.
 
 ## License
 
