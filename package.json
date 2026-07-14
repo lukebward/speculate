@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "test:e2e": "SPECULATE_E2E_LIVE=1 vitest run test/e2e-github-live.test.ts",
     "bench": "tsx bench/bench.ts",
     "mock-github": "tsx mock/mock-github.ts",
     "start": "tsx src/cli.ts",
