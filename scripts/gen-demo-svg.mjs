@@ -1,6 +1,7 @@
 /**
- * Render captured ANSI terminal output (the benchmark run) into an animated
- * SVG for the README: a terminal window whose lines reveal on a timeline.
+ * Render captured ANSI terminal output (the live demo run) into an animated
+ * SVG for the README: a terminal window whose lines reveal on a timeline
+ * paced by the latencies the demo actually measured and printed.
  * Self-contained — GitHub renders SVG animations inside <img>.
  *
  * Usage: node scripts/gen-demo-svg.mjs <ansi-text-file> <out.svg>
@@ -62,21 +63,21 @@ const esc = (s) =>
 
 const raw = readFileSync(inPath, 'utf8').split('\n');
 // Drop npm's run banner; keep everything from the title line on.
-const start = raw.findIndex((l) => l.includes('Speculate benchmark'));
+const start = raw.findIndex((l) => l.includes('Speculate demo'));
 const lines = raw.slice(start === -1 ? 0 : start).map(parseAnsi);
 while (lines.length && lines[lines.length - 1].every((s) => !s.text.trim())) lines.pop();
 
-// Timeline: title immediately; "running off…" holds (simulating the slow
-// run), "running on…" holds briefly; then the table rows land quickly.
-let t = 0.3;
+// Timeline: each tool-call line waits for the latency it reports (capped
+// for watchability), so the animation replays the run's real pacing and
+// the prefetched call visibly lands the instant it is asked for.
+let t = 0;
 const delays = lines.map((spans) => {
   const text = spans.map((s) => s.text).join('');
-  const at = t;
-  if (text.includes('running with speculation off')) t += 2.2;
-  else if (text.includes('running with speculation on')) t += 1.6;
-  else if (text.trim() === '') t += 0.05;
-  else t += 0.28;
-  return at;
+  const dur = /(\d+(?:\.\d+)?) (ms|s)\b/.exec(text);
+  if (dur) t += 0.35 + Math.min(dur[2] === 'ms' ? Number(dur[1]) / 1000 : Number(dur[1]), 1.6);
+  else if (text.trim() === '') t += 0.08;
+  else t += 0.45;
+  return t;
 });
 
 const FONT = 13;
@@ -113,7 +114,7 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" fon
 <circle cx="20" cy="${HEADER / 2}" r="5.5" fill="#ff5f57"/>
 <circle cx="40" cy="${HEADER / 2}" r="5.5" fill="#febc2e"/>
 <circle cx="60" cy="${HEADER / 2}" r="5.5" fill="#28c840"/>
-<text x="${W / 2}" y="${HEADER / 2 + 4}" text-anchor="middle" font-size="12" fill="#8b949e">npm run bench — speculation off vs on</text>
+<text x="${W / 2}" y="${HEADER / 2 + 4}" text-anchor="middle" font-size="12" fill="#8b949e">npm run demo · live against github.com</text>
 ${body}</svg>
 `;
 

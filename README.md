@@ -2,9 +2,9 @@
 
 Speculative prefetching for coding agents. Speculate sits between your MCP client (Claude Code, Cursor, any host) and everything the agent calls (MCP servers *and* workspace CLI commands), predicts the next read-only call, runs it early, and serves the result the moment it's asked for. Like Gmail preloading your inbox, applied to tool calls.
 
-![Benchmark: the same 7-call agent session with speculation off vs on](demo/speculate-demo.svg)
+![Demo: a real GitHub workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
 
-**71% hit rate, −66% tool wait, zero wasted upstream calls** on the benchmark workflow. Reproduce with `npm run bench`.
+A live run against real GitHub, captured as-is: the first pass teaches Speculate the workflow, and on the second the PR is already fetched by the time the agent asks. Re-run it with `npm run demo`; `npm run bench` reproduces the measured off/on comparison (71% hit rate, −66% tool wait, zero wasted calls).
 
 ## Try it: nothing installed, nothing written
 
@@ -83,6 +83,7 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 npm install     # builds dist/ via the prepare hook
 npm test        # 444 unit and end-to-end tests
 npm run bench   # speculation off vs on
+npm run demo    # the README demo, live against real GitHub (needs gh)
 ```
 
 Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation + drain queue), `src/predictor.ts`/`learner.ts`/`priming.ts` (prediction), `src/cache.ts`, `src/policy.ts`/`budget.ts` (safety and limits), `src/manage.ts`/`tryRun.ts` (on/off/try), `shell/` + `src/exec*.ts` (CLI speculation), `plugin/` (Claude Code plugin), `mock/`, `bench/`.

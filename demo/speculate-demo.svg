@@ -1,37 +1,21 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 598" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 256" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
 <style>
   .l { opacity: 0; animation: reveal 0.15s ease-out forwards; }
   @keyframes reveal { to { opacity: 1; } }
 </style>
-<rect width="780" height="598" rx="10" fill="#0d1117" stroke="#30363d"/>
+<rect width="780" height="256" rx="10" fill="#0d1117" stroke="#30363d"/>
 <rect width="780" height="34" rx="10" fill="#161b22"/>
 <rect y="24" width="780" height="10" fill="#161b22"/>
 <circle cx="20" cy="17" r="5.5" fill="#ff5f57"/>
 <circle cx="40" cy="17" r="5.5" fill="#febc2e"/>
 <circle cx="60" cy="17" r="5.5" fill="#28c840"/>
-<text x="390" y="21" text-anchor="middle" font-size="12" fill="#8b949e">npm run bench — speculation off vs on</text>
-<text class="l" style="animation-delay:0.30s" y="64" font-size="13"><tspan x="16" fill="#e6edf3" font-weight="600" xml:space="preserve">  Speculate benchmark — scripted agent session, mock GitHub upstream</tspan></text>
-<text class="l" style="animation-delay:0.58s" y="83" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  upstream latency 400 ms · 7 tool calls across 3 user turns</tspan></text>
-<text class="l" style="animation-delay:0.91s" y="121" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  running with speculation off…</tspan></text>
-<text class="l" style="animation-delay:3.11s" y="140" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  running with speculation on (strict mode)…</tspan></text>
-<text class="l" style="animation-delay:4.76s" y="178" font-size="13"><tspan x="16" fill="#e6edf3" font-weight="600" xml:space="preserve">  tool call                    off       on   outcome</tspan></text>
-<text class="l" style="animation-delay:5.04s" y="197" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  ─────────────────────────────────────────────────────</tspan></text>
-<text class="l" style="animation-delay:5.32s" y="216" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">  get_issue                 409 ms   409 ms   </tspan><tspan x="375.996" fill="#8b949e" xml:space="preserve">miss (live call)</tspan><tspan x="501.212" fill="#e6edf3" xml:space="preserve"> </tspan></text>
-<text class="l" style="animation-delay:5.60s" y="235" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">  get_issue_comments        405 ms     2 ms   </tspan><tspan x="375.996" fill="#3fb950" xml:space="preserve">prefetched ✓</tspan><tspan x="469.90799999999996" fill="#e6edf3" xml:space="preserve"> </tspan><tspan x="477.734" fill="#3fb950" xml:space="preserve">205×</tspan></text>
-<text class="l" style="animation-delay:5.88s" y="254" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">  list_pull_requests        405 ms     2 ms   </tspan><tspan x="375.996" fill="#3fb950" xml:space="preserve">prefetched ✓</tspan><tspan x="469.90799999999996" fill="#e6edf3" xml:space="preserve"> </tspan><tspan x="477.734" fill="#3fb950" xml:space="preserve">208×</tspan></text>
-<text class="l" style="animation-delay:6.16s" y="273" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">  get_pull_request          405 ms     2 ms   </tspan><tspan x="375.996" fill="#3fb950" xml:space="preserve">prefetched ✓</tspan><tspan x="469.90799999999996" fill="#e6edf3" xml:space="preserve"> </tspan><tspan x="477.734" fill="#3fb950" xml:space="preserve">247×</tspan></text>
-<text class="l" style="animation-delay:6.44s" y="292" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">  get_pull_request_diff     416 ms   153 ms   </tspan><tspan x="375.996" fill="#39c5cf" xml:space="preserve">joined in flight ~</tspan><tspan x="516.864" fill="#e6edf3" xml:space="preserve"> </tspan><tspan x="524.69" fill="#3fb950" xml:space="preserve">3×</tspan></text>
-<text class="l" style="animation-delay:6.72s" y="311" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">  list_issues               406 ms   405 ms   </tspan><tspan x="375.996" fill="#8b949e" xml:space="preserve">miss (live call)</tspan><tspan x="501.212" fill="#e6edf3" xml:space="preserve"> </tspan></text>
-<text class="l" style="animation-delay:7.00s" y="330" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">  get_issue                 404 ms     2 ms   </tspan><tspan x="375.996" fill="#3fb950" xml:space="preserve">prefetched ✓</tspan><tspan x="469.90799999999996" fill="#e6edf3" xml:space="preserve"> </tspan><tspan x="477.734" fill="#3fb950" xml:space="preserve">250×</tspan></text>
-<text class="l" style="animation-delay:7.28s" y="349" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  ─────────────────────────────────────────────────────</tspan></text>
-<text class="l" style="animation-delay:7.56s" y="368" font-size="13"><tspan x="16" fill="#e6edf3" font-weight="600" xml:space="preserve">  total tool wait           2.85 s   974 ms   </tspan><tspan x="375.996" fill="#3fb950" font-weight="600" xml:space="preserve">−66%</tspan></text>
-<text class="l" style="animation-delay:7.89s" y="406" font-size="13"><tspan x="16" fill="#e6edf3" font-weight="600" xml:space="preserve">  speculation stats (strict run)</tspan></text>
-<text class="l" style="animation-delay:8.17s" y="425" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    speculative calls   7</tspan></text>
-<text class="l" style="animation-delay:8.45s" y="444" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    hits / joins        4 / 1  </tspan><tspan x="258.606" fill="#8b949e" xml:space="preserve">(71% of eligible reads)</tspan></text>
-<text class="l" style="animation-delay:8.73s" y="463" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    wasted              0  </tspan><tspan x="227.302" fill="#8b949e" xml:space="preserve">(0.00 per hit)</tspan></text>
-<text class="l" style="animation-delay:9.01s" y="482" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    est. time saved     </tspan><tspan x="203.82399999999998" fill="#3fb950" xml:space="preserve">1.86 s</tspan></text>
-<text class="l" style="animation-delay:9.34s" y="520" font-size="13"><tspan x="16" fill="#e6edf3" font-weight="600" xml:space="preserve">  vs DESIGN.md §10 success criteria</tspan></text>
-<text class="l" style="animation-delay:9.62s" y="539" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    hit rate ≥ 40%        71%   </tspan><tspan x="266.432" fill="#3fb950" xml:space="preserve">pass</tspan></text>
-<text class="l" style="animation-delay:9.90s" y="558" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    tool-wait cut ≥ 30%   66%   </tspan><tspan x="266.432" fill="#3fb950" xml:space="preserve">pass</tspan></text>
-<text class="l" style="animation-delay:10.18s" y="577" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    waste ≤ 2/hit         0.00   </tspan><tspan x="274.258" fill="#3fb950" xml:space="preserve">pass</tspan></text>
+<text x="390" y="21" text-anchor="middle" font-size="12" fill="#8b949e">npm run demo · live against github.com</text>
+<text class="l" style="animation-delay:0.45s" y="64" font-size="13"><tspan x="16" fill="#e6edf3" font-weight="600" xml:space="preserve">  Speculate demo: a real agent workflow against live GitHub</tspan></text>
+<text class="l" style="animation-delay:0.90s" y="83" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  list PRs, then read the top one · repo cli/cli · no mocks, no injected latency</tspan></text>
+<text class="l" style="animation-delay:1.43s" y="121" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  pass 1: Speculate watches the workflow</tspan></text>
+<text class="l" style="animation-delay:2.29s" y="140" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    gh_pr_list            508 ms</tspan></text>
+<text class="l" style="animation-delay:3.08s" y="159" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    gh_pr_view #13875     442 ms   </tspan><tspan x="289.90999999999997" fill="#8b949e" xml:space="preserve">"docs(api): explain response caching"</tspan></text>
+<text class="l" style="animation-delay:3.61s" y="197" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  pass 2: the same workflow</tspan></text>
+<text class="l" style="animation-delay:4.55s" y="216" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    gh_pr_list            587 ms   </tspan><tspan x="289.90999999999997" fill="#8b949e" xml:space="preserve">→ prefetches gh_pr_view #13875</tspan></text>
+<text class="l" style="animation-delay:4.90s" y="235" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    gh_pr_view #13875       2 ms   </tspan><tspan x="289.90999999999997" fill="#3fb950" xml:space="preserve">prefetched ✓ 285× faster</tspan></text>
 </svg>
