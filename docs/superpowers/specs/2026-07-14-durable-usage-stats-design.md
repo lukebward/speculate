@@ -6,6 +6,8 @@ Add a top-level `speculate stats` command that reports durable, machine-wide usa
 
 Collection begins when this version runs. Existing session-only analytics remain unchanged, and historical usage cannot be reconstructed.
 
+`speculate try` remains a zero-write trial and does not contribute durable usage records.
+
 ## Command
 
 ```bash
@@ -56,6 +58,8 @@ The recorder creates an initial session snapshot, keeps current counters in memo
 
 Recording is an optimization and never affects proxy or command behavior. Directory creation, serialization, or write failures are reported once to stderr and otherwise ignored.
 
+`speculate try` launches its temporary client session with an internal usage-disable environment flag inherited by its wrapped MCP and workspace processes. This preserves the command's existing promise that the trial leaves no trace on disk.
+
 ## Aggregation
 
 `speculate stats` scans every supported snapshot in the usage directory and aggregates:
@@ -100,6 +104,7 @@ Existing interfaces remain unchanged:
 
 - `speculate__stats` continues to report the current MCP session;
 - `speculate exec --stats` continues to report the current workspace daemon lifetime; and
+- `speculate try` continues to write no durable state; and
 - the signal-driven MCP session summary continues to print to stderr.
 
 ## Security and Permissions
@@ -121,6 +126,7 @@ Tests cover:
 - malformed and version-mismatched record handling;
 - human-readable and JSON formatting;
 - CLI parsing and empty-state behavior; and
+- exclusion of `speculate try` sessions from durable usage; and
 - preservation of existing live stats commands.
 
 Verification includes focused tests for the new persistence and CLI modules, the existing metrics and exec-daemon suites, the full test suite, and a production build.
