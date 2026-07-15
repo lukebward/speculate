@@ -64,6 +64,7 @@ describe('runExec', () => {
       socketPath: execSocketPath(fixture),
       persist: false,
       watch: false,
+      usageRecorder: null,
       log: () => {},
     });
   });
@@ -161,12 +162,15 @@ describe('CLI output integrity under backpressure', () => {
     const daemonProc = spawn(
       TSX,
       [CLI, 'exec-daemon', '--cwd', fixture, '--idle-ms', '20000', '--no-persist'],
-      { stdio: ['ignore', 'ignore', 'ignore'] },
+      {
+        env: { ...process.env, SPECULATE_USAGE_OFF: '1' },
+        stdio: ['ignore', 'ignore', 'ignore'],
+      },
     );
     await new Promise((r) => setTimeout(r, 2_500)); // let it bind
     try {
       const child = spawn(TSX, [CLI, 'exec', '--cwd', fixture, '--', 'git', 'show', 'HEAD'], {
-        env: process.env,
+        env: { ...process.env, SPECULATE_USAGE_OFF: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       // Capture exit immediately (a buggy early exit must not be missed),
@@ -198,7 +202,11 @@ describe('CLI output integrity under backpressure', () => {
 describe('spawn-on-demand through the real CLI', () => {
   it('starts a daemon, serves, and honors --stop', async () => {
     const fixture = makeFixtureRepo();
-    const env = { ...process.env, SPECULATE_EXEC_IDLE_MS: '5000' };
+    const env = {
+      ...process.env,
+      SPECULATE_EXEC_IDLE_MS: '5000',
+      SPECULATE_USAGE_OFF: '1',
+    };
     const run = (args: string[]): Promise<{ code: number; stdout: string }> =>
       new Promise((resolve, reject) => {
         const child = spawn(TSX, [CLI, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });

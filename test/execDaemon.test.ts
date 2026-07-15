@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { connect } from 'node:net';
 import { ExecCache, type ExecOutcome } from '../src/execCache.js';
 import { startExecDaemon, type DaemonHandle } from '../src/execDaemon.js';
+import { readUsageReport, UsageRecorder } from '../src/usage.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -76,6 +77,38 @@ describe('ExecCache', () => {
     expect(cache.wasted).toBe(1);
   });
 
+  it('notifies when asynchronous speculative execution is wasted', async () => {
+    let notifications = 0;
+    const cache = new ExecCache({ onWaste: () => notifications++ });
+    cache.beginSpeculative('key', 100, async () => {
+      throw new Error('failed');
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(cache.wasted).toBe(1);
+    expect(notifications).toBe(1);
+  });
+
+  it('does not let waste observer failures change cache behavior', async () => {
+    let t = 0;
+    let notifications = 0;
+    const cache = new ExecCache({
+      now: () => t,
+      onWaste: () => {
+        notifications++;
+        throw new Error('observer failed');
+      },
+    });
+    cache.beginSpeculative('key', 100, async () => outcome('data'));
+    await Promise.resolve();
+    await Promise.resolve();
+    t = 200;
+
+    expect(() => cache.lookup('key')).not.toThrow();
+    expect(cache.wasted).toBe(1);
+    expect(notifications).toBe(1);
+  });
+
   it('deduplicates via has()', async () => {
     const cache = new ExecCache();
     let runs = 0;
@@ -113,6 +146,37 @@ function makeFixtureRepo(): string {
   return dir;
 }
 
+function send(
+  socketPath: string,
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const sock = connect(socketPath);
+    let buf = '';
+    const timer = setTimeout(() => reject(new Error('daemon response timeout')), 15_000);
+    sock.on('connect', () => sock.write(`${JSON.stringify(payload)}\n`));
+    sock.on('data', (chunk) => {
+      buf += chunk.toString();
+      const nl = buf.indexOf('\n');
+      if (nl !== -1) {
+        clearTimeout(timer);
+        sock.destroy();
+        resolve(JSON.parse(buf.slice(0, nl)) as Record<string, unknown>);
+      }
+    });
+    sock.on('error', reject);
+  });
+}
+
+class CountingUsageRecorder extends UsageRecorder {
+  closeCalls = 0;
+
+  override close(): void {
+    this.closeCalls++;
+    super.close();
+  }
+}
+
 describe('exec daemon end to end', () => {
   let fixture: string;
   let daemon: DaemonHandle;
@@ -124,6 +188,7 @@ describe('exec daemon end to end', () => {
       socketPath: join(mkdtempSync(join(tmpdir(), 'speculate-sock-')), 'd.sock'),
       persist: false,
       watch: false, // deterministic: no fs-event flushes mid-test
+      usageRecorder: null,
       log: () => {},
     });
   });
@@ -132,25 +197,7 @@ describe('exec daemon end to end', () => {
     rmSync(fixture, { recursive: true, force: true });
   });
 
-  function send(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return new Promise((resolve, reject) => {
-      const sock = connect(daemon.socketPath);
-      let buf = '';
-      sock.on('connect', () => sock.write(`${JSON.stringify(payload)}\n`));
-      sock.on('data', (c) => {
-        buf += c.toString();
-        const nl = buf.indexOf('\n');
-        if (nl !== -1) {
-          sock.destroy();
-          resolve(JSON.parse(buf.slice(0, nl)) as Record<string, unknown>);
-        }
-      });
-      sock.on('error', reject);
-      setTimeout(() => reject(new Error('daemon response timeout')), 15_000);
-    });
-  }
-
-  const exec = (argv: string[]) => send({ id: 1, op: 'exec', argv });
+  const exec = (argv: string[]) => send(daemon.socketPath, { id: 1, op: 'exec', argv });
 
   it('serves vetted commands byte-faithfully', async () => {
     const res = await exec(['git', 'status', '--porcelain=v2']);
@@ -218,18 +265,57 @@ describe('exec daemon end to end', () => {
   });
 
   it('answers stats and ping', async () => {
-    const ping = await send({ id: 9, op: 'ping' });
+    const ping = await send(daemon.socketPath, { id: 9, op: 'ping' });
     expect(ping.ok).toBe(true);
-    const stats = await send({ id: 10, op: 'stats' });
+    const stats = await send(daemon.socketPath, { id: 10, op: 'stats' });
     expect(stats.ok).toBe(true);
     expect(stats.stats).toHaveProperty('hits');
   });
 
   it('rejects malformed requests without dying', async () => {
-    const bad = await send({ id: 11, op: 'exec', argv: 'git status' });
+    const bad = await send(daemon.socketPath, { id: 11, op: 'exec', argv: 'git status' });
     expect(bad.ok).toBe(false);
     // Daemon still alive:
-    const ping = await send({ id: 12, op: 'ping' });
+    const ping = await send(daemon.socketPath, { id: 12, op: 'ping' });
     expect(ping.ok).toBe(true);
   });
+});
+
+it('records durable CLI usage', async () => {
+  const fixture = makeFixtureRepo();
+  const usageBase = mkdtempSync(join(tmpdir(), 'speculate-cli-usage-'));
+  const usageDirectory = join(usageBase, 'usage');
+  const recorder = new CountingUsageRecorder({
+    source: 'cli',
+    workspace: fixture,
+    directory: usageDirectory,
+    sessionId: 'daemon-test',
+    flushDelayMs: 0,
+  });
+  const daemon = await startExecDaemon({
+    root: fixture,
+    socketPath: join(mkdtempSync(join(tmpdir(), 'speculate-sock-')), 'd.sock'),
+    persist: false,
+    watch: false,
+    usageRecorder: recorder,
+    log: () => {},
+  });
+
+  try {
+    const response = await send(daemon.socketPath, { id: 1, op: 'exec', argv: ['git', 'status'] });
+    expect(response.ok).toBe(true);
+  } finally {
+    await daemon.close();
+    await daemon.close();
+  }
+
+  try {
+    expect(recorder.closeCalls).toBe(1);
+    const report = readUsageReport(usageDirectory);
+    expect(report.bySource.cli.sessions).toBe(1);
+    expect(report.bySource.cli.misses).toBe(1);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+    rmSync(usageBase, { recursive: true, force: true });
+  }
 });

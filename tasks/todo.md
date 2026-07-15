@@ -20,7 +20,13 @@
   - [x] Add a failing real-proxy persistence test
   - [x] Inject, close, and construct the MCP usage recorder
   - [x] Run focused tests, build, full suite, and self-review
-- [ ] Record CLI usage
+- [x] Record CLI usage
+  - [x] Add a failing asynchronous cache-waste notification test
+  - [x] Centralize waste increments behind a failure-safe observer
+  - [x] Add a failing durable daemon usage test
+  - [x] Normalize daemon counters and close the recorder once
+  - [x] Disable real state writes in unrelated daemon/client tests
+  - [x] Run focused tests, build, full suite, and self-review
 - [ ] Register the command and preserve zero-write trials
 - [ ] Run focused tests, full tests, and build
 - [ ] Review the final diff
@@ -34,3 +40,5 @@
 - Task 2 focused tests pass 21/21, the TypeScript build passes, and the full suite passes 465/465.
 - Task 3 records only cumulative MCP counters through Metrics and closes the durable recorder with proxy shutdown.
 - Task 3 focused tests pass 33/33, the TypeScript build passes, and the full suite passes 467/467.
+- Task 4 records normalized CLI daemon counters without changing daemon-local stats output.
+- Task 4 focused tests pass 22/22, the TypeScript build passes, and the full suite passes 470/470.

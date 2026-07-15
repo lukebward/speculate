@@ -30,6 +30,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { TransitionLearner } from './learner.js';
 import { StateStore, defaultStatePathForKey } from './persistence.js';
 import { ExecCache, type ExecOutcome } from './execCache.js';
+import { createUsageRecorder, type UsageCounters, type UsageRecorder } from './usage.js';
 import {
   CLI_PRIMES,
   CLI_SERVER,
@@ -234,6 +235,7 @@ export interface DaemonOptions {
   idleExitMs?: number;
   watch?: boolean;
   persist?: boolean;
+  usageRecorder?: UsageRecorder | null;
   log?: (line: string) => void;
   /** Called when the idle timer fires, after close(). CLI exits here. */
   onIdle?: () => void;
@@ -282,7 +284,44 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
     unlinkSync(socketPath); // stale socket from a dead daemon
   }
 
-  const cache = new ExecCache();
+  const stats: DaemonStats = {
+    hits: 0,
+    joins: 0,
+    misses: 0,
+    unsupported: 0,
+    speculated: 0,
+    wasted: 0,
+    estimatedSavedMs: 0,
+  };
+  let usageRecorder =
+    opts.usageRecorder === undefined
+      ? createUsageRecorder({ source: 'cli', workspace: root })
+      : opts.usageRecorder;
+  const durableCounters = (): UsageCounters => ({
+    hits: stats.hits,
+    joins: stats.joins,
+    misses: stats.misses,
+    speculativeCalls: stats.speculated,
+    wasted: stats.wasted + cache.wasted,
+    estimatedSavedMs: stats.estimatedSavedMs,
+  });
+  const publishUsage = (): void => {
+    try {
+      usageRecorder?.update(durableCounters());
+    } catch {}
+  };
+  const closeUsageRecorder = (): void => {
+    const recorder = usageRecorder;
+    usageRecorder = null;
+    if (!recorder) return;
+    try {
+      recorder.update(durableCounters());
+    } catch {}
+    try {
+      recorder.close();
+    } catch {}
+  };
+  const cache = new ExecCache({ onWaste: publishUsage });
   const learner = new TransitionLearner();
   for (const [prev, next] of CLI_PRIMES) learner.prime(CLI_SERVER, prev, next);
 
@@ -303,16 +342,6 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
       }
     }, 1_000);
     saveTimer.unref();
-  };
-
-  const stats: DaemonStats = {
-    hits: 0,
-    joins: 0,
-    misses: 0,
-    unsupported: 0,
-    speculated: 0,
-    wasted: 0,
-    estimatedSavedMs: 0,
   };
 
   let lastActivity = Date.now();
@@ -416,10 +445,12 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
       try {
         outcome = await runCommand(cls, root);
       } catch (err) {
+        publishUsage();
         return { ok: false, error: `exec-failed: ${(err as Error).message}` };
       }
     }
     observeAndSpeculate(cls, outcome);
+    publishUsage();
     return {
       ok: true,
       served,
@@ -500,6 +531,7 @@ export async function startExecDaemon(opts: DaemonOptions): Promise<DaemonHandle
   const close = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    closeUsageRecorder();
     clearInterval(sweeper);
     clearInterval(idleTimer);
     if (saveTimer) clearTimeout(saveTimer);

@@ -33,12 +33,14 @@ export class ExecCache {
   private readonly ready = new Map<string, ReadyEntry>();
   private readonly inflight = new Map<string, InFlightEntry>();
   private readonly now: () => number;
+  private readonly onWaste?: () => void;
   private generation = 0;
   /** Speculative results produced but never served. */
   wasted = 0;
 
-  constructor(opts: { now?: () => number } = {}) {
+  constructor(opts: { now?: () => number; onWaste?: () => void } = {}) {
     this.now = opts.now ?? Date.now;
+    this.onWaste = opts.onWaste;
   }
 
   lookup(key: string): ExecLookup {
@@ -46,7 +48,7 @@ export class ExecCache {
     if (entry) {
       this.ready.delete(key); // single-use, hit or expired
       if (entry.expiresAt > this.now()) return { kind: 'hit', outcome: entry.outcome };
-      this.wasted++;
+      this.recordWaste();
     }
     const inFlight = this.inflight.get(key);
     if (inFlight) return { kind: 'join', promise: inFlight.promise, issuedAt: inFlight.issuedAt };
@@ -76,13 +78,13 @@ export class ExecCache {
         if (gen === this.generation) {
           this.ready.set(key, { outcome, expiresAt: this.now() + ttlMs });
         } else {
-          this.wasted++; // finished after a flush: stale by definition
+          this.recordWaste(); // finished after a flush: stale by definition
         }
         return outcome;
       },
       () => {
         this.inflight.delete(key);
-        this.wasted++;
+        this.recordWaste();
         return null;
       },
     );
@@ -92,7 +94,7 @@ export class ExecCache {
   /** Workspace changed (or a mutation ran): everything staged is stale. */
   invalidateAll(): void {
     this.generation++;
-    this.wasted += this.ready.size;
+    this.recordWaste(this.ready.size);
     this.ready.clear();
     // Joining a pre-flush in-flight run would serve stale bytes: drop the
     // handles; the doomed runs discard themselves via the generation stamp.
@@ -105,12 +107,20 @@ export class ExecCache {
     for (const [key, entry] of this.ready) {
       if (entry.expiresAt <= now) {
         this.ready.delete(key);
-        this.wasted++;
+        this.recordWaste();
       }
     }
   }
 
   size(): { ready: number; inFlight: number } {
     return { ready: this.ready.size, inFlight: this.inflight.size };
+  }
+
+  private recordWaste(count = 1): void {
+    if (count === 0) return;
+    this.wasted += count;
+    try {
+      this.onWaste?.();
+    } catch {}
   }
 }
