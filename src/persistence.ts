@@ -111,6 +111,10 @@ export function defaultStatePath(configPath: string): string {
  */
 export function defaultStatePathForKey(key: string): string {
   const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
+  return join(defaultStateDirectory(), `state-${hash}.json`);
+}
+
+export function defaultStateDirectory(): string {
   const xdg = process.env.XDG_STATE_HOME;
   const stateHome =
     xdg && xdg.length > 0 && isAbsolute(xdg)
@@ -118,5 +122,5 @@ export function defaultStatePathForKey(key: string): string {
       : process.platform === 'win32' && process.env.LOCALAPPDATA
         ? process.env.LOCALAPPDATA
         : join(homedir(), '.local', 'state');
-  return join(stateHome, 'speculate', `state-${hash}.json`);
+  return join(stateHome, 'speculate');
 }

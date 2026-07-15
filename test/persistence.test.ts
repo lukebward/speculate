@@ -6,7 +6,11 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { StateStore, defaultStatePath } from '../src/persistence.js';
+import {
+  StateStore,
+  defaultStateDirectory,
+  defaultStatePath,
+} from '../src/persistence.js';
 import { TransitionLearner } from '../src/learner.js';
 import { Metrics } from '../src/metrics.js';
 import type { ObservedCall } from '../src/types.js';
@@ -150,6 +154,8 @@ describe('defaultStatePath', () => {
       const a = defaultStatePath('/proj/speculate.config.json');
       const b = defaultStatePath('/proj/speculate.config.json');
       const c = defaultStatePath('/other/speculate.config.json');
+      expect(defaultStateDirectory()).toBe(`${sep}xdg-state${sep}speculate`);
+      expect(defaultStatePath('/proj/speculate.config.json')).toMatch(/state-[0-9a-f]+\.json$/);
       expect(a).toBe(b);
       expect(a).not.toBe(c);
       expect(a.startsWith(`${sep}xdg-state${sep}speculate${sep}state-`)).toBe(true);
