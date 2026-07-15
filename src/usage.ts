@@ -90,7 +90,14 @@ export class UsageRecorder {
   }
 
   update(counters: UsageCounters): void {
-    this.snapshot.counters = { ...counters };
+    this.snapshot.counters = {
+      hits: counters.hits,
+      joins: counters.joins,
+      misses: counters.misses,
+      speculativeCalls: counters.speculativeCalls,
+      wasted: counters.wasted,
+      estimatedSavedMs: counters.estimatedSavedMs,
+    };
     this.snapshot.updatedAt = this.now();
     if (this.flushDelayMs === 0) {
       this.flush();

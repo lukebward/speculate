@@ -96,6 +96,30 @@ describe('UsageRecorder', () => {
     expect(snapshot.endedAt).toBeUndefined();
   });
 
+  it('persists only approved counter fields from compatible objects', () => {
+    const directory = dir();
+    const recorder = new UsageRecorder({
+      source: 'mcp',
+      workspace: '/workspace/a',
+      directory,
+      sessionId: 'a',
+      now: () => 1000,
+      flushDelayMs: 0,
+    });
+    const compatibleCounters = {
+      ...counters({ hits: 2, estimatedSavedMs: 750 }),
+      perServer: { github: 2 },
+      perRule: { nextIssue: 1 },
+      cache: { entries: 3 },
+    };
+
+    recorder.update(compatibleCounters);
+    recorder.close();
+
+    const saved = JSON.parse(readFileSync(join(directory, '1000-a.json'), 'utf8'));
+    expect(saved.counters).toEqual(counters({ hits: 2, estimatedSavedMs: 750 }));
+  });
+
   it('keeps simultaneous sessions in independent files', () => {
     const directory = dir();
     const a = new UsageRecorder({

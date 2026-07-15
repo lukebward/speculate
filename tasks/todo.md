@@ -7,6 +7,7 @@
   - [x] Expose the state directory and implement durable snapshots
   - [x] Add failing validation and aggregation tests
   - [x] Implement strict report validation and aggregation
+  - [x] Project recorder updates onto the approved counter schema
   - [x] Run focused tests, build, full suite, and self-review
 - [ ] Format human and JSON stats
 - [ ] Record MCP usage
@@ -18,5 +19,5 @@
 ## Review
 
 - Task 1 persists owner-only aggregate session snapshots and reports validated totals by source and workspace.
-- Focused tests pass 19/19 and the TypeScript build passes.
+- Focused tests pass 20/20 and the TypeScript build passes.
 - The full suite passed 452/453; the unrelated shim timeout passed immediately in isolation.
