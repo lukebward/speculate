@@ -9,7 +9,11 @@
   - [x] Implement strict report validation and aggregation
   - [x] Project recorder updates onto the approved counter schema
   - [x] Run focused tests, build, full suite, and self-review
-- [ ] Format human and JSON stats
+- [x] Format human and JSON stats
+  - [x] Add failing parser, formatter, empty-state, and JSON tests
+  - [x] Implement argument parsing and deterministic human formatting
+  - [x] Implement injectable command execution
+  - [x] Run focused tests, build, full suite, and self-review
 - [ ] Record MCP usage
 - [ ] Record CLI usage
 - [ ] Register the command and preserve zero-write trials
@@ -20,4 +24,6 @@
 
 - Task 1 persists owner-only aggregate session snapshots and reports validated totals by source and workspace.
 - Focused tests pass 20/20 and the TypeScript build passes.
-- The full suite passed 452/453; the unrelated shim timeout passed immediately in isolation.
+- The full suite passed 453/453.
+- Task 2 formats cumulative human and exact JSON reports behind an injectable command runner.
+- Task 2 focused tests pass 21/21, the TypeScript build passes, and the full suite passes 465/465.
