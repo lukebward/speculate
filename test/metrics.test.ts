@@ -2,6 +2,7 @@ import process from 'node:process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Metrics } from '../src/metrics.js';
 import type { DecisionEvent, StatsReport } from '../src/types.js';
+import type { UsageCounters } from '../src/usage.js';
 
 function clock(start = 0): { now: () => number; set: (t: number) => void } {
   let t = start;
@@ -42,6 +43,28 @@ function recorded(events: DecisionEvent[] = SESSION): Metrics {
 
 describe('Metrics — counter accumulation', () => {
   const snap = recorded().statsSnapshot();
+
+  it('publishes common durable counters', () => {
+    const snapshots: UsageCounters[] = [];
+    const m = new Metrics({
+      mode: 'strict',
+      log: 'off',
+      onUsage: (snapshot) => snapshots.push(snapshot),
+    });
+    m.record({ type: 'predicted', server: 's', tool: 't' });
+    expect(snapshots).toEqual([]);
+    m.record({ type: 'miss', server: 's', tool: 't' });
+    m.record({ type: 'speculated', server: 's', tool: 't' });
+    m.record({ type: 'hit', server: 's', tool: 't', savedMs: 250 });
+    expect(snapshots.at(-1)).toEqual({
+      hits: 1,
+      joins: 0,
+      misses: 1,
+      speculativeCalls: 1,
+      wasted: 0,
+      estimatedSavedMs: 250,
+    });
+  });
 
   it('accumulates top-level counters from the event stream', () => {
     expect(snap.realCalls).toBe(2);

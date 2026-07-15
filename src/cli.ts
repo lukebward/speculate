@@ -26,6 +26,7 @@ import {
   startExecDaemon,
 } from './execDaemon.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
+import { createUsageRecorder } from './usage.js';
 import { VERSION } from './version.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
@@ -345,7 +346,11 @@ async function runProxy(
   statePath: string | null,
   configLabel: string,
 ): Promise<void> {
-  const proxy = new SpeculateProxy(config, { statePath });
+  const usageRecorder = createUsageRecorder({
+    source: 'mcp',
+    workspace: process.cwd(),
+  });
+  const proxy = new SpeculateProxy(config, { statePath, usageRecorder });
   const shutdown = async (): Promise<void> => {
     try {
       const s = proxy.metrics.statsSnapshot();

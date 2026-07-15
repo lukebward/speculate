@@ -14,7 +14,12 @@
   - [x] Implement argument parsing and deterministic human formatting
   - [x] Implement injectable command execution
   - [x] Run focused tests, build, full suite, and self-review
-- [ ] Record MCP usage
+- [x] Record MCP usage
+  - [x] Add a failing Metrics durable-counter notification test
+  - [x] Publish only durable counter changes from Metrics
+  - [x] Add a failing real-proxy persistence test
+  - [x] Inject, close, and construct the MCP usage recorder
+  - [x] Run focused tests, build, full suite, and self-review
 - [ ] Record CLI usage
 - [ ] Register the command and preserve zero-write trials
 - [ ] Run focused tests, full tests, and build
@@ -27,3 +32,5 @@
 - The full suite passed 453/453.
 - Task 2 formats cumulative human and exact JSON reports behind an injectable command runner.
 - Task 2 focused tests pass 21/21, the TypeScript build passes, and the full suite passes 465/465.
+- Task 3 records only cumulative MCP counters through Metrics and closes the durable recorder with proxy shutdown.
+- Task 3 focused tests pass 33/33, the TypeScript build passes, and the full suite passes 467/467.

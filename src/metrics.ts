@@ -14,6 +14,7 @@ import type {
   SpeculationMode,
   StatsReport,
 } from './types.js';
+import type { UsageCounters } from './usage.js';
 
 interface PerServerCounters {
   speculativeCalls: number;
@@ -34,6 +35,7 @@ export class Metrics {
   private readonly mode: SpeculationMode;
   private readonly log: 'stderr' | 'off';
   private readonly now: () => number;
+  private readonly onUsage: ((counters: UsageCounters) => void) | undefined;
   private readonly startedAt: number;
 
   private realCalls = 0;
@@ -71,10 +73,12 @@ export class Metrics {
     mode: SpeculationMode;
     log: 'stderr' | 'off';
     now?: () => number;
+    onUsage?: (counters: UsageCounters) => void;
   }) {
     this.mode = opts.mode;
     this.log = opts.log;
     this.now = opts.now ?? Date.now;
+    this.onUsage = opts.onUsage;
     this.startedAt = this.now();
   }
 
@@ -120,6 +124,7 @@ export class Metrics {
   record(ev: DecisionEvent): void {
     const event: DecisionEvent =
       ev.timestamp === undefined ? { ...ev, timestamp: this.now() } : ev;
+    let usageChanged = false;
 
     if (this.log === 'stderr') {
       process.stderr.write(`${JSON.stringify({ speculate: event })}\n`);
@@ -131,6 +136,7 @@ export class Metrics {
         break;
       case 'speculated':
         this.speculativeCalls++;
+        usageChanged = true;
         this.server(event.server).speculativeCalls++;
         if (event.ruleId !== undefined) {
           this.rule(event.ruleId).speculated++;
@@ -139,24 +145,30 @@ export class Metrics {
         break;
       case 'hit':
         this.hits++;
+        usageChanged = true;
         this.recordUse(event);
         break;
       case 'joined':
         this.joins++;
+        usageChanged = true;
         this.recordUse(event);
         break;
       case 'miss':
         this.misses++;
+        usageChanged = true;
         break;
       case 'expired':
         this.expired++;
+        usageChanged = true;
         this.recordWaste(event);
         break;
       case 'invalidated':
         this.invalidated++;
+        usageChanged = true;
         this.recordWaste(event);
         break;
       case 'spec_error':
+        usageChanged = true;
         this.server(event.server).specErrors++;
         this.recordWaste(event);
         break;
@@ -181,6 +193,16 @@ export class Metrics {
         // Waste is derived from its terminal causes (expired / invalidated /
         // spec_error); remaining event types carry no counters.
         break;
+    }
+    if (usageChanged) {
+      this.onUsage?.({
+        hits: this.hits,
+        joins: this.joins,
+        misses: this.misses,
+        speculativeCalls: this.speculativeCalls,
+        wasted: this.wasted,
+        estimatedSavedMs: this.estimatedSavedMs,
+      });
     }
   }
 

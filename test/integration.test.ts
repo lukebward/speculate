@@ -7,11 +7,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { StatsReport } from '../src/types.js';
+import { readUsageReport } from '../src/usage.js';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
@@ -65,7 +66,7 @@ async function startProxy(
   const transport = new StdioClientTransport({
     command: TSX,
     args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
-    env: { ...process.env } as Record<string, string>,
+    env: { ...process.env, XDG_STATE_HOME: dir } as Record<string, string>,
     stderr: 'inherit',
   });
   await client.connect(transport);
@@ -166,6 +167,33 @@ describe('speculate end-to-end', () => {
     expect(stats.speculativeCalls).toBeGreaterThanOrEqual(2);
     expect(stats.hits + stats.joins).toBeGreaterThanOrEqual(2);
     expect(stats.estimatedSavedMs).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('records durable MCP usage', async () => {
+    const h = await startProxy('strict');
+    await timedCall(h.client, 'get_issue', { ...REPO, issue_number: 42 });
+    await sleep(LATENCY_MS * 3 + 200);
+    await timedCall(h.client, 'get_issue_comments', { ...REPO, issue_number: 42 });
+    await h.client.close();
+
+    const usageDirectory = join(h.dir, 'speculate', 'usage');
+    let report = readUsageReport(usageDirectory);
+    for (
+      let attempts = 0;
+      attempts < 40 &&
+      (report.bySource.mcp.sessions === 0 ||
+        report.bySource.mcp.hits + report.bySource.mcp.joins === 0 ||
+        report.bySource.mcp.estimatedSavedMs === 0);
+      attempts++
+    ) {
+      await sleep(25);
+      report = readUsageReport(usageDirectory);
+    }
+
+    expect(report.bySource.mcp.sessions).toBe(1);
+    expect(report.bySource.mcp.hits + report.bySource.mcp.joins).toBeGreaterThanOrEqual(1);
+    expect(report.bySource.mcp.estimatedSavedMs).toBeGreaterThan(0);
+    expect(report.workspaces[0]?.workspace).toBe(resolve(process.cwd()));
   }, 30_000);
 
   it('single-use: a consumed entry is not served twice', async () => {

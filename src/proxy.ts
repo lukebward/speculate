@@ -35,6 +35,7 @@ import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
 import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
+import type { UsageRecorder } from './usage.js';
 
 const STATS_TOOL = 'speculate__stats';
 /** Names the proxy itself serves; upstream tools may never claim them. */
@@ -67,15 +68,21 @@ export class SpeculateProxy {
   private readonly learner: TransitionLearner;
   private readonly noProfile = new Set<string>();
   private readonly store: StateStore | null;
+  private readonly usageRecorder: UsageRecorder | null;
   private saveTimer: NodeJS.Timeout | null = null;
   private savedStamp = '';
 
   constructor(
     config: SpeculateConfig,
-    opts: { now?: () => number; statePath?: string | null } = {},
+    opts: {
+      now?: () => number;
+      statePath?: string | null;
+      usageRecorder?: UsageRecorder | null;
+    } = {},
   ) {
     this.config = config;
     this.now = opts.now ?? Date.now;
+    this.usageRecorder = opts.usageRecorder ?? null;
     const now = this.now;
 
     // Per-server profile resolution (config profile name -> builtin profile).
@@ -90,7 +97,12 @@ export class SpeculateProxy {
       }
     }
 
-    this.metrics = new Metrics({ mode: config.mode, log: config.log, now });
+    this.metrics = new Metrics({
+      mode: config.mode,
+      log: config.log,
+      now,
+      onUsage: (counters) => this.usageRecorder?.update(counters),
+    });
     this.cache = new SpeculationCache({
       now,
       onEvent: (ev) =>
@@ -297,8 +309,12 @@ export class SpeculateProxy {
     if (this.sweeper) clearInterval(this.sweeper);
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveState(); // best-effort final flush
-    await Promise.all([...this.upstreams.values()].map((u) => u.close()));
-    await this.server.close();
+    try {
+      await Promise.all([...this.upstreams.values()].map((u) => u.close()));
+      await this.server.close();
+    } finally {
+      this.usageRecorder?.close();
+    }
   }
 
   /** Learner + feedback state fingerprint for the dirty gate (§13.6). */
