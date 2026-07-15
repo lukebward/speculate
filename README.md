@@ -6,7 +6,7 @@ Speculative prefetching for coding agents. Speculate sits between your MCP clien
 
 A live run against real GitHub, captured as-is: the first pass teaches Speculate the workflow, and on the second the PR is already fetched by the time the agent asks. Re-run it with `npm run demo`; `npm run bench` reproduces the measured off/on comparison (71% hit rate, −66% tool wait, zero wasted calls).
 
-## Try it: nothing installed, nothing written
+## Try it in Claude Code: nothing installed, nothing written
 
 ```bash
 npx -y github:lukebward/speculate try
@@ -14,17 +14,19 @@ npx -y github:lukebward/speculate try
 
 Launches a normal `claude` session with every MCP server wrapped and CLI speculation on, via a throwaway config. Exit the session and no trace remains.
 
-## Turn it on
+## Turn it on (Claude Code)
 
 ```bash
-npm install -g github:lukebward/speculate
-speculate on
+npm install -g github:lukebward/speculate   # install the CLI once
+speculate on                                # enable it for the current project
 ```
+
+`try` and `on` are Claude Code integrations. Using any other MCP client? Skip to [the wrap prefix](#any-other-mcp-client); nothing in this section is required.
 
 One command, one project, everything the agent uses:
 
 - **Your MCP servers** are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
-- **CLI speculation** is installed as a Claude Code plugin (local scope, this project): a workspace MCP server for git/ripgrep/`gh`/npm tools, plus a Bash hook that serves the agent's native `git status`, `git diff`, `rg`, `ls` from the prefetch cache. On hosts without a plugin CLI it falls back to the workspace server alone (`--no-plugin` forces that).
+- **CLI speculation** is installed as a Claude Code plugin (local scope, this project): a workspace MCP server for git/ripgrep/`gh`/npm tools, plus a Bash hook that serves the agent's native `git status`, `git diff`, `rg`, `ls` from the prefetch cache. On older Claude Code versions without a plugin CLI it falls back to the workspace server alone (`--no-plugin` forces that).
 
 `speculate status` shows what's active and what drifted. `speculate off` restores everything exactly, even without its state file, since wrapped entries carry their original command line after the `--`.
 
@@ -48,7 +50,7 @@ npm install && npm pack && npm install -g ./speculate-mcp-*.tgz
 
 ## Any other MCP client
 
-Prefix the server command already in your client's config:
+No install and no Claude Code required: prefix the server command already in your client's config:
 
 ```jsonc
 // before
