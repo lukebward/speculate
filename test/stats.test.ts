@@ -141,6 +141,34 @@ describe('formatUsageReport', () => {
     expect(output).toContain('Hit rate: —');
     expect(output).toContain('Wasted calls: 0 (— per hit)');
   });
+
+  it('reports malformed records when no valid sessions exist', () => {
+    const fixture: UsageReport = { ...emptyReport, ignoredRecords: 2 };
+
+    expect(formatUsageReport(fixture)).toBe(
+      'No Speculate usage recorded yet.\n' +
+      'Collection starts after installing this version.\n' +
+      'Ignored records: 2\n',
+    );
+  });
+
+  it('escapes workspace controls only in human output', () => {
+    const workspace = '/workspace/a\n\u001b[31mred\u001b[0m';
+    const fixture: UsageReport = {
+      ...report,
+      workspaces: [{ ...report.workspaces[0]!, workspace }],
+    };
+    let json = '';
+    runStats(
+      { json: true },
+      { read: () => fixture, write: (text) => { json += text; } },
+    );
+
+    expect(JSON.parse(json).workspaces[0].workspace).toBe(workspace);
+    const human = formatUsageReport(fixture);
+    expect(human).toContain('/workspace/a\\n\\u001b[31mred\\u001b[0m: 1m 30s saved');
+    expect(human).not.toContain('\u001b');
+  });
 });
 
 describe('runStats', () => {

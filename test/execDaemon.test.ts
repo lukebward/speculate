@@ -45,6 +45,26 @@ describe('ExecCache', () => {
     expect(cache.wasted).toBe(1);
   });
 
+  it('counts an expired ready entry replaced before sweep', async () => {
+    let t = 0;
+    let notifications = 0;
+    const cache = new ExecCache({ now: () => t, onWaste: () => notifications++ });
+    cache.beginSpeculative('k', 100, async () => outcome('old'));
+    await Promise.resolve();
+    await Promise.resolve();
+    t = 100;
+
+    cache.beginSpeculative('k', 100, async () => outcome('new'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(cache.wasted).toBe(1);
+    expect(notifications).toBe(1);
+    const found = cache.lookup('k');
+    expect(found.kind).toBe('hit');
+    expect((found as { outcome: ExecOutcome }).outcome.stdout.toString()).toBe('new');
+  });
+
   it('joins an in-flight execution', async () => {
     const cache = new ExecCache();
     let release!: (o: ExecOutcome) => void;

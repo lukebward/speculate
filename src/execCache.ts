@@ -58,7 +58,11 @@ export class ExecCache {
   /** Fresh-or-in-flight — the prefetcher's dedupe check. */
   has(key: string): boolean {
     const entry = this.ready.get(key);
-    if (entry && entry.expiresAt > this.now()) return true;
+    if (entry) {
+      if (entry.expiresAt > this.now()) return true;
+      this.ready.delete(key);
+      this.recordWaste();
+    }
     return this.inflight.has(key);
   }
 

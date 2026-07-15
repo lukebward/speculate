@@ -36,6 +36,12 @@
   - [x] Run focused tests, build, full suite, diff check, and self-review
 - [x] Run focused tests, full tests, and build
 - [x] Review the final diff
+- [x] Apply final review fixes
+  - [x] Preserve ignored-record visibility with zero valid sessions
+  - [x] Account for expired cache entries replaced before sweep
+  - [x] Escape control characters only in human workspace output
+  - [x] Remove the unrelated local-worktree ignore
+  - [x] Run focused tests, build, isolated full suite, diff check, and self-review
 
 ## Review
 
@@ -50,3 +56,5 @@
 - Task 4 focused tests pass 22/22, the TypeScript build passes, and the full suite passes 470/470.
 - Task 5 registers only `speculate stats [--json]`, preserves trial zero-write behavior, and documents durable versus live stats.
 - Task 5 focused tests pass 102/102, the TypeScript build passes, the full suite passes 472/472, and `git diff --check` passes.
+- Final review fixes retain ignored-record visibility, count pre-sweep cache replacement waste, escape human-only workspace controls, and remove the unrelated worktree ignore.
+- Final focused stats tests pass 14/14, cache tests pass 9/9, the TypeScript build passes, the isolated full suite passes 475/475, and text/control-byte/diff checks pass.

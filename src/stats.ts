@@ -25,9 +25,22 @@ function formatPercentage(value: number | null): string {
   return value === null ? '—' : `${(value * 100).toFixed(1)}%`;
 }
 
+function escapeControls(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, (character) =>
+    character === '\n'
+      ? '\\n'
+      : `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
 export function formatUsageReport(report: UsageReport): string {
   if (report.totals.sessions === 0) {
-    return 'No Speculate usage recorded yet.\nCollection starts after installing this version.\n';
+    const lines = [
+      'No Speculate usage recorded yet.',
+      'Collection starts after installing this version.',
+    ];
+    if (report.ignoredRecords > 0) lines.push(`Ignored records: ${report.ignoredRecords}`);
+    return `${lines.join('\n')}\n`;
   }
 
   const heading = report.since === null
@@ -48,7 +61,8 @@ export function formatUsageReport(report: UsageReport): string {
     `MCP: ${formatDuration(report.bySource.mcp.estimatedSavedMs)} saved`,
     `CLI: ${formatDuration(report.bySource.cli.estimatedSavedMs)} saved`,
     ...report.workspaces.map(
-      (workspace) => `${workspace.workspace}: ${formatDuration(workspace.estimatedSavedMs)} saved`,
+      (workspace) =>
+        `${escapeControls(workspace.workspace)}: ${formatDuration(workspace.estimatedSavedMs)} saved`,
     ),
     `Ignored records: ${report.ignoredRecords}`,
   ];
