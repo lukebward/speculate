@@ -30,6 +30,8 @@ One command, one project, everything the agent uses:
 
 `speculate status` shows what's active and what drifted. `speculate off` restores everything exactly, even without its state file, since wrapped entries carry their original command line after the `--`.
 
+`speculate stats` shows cumulative estimated time saved, hit rate, waste, and per-workspace usage across MCP and CLI speculation. Use `speculate stats --json` for structured output. Collection starts with this version; `speculate try` remains zero-write and is excluded.
+
 No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed GitHub server still gets the vetted GitHub profile), workspaces configure themselves by probing the repo, and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config. A restarted proxy prefetches your workflows from the first trigger.
 
 <details>
@@ -63,7 +65,7 @@ No install and no Claude Code required: prefix the server command already in you
 }
 ```
 
-The client sees standard MCP: same tools, same results, some just arrive ~200× faster. `wrap --workspace .` gives the same treatment to a repo's CLI tools. Ask the agent to call `speculate__stats` for live hit rate and time saved.
+The client sees standard MCP: same tools, same results, some just arrive ~200× faster. `wrap --workspace .` gives the same treatment to a repo's CLI tools. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate and time saved; `speculate stats` reports durable cumulative usage.
 
 ## Safety
 

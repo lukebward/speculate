@@ -27,9 +27,15 @@
   - [x] Normalize daemon counters and close the recorder once
   - [x] Disable real state writes in unrelated daemon/client tests
   - [x] Run focused tests, build, full suite, and self-review
-- [ ] Register the command and preserve zero-write trials
-- [ ] Run focused tests, full tests, and build
-- [ ] Review the final diff
+- [x] Register the command and preserve zero-write trials
+  - [x] Add failing real-CLI human, JSON, and argument-error tests
+  - [x] Register only top-level `stats` and `--json`
+  - [x] Add a failing trial usage-disable environment test
+  - [x] Pass the usage-disable flag to the trial client
+  - [x] Document durable versus live stats and snapshot privacy
+  - [x] Run focused tests, build, full suite, diff check, and self-review
+- [x] Run focused tests, full tests, and build
+- [x] Review the final diff
 
 ## Review
 
@@ -42,3 +48,5 @@
 - Task 3 focused tests pass 33/33, the TypeScript build passes, and the full suite passes 467/467.
 - Task 4 records normalized CLI daemon counters without changing daemon-local stats output.
 - Task 4 focused tests pass 22/22, the TypeScript build passes, and the full suite passes 470/470.
+- Task 5 registers only `speculate stats [--json]`, preserves trial zero-write behavior, and documents durable versus live stats.
+- Task 5 focused tests pass 102/102, the TypeScript build passes, the full suite passes 472/472, and `git diff --check` passes.

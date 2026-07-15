@@ -26,6 +26,7 @@ import {
   startExecDaemon,
 } from './execDaemon.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
+import { parseStatsArgs, runStats } from './stats.js';
 import { createUsageRecorder } from './usage.js';
 import { VERSION } from './version.js';
 
@@ -41,6 +42,7 @@ install-and-it-works (no config files edited by hand):
                                            (--no-plugin: workspace server only, no hook)
   speculate off                            undo everything 'on' did (exact restore)
   speculate status                         what's wrapped here, and what drifted since 'on'
+  speculate stats [--json]                 cumulative MCP and CLI speculation usage
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
                                            server any client launches, even ones added later
 
@@ -100,6 +102,7 @@ interface Args {
     | 'on'
     | 'off'
     | 'status'
+    | 'stats'
     | 'exec'
     | 'exec-daemon'
     | 'shims';
@@ -115,6 +118,7 @@ const REST_COMMANDS = new Set([
   'on',
   'off',
   'status',
+  'stats',
   'exec',
   'exec-daemon',
   'shims',
@@ -220,6 +224,13 @@ async function main(): Promise<void> {
     if ('error' in tryArgs) fail(`try: ${tryArgs.error}`);
     process.exitCode = await runTry(tryArgs);
     return; // natural exit: the loop drains, stdout flushes completely
+  }
+
+  if (args.command === 'stats') {
+    const statsArgs = parseStatsArgs(args.rest);
+    if ('error' in statsArgs) fail(`stats: ${statsArgs.error}`);
+    process.exitCode = runStats(statsArgs);
+    return;
   }
 
   if (args.command === 'exec') {

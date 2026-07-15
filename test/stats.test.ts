@@ -1,10 +1,39 @@
 import { describe, expect, it } from 'vitest';
+import { execFile } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   formatUsageReport,
   parseStatsArgs,
   runStats,
 } from '../src/stats.js';
-import type { UsageReport, UsageTotals } from '../src/usage.js';
+import { UsageRecorder, type UsageReport, type UsageTotals } from '../src/usage.js';
+
+const ROOT = new URL('..', import.meta.url).pathname;
+const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+
+function runCli(
+  args: string[],
+  stateHome: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      TSX,
+      [join(ROOT, 'src', 'cli.ts'), ...args],
+      { env: { ...process.env, XDG_STATE_HOME: stateHome }, encoding: 'utf8' },
+      (error, stdout, stderr) => {
+        const code =
+          error && typeof (error as { code?: unknown }).code === 'number'
+            ? ((error as { code: number }).code)
+            : error
+              ? 1
+              : 0;
+        resolve({ code, stdout, stderr });
+      },
+    );
+  });
+}
 
 const totals = (overrides: Partial<UsageTotals> = {}): UsageTotals => ({
   sessions: 0,
@@ -115,6 +144,43 @@ describe('formatUsageReport', () => {
 });
 
 describe('runStats', () => {
+  it('exposes stats through the real CLI', async () => {
+    const stateHome = mkdtempSync(join(tmpdir(), 'speculate-stats-cli-'));
+    try {
+      const recorder = new UsageRecorder({
+        source: 'mcp',
+        workspace: '/workspace/a',
+        directory: join(stateHome, 'speculate', 'usage'),
+        sessionId: 'test',
+        now: () => 1000,
+        flushDelayMs: 0,
+      });
+      recorder.update({
+        hits: 1,
+        joins: 0,
+        misses: 0,
+        speculativeCalls: 1,
+        wasted: 0,
+        estimatedSavedMs: 1500,
+      });
+      recorder.close();
+
+      const human = await runCli(['stats'], stateHome);
+      expect(human.code).toBe(0);
+      expect(human.stdout).toContain('Estimated time saved: 2s');
+
+      const json = await runCli(['stats', '--json'], stateHome);
+      expect(json.code).toBe(0);
+      expect(JSON.parse(json.stdout).totals.estimatedSavedMs).toBe(1500);
+
+      const bad = await runCli(['stats', '--bogus'], stateHome);
+      expect(bad.code).toBe(2);
+      expect(bad.stderr).toContain("unknown stats argument '--bogus'");
+    } finally {
+      rmSync(stateHome, { recursive: true, force: true });
+    }
+  });
+
   it('prints guidance when no snapshots exist', () => {
     let stdout = '';
 

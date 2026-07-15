@@ -16,7 +16,7 @@ import {
   unwrapEntry,
   wrapEntry,
 } from '../src/hostConfig.js';
-import { buildTryConfig, parseTryArgs } from '../src/tryRun.js';
+import { buildTryConfig, parseTryArgs, tryClientEnv } from '../src/tryRun.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
 
@@ -195,5 +195,14 @@ describe('parseTryArgs', () => {
   });
   it('rejects unknown flags', () => {
     expect(parseTryArgs(['--frobnicate'])).toHaveProperty('error');
+  });
+});
+
+describe('tryClientEnv', () => {
+  it('disables durable usage', () => {
+    expect(tryClientEnv({ KEEP: 'yes' })).toEqual({
+      KEEP: 'yes',
+      SPECULATE_USAGE_OFF: '1',
+    });
   });
 });

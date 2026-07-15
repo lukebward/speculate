@@ -109,6 +109,10 @@ export function buildTryConfig(opts: {
   return plan;
 }
 
+export function tryClientEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, SPECULATE_USAGE_OFF: '1' };
+}
+
 /** Assemble, launch, clean up. Returns the client's exit code. */
 export async function runTry(args: TryArgs): Promise<number> {
   const plan = buildTryConfig({
@@ -150,7 +154,7 @@ export async function runTry(args: TryArgs): Promise<number> {
   const child = spawn(
     clientBin,
     [...args.clientArgs, '--mcp-config', configPath, '--strict-mcp-config'],
-    { stdio: 'inherit' },
+    { env: tryClientEnv(process.env), stdio: 'inherit' },
   );
 
   // Claude Code runs its own TUI and traps SIGINT; forward terminal signals

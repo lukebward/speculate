@@ -228,7 +228,8 @@ MVP ships with:
 
 - **Structured log** of every speculative decision: prediction source, confidence, executed or suppressed (and why), outcome (hit / joined-in-flight / expired / invalidated / wasted), and per-hit head start.
 - **Near-miss logging:** on cache misses, key distance to the nearest cached entry (to size fuzzy matching — §6.1). **Parser-miss logging** for §5.1 failures.
-- **Session summary + `/stats`:** hit rate, wasted calls, estimated wall-clock saved (Σ min(gap, L) over hits), speculative quota consumed per server, bounded-delay events on stdio upstreams (§3.1).
+- **Session summary + `speculate__stats`:** current-session hit rate, wasted calls, estimated wall-clock saved (Σ min(gap, L) over hits), speculative quota consumed per server, bounded-delay events on stdio upstreams (§3.1).
+- **Durable `speculate stats`:** cumulative MCP and CLI estimated time saved, hit rate, waste, source totals, and per-workspace totals; `--json` emits the same aggregate report as structured output.
 - **Standard MCP-level logs** for the proxy function itself.
 
 The honest metric to watch is **estimated seconds saved per wasted call** — it prices the trade-off directly. Hit rate has no universal target; a 20%-hit rule that saves 2 s per hit at trivial quota cost is worth keeping, and the per-rule feedback loop (§5.6) suppresses rules that don't pay.
@@ -347,6 +348,8 @@ The learner's model and per-rule feedback now survive restarts, so a proxy that 
 2. Per-rule feedback counters (hits/wasted/speculated), so suppression knowledge survives too.
 
 **What never persists:** tool results. The §6.4 memory-only cache promise is untouched — the state file contains tool names, argument-shape templates (including constant *argument* values, which is why the file is 0600 under a 0700 dir), and counters.
+
+**Durable usage snapshots:** separate versioned session records are aggregate-only. Beyond schema version and opaque session identity, they contain only source, absolute workspace path, timestamps, and cumulative counters. They never contain command arguments, tool or server names, results, prediction templates, or cache contents; caches and results remain memory-only. `speculate stats` validates and aggregates these records across MCP and CLI sessions, while `speculate try` disables their creation to preserve its zero-write contract.
 
 **Durability semantics (state is an optimization, never a liability):**
 - Atomic writes (same-directory tmp + rename); a crash mid-save leaves the previous state intact.
