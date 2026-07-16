@@ -7,6 +7,7 @@
     "build": "tsc",
     "test": "vitest run",
     "test:e2e": "SPECULATE_E2E_LIVE=1 vitest run test/e2e-github-live.test.ts",
+    "test:scenarios": "vitest run test/scenarios.test.ts",
     "bench": "tsx bench/bench.ts",
     "demo": "tsx demo/demo.ts",
     "mock-github": "tsx mock/mock-github.ts",
