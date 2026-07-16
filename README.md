@@ -32,7 +32,7 @@ One command, one project, everything the agent uses:
 
 `speculate stats` shows cumulative estimated time saved, hit rate, waste, and per-workspace usage across MCP and CLI speculation. Use `speculate stats --json` for structured output. Collection starts with this version; `speculate try` remains zero-write and is excluded.
 
-No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed GitHub server still gets the vetted GitHub profile), workspaces configure themselves by probing the repo, and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config. A restarted proxy prefetches your workflows from the first trigger.
+No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed server still gets its vetted profile — GitHub, filesystem, and Slack ship built in), workspaces configure themselves by probing the repo, and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config. A restarted proxy prefetches your workflows from the first trigger — and once it has seen how your sessions open (twice), it prefetches those opening reads at launch, before your first request.
 
 <details>
 <summary><code>npm install -g</code> from git fails with <code>ENOTDIR … node_modules/speculate-mcp</code>?</summary>
@@ -85,7 +85,7 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 444 unit and end-to-end tests
+npm test        # 515 unit and end-to-end tests
 npm run bench   # speculation off vs on
 npm run demo    # the README demo, live against real GitHub (needs gh)
 ```

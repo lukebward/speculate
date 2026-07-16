@@ -49,6 +49,8 @@ export interface PredictorOptions {
   learner?: {
     observe(call: ObservedCall): void;
     predict(call: ObservedCall): Prediction[];
+    /** Session-opening reads worth prefetching at proxy start (§13.15). */
+    openerPredictions?(server: string): Prediction[];
   };
 }
 
@@ -226,9 +228,58 @@ export class Predictor {
       }
     }
 
-    // Batch dedupe on canonical cache key, keeping the higher-scored
-    // prediction. The key is stamped onto the prediction so the executor
-    // reuses it instead of recomputing (and possibly diverging).
+    return this.selectBatch(profile, candidates, call.timestamp);
+  }
+
+  /**
+   * §13.15 session-start priming: the learner's persisted opening reads for
+   * `server`, run through the same feedback/dedupe/cap pipeline as any
+   * trigger-driven batch. Returns [] when nothing qualifies; never throws.
+   */
+  sessionStart(server: string): Prediction[] {
+    if (!this.learner?.openerPredictions) return [];
+    const profile = this.profiles.get(server) ?? GENERIC_PROFILE;
+    const candidates: ScoredPrediction[] = [];
+    let order = 0;
+    try {
+      for (const raw of this.learner.openerPredictions(server)) {
+        const openerId =
+          typeof (raw as { ruleId?: unknown }).ruleId === 'string'
+            ? (raw as { ruleId: string }).ruleId
+            : 'opener:unknown';
+        const p = validatePrediction(raw, server, openerId);
+        if (!p) continue;
+        const fb = this.metrics.ruleFeedback(p.ruleId);
+        const eff = effectiveness(fb);
+        if (fb.speculated >= FEEDBACK_MIN_SPECULATED && eff < FEEDBACK_EFFECTIVENESS_FLOOR) {
+          this.metrics.record({
+            type: 'suppressed',
+            server,
+            tool: p.tool,
+            ruleId: p.ruleId,
+            reason: 'feedback',
+            confidence: p.confidence,
+          });
+          continue;
+        }
+        candidates.push({ prediction: p, score: p.confidence * eff, order: order++ });
+      }
+    } catch {
+      return [];
+    }
+    return this.selectBatch(profile, candidates);
+  }
+
+  /**
+   * Shared batch tail: dedupe on canonical cache key (keeping the
+   * higher-scored prediction; the key is stamped so the executor reuses it
+   * instead of recomputing), rank by score, cap (§5.6), and record events.
+   */
+  private selectBatch(
+    profile: ServerProfile,
+    candidates: ScoredPrediction[],
+    timestamp?: number,
+  ): Prediction[] {
     const byKey = new Map<string, ScoredPrediction>();
     for (const cand of candidates) {
       const key = dedupeKey(profile, cand.prediction, cand.order);
@@ -237,7 +288,6 @@ export class Predictor {
       if (!existing || cand.score > existing.score) byKey.set(key, cand);
     }
 
-    // Rank by score descending (stable on emission order) and cap (§5.6).
     const ranked = [...byKey.values()].sort(
       (a, b) => b.score - a.score || a.order - b.order,
     );
@@ -250,7 +300,7 @@ export class Predictor {
         ruleId: cut.prediction.ruleId,
         reason: 'per-trigger-cap',
         confidence: cut.prediction.confidence,
-        timestamp: call.timestamp,
+        timestamp,
       });
     }
 
@@ -261,7 +311,7 @@ export class Predictor {
         tool: prediction.tool,
         ruleId: prediction.ruleId,
         confidence: prediction.confidence,
-        timestamp: call.timestamp,
+        timestamp,
       });
     }
     return kept.map((c) => c.prediction);

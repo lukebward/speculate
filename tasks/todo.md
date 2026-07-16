@@ -58,3 +58,21 @@
 - Task 5 focused tests pass 102/102, the TypeScript build passes, the full suite passes 472/472, and `git diff --check` passes.
 - Final review fixes retain ignored-record visibility, count pre-sweep cache replacement waste, escape human-only workspace controls, and remove the unrelated worktree ignore.
 - Final focused stats tests pass 14/14, cache tests pass 9/9, the TypeScript build passes, the isolated full suite passes 475/475, and text/control-byte/diff checks pass.
+
+# v0.10 — session-start priming + filesystem/slack profiles
+
+Rebased onto the durable-usage-stats work after it landed on main (the
+receipts feature was implemented in parallel; main's version kept — it also
+covers the CLI daemon).
+
+- [x] Learner opener tracking: first 3 read-eligible asks per server per
+      session, constant-args-only, persisted with defensive deserialization
+- [x] `Predictor.sessionStart` through the shared feedback/dedupe/cap tail
+- [x] Proxy records openers and fires them at start (mode-gated, fail-open)
+- [x] filesystem + slack vetted profiles, validated against bundled mocks
+      mirroring the reference servers; registered for fingerprinting
+- [x] Unit tests: openers (10), filesystem profile (8), slack profile (6)
+- [x] Scenario tests: S9 priming curve 215ms → 219ms → 5ms; S10/S11 both
+      ~60% hit / ~58% cut vs off; S12 rewritten against the landed stats CLI
+      (accumulation via `speculate stats --json`; snapshots aggregate-only)
+- [x] DESIGN §13.15, README, version 0.10.0; full suite green

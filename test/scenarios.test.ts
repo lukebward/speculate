@@ -9,7 +9,8 @@
  * commits to them).
  */
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -40,18 +41,32 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 interface Harness {
   client: Client;
   callLogPath: string;
+  configPath: string;
   dir: string;
 }
 
 const harnesses: Harness[] = [];
 
+/** Bundled mock upstreams, each mirroring its real server's shapes. */
+const MOCK_SERVERS = {
+  github: 'mock-github.ts',
+  filesystem: 'mock-filesystem.ts',
+  slack: 'mock-slack.ts',
+} as const;
+
 async function startProxy(
   opts: {
     mode?: 'strict' | 'annotated' | 'off';
-    profile?: 'github' | 'none';
+    server?: keyof typeof MOCK_SERVERS;
+    profile?: string;
     speculation?: ServerConfig['speculation'];
+    /** Enables persistence at this path (default: hermetic, no state). */
+    statePath?: string;
+    /** Share a state home across sessions (default: this harness's tmp dir). */
+    xdgStateHome?: string;
   } = {},
 ): Promise<Harness> {
+  const server = opts.server ?? 'github';
   const dir = mkdtempSync(join(tmpdir(), 'speculate-scenario-'));
   const callLogPath = join(dir, 'calls.jsonl');
   const configPath = join(dir, 'config.json');
@@ -60,16 +75,16 @@ async function startProxy(
     JSON.stringify({
       mode: opts.mode ?? 'strict',
       log: 'off',
-      persistence: { enabled: false }, // hermetic: no learner state on disk
+      persistence: opts.statePath ? { path: opts.statePath } : { enabled: false },
       servers: {
-        github: {
+        [server]: {
           command: TSX,
-          args: [join(ROOT, 'mock', 'mock-github.ts')],
+          args: [join(ROOT, 'mock', MOCK_SERVERS[server])],
           env: {
             SPECULATE_MOCK_LATENCY_MS: String(L),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
           },
-          profile: opts.profile ?? 'github',
+          profile: opts.profile ?? server,
           ...(opts.speculation ? { speculation: opts.speculation } : {}),
         },
       },
@@ -79,13 +94,26 @@ async function startProxy(
   const transport = new StdioClientTransport({
     command: TSX,
     args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
-    env: { ...process.env } as Record<string, string>,
+    // Sandboxed state home: usage snapshots land in the harness dir, never
+    // in the runner's real XDG state.
+    env: {
+      ...process.env,
+      XDG_STATE_HOME: opts.xdgStateHome ?? dir,
+    } as Record<string, string>,
     stderr: 'ignore',
   });
   await client.connect(transport);
-  const h = { client, callLogPath, dir };
+  const h = { client, callLogPath, configPath, dir };
   harnesses.push(h);
   return h;
+}
+
+/** Mid-test teardown for multi-session scenarios (restart flows). */
+async function closeHarness(h: Harness): Promise<void> {
+  const i = harnesses.indexOf(h);
+  if (i !== -1) harnesses.splice(i, 1);
+  await h.client.close().catch(() => {});
+  rmSync(h.dir, { recursive: true, force: true });
 }
 
 afterEach(async () => {
@@ -522,5 +550,171 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
     ).toBeLessThan(sweep[0]!.followUpWaitMs * 0.75);
     expect(last.stats.hits, 'long think converts to completed prefetches').toBeGreaterThanOrEqual(2);
     expect(last.stats.estimatedSavedMs).toBeGreaterThanOrEqual(sweep[0]!.stats.estimatedSavedMs);
+  }, 120_000);
+
+  it('S9 session-start priming: a session-opening read goes from cold to prefetched (v0.10)', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'speculate-openers-'));
+    const statePath = join(stateDir, 'state.json');
+    const firstCallMs: number[] = [];
+    let finalStats: StatsReport | null = null;
+
+    // Three sessions sharing one state file, each opening with the same read.
+    for (let session = 1; session <= 3; session++) {
+      const h = await startProxy({ mode: 'strict', statePath });
+      await sleep(700); // the pre-first-request idle window (§13.15)
+      const run = await runScript(h.client, [call('get_issue', { ...REPO, issue_number: 42 })]);
+      firstCallMs.push(run.perCall[0]!.ms);
+      await sleep(1_300); // let the debounced state save land
+      if (session === 3) finalStats = await readStats(h.client);
+      await closeHarness(h);
+    }
+    rmSync(stateDir, { recursive: true, force: true });
+
+    console.log(
+      `  S9 first-call latency per session: ${firstCallMs
+        .map((ms, i) => `#${i + 1} ${fmtMs(ms)}`)
+        .join(' · ')}`,
+    );
+    record(
+      'session-start priming',
+      finalStats!,
+      firstCallMs[2]!,
+      firstCallMs[0]!,
+      'first call: cold session vs primed session',
+    );
+
+    expect(firstCallMs[0]!, 'session 1 opener is cold').toBeGreaterThanOrEqual(LIVE_MS);
+    expect(firstCallMs[1]!, 'session 2 opener still cold (threshold is 2)').toBeGreaterThanOrEqual(
+      LIVE_MS,
+    );
+    expect(firstCallMs[2]!, 'session 3 opener is prefetched at start').toBeLessThan(HIT_MS);
+    expect(
+      finalStats!.perRule.some((r) => r.ruleId === 'opener:github:get_issue' && r.hits >= 1),
+      'the opener rule owns the hit',
+    ).toBe(true);
+  }, 120_000);
+
+  it('S10 filesystem profile: listing/search flows meet the §10 criteria (v0.10)', async () => {
+    const script = [
+      call('list_directory', { path: '/ws/src' }),
+      think(600), // fs:list→read prefetches the first files
+      call('read_text_file', { path: '/ws/src/app.ts' }),
+      think(400),
+      call('read_text_file', { path: '/ws/src/util.ts' }),
+      think(400),
+      call('search_files', { path: '/ws', pattern: 'limiter' }),
+      think(600), // fs:search→read prefetches the match
+      call('read_text_file', { path: '/ws/src/lib/limiter.ts' }),
+      think(400),
+    ];
+
+    const off = await startProxy({ mode: 'off', server: 'filesystem' });
+    const offRun = await runScript(off.client, script);
+    const on = await startProxy({ mode: 'strict', server: 'filesystem' });
+    const onRun = await runScript(on.client, script);
+    const stats = await readStats(on.client);
+
+    const eligible = stats.hits + stats.joins + stats.misses;
+    const hitRate = ((stats.hits + stats.joins) / eligible) * 100;
+    const reduction = (1 - onRun.toolWaitMs / offRun.toolWaitMs) * 100;
+    record('filesystem profile', stats, onRun.toolWaitMs, offRun.toolWaitMs, 'new vetted profile');
+
+    expect(hitRate, 'hit rate ≥ 40%').toBeGreaterThanOrEqual(40);
+    expect(reduction, 'tool-wait reduction ≥ 30%').toBeGreaterThanOrEqual(30);
+    expect(stats.wastePerHit ?? 0).toBeLessThanOrEqual(2);
+  }, 120_000);
+
+  it('S11 slack profile: channel/thread/user flows meet the §10 criteria (v0.10)', async () => {
+    const script = [
+      call('slack_list_channels', {}),
+      think(600), // slack:channels→history prefetches the top channels
+      call('slack_get_channel_history', { channel_id: 'C0001' }),
+      think(600), // slack:history→thread prefetches the threaded message
+      call('slack_get_thread_replies', { channel_id: 'C0001', thread_ts: '1752500000.000100' }),
+      think(400),
+      call('slack_get_users', {}),
+      think(600), // slack:users→profile prefetches the top users
+      call('slack_get_user_profile', { user_id: 'U100' }),
+      think(400),
+    ];
+
+    const off = await startProxy({ mode: 'off', server: 'slack' });
+    const offRun = await runScript(off.client, script);
+    const on = await startProxy({ mode: 'strict', server: 'slack' });
+    const onRun = await runScript(on.client, script);
+    const stats = await readStats(on.client);
+
+    const eligible = stats.hits + stats.joins + stats.misses;
+    const hitRate = ((stats.hits + stats.joins) / eligible) * 100;
+    const reduction = (1 - onRun.toolWaitMs / offRun.toolWaitMs) * 100;
+    record('slack profile', stats, onRun.toolWaitMs, offRun.toolWaitMs, 'new vetted profile');
+
+    expect(hitRate, 'hit rate ≥ 40%').toBeGreaterThanOrEqual(40);
+    expect(reduction, 'tool-wait reduction ≥ 30%').toBeGreaterThanOrEqual(30);
+    expect(stats.wastePerHit ?? 0).toBeLessThanOrEqual(2);
+  }, 120_000);
+
+  it('S12 receipts: usage accumulates across sessions, stats reads it, contents stay aggregate-only (v0.10)', async () => {
+    const xdgStateHome = mkdtempSync(join(tmpdir(), 'speculate-receipts-'));
+    const script = [
+      call('get_issue', { ...REPO, issue_number: 42 }),
+      think(600),
+      call('get_issue_comments', { ...REPO, issue_number: 42 }), // prefetch hit
+      think(1_200), // debounced usage snapshot flush
+    ];
+
+    const runs: { toolWaitMs: number }[] = [];
+    let finalReceiptStats: StatsReport | null = null;
+    for (let session = 1; session <= 2; session++) {
+      const h = await startProxy({ mode: 'strict', xdgStateHome });
+      runs.push(await runScript(h.client, script));
+      if (session === 2) finalReceiptStats = await readStats(h.client);
+      await closeHarness(h);
+    }
+    await sleep(300); // let the shutdown flush settle
+
+    const statsCliOut = execFileSync(
+      TSX,
+      [join(ROOT, 'src', 'cli.ts'), 'stats', '--json'],
+      { encoding: 'utf8', env: { ...process.env, XDG_STATE_HOME: xdgStateHome } },
+    );
+    const report = JSON.parse(statsCliOut) as {
+      totals: { sessions: number; hits: number; joins: number; estimatedSavedMs: number };
+      bySource: { mcp: { sessions: number; hits: number } };
+    };
+    expect(report.totals.sessions, 'both sessions counted').toBe(2);
+    expect(report.bySource.mcp.sessions).toBe(2);
+    expect(
+      report.totals.hits + report.totals.joins,
+      'hits accumulated across sessions',
+    ).toBeGreaterThanOrEqual(2);
+    expect(report.totals.estimatedSavedMs).toBeGreaterThan(0);
+
+    // Usage snapshots are aggregate-only: no tool or server names, no
+    // arguments, and never fetched result content.
+    const usageDir = join(xdgStateHome, 'speculate', 'usage');
+    const snapshotFiles = readdirSync(usageDir).filter((f) => f.endsWith('.json'));
+    expect(snapshotFiles.length).toBe(2);
+    for (const file of snapshotFiles) {
+      const text = readFileSync(join(usageDir, file), 'utf8');
+      for (const leaked of [
+        'get_issue',
+        '"args"',
+        'Rate limiter drops burst',
+        'Token bucket refill',
+        'Repro: 100 rps',
+      ]) {
+        expect(text, `usage snapshot must not contain "${leaked}"`).not.toContain(leaked);
+      }
+    }
+
+    record(
+      'receipts (2 sessions)',
+      finalReceiptStats!,
+      runs[1]!.toolWaitMs,
+      runs[0]!.toolWaitMs,
+      'row = session1 vs session2 wait',
+    );
+    rmSync(xdgStateHome, { recursive: true, force: true });
   }, 120_000);
 });

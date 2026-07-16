@@ -42,6 +42,10 @@ const MAX_PARSED_KEYS_PER_LEVEL = 32;
 const MAX_PARSED_PATHS = 256;
 /** Per-arg candidate-source cap (arg-copies + parsed-paths; const always kept). */
 const MAX_SOURCES_PER_ARG = 12;
+/** Session-opener tracking (§13.15): per-server cap and sanity bounds. */
+const MAX_OPENERS_PER_SERVER = 8;
+const MAX_OPENER_REPR_LENGTH = 4_096;
+const MAX_IMPORTED_OPENER_COUNT = 1_000;
 
 // -- persistence shapes (DESIGN.md §13.6) --------------------------------------
 //
@@ -66,8 +70,18 @@ export interface SerializedTransition {
   templates: Array<{ name: string; underivable: boolean; sources: SerializedSource[] }>;
 }
 
+export interface SerializedOpener {
+  server: string;
+  tool: string;
+  /** stableStringify of the opening call's args (constants only, by nature). */
+  argsRepr: string;
+  count: number;
+}
+
 export interface SerializedLearner {
   transitions: SerializedTransition[];
+  /** Session-opening reads (§13.15). Absent in pre-v0.10 state files. */
+  openers?: SerializedOpener[];
 }
 
 /**
@@ -106,6 +120,15 @@ interface PrevCall {
   timestamp: number;
 }
 
+interface OpenerState {
+  server: string;
+  tool: string;
+  argsRepr: string;
+  count: number;
+  /** Injected-clock time of the last sighting (eviction tie-break). */
+  lastUpdated: number;
+}
+
 /** A parsed-result path candidate: segments plus the value found there. */
 interface ParsedPath {
   segs: string[];
@@ -140,6 +163,13 @@ export class TransitionLearner {
    * order: every update deletes and re-sets the entry.
    */
   private readonly transitions = new Map<string, TransitionState>();
+  /**
+   * Session-opening reads (§13.15): the first few read-eligible calls of
+   * each session, keyed by (server, tool, exact args repr). Only calls
+   * whose arguments repeat verbatim across sessions ever reach the
+   * prediction threshold — an opener with varying args never fires.
+   */
+  private readonly openers = new Map<string, OpenerState>();
 
   constructor(opts: TransitionLearnerOptions = {}) {
     this.now = opts.now ?? Date.now;
@@ -190,6 +220,78 @@ export class TransitionLearner {
   }
 
   /**
+   * Record one of a session's opening reads (§13.15). Called by the proxy
+   * for the first few read-eligible asks per server per session. Never
+   * throws; oversized or unrepresentable args are skipped (fail closed).
+   */
+  recordOpener(server: string, tool: string, args: Record<string, unknown>): void {
+    try {
+      if (server.includes(' ') || tool.includes(' ') || tool.length === 0) return;
+      const repr = safeStringify(args);
+      if (repr === undefined || repr.length > MAX_OPENER_REPR_LENGTH) return;
+      const key = `${server}\x00${tool}\x00${repr}`;
+      const existing = this.openers.get(key);
+      if (existing) {
+        existing.count = Math.min(existing.count + 1, MAX_IMPORTED_OPENER_COUNT);
+        existing.lastUpdated = this.now();
+      } else {
+        this.openers.set(key, {
+          server,
+          tool,
+          argsRepr: repr,
+          count: 1,
+          lastUpdated: this.now(),
+        });
+        const mine = [...this.openers.entries()].filter(([, o]) => o.server === server);
+        if (mine.length > MAX_OPENERS_PER_SERVER) {
+          // Evict the weakest opener (lowest count, then stalest).
+          mine.sort(
+            (a, b) => a[1].count - b[1].count || a[1].lastUpdated - b[1].lastUpdated,
+          );
+          this.openers.delete(mine[0]![0]);
+        }
+      }
+      this.mutations++;
+    } catch {
+      // Fail closed: an unrecordable opener costs a future prefetch, nothing else.
+    }
+  }
+
+  /**
+   * Openers worth prefetching at session start: seen in at least
+   * minObservations sightings with identical args. Confidence stays below
+   * hand-written rules; ruleId feeds the normal §5.6 feedback loop.
+   */
+  openerPredictions(server: string): Prediction[] {
+    try {
+      const mine = [...this.openers.values()].filter(
+        (o) => o.server === server && o.count >= this.minObservations,
+      );
+      mine.sort((a, b) => b.count - a.count || (a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0));
+      const out: Prediction[] = [];
+      for (const o of mine.slice(0, this.maxPredictionsPerTrigger)) {
+        let args: unknown;
+        try {
+          args = JSON.parse(o.argsRepr) as unknown;
+        } catch {
+          continue;
+        }
+        if (!isPlainObject(args)) continue;
+        out.push({
+          server,
+          tool: o.tool,
+          args: jsonCopyRecord(args),
+          confidence: Math.min(0.5, 0.2 + 0.1 * o.count),
+          ruleId: `opener:${server}:${o.tool}`,
+        });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Snapshot of learned transitions for persistence (LRU order, oldest
    * first, so importing re-establishes the same eviction order). Chain
    * heads and recency clocks are session-local and excluded.
@@ -209,7 +311,13 @@ export class TransitionLearner {
         })),
       });
     }
-    return { transitions };
+    const openers: SerializedOpener[] = [...this.openers.values()].map((o) => ({
+      server: o.server,
+      tool: o.tool,
+      argsRepr: o.argsRepr,
+      count: o.count,
+    }));
+    return openers.length > 0 ? { transitions, openers } : { transitions };
   }
 
   /**
@@ -220,7 +328,7 @@ export class TransitionLearner {
    */
   importState(data: unknown): void {
     try {
-      const root = data as { transitions?: unknown };
+      const root = data as { transitions?: unknown; openers?: unknown };
       if (!root || !Array.isArray(root.transitions)) return;
       for (const raw of root.transitions) {
         const t = deserializeTransition(raw);
@@ -234,6 +342,16 @@ export class TransitionLearner {
           const oldest = this.transitions.keys().next();
           if (oldest.done) break;
           this.transitions.delete(oldest.value);
+        }
+      }
+      if (Array.isArray(root.openers)) {
+        for (const raw of root.openers) {
+          const o = deserializeOpener(raw);
+          if (!o) continue; // malformed openers are skipped, never fatal
+          this.openers.set(`${o.server}\x00${o.tool}\x00${o.argsRepr}`, {
+            ...o,
+            lastUpdated: this.now(),
+          });
         }
       }
       this.mutations++;
@@ -363,6 +481,41 @@ function deserializeSource(raw: unknown): Source | null {
     }
   }
   return null;
+}
+
+/**
+ * Validate one persisted opener (untrusted input): sane strings, args that
+ * round-trip to a plain object, count clamped. Null skips the entry.
+ */
+function deserializeOpener(raw: unknown): Omit<OpenerState, 'lastUpdated'> | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const o = raw as SerializedOpener;
+  if (
+    typeof o.server !== 'string' ||
+    o.server.length === 0 ||
+    o.server.includes(' ') ||
+    typeof o.tool !== 'string' ||
+    o.tool.length === 0 ||
+    o.tool.includes(' ') ||
+    typeof o.argsRepr !== 'string' ||
+    o.argsRepr.length > MAX_OPENER_REPR_LENGTH ||
+    typeof o.count !== 'number' ||
+    !Number.isFinite(o.count) ||
+    o.count < 1
+  ) {
+    return null;
+  }
+  try {
+    if (!isPlainObject(JSON.parse(o.argsRepr))) return null;
+  } catch {
+    return null;
+  }
+  return {
+    server: o.server,
+    tool: o.tool,
+    argsRepr: o.argsRepr,
+    count: Math.min(Math.floor(o.count), MAX_IMPORTED_OPENER_COUNT),
+  };
 }
 
 function deserializeTransition(

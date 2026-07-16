@@ -42,6 +42,8 @@ const STATS_TOOL = 'speculate__stats';
 const BUILTIN_TOOLS = new Set([STATS_TOOL]);
 /** Generous ceiling for forwarded real calls; progress resets the clock. */
 const REAL_CALL_TIMEOUT_MS = 600_000;
+/** How many of a session's leading reads are recorded as openers (§13.15). */
+const OPENER_RECORD_LIMIT = 3;
 
 interface Route {
   server: string;
@@ -71,6 +73,8 @@ export class SpeculateProxy {
   private readonly usageRecorder: UsageRecorder | null;
   private saveTimer: NodeJS.Timeout | null = null;
   private savedStamp = '';
+  /** Remaining opener-recording slots per server this session (§13.15). */
+  private readonly openerSlots = new Map<string, number>();
 
   constructor(
     config: SpeculateConfig,
@@ -202,6 +206,23 @@ export class SpeculateProxy {
 
   async start(): Promise<void> {
     await this.connectUpstreams();
+
+    // §13.15 session-start priming: the biggest idle window is the one
+    // before the first request — fire persisted opening reads now, through
+    // the normal policy/budget/dedupe pipeline like any other prediction.
+    if (this.config.mode !== 'off') {
+      for (const [name, up] of this.upstreams) {
+        if (!up.connected) continue;
+        try {
+          const openers = this.predictor.sessionStart(name);
+          if (openers.length > 0) this.executor.submit(openers);
+        } catch (err) {
+          process.stderr.write(
+            `[speculate] session-start priming error: ${(err as Error).message}\n`,
+          );
+        }
+      }
+    }
 
     // §10: resources/prompts pass through only in single-upstream mode, and
     // only when the upstream actually advertises them. Capability and handler
@@ -697,6 +718,15 @@ export class SpeculateProxy {
     if (!finalResult.isError && this.config.mode !== 'off') {
       setImmediate(() => {
         try {
+          // §13.15: the session's first few read asks per server become
+          // opener candidates for the NEXT session's start-time prefetch.
+          if (isReadOnly) {
+            const slots = this.openerSlots.get(server) ?? OPENER_RECORD_LIMIT;
+            if (slots > 0) {
+              this.openerSlots.set(server, slots - 1);
+              this.learner.recordOpener(server, tool, args);
+            }
+          }
           const predictions = this.predictor.observe({
             server,
             tool,
