@@ -161,7 +161,7 @@ interface Row {
   hitPct: number;
   spec: number;
   unused: number;
-  offMs: number | null;
+  offMs: number;
   onMs: number;
   savedMs: number;
   note: string;
@@ -173,7 +173,7 @@ function record(
   name: string,
   stats: StatsReport,
   onMs: number,
-  offMs: number | null,
+  offMs: number,
   note: string,
 ): void {
   const eligible = stats.hits + stats.joins + stats.misses;
@@ -190,8 +190,8 @@ function record(
   });
 }
 
-const fmtMs = (ms: number | null): string =>
-  ms === null ? '—' : ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms.toFixed(0)}ms`;
+const fmtMs = (ms: number): string =>
+  ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms.toFixed(0)}ms`;
 
 afterAll(() => {
   const pad = (s: string, w: number) => s.padEnd(w);
@@ -202,8 +202,7 @@ afterAll(() => {
   );
   console.log(`  ${'─'.repeat(104)}`);
   for (const r of rows) {
-    const cut =
-      r.offMs === null ? '—' : `${Math.round((1 - r.onMs / Math.max(r.offMs, 1)) * 100)}%`;
+    const cut = `${Math.round((1 - r.onMs / Math.max(r.offMs, 1)) * 100)}%`;
     console.log(
       `  ${pad(r.name, 26)}${num(String(r.eligible), 6)}${num(`${r.hitPct.toFixed(0)}%`, 6)}${num(String(r.spec), 6)}${num(String(r.unused), 7)}${num(fmtMs(r.offMs), 9)}${num(fmtMs(r.onMs), 9)}${num(cut, 6)}${num(fmtMs(r.savedMs), 9)}  ${r.note}`,
     );
@@ -305,36 +304,41 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
   }, 120_000);
 
   it('S3 mutation-heavy: writes invalidate, reads see their effects, writes reach upstream exactly once', async () => {
-    const { client, callLogPath } = await startProxy({ mode: 'strict' });
-
-    await runScript(client, [
+    const script = [
       call('get_issue', { ...REPO, issue_number: 42 }),
       think(600), // comments(42) + open-PRs prefetches land — pre-write data
-    ]);
-    await runScript(client, [
       call('add_issue_comment', { ...REPO, issue_number: 42, body: 'scenario-comment' }),
-    ]);
-
-    // The flush must beat us here: a stale hit would miss the new comment.
-    const afterWrite = await runScript(client, [
       call('get_issue_comments', { ...REPO, issue_number: 42 }),
-    ]);
-    const comments = textPayload<{ body: string }[]>(afterWrite.perCall[0]!.result);
-    expect(comments.some((c) => c.body === 'scenario-comment'), 'read-your-own-writes').toBe(true);
-    expect(afterWrite.perCall[0]!.ms, 'post-write read is live').toBeGreaterThanOrEqual(LIVE_MS);
-
-    await runScript(client, [call('merge_pull_request', { ...REPO, pull_number: 7 })]);
-    const pr = await runScript(client, [
+      call('merge_pull_request', { ...REPO, pull_number: 7 }),
       call('get_pull_request', { ...REPO, pull_number: 7 }),
-      think(400),
-    ]);
-    expect(textPayload<{ state: string }>(pr.perCall[0]!.result).state).toBe('merged');
+      think(400), // let tail speculation settle before reading stats
+    ];
 
-    const stats = await readStats(client);
-    record('mutation-heavy', stats, 0, null, 'writes flush; reads stay correct');
+    // Each proxy spawns its own mock, so the off-run's writes are isolated.
+    const off = await startProxy({ mode: 'off' });
+    const offRun = await runScript(off.client, script);
+    const on = await startProxy({ mode: 'strict' });
+    const onRun = await runScript(on.client, script);
+
+    // The flush must beat the post-write read: a stale hit would miss the
+    // new comment.
+    const afterWrite = onRun.perCall[2]!;
+    const comments = textPayload<{ body: string }[]>(afterWrite.result);
+    expect(comments.some((c) => c.body === 'scenario-comment'), 'read-your-own-writes').toBe(true);
+    expect(afterWrite.ms, 'post-write read is live').toBeGreaterThanOrEqual(LIVE_MS);
+    expect(textPayload<{ state: string }>(onRun.perCall[4]!.result).state).toBe('merged');
+
+    const stats = await readStats(on.client);
+    record(
+      'mutation-heavy',
+      stats,
+      onRun.toolWaitMs,
+      offRun.toolWaitMs,
+      'writes flush; reads stay correct',
+    );
 
     expect(stats.invalidated, 'mutations invalidated cached entries').toBeGreaterThanOrEqual(1);
-    const upstream = loggedTools(callLogPath);
+    const upstream = loggedTools(on.callLogPath);
     for (const write of ['add_issue_comment', 'merge_pull_request']) {
       expect(
         upstream.filter((t) => t === write).length,
@@ -380,24 +384,25 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
   }, 60_000);
 
   it('S5 learner warm-up: an unprofiled server earns hits from repetition', async () => {
-    const { client } = await startProxy({ mode: 'annotated', profile: 'none' });
+    const script = [41, 42, 43, 41].flatMap((n) => [
+      call('get_issue', { ...REPO, issue_number: n }),
+      think(500),
+      call('get_issue_comments', { ...REPO, issue_number: n }),
+    ]);
 
-    const curve: number[] = [];
-    for (const n of [41, 42, 43, 41]) {
-      await runScript(client, [call('get_issue', { ...REPO, issue_number: n }), think(500)]);
-      const followUp = await runScript(client, [
-        call('get_issue_comments', { ...REPO, issue_number: n }),
-      ]);
-      curve.push(followUp.perCall[0]!.ms);
-    }
-    const stats = await readStats(client);
+    const off = await startProxy({ mode: 'off', profile: 'none' });
+    const offRun = await runScript(off.client, script);
+    const on = await startProxy({ mode: 'annotated', profile: 'none' });
+    const onRun = await runScript(on.client, script);
+    const stats = await readStats(on.client);
 
+    const curve = onRun.perCall.filter((c) => c.tool === 'get_issue_comments').map((c) => c.ms);
     console.log(
       `  S5 learner warm-up curve (follow-up latency per iteration): ${curve
         .map((ms, i) => `#${i + 1} ${fmtMs(ms)}`)
         .join(' · ')}`,
     );
-    record('learner warm-up', stats, curve.reduce((a, b) => a + b, 0), null, 'unprofiled server');
+    record('learner warm-up', stats, onRun.toolWaitMs, offRun.toolWaitMs, 'unprofiled server');
 
     expect(curve[0]!, 'iteration 1 is cold (live)').toBeGreaterThanOrEqual(LIVE_MS);
     expect(curve[2]!, 'iteration 3 is prefetched').toBeLessThan(HIT_MS);
@@ -406,48 +411,58 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
   }, 60_000);
 
   it('S6 TTL expiry: a stale entry is never served', async () => {
-    const { client } = await startProxy({
+    const script = [
+      call('get_issue', { ...REPO, issue_number: 42 }),
+      think(1200), // prefetch lands ~L, then outlives its 350 ms TTL
+      call('get_issue_comments', { ...REPO, issue_number: 42 }),
+    ];
+
+    const off = await startProxy({ mode: 'off' });
+    const offRun = await runScript(off.client, script);
+    const on = await startProxy({
       mode: 'strict',
       speculation: { ttlMsByTool: { get_issue_comments: 350 } },
     });
+    const onRun = await runScript(on.client, script);
+    const stats = await readStats(on.client);
 
-    await runScript(client, [
-      call('get_issue', { ...REPO, issue_number: 42 }),
-      think(1200), // prefetch lands ~L, then outlives its 350 ms TTL
-    ]);
-    const stale = await runScript(client, [
-      call('get_issue_comments', { ...REPO, issue_number: 42 }),
-    ]);
-    const stats = await readStats(client);
+    record('ttl expiry', stats, onRun.toolWaitMs, offRun.toolWaitMs, 'expired entry → live call');
 
-    record('ttl expiry', stats, stale.toolWaitMs, null, 'expired entry → live call');
-
-    expect(stale.perCall[0]!.ms, 'expired entry not served').toBeGreaterThanOrEqual(LIVE_MS);
+    expect(onRun.perCall[1]!.ms, 'expired entry not served').toBeGreaterThanOrEqual(LIVE_MS);
     expect(stats.expired).toBeGreaterThanOrEqual(1);
     expect(stats.hits).toBe(0);
   }, 60_000);
 
   it('S7 budget storm: maxPerMinute caps spend and real calls are untouched', async () => {
-    const { client } = await startProxy({
-      mode: 'strict',
-      speculation: { maxPerMinute: 2 },
-    });
-
-    const run = await runScript(client, [
+    const script = [
       call('get_issue', { ...REPO, issue_number: 41 }),
       think(450),
       call('get_issue', { ...REPO, issue_number: 42 }),
       think(450),
       call('list_issues', { ...REPO, state: 'open' }),
       think(450),
-    ]);
-    const stats = await readStats(client);
+    ];
 
-    record('budget storm', stats, run.toolWaitMs, null, `cap 2 → spec ${stats.speculativeCalls}`);
+    const off = await startProxy({ mode: 'off' });
+    const offRun = await runScript(off.client, script);
+    const on = await startProxy({
+      mode: 'strict',
+      speculation: { maxPerMinute: 2 },
+    });
+    const onRun = await runScript(on.client, script);
+    const stats = await readStats(on.client);
+
+    record(
+      'budget storm',
+      stats,
+      onRun.toolWaitMs,
+      offRun.toolWaitMs,
+      `cap 2 → spec ${stats.speculativeCalls}`,
+    );
 
     expect(stats.speculativeCalls, 'per-minute budget respected').toBeLessThanOrEqual(2);
     expect(stats.realCalls).toBe(3);
-    for (const c of run.perCall) {
+    for (const c of onRun.perCall) {
       expect(c.result.isError ?? false, `real call ${c.tool} succeeded`).toBe(false);
     }
     const suppressionReasons = Object.keys(stats.suppressed);
@@ -458,22 +473,31 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
   }, 60_000);
 
   it('S8 think-time sweep: savings scale with the idle head start', async () => {
-    const sweep: { thinkMs: number; followUpWaitMs: number; stats: StatsReport }[] = [];
+    const chain = (thinkMs: number): Step[] => [
+      call('get_issue', { ...REPO, issue_number: 42 }),
+      think(thinkMs),
+      call('get_issue_comments', { ...REPO, issue_number: 42 }),
+      think(thinkMs),
+      call('list_pull_requests', { ...REPO, state: 'open' }),
+      think(thinkMs),
+      call('get_pull_request', { ...REPO, pull_number: 7 }),
+    ];
+
+    const sweep: {
+      thinkMs: number;
+      followUpWaitMs: number;
+      totalMs: number;
+      stats: StatsReport;
+    }[] = [];
     for (const thinkMs of [0, 300, 1000]) {
       const { client } = await startProxy({ mode: 'strict' });
-      const run = await runScript(client, [
-        call('get_issue', { ...REPO, issue_number: 42 }),
-        think(thinkMs),
-        call('get_issue_comments', { ...REPO, issue_number: 42 }),
-        think(thinkMs),
-        call('list_pull_requests', { ...REPO, state: 'open' }),
-        think(thinkMs),
-        call('get_pull_request', { ...REPO, pull_number: 7 }),
-      ]);
+      const run = await runScript(client, chain(thinkMs));
       const stats = await readStats(client);
       const followUpWaitMs = run.perCall.slice(1).reduce((a, c) => a + c.ms, 0);
-      sweep.push({ thinkMs, followUpWaitMs, stats });
+      sweep.push({ thinkMs, followUpWaitMs, totalMs: run.toolWaitMs, stats });
     }
+    const off = await startProxy({ mode: 'off' });
+    const offRun = await runScript(off.client, chain(1000));
 
     console.log(
       `  S8 think-time sweep (3 follow-up reads): ${sweep
@@ -487,9 +511,9 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
     record(
       'think-time sweep',
       last.stats,
-      last.followUpWaitMs,
-      sweep[0]!.followUpWaitMs,
-      'off column = zero-think wait',
+      last.totalMs,
+      offRun.toolWaitMs,
+      'row = 1000 ms think; sweep above',
     );
 
     expect(
