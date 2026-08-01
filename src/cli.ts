@@ -234,10 +234,23 @@ async function runExecPassThrough(execArgs: ExecArgs): Promise<number> {
   process.stderr.write(`${EXEC_NOTICE}\n`);
   const command = execArgs.argv[0]!;
   return new Promise<number>((resolveExit) => {
-    const child = spawn(command, execArgs.argv.slice(1), {
-      cwd: execArgs.cwd ?? process.cwd(),
-      stdio: 'inherit',
-    });
+    let child;
+    try {
+      child = spawn(command, execArgs.argv.slice(1), {
+        cwd: execArgs.cwd ?? process.cwd(),
+        stdio: 'inherit',
+      });
+    } catch (err) {
+      // spawn() can throw SYNCHRONOUSLY instead of emitting 'error': EINVAL
+      // for a .cmd/.bat target on Node >= 20 (CVE-2024-27980), or
+      // ERR_INVALID_ARG_VALUE for an empty argv0. A legacy hook's call must
+      // fail the same fail-soft way whichever door it comes through.
+      process.stderr.write(
+        `[speculate] exec: cannot run '${command}': ${(err as Error).message}\n`,
+      );
+      resolveExit(127);
+      return;
+    }
     child.on('error', (err) => {
       process.stderr.write(`[speculate] exec: cannot run '${command}': ${err.message}\n`);
       resolveExit(127);

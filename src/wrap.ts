@@ -13,6 +13,7 @@
  * trade-off, overridable with --mode/--allow), persistence on (keyed by
  * the wrapped command line), known servers auto-matched to vetted profiles.
  */
+import { RETIRED_PROFILES } from './config.js';
 import { builtinProfiles } from './profiles/index.js';
 import type { SpeculateConfig, SpeculationMode } from './types.js';
 
@@ -66,7 +67,17 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
   if (out.command.length === 0) {
     return { error: "wrap needs a server command after '--'" };
   }
-  if (out.profile && out.profile !== 'none' && !Object.hasOwn(builtinProfiles, out.profile)) {
+  if (out.profile && RETIRED_PROFILES.has(out.profile)) {
+    // Same contract a config file gets (config.ts): a ≤0.10 invocation naming
+    // a profile 0.11 retired must not lose the user a working server. Warn,
+    // drop the profile — the server is then fingerprinted like any unprofiled
+    // one — and carry on.
+    process.stderr.write(
+      `[speculate] warning: profile '${out.profile}' was retired in 0.11 with CLI ` +
+        `speculation — ignoring it (drop the --profile flag).\n`,
+    );
+    out.profile = null;
+  } else if (out.profile && out.profile !== 'none' && !Object.hasOwn(builtinProfiles, out.profile)) {
     return {
       error: `unknown profile '${out.profile}' (available: ${Object.keys(builtinProfiles).join(', ')}, none)`,
     };

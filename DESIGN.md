@@ -464,6 +464,22 @@ project's POSIX-only surface (unix sockets, uid checks) plus a Windows
 up artifacts a ≤0.10 install left behind. Full trail:
 docs/superpowers/specs/2026-08-01-focus-mcp-design.md.
 
+`speculate exec` survives as a verbatim pass-through (no shell, no rewriting,
+the child's exit code) so the ≤0.10 Bash hook — which rewrites the agent's
+`git status`/`rg`/`ls` into `speculate exec -- …` in every project until
+`speculate on` removes it — keeps working. Compatibility only, one release:
+removed in 0.12.
+
+Windows: npm installs `claude` as a `.cmd` shim, which Node refuses to spawn
+(CVE-2024-27980), so `on`/`off`/`status` reach the front door through cmd.exe.
+Arguments are quoted for the child's CommandLineToArgvW, then escaped twice
+for cmd (the shim's `%*` re-parses one of the rounds), with `%` stepped
+outside the quotes — a caret inside quotes is literal — so a `%APPDATA%` in an
+MCP entry can neither expand nor inject. Two limits are cmd's own: the command
+line cannot exceed ~8191 characters (fails loud — "The command line is too
+long.", exit 1) and a raw `\n`/`\r` inside an argument truncates the line
+(JSON-escaped `\\n`, what `mcp add-json` payloads carry, is unaffected).
+
 ---
 
 ## Appendix A. Market research & prior art

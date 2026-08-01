@@ -51,9 +51,10 @@ const configSchema = z.object({
 
 /**
  * Profiles that existed in ≤0.10 and no longer do. Referencing one is a
- * warning, not a fatal: the rest of the config still loads.
+ * warning, not a fatal: the rest of the config still loads. Shared with
+ * `speculate wrap --profile` (wrap.ts), which degrades the same way.
  */
-const RETIRED_PROFILES: ReadonlySet<string> = new Set(['shell']);
+export const RETIRED_PROFILES: ReadonlySet<string> = new Set(['shell']);
 
 export function parseConfig(raw: unknown): SpeculateConfig {
   const result = configSchema.safeParse(raw);

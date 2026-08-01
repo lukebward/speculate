@@ -2,7 +2,7 @@
  * wrap.ts tests (DESIGN.md §13.9): parseWrapArgs flag handling and
  * buildWrapConfig assembly (profile autodetect, allowlist, state keys).
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildWrapConfig, parseWrapArgs, type WrapArgs } from '../src/wrap.js';
 
 // --- helpers -----------------------------------------------------------------
@@ -62,6 +62,22 @@ describe('parseWrapArgs', () => {
     expect(e).toContain("unknown profile 'gitlab'");
     expect(e).toContain('github');
     expect(e).toContain('filesystem');
+  });
+
+  it("degrades a retired --profile shell instead of failing the wrap", () => {
+    // Same contract as a config file naming it (config.ts RETIRED_PROFILES):
+    // a ≤0.10 invocation still runs, profile-less, with one stderr warning.
+    // Failing here would break a wrapped server that works fine unprofiled.
+    const written: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown): boolean => {
+      written.push(String(chunk));
+      return true;
+    });
+    const args = ok(parseWrapArgs(['--profile', 'shell', '--', 'srv']));
+    expect(args.profile).toBeNull();
+    expect(written.join('')).toContain("profile 'shell'");
+    expect(written.join('')).toContain('retired in 0.11');
+    vi.restoreAllMocks();
   });
 
   it('parses --allow csv: trims spaces, drops empties', () => {

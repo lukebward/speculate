@@ -6,7 +6,7 @@
  * shadow-don't-touch rule for .mcp.json and the state-less unwrap net.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,6 +15,7 @@ import {
   speculateOff,
   speculateOn,
   speculateStatus,
+  win32ShimInvocation,
   type CmdRunner,
 } from '../src/manage.js';
 import { isWindows } from './platform.js';
@@ -890,29 +891,98 @@ describe('speculate status', () => {
 });
 
 describe('execFileRunner against a real Windows .cmd shim', () => {
-  it.skipIf(!isWindows)('runs the shim and round-trips argv verbatim', async () => {
-    // npm-installed Claude Code IS a .cmd; Node refuses to spawn one
-    // directly (EINVAL), so the runner goes through cmd.exe — and the JSON
-    // `mcp add-json` payload must survive that hop byte-for-byte.
-    const dir = mkdtempSync(join(tmpdir(), 'speculate-shim-'));
-    try {
-      writeFileSync(join(dir, 'echo-args.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)));\n');
-      writeFileSync(
-        join(dir, 'claude.cmd'),
-        `@echo off\r\n"${process.execPath}" "%~dp0echo-args.mjs" %*\r\n`,
-      );
+  /**
+   * Runs `fn` against a real `%*`-forwarding batch shim — the shape npm
+   * installs for Claude Code. Node refuses to spawn a .cmd directly (EINVAL
+   * since CVE-2024-27980), so the runner goes through cmd.exe, and the JSON
+   * `mcp add-json` payload must survive that hop byte-for-byte.
+   */
+  function withShim(
+    fn: (shim: string, dir: string) => Promise<void>,
+  ): () => Promise<void> {
+    return async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'speculate-shim-'));
+      try {
+        writeFileSync(
+          join(dir, 'echo-args.mjs'),
+          'console.log(JSON.stringify(process.argv.slice(2)));\n',
+        );
+        writeFileSync(
+          join(dir, 'claude.cmd'),
+          `@echo off\r\n"${process.execPath}" "%~dp0echo-args.mjs" %*\r\n`,
+        );
+        await fn(join(dir, 'claude.cmd'), dir);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+  }
+
+  it.skipIf(!isWindows)(
+    'runs the shim and round-trips argv verbatim',
+    withShim(async (shim, dir) => {
       const payload = JSON.stringify({
         command: 'gh server',
         args: ['stdio', 'a&b', 'c|d', 'e>f', '(g)'],
         env: { T: '1' },
       });
       const args = ['mcp', 'add-json', 'github', payload, '-s', 'user'];
-      const res = await execFileRunner(join(dir, 'claude.cmd'), args, { cwd: dir });
+      const res = await execFileRunner(shim, args, { cwd: dir });
       expect(res.code).toBe(0);
       expect(JSON.parse(res.stdout)).toEqual(args);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    }),
+  );
+
+  it.skipIf(!isWindows)(
+    'carries %VAR% through literally — no expansion, no injection',
+    withShim(async (shim, dir) => {
+      // Windows MCP entries idiomatically hold %APPDATA%/%USERPROFILE%.
+      // Expanding one here would bake the expansion into the wrapped entry,
+      // so `off`'s exact restore would hand back a mangled original — and a
+      // variable whose VALUE is cmd syntax would execute (verified below).
+      process.env['SPECULATE_TEST_EVIL'] = '& echo PWNED > pwned.txt & rem ';
+      try {
+        const payload = JSON.stringify({
+          command: 'gh',
+          args: ['%APPDATA%\\server.js', 'C:\\x\\%APPDATA%\\y'],
+          env: { HOME: '%USERPROFILE%', E: '%SPECULATE_TEST_EVIL%' },
+        });
+        const args = ['mcp', 'add-json', 'github', payload, '-s', 'user'];
+        const res = await execFileRunner(shim, args, { cwd: dir });
+        expect(res.code).toBe(0);
+        // Byte-identical: nothing expanded, and the JSON is not truncated.
+        expect(JSON.parse(res.stdout)).toEqual(args);
+        // The injected `& echo … > pwned.txt` never ran.
+        expect(existsSync(join(dir, 'pwned.txt'))).toBe(false);
+      } finally {
+        delete process.env['SPECULATE_TEST_EVIL'];
+      }
+    }),
+  );
+
+  it.skipIf(!isWindows)(
+    'carries literal percents (100%, %%, bare) through unchanged',
+    withShim(async (shim, dir) => {
+      const args = ['mcp', 'add-json', 'p', '100%', '%%', '%', 'a\\%b', '50%off'];
+      const res = await execFileRunner(shim, args, { cwd: dir });
+      expect(res.code).toBe(0);
+      expect(JSON.parse(res.stdout)).toEqual(args);
+    }),
+  );
+
+  // Platform-independent: the escaping itself, so a non-Windows CI still
+  // guards it. `%` cannot be protected with a bare `^` where it sits — a
+  // caret INSIDE quotes is a literal caret (cmd only consumes carets outside
+  // quotes), so the percent has to step out of the quotes to be escaped.
+  it('escapes % by stepping outside the quotes, twice (once per cmd parse)', () => {
+    const { args } = win32ShimInvocation('C:\\bin\\claude.cmd', ['%APPDATA%']);
+    expect(args.slice(0, 3)).toEqual(['/d', '/s', '/c']);
+    expect(args[3]).toBe('""C:\\bin\\claude.cmd" ""^^^%"APPDATA"^^^%"""');
+    // A backslash run immediately before an inserted quote is doubled, or the
+    // child's CommandLineToArgvW would read it as an escaped quote and eat it:
+    // C:\x\%APPDATA% must not arrive as C:\x"%APPDATA%.
+    const path = win32ShimInvocation('c.cmd', ['C:\\x\\%A%']);
+    expect(path.args[3]).toBe('""c.cmd" "C:\\x\\\\"^^^%"A"^^^%"""');
   });
 });
 

@@ -55,21 +55,39 @@ function quoteWin32Arg(arg: string): string {
  * Escape the characters cmd.exe acts on. cmd tracks "inside quotes" by
  * toggling on EVERY `"` — it knows nothing of the `\"` escapes the child's
  * parser uses — and only treats metacharacters specially while it considers
- * itself outside quotes, so escape exactly those. (`%` is deliberately not
- * escaped: cmd expands variables regardless of quoting and `^%` does not
- * prevent it. MCP entries with `%VAR%` in an env value are the one shape
- * this hop cannot carry.)
+ * itself outside quotes, so escape exactly those.
+ *
+ * `%` needs more than a caret, and is why this function inserts quotes.
+ * Expansion happens BEFORE caret removal and ignores quoting, while a caret
+ * INSIDE quotes is a literal caret (cmd only consumes carets outside them) —
+ * so `"^%APPDATA^%"` would reach the child as `^%APPDATA^%`, corrupted. The
+ * percent therefore steps OUT of the quotes to be escaped: `"` + `^%` + `"`.
+ * There the caret is consumed, and while it lives it sits inside the variable
+ * NAME cmd is scanning for (`APPDATA^`), which is undefined, so the reference
+ * survives as written. The extra quotes are invisible to the child:
+ * CommandLineToArgvW treats a quote boundary with no whitespace as the same
+ * argument continuing — provided the inserted quote is not itself escaped,
+ * hence the doubling of any backslash run in front of it (`C:\x\%APPDATA%`
+ * would otherwise arrive as `C:\x"%APPDATA%`).
+ *
+ * Without this, `%APPDATA%` in an MCP entry expanded on the way through
+ * (breaking `off`'s exact restore) and a variable whose VALUE was cmd syntax
+ * executed it.
  */
 function escapeCmdMetaChars(line: string): string {
   let out = '';
   let inQuotes = false;
+  let backslashes = 0; // length of the `\` run immediately before this char
   for (const ch of line) {
     if (ch === '"') {
       inQuotes = !inQuotes;
       out += ch;
-      continue;
+    } else if (ch === '%') {
+      out += inQuotes ? `${'\\'.repeat(backslashes)}"^%"` : '^%';
+    } else {
+      out += !inQuotes && '()!^<>&|'.includes(ch) ? `^${ch}` : ch;
     }
-    out += !inQuotes && '()!^<>&|'.includes(ch) ? `^${ch}` : ch;
+    backslashes = ch === '\\' ? backslashes + 1 : 0;
   }
   return out;
 }
@@ -84,6 +102,13 @@ function escapeCmdMetaChars(line: string): string {
  * `%*`, which cmd re-parses: one round is consumed launching the shim, the
  * second survives into the batch line that finally starts the real program.
  * Verified end-to-end against a `%*`-forwarding shim in manage.test.ts.
+ *
+ * Known limits of this route, both inherited from cmd.exe:
+ *   - the command line cannot exceed ~8191 characters. It fails loud —
+ *     "The command line is too long.", exit 1 — never silently truncated.
+ *   - a RAW newline inside an argument ends the line there (`\r` is simply
+ *     dropped), so the rest of the arguments are lost. JSON-escaped `\\n` —
+ *     what `mcp add-json` payloads actually carry — is unaffected.
  */
 export function win32ShimInvocation(
   cmd: string,
@@ -432,8 +457,8 @@ async function detectLegacyMarketplace(ctx: Ctx): Promise<boolean> {
  * uninstall was attempted at all, so callers with their own record of a
  * legacy plugin install (off()'s `action: 'plugin'` state entries) know
  * whether they still need to try themselves — detection can miss (older
- * hosts with no `claude plugin` CLI at all, or a plugin id shape this
- * substring check doesn't recognize), and a recorded install must never be
+ * hosts with no `claude plugin` CLI at all, or an id outside the exact set
+ * LEGACY_PLUGIN_MATCH matches), and a recorded install must never be
  * silently dropped just because detection missed. When an attempt was made
  * here and it failed, callers should also skip a duplicate attempt (it would
  * just fail again) but still count the failure — see off() below. The same
@@ -697,7 +722,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       // retrying would just fail again with a near-identical second line —
       // count the failure without repeating the attempt. Only when cleanup
       // never got to try (detection can miss: older host with no `claude
-      // plugin` CLI, or a plugin id shape it doesn't recognize) does a
+      // plugin` CLI, or an id its exact match doesn't cover) does a
       // recorded install need a direct attempt here, so it's never silently
       // dropped.
       if (legacyCleanup.pluginUninstalled) {

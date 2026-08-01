@@ -25,7 +25,7 @@ speculate on                                # enable it for the current project
 
 One command, one project, every MCP server the agent uses: your MCP servers are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
 
-Upgrading from ≤0.10? `speculate on` also removes the retired CLI-speculation plugin and workspace server.
+Upgrading from ≤0.10? `speculate on` also removes the retired CLI-speculation plugin and workspace server. Until you run it, `speculate exec` stays as a compatibility pass-through so that plugin's still-installed Bash hook keeps working — one release only, removed in 0.12.
 
 `speculate status` shows what's active and what drifted. `speculate off` restores everything exactly, even without its state file, since wrapped entries carry their original command line after the `--`.
 
@@ -82,7 +82,7 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 404 tests (398 passing, 6 skipped on this platform)
+npm test        # 431 tests (424 passing, 7 skipped on this platform)
 npm run bench   # speculation off vs on
 npm run demo    # the README demo, against the bundled mock (injected latency)
 ```

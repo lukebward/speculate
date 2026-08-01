@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isWindows } from './platform.js';
 import {
   formatUsageReport,
   parseStatsArgs,
@@ -290,9 +291,36 @@ describe('runStats', () => {
       );
       expect(missing.code).not.toBe(0);
       expect(missing.stderr).toContain('speculate-no-such-binary-xyz');
+
+      // spawn() also throws SYNCHRONOUSLY (never emitting 'error'): an empty
+      // argv0 is ERR_INVALID_ARG_VALUE on every platform. That must land as
+      // the same fail-soft 127, not an unhandled '[speculate] fatal:'.
+      const empty = await runCli(['exec', '--', ''], stateHome);
+      expect(empty.code).toBe(127);
+      expect(empty.stderr).toContain("[speculate] exec: cannot run ''");
+      expect(empty.stderr).not.toContain('fatal');
     } finally {
       rmSync(stateHome, { recursive: true, force: true });
       rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!isWindows)('exec fails soft on a .cmd target (Node throws EINVAL synchronously)', async () => {
+    // Since CVE-2024-27980 Node refuses to spawn a batch file: spawn() throws
+    // EINVAL right there rather than emitting 'error'. exec is a one-release
+    // compatibility shim, so the contract is a clean 127 with the same
+    // "cannot run" line as any other unspawnable command — never a crash.
+    const stateHome = mkdtempSync(join(tmpdir(), 'speculate-exec-cmd-'));
+    try {
+      const shim = join(stateHome, 'legacy.cmd');
+      writeFileSync(shim, '@echo off\r\necho should-not-run\r\n');
+      const res = await runCli(['exec', '--', shim], stateHome);
+      expect(res.code).toBe(127);
+      expect(res.stdout).not.toContain('should-not-run');
+      expect(res.stderr).toContain(`[speculate] exec: cannot run '${shim}'`);
+      expect(res.stderr).not.toContain('fatal');
+    } finally {
+      rmSync(stateHome, { recursive: true, force: true });
     }
   });
 
