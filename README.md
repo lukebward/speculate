@@ -4,7 +4,7 @@ Speculative prefetching for coding agents. Speculate sits between your MCP clien
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
 
-A run against the bundled mock GitHub server with injected latency, captured as-is: the first pass teaches Speculate the workflow, and on the second the PR is already fetched by the time the agent asks. Re-run it with `npm run demo`; `npm run bench` reproduces the measured off/on comparison (71% hit rate, −66% tool wait, zero wasted calls).
+A run against the bundled mock GitHub server with injected latency, captured as-is: the first pass teaches Speculate the workflow, and on the second the PR is already fetched by the time the agent asks. Re-run it with `npm run demo`; `npm run bench` reproduces the measured off/on comparison — 71% hit rate, −66% tool wait, zero wasted calls on a scripted 7-call session against the mock at 400 ms. That is the optimistic ceiling, not a wild-traffic estimate.
 
 ## Try it in Claude Code: nothing installed, nothing written
 

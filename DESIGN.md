@@ -480,6 +480,14 @@ line cannot exceed ~8191 characters (fails loud — "The command line is too
 long.", exit 1) and a raw `\n`/`\r` inside an argument truncates the line
 (JSON-escaped `\\n`, what `mcp add-json` payloads carry, is unaffected).
 
+Benchmark re-verified after the removal (the harness was always MCP-only, so
+the §11 numbers carry forward unchanged): hit rate 71%, waste 0.00/hit, both
+deterministic across runs; tool-wait cut −64%…−67% over four runs (timing
+jitter; −66% is the central value). Test suite: 431 tests, 424 passing, 7
+skipped on Windows. The §10 caveat still governs — this is a scripted,
+workflow-shaped ceiling, and §10 item 8's adversarial floor script remains
+unwritten, so no measured lower bound exists yet.
+
 ---
 
 ## Appendix A. Market research & prior art
