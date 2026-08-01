@@ -1,12 +1,14 @@
 /**
- * Live README demo: MCP client ↔ Speculate proxy ↔ bundled gh workspace
- * server ↔ real GitHub. Two passes of "list PRs, read the top one": the
- * first pass teaches the learner, the second is served from prefetch.
+ * Live README demo: MCP client ↔ Speculate proxy ↔ bundled mock GitHub
+ * server (mock/mock-github.ts), with injected upstream latency. Two passes
+ * of "list PRs, read the top one": the first pass teaches the learner
+ * (both calls are real, unaccelerated), the second is served from
+ * prefetch — the same single-session mechanism `speculate on` uses, just
+ * watched deliberately instead of live.
  *
- * Usage: npm run demo [-- --repo cli/cli]   (requires an authenticated gh)
+ * Usage: npm run demo
  */
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,11 +17,13 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { resultText } from '../src/upstream.js';
 import type { StatsReport } from '../src/types.js';
+import { FIXTURE_OWNER, FIXTURE_REPO } from '../mock/fixtures.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TSX = process.execPath;
 const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const THINK_MS = 1500;
+const LATENCY_MS = 400;
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
@@ -42,15 +46,7 @@ interface PrItem {
 }
 
 async function main(): Promise<void> {
-  const repoArg = process.argv.indexOf('--repo');
-  const repo = repoArg !== -1 ? process.argv[repoArg + 1]! : 'cli/cli';
-
-  try {
-    execFileSync('gh', ['auth', 'status'], { stdio: 'ignore' });
-  } catch {
-    console.error('gh is not authenticated (run: gh auth login)');
-    process.exit(1);
-  }
+  const repo = { owner: FIXTURE_OWNER, repo: FIXTURE_REPO };
 
   const dir = mkdtempSync(join(tmpdir(), 'speculate-demo-'));
   const configPath = join(dir, 'config.json');
@@ -61,14 +57,13 @@ async function main(): Promise<void> {
       log: 'off',
       persistence: { enabled: false },
       servers: {
-        workspace: {
+        github: {
           command: TSX,
-          args: [TSX_CLI, join(ROOT, 'shell', 'speculate-shell.ts'), '--cwd', ROOT],
-          env: {
-            GH_REPO: repo,
-            ...(process.env.GH_TOKEN ? { GH_TOKEN: process.env.GH_TOKEN } : {}),
-            ...(process.env.GITHUB_TOKEN ? { GITHUB_TOKEN: process.env.GITHUB_TOKEN } : {}),
-          },
+          args: [TSX_CLI, join(ROOT, 'mock', 'mock-github.ts')],
+          env: { SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS) },
+          // No vetted profile: this run demonstrates Tier 2 (the
+          // server-agnostic learner), the same path any unprofiled MCP
+          // server gets — not the GitHub profile's pre-loaded rules.
           profile: 'none',
         },
       },
@@ -90,34 +85,42 @@ async function main(): Promise<void> {
     return { ms: performance.now() - t0, result };
   };
   const topPr = (result: CallToolResult): PrItem => {
-    const out = (JSON.parse(resultText(result)) as { output: PrItem[] }).output;
-    if (!out.length) throw new Error(`repo ${repo} has no open PRs — try --repo <owner/repo>`);
+    const out = JSON.parse(resultText(result)) as PrItem[];
+    if (!out.length) throw new Error(`fixture repo ${repo.owner}/${repo.repo} has no open PRs`);
     return out[0]!;
   };
 
   console.log();
-  console.log(bold('  Speculate demo: a real agent workflow against live GitHub'));
-  console.log(dim(`  list PRs, then read the top one · repo ${repo} · no mocks, no injected latency\n`));
+  console.log(bold('  Speculate demo: list PRs, then read the top one'));
+  console.log(
+    dim(
+      `  mock GitHub upstream · repo ${repo.owner}/${repo.repo} · ${LATENCY_MS} ms injected latency\n`,
+    ),
+  );
 
   console.log(dim('  pass 1: Speculate watches the workflow'));
-  const list1 = await timed('gh_pr_list', { limit: 10 });
-  console.log(callLine('gh_pr_list', list1.ms));
+  const list1 = await timed('list_pull_requests', repo);
+  console.log(callLine('list_pull_requests', list1.ms));
   await sleep(THINK_MS);
   const pr1 = topPr(list1.result);
-  const view1 = await timed('gh_pr_view', { number: pr1.number });
+  const view1 = await timed('get_pull_request', { ...repo, pull_number: pr1.number });
   const title = pr1.title.length > 36 ? `${pr1.title.slice(0, 35)}…` : pr1.title;
-  console.log(callLine(`gh_pr_view #${pr1.number}`, view1.ms, dim(`"${title}"`)));
+  console.log(callLine(`get_pull_request #${pr1.number}`, view1.ms, dim(`"${title}"`)));
   console.log();
 
   await sleep(1200);
   console.log(dim('  pass 2: the same workflow'));
-  const list2 = await timed('gh_pr_list', { limit: 10 });
+  const list2 = await timed('list_pull_requests', repo);
   const pr2 = topPr(list2.result);
-  console.log(callLine('gh_pr_list', list2.ms, dim(`→ prefetches gh_pr_view #${pr2.number}`)));
+  console.log(
+    callLine('list_pull_requests', list2.ms, dim(`→ prefetches get_pull_request #${pr2.number}`)),
+  );
   await sleep(THINK_MS);
-  const view2 = await timed('gh_pr_view', { number: pr2.number });
+  const view2 = await timed('get_pull_request', { ...repo, pull_number: pr2.number });
   const speedup = view1.ms / Math.max(view2.ms, 1);
-  console.log(callLine(`gh_pr_view #${pr2.number}`, view2.ms, green(`prefetched ✓ ${speedup.toFixed(0)}× faster`)));
+  console.log(
+    callLine(`get_pull_request #${pr2.number}`, view2.ms, green(`prefetched ✓ ${speedup.toFixed(0)}× faster`)),
+  );
   console.log();
 
   const stats = JSON.parse(
@@ -127,7 +130,7 @@ async function main(): Promise<void> {
   rmSync(dir, { recursive: true, force: true });
 
   if (stats.hits + stats.joins < 1) {
-    console.error(yellow('  prefetch did not land this run (slow upstream?); rerun the demo'));
+    console.error(yellow('  prefetch did not land this run (slow machine?); rerun the demo'));
     process.exit(1);
   }
 }

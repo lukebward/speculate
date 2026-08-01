@@ -12,7 +12,7 @@
     "mock-github": "tsx mock/mock-github.ts",
     "start": "tsx src/cli.ts",
     "prepare": "node scripts/prepare.cjs",
-    "demo:svg": "npm run demo > /tmp/speculate-demo-capture.txt && node scripts/gen-demo-svg.mjs /tmp/speculate-demo-capture.txt demo/speculate-demo.svg"
+    "demo:svg": "node scripts/demo-svg.mjs"
   },
   "repository": {
     "type": "git",

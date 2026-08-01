@@ -2,7 +2,7 @@
 
 Speculative prefetching for coding agents. Speculate sits between your MCP client (Claude Code, Cursor, any host) and its MCP servers, predicts the next read-only call, runs it early, and serves the result the moment it's asked for. Like Gmail preloading your inbox, applied to tool calls.
 
-![Demo: a real GitHub workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
+![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
 
 A run against the bundled mock GitHub server with injected latency, captured as-is: the first pass teaches Speculate the workflow, and on the second the PR is already fetched by the time the agent asks. Re-run it with `npm run demo`; `npm run bench` reproduces the measured off/on comparison (71% hit rate, −66% tool wait, zero wasted calls).
 
@@ -84,7 +84,7 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 390 unit and end-to-end tests
+npm test        # 392 unit and end-to-end tests (6 skipped on this platform)
 npm run bench   # speculation off vs on
 npm run demo    # the README demo, against the bundled mock (injected latency)
 ```
