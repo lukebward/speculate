@@ -9,14 +9,16 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { resultText } from '../src/upstream.js';
 import type { StatsReport } from '../src/types.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const THINK_MS = 1500;
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
@@ -61,7 +63,7 @@ async function main(): Promise<void> {
       servers: {
         workspace: {
           command: TSX,
-          args: [join(ROOT, 'shell', 'speculate-shell.ts'), '--cwd', ROOT],
+          args: [TSX_CLI, join(ROOT, 'shell', 'speculate-shell.ts'), '--cwd', ROOT],
           env: {
             GH_REPO: repo,
             ...(process.env.GH_TOKEN ? { GH_TOKEN: process.env.GH_TOKEN } : {}),
@@ -76,7 +78,7 @@ async function main(): Promise<void> {
   const client = new Client({ name: 'demo', version: '0.1.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: TSX,
-    args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
+    args: [TSX_CLI, join(ROOT, 'src', 'cli.ts'), '--config', configPath],
     env: { ...process.env } as Record<string, string>,
     stderr: 'ignore',
   });

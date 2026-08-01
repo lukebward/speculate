@@ -10,14 +10,16 @@
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { resultText } from '../src/upstream.js';
 import type { StatsReport } from '../src/types.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
@@ -78,7 +80,7 @@ async function runSession(mode: 'strict' | 'off', latencyMs: number): Promise<Ru
       servers: {
         github: {
           command: TSX,
-          args: [join(ROOT, 'mock', 'mock-github.ts')],
+          args: [TSX_CLI, join(ROOT, 'mock', 'mock-github.ts')],
           env: { SPECULATE_MOCK_LATENCY_MS: String(latencyMs) },
           profile: 'github',
         },
@@ -89,7 +91,7 @@ async function runSession(mode: 'strict' | 'off', latencyMs: number): Promise<Ru
   const client = new Client({ name: 'bench', version: '0.1.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: TSX,
-    args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
+    args: [TSX_CLI, join(ROOT, 'src', 'cli.ts'), '--config', configPath],
     env: { ...process.env } as Record<string, string>,
     stderr: 'ignore',
   });

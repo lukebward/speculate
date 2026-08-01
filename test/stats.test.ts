@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   formatUsageReport,
   parseStatsArgs,
@@ -10,8 +11,9 @@ import {
 } from '../src/stats.js';
 import { UsageRecorder, type UsageReport, type UsageTotals } from '../src/usage.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
 function runCli(
   args: string[],
@@ -20,7 +22,7 @@ function runCli(
   return new Promise((resolve) => {
     execFile(
       TSX,
-      [join(ROOT, 'src', 'cli.ts'), ...args],
+      [TSX_CLI, join(ROOT, 'src', 'cli.ts'), ...args],
       { env: { ...process.env, XDG_STATE_HOME: stateHome }, encoding: 'utf8' },
       (error, stdout, stderr) => {
         const code =

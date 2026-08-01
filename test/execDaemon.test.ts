@@ -5,6 +5,7 @@
  * canonical workflow.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { hasUnixSockets } from './platform.js';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -197,7 +198,7 @@ class CountingUsageRecorder extends UsageRecorder {
   }
 }
 
-describe('exec daemon end to end', () => {
+describe.skipIf(!hasUnixSockets)('exec daemon end to end', () => {
   let fixture: string;
   let daemon: DaemonHandle;
 
@@ -301,7 +302,7 @@ describe('exec daemon end to end', () => {
   });
 });
 
-it('records durable CLI usage', async () => {
+it.skipIf(!hasUnixSockets)('records durable CLI usage', async () => {
   const fixture = makeFixtureRepo();
   const usageBase = mkdtempSync(join(tmpdir(), 'speculate-cli-usage-'));
   const usageDirectory = join(usageBase, 'usage');

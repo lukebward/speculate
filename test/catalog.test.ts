@@ -4,16 +4,19 @@
  * (docker/kubectl: bare binary probes) are never asserted absent.
  */
 import { afterAll, describe, expect, it } from 'vitest';
+import { hasPosixShell } from './platform.js';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { binaryOnPath, probePasses } from '../shell/catalog.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const SHELL_SERVER = join(ROOT, 'shell', 'speculate-shell.ts');
 
 const cleanups: string[] = [];
@@ -39,7 +42,7 @@ async function spawnServer(cwd: string, env: Record<string, string>): Promise<Cl
   const client = new Client({ name: 'cat-test', version: '0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: TSX,
-    args: [SHELL_SERVER, '--cwd', cwd, '--no-watch'],
+    args: [TSX_CLI, SHELL_SERVER, '--cwd', cwd, '--no-watch'],
     env: { ...process.env, ...env } as Record<string, string>,
     stderr: 'ignore',
   });
@@ -98,7 +101,7 @@ describe('auto-registration through MCP', () => {
     for (const t of tools) expect(t.annotations?.readOnlyHint).toBe(true);
   }, 30_000);
 
-  it('gh tools appear in a github-remote repo (stub gh) and execute via execFile', async () => {
+  it.skipIf(!hasPosixShell)('gh tools appear in a github-remote repo (stub gh) and execute via execFile', async () => {
     const bin = tmp('cat-bin-');
     fakeBin(bin, 'gh', `echo '[{"number": 7, "title": "stub"}]'`);
     const root = tmp('cat-repo-');
@@ -127,7 +130,7 @@ describe('auto-registration through MCP', () => {
     expect(payload.output).toEqual([{ number: 7, title: 'stub' }]); // JSON stdout mined as structure
   }, 30_000);
 
-  it('a failing catalog binary yields isError, and --no-auto disables the catalog', async () => {
+  it.skipIf(!hasPosixShell)('a failing catalog binary yields isError, and --no-auto disables the catalog', async () => {
     const bin = tmp('cat-bin-');
     fakeBin(bin, 'gh', 'echo "boom" >&2; exit 3');
     const root = tmp('cat-repo2-');
@@ -151,7 +154,7 @@ describe('auto-registration through MCP', () => {
     const bare = new Client({ name: 'cat-test', version: '0' }, { capabilities: {} });
     const transport = new StdioClientTransport({
       command: TSX,
-      args: [SHELL_SERVER, '--cwd', root, '--no-watch', '--no-auto'],
+      args: [TSX_CLI, SHELL_SERVER, '--cwd', root, '--no-watch', '--no-auto'],
       env: { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}` } as Record<string, string>,
       stderr: 'ignore',
     });

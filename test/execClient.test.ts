@@ -4,15 +4,18 @@
  * spawn-on-demand path through the real CLI.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { hasUnixSockets } from './platform.js';
 import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseExecArgs, runExec } from '../src/execClient.js';
 import { execSocketPath, startExecDaemon, type DaemonHandle } from '../src/execDaemon.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const CLI = join(ROOT, 'src', 'cli.ts');
 
 const FIXTURE_GIT_ENV: NodeJS.ProcessEnv = {
@@ -51,7 +54,7 @@ describe('parseExecArgs', () => {
   });
 });
 
-describe('runExec', () => {
+describe.skipIf(!hasUnixSockets)('runExec', () => {
   let fixture: string;
   let daemon: DaemonHandle;
 
@@ -126,7 +129,7 @@ describe('runExec', () => {
   });
 });
 
-describe('CLI output integrity under backpressure', () => {
+describe.skipIf(!hasUnixSockets)('CLI output integrity under backpressure', () => {
   // Regression for the truncation bug family: process.exit() (or any
   // flush-with-timeout) after writing a payload larger than the OS pipe
   // buffer hands a slow reader exit 0 with partial bytes. The CLI must
@@ -161,7 +164,7 @@ describe('CLI output integrity under backpressure', () => {
     // reader's absence overlaps a flush timer, not daemon startup.
     const daemonProc = spawn(
       TSX,
-      [CLI, 'exec-daemon', '--cwd', fixture, '--idle-ms', '20000', '--no-persist'],
+      [TSX_CLI, CLI, 'exec-daemon', '--cwd', fixture, '--idle-ms', '20000', '--no-persist'],
       {
         env: { ...process.env, SPECULATE_USAGE_OFF: '1' },
         stdio: ['ignore', 'ignore', 'ignore'],
@@ -169,7 +172,7 @@ describe('CLI output integrity under backpressure', () => {
     );
     await new Promise((r) => setTimeout(r, 2_500)); // let it bind
     try {
-      const child = spawn(TSX, [CLI, 'exec', '--cwd', fixture, '--', 'git', 'show', 'HEAD'], {
+      const child = spawn(TSX, [TSX_CLI, CLI, 'exec', '--cwd', fixture, '--', 'git', 'show', 'HEAD'], {
         env: { ...process.env, SPECULATE_USAGE_OFF: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -199,7 +202,7 @@ describe('CLI output integrity under backpressure', () => {
   }, 30_000);
 });
 
-describe('spawn-on-demand through the real CLI', () => {
+describe.skipIf(!hasUnixSockets)('spawn-on-demand through the real CLI', () => {
   it('starts a daemon, serves, and honors --stop', async () => {
     const fixture = makeFixtureRepo();
     const env = {
@@ -209,7 +212,7 @@ describe('spawn-on-demand through the real CLI', () => {
     };
     const run = (args: string[]): Promise<{ code: number; stdout: string }> =>
       new Promise((resolve, reject) => {
-        const child = spawn(TSX, [CLI, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+        const child = spawn(TSX, [TSX_CLI, CLI, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
         const out: Buffer[] = [];
         child.stdout.on('data', (c: Buffer) => out.push(c));
         child.on('error', reject);

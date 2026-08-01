@@ -11,17 +11,20 @@
  * proxy stack, never a bare hardcoded constant.
  */
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { isWindows, hasRipgrep, cliSpeculationLandsHits } from './platform.js';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { StatsReport } from '../src/types.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const SHELL_SERVER = join(ROOT, 'shell', 'speculate-shell.ts');
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -92,7 +95,7 @@ async function startShellProxy(
           command: TSX,
           // Watcher stays ON (default) — the invalidation test exercises it.
           // --no-auto: assert the fixed surface; the catalog is env-sensitive.
-          args: [SHELL_SERVER, '--cwd', fixtureDir, '--no-auto'],
+          args: [TSX_CLI, SHELL_SERVER, '--cwd', fixtureDir, '--no-auto'],
           ...(opts.profile === false ? {} : { profile: 'shell' }),
         },
       },
@@ -101,7 +104,7 @@ async function startShellProxy(
   const client = new Client({ name: 'shell-itest', version: '0.0.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: TSX,
-    args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
+    args: [TSX_CLI, join(ROOT, 'src', 'cli.ts'), '--config', configPath],
     env: { ...process.env } as Record<string, string>,
     stderr: 'inherit',
   });
@@ -152,7 +155,13 @@ async function readStats(client: Client): Promise<StatsReport> {
 // through the full client→proxy→shell-server stack, not hardcoded.
 // ---------------------------------------------------------------------------
 
-let HIT_THRESHOLD_MS = 20;
+// Floor for "served from the buffer". Windows stdio round-trips cost
+// measurably more than POSIX pipes, so the floor is higher there; the
+// calibration below still raises it further on a slow machine.
+const HIT_FLOOR_MS = isWindows ? 60 : 20;
+/** Below this, a live call is too fast for the "hit is 3x faster" ratio to mean anything. */
+const RATIO_FLOOR_MS = isWindows ? HIT_FLOOR_MS : 15;
+let HIT_THRESHOLD_MS = HIT_FLOOR_MS;
 let coldMedianMs = 0;
 
 beforeAll(async () => {
@@ -167,7 +176,7 @@ beforeAll(async () => {
     }
     samples.sort((a, b) => a - b);
     coldMedianMs = samples[1]!;
-    HIT_THRESHOLD_MS = Math.max(20, coldMedianMs * 0.5);
+    HIT_THRESHOLD_MS = Math.max(HIT_FLOOR_MS, coldMedianMs * 0.5);
     console.log(
       `[shell-itest] cold git_diff samples: ${samples.map((s) => s.toFixed(1)).join(' / ')} ms` +
         ` → HIT_THRESHOLD ${HIT_THRESHOLD_MS.toFixed(1)} ms`,
@@ -182,7 +191,7 @@ beforeAll(async () => {
 // ---------------------------------------------------------------------------
 
 describe('speculate-shell behind the proxy (shell profile)', () => {
-  it('prefetch hit via profile rule: git_status on a dirty tree prefetches git_diff', async () => {
+  it.skipIf(!cliSpeculationLandsHits)('prefetch hit via profile rule: git_status on a dirty tree prefetches git_diff', async () => {
     const { client } = await startShellProxy('strict');
 
     // Real upstream exec — timing recorded, no floor asserted (tiny repos
@@ -205,8 +214,10 @@ describe('speculate-shell behind the proxy (shell profile)', () => {
       `[shell-itest] git_status ${status.ms.toFixed(1)} ms; git_diff hit ${hit.ms.toFixed(1)} ms` +
         ` vs live baseline ${baseline.ms.toFixed(1)} ms`,
     );
-    if (baseline.ms < 15) {
+    if (baseline.ms < RATIO_FLOOR_MS) {
       // Floor guard: a near-instant live call makes the 3x ratio meaningless.
+      // On Windows the stdio round-trip alone costs more than a live git_diff
+      // on a tiny repo, so the ratio is meaningless well past the POSIX floor.
       expect(hit.ms).toBeLessThan(baseline.ms + 5);
     } else {
       expect(hit.ms).toBeLessThan(baseline.ms / 3);
@@ -219,7 +230,7 @@ describe('speculate-shell behind the proxy (shell profile)', () => {
     expect(rule!.hits).toBeGreaterThanOrEqual(1);
   }, 30_000);
 
-  it('chained rule with result-derived args: git_log prefetches git_show for the newest sha', async () => {
+  it.skipIf(!cliSpeculationLandsHits)('chained rule with result-derived args: git_log prefetches git_show for the newest sha', async () => {
     const { client, fixtureDir } = await startShellProxy('strict');
     const headSha = execFileSync('git', ['rev-parse', 'HEAD'], {
       cwd: fixtureDir,
@@ -270,7 +281,7 @@ describe('speculate-shell behind the proxy (shell profile)', () => {
     expect(stats.invalidated).toBeGreaterThanOrEqual(1);
   }, 30_000);
 
-  it('learner earns speculation from repeated shell traffic (no profile, annotated mode)', async () => {
+  it.skipIf(!hasRipgrep)('learner earns speculation from repeated shell traffic (no profile, annotated mode)', async () => {
     const { client } = await startShellProxy('annotated', { profile: false });
 
     // Two observations of the list_dir → search transition…
@@ -292,7 +303,7 @@ describe('speculate-shell behind the proxy (shell profile)', () => {
     expect(stats.perRule.some((r) => r.ruleId.startsWith('learned:workspace:'))).toBe(true);
   }, 30_000);
 
-  it('mutation safety: only the 7 read-only tools plus speculate__stats exist, all readOnlyHint', async () => {
+  it.skipIf(!hasRipgrep)('mutation safety: only the 7 read-only tools plus speculate__stats exist, all readOnlyHint', async () => {
     const { client } = await startShellProxy('strict');
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();

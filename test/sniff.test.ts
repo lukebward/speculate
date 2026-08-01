@@ -9,13 +9,15 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { looksLikeMcpInitialize, sniffFirstLine } from '../src/sniff.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const CLI = join(ROOT, 'src', 'cli.ts');
 const MOCK = join(ROOT, 'mock', 'mock-github.ts');
 
@@ -96,7 +98,7 @@ describe('sniffFirstLine', () => {
 
 describe('wrap --sniff end to end', () => {
   it('pipes a non-MCP command transparently and forwards its exit code', async () => {
-    const child = spawn(TSX, [CLI, 'wrap', '--sniff', '--', 'cat'], {
+    const child = spawn(TSX, [TSX_CLI, CLI, 'wrap', '--sniff', '--', 'cat'], {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     child.stdin.end('first line\nsecond line\n');
@@ -108,7 +110,7 @@ describe('wrap --sniff end to end', () => {
   }, 30_000);
 
   it('propagates a non-zero exit code in pipe mode', async () => {
-    const child = spawn(TSX, [CLI, 'wrap', '--sniff', '--', 'false'], {
+    const child = spawn(TSX, [TSX_CLI, CLI, 'wrap', '--sniff', '--', 'false'], {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     child.stdin.end('not mcp\n');
@@ -120,7 +122,7 @@ describe('wrap --sniff end to end', () => {
     const client = new Client({ name: 'sniff-e2e', version: '0' }, { capabilities: {} });
     const transport = new StdioClientTransport({
       command: TSX,
-      args: [CLI, 'wrap', '--sniff', '--', TSX, MOCK],
+      args: [TSX_CLI, CLI, 'wrap', '--sniff', '--', TSX, TSX_CLI, MOCK],
       env: { ...process.env } as Record<string, string>,
       stderr: 'pipe',
     });

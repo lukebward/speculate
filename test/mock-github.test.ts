@@ -69,7 +69,7 @@ describe('mock-github MCP server', () => {
     client = new Client({ name: 'mock-github-test', version: '0.0.0' });
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ['node_modules/.bin/tsx', 'mock/mock-github.ts'],
+      args: ['node_modules/tsx/dist/cli.mjs', 'mock/mock-github.ts'],
       cwd: projectRoot,
       env,
     });

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { hasPosixFileModes } from './platform.js';
 import {
   existsSync,
   mkdirSync,
@@ -50,7 +51,7 @@ afterEach(() => {
 });
 
 describe('UsageRecorder', () => {
-  it('persists an owner-only snapshot atomically', () => {
+  it.skipIf(!hasPosixFileModes)('persists an owner-only snapshot atomically', () => {
     const directory = join(dir(), 'nested');
     let now = 1000;
     const recorder = new UsageRecorder({

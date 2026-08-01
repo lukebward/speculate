@@ -27,6 +27,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { hasRipgrep } from './platform.js';
 
 const TEST_TIMEOUT_MS = 20_000;
 
@@ -130,7 +131,7 @@ async function connectServer(workspace: string): Promise<Client> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [
-      'node_modules/.bin/tsx',
+      'node_modules/tsx/dist/cli.mjs',
       'shell/speculate-shell.ts',
       '--cwd',
       workspace,
@@ -338,7 +339,7 @@ describe('speculate-shell MCP server', () => {
     TEST_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(!hasRipgrep)(
     'search finds the distinctive string with correct file and line',
     async () => {
       const result = await callTool('search', { pattern: NEEDLE });
@@ -357,7 +358,7 @@ describe('speculate-shell MCP server', () => {
     TEST_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(!hasRipgrep)(
     'search glob filter includes and excludes correctly',
     async () => {
       const md = textPayload(await callTool('search', { pattern: NEEDLE, glob: '*.md' })) as {
@@ -375,7 +376,7 @@ describe('speculate-shell MCP server', () => {
     TEST_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(!hasRipgrep)(
     'search for a nonexistent string returns empty matches, not an error (rg exit 1)',
     async () => {
       const result = await callTool('search', { pattern: 'ZZZ_NO_SUCH_STRING_1a2b3c4d5e' });
@@ -436,7 +437,7 @@ describe('speculate-shell MCP server', () => {
     TEST_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(!hasRipgrep)(
     "search glob '--pre=/bin/sh' is rejected (leading dash)",
     async () => {
       expectCleanError(
@@ -447,7 +448,7 @@ describe('speculate-shell MCP server', () => {
     TEST_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(!hasRipgrep)(
     'search pattern starting with a dash works safely (goes after --)',
     async () => {
       const result = await callTool('search', { pattern: '-dashpattern' });
@@ -562,7 +563,7 @@ describe('speculate-shell MCP server', () => {
   // 5. Tool annotations
   // -------------------------------------------------------------------------
 
-  test(
+  test.skipIf(!hasRipgrep)(
     'all 7 tools are listed with readOnlyHint === true',
     async () => {
       const { tools } = await client.listTools();
@@ -580,7 +581,7 @@ describe('speculate-shell MCP server', () => {
   // 6. Non-git workspace
   // -------------------------------------------------------------------------
 
-  test(
+  test.skipIf(!hasRipgrep)(
     'a non-git workspace exposes list_dir and search but no git_* tools',
     async () => {
       const plainDir = mkdtempSync(path.join(os.tmpdir(), 'speculate-shell-plain-'));

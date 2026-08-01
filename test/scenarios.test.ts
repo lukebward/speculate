@@ -13,13 +13,15 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { ServerConfig, StatsReport } from '../src/types.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
 const L = 200; // injected upstream latency
 const HIT_MS = L * 0.5; // served from buffer
@@ -79,7 +81,7 @@ async function startProxy(
       servers: {
         [server]: {
           command: TSX,
-          args: [join(ROOT, 'mock', MOCK_SERVERS[server])],
+          args: [TSX_CLI, join(ROOT, 'mock', MOCK_SERVERS[server])],
           env: {
             SPECULATE_MOCK_LATENCY_MS: String(L),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
@@ -93,7 +95,7 @@ async function startProxy(
   const client = new Client({ name: 'scenario', version: '0.0.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: TSX,
-    args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
+    args: [TSX_CLI, join(ROOT, 'src', 'cli.ts'), '--config', configPath],
     // Sandboxed state home: usage snapshots land in the harness dir, never
     // in the runner's real XDG state.
     env: {
@@ -674,8 +676,8 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
     await sleep(300); // let the shutdown flush settle
 
     const statsCliOut = execFileSync(
-      TSX,
-      [join(ROOT, 'src', 'cli.ts'), 'stats', '--json'],
+      process.execPath,
+      [TSX_CLI, join(ROOT, 'src', 'cli.ts'), 'stats', '--json'],
       { encoding: 'utf8', env: { ...process.env, XDG_STATE_HOME: xdgStateHome } },
     );
     const report = JSON.parse(statsCliOut) as {

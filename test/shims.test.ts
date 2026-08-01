@@ -5,6 +5,7 @@
  * marker-managed and idempotent.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { hasPosixShell } from './platform.js';
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -75,13 +76,13 @@ describe('shim script behavior', () => {
     makeFakeBin(specDir, 'speculate', '#!/bin/sh\necho "speculate-called $@"\n');
   });
 
-  it('resolves and execs the real launcher when speculate is not installed', async () => {
+  it.skipIf(!hasPosixShell)('resolves and execs the real launcher when speculate is not installed', async () => {
     const res = await runShim(join(shimDir, 'npx'), ['-y', 'pkg'], `${shimDir}:${realDir}`);
     expect(res.code).toBe(0);
     expect(res.stdout).toBe('real-npx -y pkg\n');
   });
 
-  it('routes through speculate wrap --sniff when available and non-interactive', async () => {
+  it.skipIf(!hasPosixShell)('routes through speculate wrap --sniff when available and non-interactive', async () => {
     const res = await runShim(
       join(shimDir, 'npx'),
       ['-y', 'some-mcp-server'],
@@ -93,7 +94,7 @@ describe('shim script behavior', () => {
     );
   });
 
-  it('honors the SPECULATE_OFF kill switch', async () => {
+  it.skipIf(!hasPosixShell)('honors the SPECULATE_OFF kill switch', async () => {
     const res = await runShim(
       join(shimDir, 'npx'),
       ['x'],
@@ -103,7 +104,7 @@ describe('shim script behavior', () => {
     expect(res.stdout).toBe('real-npx x\n');
   });
 
-  it('fails with 127 when no real launcher exists anywhere', async () => {
+  it.skipIf(!hasPosixShell)('fails with 127 when no real launcher exists anywhere', async () => {
     const res = await runShim(join(shimDir, 'npx'), [], shimDir);
     expect(res.code).toBe(127);
   });

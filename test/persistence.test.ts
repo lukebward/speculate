@@ -3,6 +3,7 @@
  * learner export/import round-trip, and rule-feedback priors with decay.
  */
 import { describe, expect, it } from 'vitest';
+import { hasPosixFileModes } from './platform.js';
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
@@ -28,7 +29,7 @@ function call(
 }
 
 describe('StateStore', () => {
-  it('round-trips state atomically and owner-only', () => {
+  it.skipIf(!hasPosixFileModes)('round-trips state atomically and owner-only', () => {
     const path = join(dir(), 'nested', 'deeper', 'state.json');
     const store = new StateStore(path, () => 1234);
     expect(store.load()).toBeNull(); // first run: cold start

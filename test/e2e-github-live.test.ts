@@ -9,13 +9,15 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { StatsReport } from '../src/types.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const REPO = process.env.SPECULATE_E2E_REPO ?? 'cli/cli';
 const THINK_GAP_MS = 500;
 
@@ -52,7 +54,7 @@ async function startWrappedShell(mode: 'annotated' | 'off'): Promise<Harness> {
       servers: {
         workspace: {
           command: TSX,
-          args: [join(ROOT, 'shell', 'speculate-shell.ts'), '--cwd', ROOT],
+          args: [TSX_CLI, join(ROOT, 'shell', 'speculate-shell.ts'), '--cwd', ROOT],
           // forward token-env auth so the child matches what liveReady()'s gh-auth check validated
           env: {
             GH_REPO: REPO,
@@ -67,7 +69,7 @@ async function startWrappedShell(mode: 'annotated' | 'off'): Promise<Harness> {
   const client = new Client({ name: 'e2e-live', version: '0.0.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: TSX,
-    args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
+    args: [TSX_CLI, join(ROOT, 'src', 'cli.ts'), '--config', configPath],
     env: { ...process.env } as Record<string, string>,
     stderr: 'inherit',
   });

@@ -4,12 +4,14 @@
  * (fail-open) in every other case.
  */
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
+import { hasPosixFileModes } from './platform.js';
 import { spawn } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HOOK = new URL('../plugin/hooks/bash-rewrite.mjs', import.meta.url).pathname;
+const HOOK = fileURLToPath(new URL('../plugin/hooks/bash-rewrite.mjs', import.meta.url));
 
 let binDir: string;
 
@@ -27,7 +29,7 @@ function runHook(
 ): Promise<{ code: number; stdout: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [HOOK], {
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, ...env },
+      env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH}`, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const out: Buffer[] = [];
@@ -49,7 +51,7 @@ describe('bash-rewrite hook', () => {
   // bare name.
   const bin = () => join(binDir, 'speculate');
 
-  it('rewrites a table-shaped read-only command, preserving other input fields', async () => {
+  it.skipIf(!hasPosixFileModes)('rewrites a table-shaped read-only command, preserving other input fields', async () => {
     const { code, stdout } = await runHook(bash('git status'));
     expect(code).toBe(0);
     const res = JSON.parse(stdout);
@@ -58,7 +60,7 @@ describe('bash-rewrite hook', () => {
     expect(res.hookSpecificOutput.updatedInput.description).toBe('test');
   });
 
-  it.each([
+  it.skipIf(!hasPosixFileModes).each([
     ['git diff --cached', 'git diff --cached'],
     ['rg -n needle src', 'rg -n needle src'],
     ['ls -la', 'ls -la'],

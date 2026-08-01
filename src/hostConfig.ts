@@ -187,9 +187,11 @@ export function selfCommand(): { command: string; args: string[] } {
     return { command: process.execPath, args: [builtJs] };
   }
   const tsSource = fileURLToPath(new URL('./cli.ts', import.meta.url));
-  const tsx = fileURLToPath(new URL('../node_modules/.bin/tsx', import.meta.url));
+  // tsx's entry point under node, not the .bin shim: Windows cannot spawn an
+  // extensionless sh script, and node refuses .cmd shims without a shell.
+  const tsx = fileURLToPath(new URL('../node_modules/tsx/dist/cli.mjs', import.meta.url));
   if (existsSync(tsSource) && existsSync(tsx)) {
-    return { command: tsx, args: [tsSource] };
+    return { command: process.execPath, args: [tsx, tsSource] };
   }
   throw new Error('cannot locate the speculate CLI entrypoint; run npm run build');
 }
