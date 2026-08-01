@@ -223,7 +223,7 @@ describe('runStats', () => {
     } finally {
       rmSync(stateHome, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it('rejects the retired CLI-speculation commands and flags (removed in v0.11)', async () => {
     const stateHome = mkdtempSync(join(tmpdir(), 'speculate-stats-cli-legacy-'));
@@ -248,7 +248,7 @@ describe('runStats', () => {
     } finally {
       rmSync(stateHome, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it('exec is a thin pass-through for a stranded ≤0.10 Bash hook', async () => {
     // A ≤0.10 plugin hook still rewrites the agent's `git status`/`rg`/`ls`
@@ -303,7 +303,10 @@ describe('runStats', () => {
       rmSync(stateHome, { recursive: true, force: true });
       rmSync(workDir, { recursive: true, force: true });
     }
-  });
+    // Five real-CLI spawns (tsx + node each): the 5 s default is not enough on
+    // a cold Windows CI runner. Same explicit budget the other process-
+    // spawning suites use.
+  }, 30_000);
 
   it.skipIf(!isWindows)('exec fails soft on a .cmd target (Node throws EINVAL synchronously)', async () => {
     // Since CVE-2024-27980 Node refuses to spawn a batch file: spawn() throws
@@ -322,7 +325,7 @@ describe('runStats', () => {
     } finally {
       rmSync(stateHome, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it('prints guidance when no snapshots exist', () => {
     let stdout = '';
