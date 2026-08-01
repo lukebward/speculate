@@ -174,20 +174,30 @@ async function frontDoorAvailable(ctx: Ctx): Promise<boolean> {
 
 // -- legacy artifact cleanup (≤0.10 plugin + workspace server) -------------------
 
+/** The one `claude plugin uninstall` invocation, shared by cleanup and off()'s fallback. */
+async function runLegacyPluginUninstall(ctx: Ctx): Promise<CmdResult> {
+  return ctx.runner(ctx.claudeBin, ['plugin', 'uninstall', '-s', 'local', 'speculate'], {
+    cwd: ctx.cwd,
+  });
+}
+
 /**
  * Remove artifacts a ≤0.10 install left behind (plugin, workspace server).
  *
- * Returns whether the plugin was confirmed uninstalled here, so callers
- * with their own record of a legacy plugin install (off()'s `action:
- * 'plugin'` state entries) know whether they still need to try themselves —
- * detection can miss (older hosts with no `claude plugin` CLI at all, or a
- * plugin id shape this substring check doesn't recognize), and a recorded
- * install must never be silently dropped just because detection missed.
+ * Returns whether the plugin was confirmed uninstalled here, and whether an
+ * uninstall was attempted at all, so callers with their own record of a
+ * legacy plugin install (off()'s `action: 'plugin'` state entries) know
+ * whether they still need to try themselves — detection can miss (older
+ * hosts with no `claude plugin` CLI at all, or a plugin id shape this
+ * substring check doesn't recognize), and a recorded install must never be
+ * silently dropped just because detection missed. When an attempt was made
+ * here and it failed, callers should also skip a duplicate attempt (it would
+ * just fail again) but still count the failure — see off() below.
  */
 export async function cleanupLegacyArtifacts(
   ctx: Ctx,
   view: ClaudeConfigView,
-): Promise<{ pluginUninstalled: boolean }> {
+): Promise<{ pluginUninstalled: boolean; pluginUninstallAttempted: boolean }> {
   if (effectiveServers(view.servers).has(WORKSPACE_SERVER_NAME)) {
     const res = await ctx.runner(
       ctx.claudeBin,
@@ -206,12 +216,8 @@ export async function cleanupLegacyArtifacts(
   const detected =
     list.code === 0 &&
     (list.stdout.includes('"speculate"') || list.stdout.includes('speculate@'));
-  if (!detected) return { pluginUninstalled: false };
-  const un = await ctx.runner(
-    ctx.claudeBin,
-    ['plugin', 'uninstall', '-s', 'local', 'speculate'],
-    { cwd: ctx.cwd },
-  );
+  if (!detected) return { pluginUninstalled: false, pluginUninstallAttempted: false };
+  const un = await runLegacyPluginUninstall(ctx);
   ctx.log(
     un.code === 0
       ? '[speculate] legacy: uninstalled the speculate plugin (Bash hook retired in 0.11)'
@@ -222,7 +228,7 @@ export async function cleanupLegacyArtifacts(
       cwd: ctx.cwd,
     });
   }
-  return { pluginUninstalled: un.code === 0 };
+  return { pluginUninstalled: un.code === 0, pluginUninstallAttempted: true };
 }
 
 // -- on ---------------------------------------------------------------------------
@@ -334,7 +340,10 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     return 1;
   }
   const preView = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
-  let legacyCleanup: { pluginUninstalled: boolean } = { pluginUninstalled: false };
+  let legacyCleanup: { pluginUninstalled: boolean; pluginUninstallAttempted: boolean } = {
+    pluginUninstalled: false,
+    pluginUninstallAttempted: false,
+  };
   try {
     legacyCleanup = await cleanupLegacyArtifacts(ctx, preView);
   } catch (err) {
@@ -350,15 +359,20 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     if (entry.action === 'plugin') {
       // Legacy (≤0.10) record. cleanupLegacyArtifacts (above) already
       // uninstalled the plugin if its detection fired — don't double up.
-      // But detection can miss (older host with no `claude plugin` CLI, or
-      // a plugin id shape it doesn't recognize): a recorded install must
-      // never be silently dropped, so fall back to a direct attempt.
-      if (!legacyCleanup.pluginUninstalled) {
-        const res = await ctx.runner(
-          ctx.claudeBin,
-          ['plugin', 'uninstall', '-s', 'local', 'speculate'],
-          { cwd: ctx.cwd },
-        );
+      // If it detected the plugin but the uninstall itself failed, don't
+      // retry here either: it already logged one honest failure line, and
+      // retrying would just fail again with a near-identical second line —
+      // count the failure without repeating the attempt. Only when cleanup
+      // never got to try (detection can miss: older host with no `claude
+      // plugin` CLI, or a plugin id shape it doesn't recognize) does a
+      // recorded install need a direct attempt here, so it's never silently
+      // dropped.
+      if (legacyCleanup.pluginUninstalled) {
+        // already confirmed removed — nothing more to do.
+      } else if (legacyCleanup.pluginUninstallAttempted) {
+        failed++;
+      } else {
+        const res = await runLegacyPluginUninstall(ctx);
         if (res.code !== 0) {
           ctx.log(
             `[speculate] plugin: uninstall failed: ${(res.stderr || res.stdout).trim()} — remove manually: ${ctx.claudeBin} plugin uninstall -s local speculate`,

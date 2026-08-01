@@ -23,9 +23,7 @@ speculate on                                # enable it for the current project
 
 `try` and `on` are Claude Code integrations. Using any other MCP client? Skip to [the wrap prefix](#any-other-mcp-client); nothing in this section is required.
 
-One command, one project, every MCP server the agent uses:
-
-- **Your MCP servers** are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
+One command, one project, every MCP server the agent uses: your MCP servers are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
 
 Upgrading from ≤0.10? `speculate on` also removes the retired CLI-speculation plugin and workspace server.
 
@@ -84,10 +82,12 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 392 unit and end-to-end tests (6 skipped on this platform)
+npm test        # 398 tests (392 passing, 6 skipped on this platform)
 npm run bench   # speculation off vs on
 npm run demo    # the README demo, against the bundled mock (injected latency)
 ```
+
+Running the test suite needs Node >= 20.19 (vitest's native rolldown binding; npm silently skips it on older Node) — the runtime floor for *using* speculate is unchanged at Node >= 18.
 
 Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation + drain queue), `src/predictor.ts`/`learner.ts`/`priming.ts` (prediction), `src/cache.ts`, `src/policy.ts`/`budget.ts` (safety and limits), `src/manage.ts`/`tryRun.ts` (on/off/try), `mock/`, `bench/`.
 

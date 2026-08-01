@@ -10,15 +10,27 @@ import { fileURLToPath } from 'node:url';
 // this file's URL already lands on the root — same pattern as bench.ts.
 const root = fileURLToPath(new URL('..', import.meta.url));
 const tsxCli = join(root, 'node_modules', 'tsx', 'dist', 'cli.mjs');
-const out = execFileSync(process.execPath, [tsxCli, join(root, 'demo', 'demo.ts')], {
-  encoding: 'utf8',
-});
+let out;
+try {
+  out = execFileSync(process.execPath, [tsxCli, join(root, 'demo', 'demo.ts')], {
+    encoding: 'utf8',
+  });
+} catch (err) {
+  // execFileSync's own error is a bare "Command failed"; without printing
+  // what the demo actually wrote before dying, the failure is undiagnosable.
+  if (err.stdout) process.stderr.write(err.stdout);
+  if (err.stderr) process.stderr.write(err.stderr);
+  throw err;
+}
 const dir = mkdtempSync(join(tmpdir(), 'speculate-demo-'));
-const capture = join(dir, 'capture.txt');
-writeFileSync(capture, out);
-execFileSync(
-  process.execPath,
-  [join(root, 'scripts', 'gen-demo-svg.mjs'), capture, join(root, 'demo', 'speculate-demo.svg')],
-  { stdio: 'inherit' },
-);
-rmSync(dir, { recursive: true, force: true });
+try {
+  const capture = join(dir, 'capture.txt');
+  writeFileSync(capture, out);
+  execFileSync(
+    process.execPath,
+    [join(root, 'scripts', 'gen-demo-svg.mjs'), capture, join(root, 'demo', 'speculate-demo.svg')],
+    { stdio: 'inherit' },
+  );
+} finally {
+  rmSync(dir, { recursive: true, force: true });
+}
