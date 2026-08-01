@@ -8,7 +8,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  WORKSPACE_SERVER_NAME,
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
@@ -144,7 +143,7 @@ describe('entry classification and wrapping', () => {
 });
 
 describe('buildTryConfig', () => {
-  it('wraps stdio servers, passes through http, adds the workspace server', () => {
+  it('wraps stdio servers, passes through http, and nothing else', () => {
     writeClaudeJson({
       mcpServers: {
         github: { command: 'github-mcp-server', args: ['stdio'] },
@@ -156,7 +155,7 @@ describe('buildTryConfig', () => {
     expect(plan.passedThrough).toEqual(['sentry']);
     expect(plan.mcpServers.github!.command).toBe(SELF.command);
     expect(plan.mcpServers.sentry).toEqual({ url: 'https://mcp.sentry.dev/mcp', type: 'http' });
-    expect(plan.mcpServers[WORKSPACE_SERVER_NAME]!.args).toContain('--workspace');
+    expect(Object.keys(plan.mcpServers).sort()).toEqual(['github', 'sentry']);
   });
 
   it('never turns pending .mcp.json approval into running servers', () => {
@@ -173,7 +172,7 @@ describe('buildTryConfig', () => {
     expect(plan.wrapped).toEqual(['team']);
   });
 
-  it('leaves already-wrapped entries alone and honors --no-workspace', () => {
+  it('leaves already-wrapped entries alone', () => {
     writeClaudeJson({
       mcpServers: {
         github: {
@@ -182,19 +181,24 @@ describe('buildTryConfig', () => {
         },
       },
     });
-    const plan = buildTryConfig({ home, cwd, self: SELF, noWorkspace: true });
+    const plan = buildTryConfig({ home, cwd, self: SELF });
     expect(plan.passedThrough).toEqual(['github']);
-    expect(plan.mcpServers[WORKSPACE_SERVER_NAME]).toBeUndefined();
+    expect(Object.keys(plan.mcpServers)).toEqual(['github']);
   });
 });
 
 describe('parseTryArgs', () => {
   it('parses flags and client args', () => {
-    const t = parseTryArgs(['--no-workspace', '--mode', 'strict', '--', '--continue']);
-    expect(t).toEqual({ noWorkspace: true, mode: 'strict', clientArgs: ['--continue'] });
+    const t = parseTryArgs(['--mode', 'strict', '--', '--continue']);
+    expect(t).toEqual({ mode: 'strict', clientArgs: ['--continue'] });
   });
   it('rejects unknown flags', () => {
     expect(parseTryArgs(['--frobnicate'])).toHaveProperty('error');
+  });
+  it('rejects --no-workspace as an unknown flag', () => {
+    const t = parseTryArgs(['--no-workspace']);
+    expect(t).toHaveProperty('error');
+    expect((t as { error: string }).error).toMatch(/--no-workspace/);
   });
 });
 

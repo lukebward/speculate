@@ -2,10 +2,9 @@
  * `speculate try` — the zero-write trial (DESIGN.md §13.12).
  *
  * Read the user's real Claude Code config (all three scopes), build an
- * in-memory copy with every stdio server wrapped and the workspace shell
- * server added, write it to a throwaway file, and launch
- * `claude --mcp-config <tmp> --strict-mcp-config`. Nothing persists:
- * no config is modified, the generated file dies with the session.
+ * in-memory copy with every stdio server wrapped, write it to a throwaway
+ * file, and launch `claude --mcp-config <tmp> --strict-mcp-config`. Nothing
+ * persists: no config is modified, the generated file dies with the session.
  *
  * Consent is preserved, not widened: checked-in .mcp.json servers are
  * included only if the host's own records show the user already approved
@@ -17,35 +16,30 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  WORKSPACE_SERVER_NAME,
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
   readClaudeServers,
   selfCommand,
-  workspaceEntry,
   wrapEntry,
   type McpServerEntry,
 } from './hostConfig.js';
 
 export interface TryArgs {
-  noWorkspace: boolean;
   mode: 'strict' | 'annotated' | 'off' | null;
   /** Arguments after `--`, passed through to the launched client. */
   clientArgs: string[];
 }
 
 export function parseTryArgs(argv: string[]): TryArgs | { error: string } {
-  const out: TryArgs = { noWorkspace: false, mode: null, clientArgs: [] };
+  const out: TryArgs = { mode: null, clientArgs: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === '--') {
       out.clientArgs = argv.slice(i + 1);
       break;
     }
-    if (a === '--no-workspace') {
-      out.noWorkspace = true;
-    } else if (a === '--mode') {
+    if (a === '--mode') {
       const m = argv[++i];
       if (m !== 'strict' && m !== 'annotated' && m !== 'off') {
         return { error: `--mode must be strict|annotated|off (got '${m ?? ''}')` };
@@ -71,7 +65,6 @@ export function buildTryConfig(opts: {
   home: string;
   cwd: string;
   self: { command: string; args: string[] };
-  noWorkspace?: boolean;
   mode?: 'strict' | 'annotated' | 'off' | null;
 }): TryPlan {
   const view = readClaudeServers({ home: opts.home, cwd: opts.cwd });
@@ -103,9 +96,6 @@ export function buildTryConfig(opts: {
       plan.passedThrough.push(name);
     }
   }
-  if (!opts.noWorkspace && !plan.mcpServers[WORKSPACE_SERVER_NAME]) {
-    plan.mcpServers[WORKSPACE_SERVER_NAME] = workspaceEntry(opts.self, opts.cwd);
-  }
   return plan;
 }
 
@@ -119,19 +109,13 @@ export async function runTry(args: TryArgs): Promise<number> {
     home: homedir(),
     cwd: process.cwd(),
     self: selfCommand(),
-    noWorkspace: args.noWorkspace,
     mode: args.mode,
   });
   for (const w of plan.warnings) process.stderr.write(`[speculate] warning: ${w}\n`);
   for (const s of plan.skipped) {
     process.stderr.write(`[speculate] skipping '${s.name}': ${s.reason}\n`);
   }
-  const summary = [
-    plan.wrapped.length ? `wrapping ${plan.wrapped.join(', ')}` : 'no servers to wrap',
-    args.noWorkspace ? null : 'workspace CLI speculation on',
-  ]
-    .filter(Boolean)
-    .join('; ');
+  const summary = plan.wrapped.length ? `wrapping ${plan.wrapped.join(', ')}` : 'no servers to wrap';
   process.stderr.write(`[speculate] try: ${summary} — nothing on disk is modified\n`);
 
   const dir = mkdtempSync(join(tmpdir(), 'speculate-try-'), { mode: 0o700 } as never);
