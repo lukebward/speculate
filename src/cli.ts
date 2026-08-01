@@ -268,7 +268,6 @@ async function main(): Promise<void> {
 
   if (args.command === 'on' || args.command === 'off' || args.command === 'status') {
     let mode: 'strict' | 'annotated' | 'off' | null = null;
-    let plugin = true;
     for (let i = 0; i < args.rest.length; i++) {
       if (args.rest[i] === '--mode' && args.command === 'on') {
         const m = args.rest[++i];
@@ -276,13 +275,11 @@ async function main(): Promise<void> {
           fail(`--mode must be strict|annotated|off (got '${m ?? ''}')`);
         }
         mode = m;
-      } else if (args.rest[i] === '--no-plugin' && args.command === 'on') {
-        plugin = false;
       } else {
         fail(`unknown ${args.command} argument '${args.rest[i]}'`);
       }
     }
-    const manageOpts = { self: selfCommand(), mode, plugin };
+    const manageOpts = { self: selfCommand(), mode };
     const code =
       args.command === 'on'
         ? await speculateOn(manageOpts)

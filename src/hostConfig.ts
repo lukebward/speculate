@@ -231,11 +231,3 @@ export function unwrapEntry(entry: McpServerEntry): McpServerEntry | null {
   const out: McpServerEntry = { ...entry, command: original[0]!, args: original.slice(1) };
   return out;
 }
-
-/** The bundled-shell workspace entry for a project directory. */
-export function workspaceEntry(
-  self: { command: string; args: string[] },
-  dir: string,
-): McpServerEntry {
-  return { command: self.command, args: [...self.args, 'wrap', '--workspace', dir] };
-}

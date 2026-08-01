@@ -127,7 +127,7 @@ const opts = () => ({
 });
 
 describe('speculate on', () => {
-  it('wraps user-scope servers in place and adds the workspace server', async () => {
+  it('wraps user-scope servers in place', async () => {
     writeClaudeJson({
       mcpServers: { github: { command: 'gh-server', args: ['stdio'], env: { T: '1' } } },
     });
@@ -140,15 +140,12 @@ describe('speculate on', () => {
     expect(wrapped.args).toContain('wrap');
     expect(wrapped.args.slice(-2)).toEqual(['gh-server', 'stdio']);
     expect(wrapped.env).toEqual({ T: '1' });
-    // Workspace server registered at local scope for this project.
-    const local = config.projects[cwd].mcpServers;
-    expect(local[WORKSPACE_SERVER_NAME].args).toContain('--workspace');
-    // State file records both.
+    // State file records it.
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     const actions = Object.fromEntries(
       state.projects[cwd].entries.map((e: AnyRecord) => [e.name, e.action]),
     );
-    expect(actions).toEqual({ github: 'rewrote', [WORKSPACE_SERVER_NAME]: 'added' });
+    expect(actions).toEqual({ github: 'rewrote' });
   });
 
   it('shadows approved .mcp.json servers at local scope, never touching the file', async () => {
@@ -211,68 +208,68 @@ describe('speculate on', () => {
   });
 });
 
-describe('speculate on + the Claude Code plugin (one command does MCP and CLI)', () => {
-  it('installs the plugin at local scope and skips the workspace server', async () => {
-    pluginSim = { installed: false, marketplace: false };
+describe('legacy artifact cleanup', () => {
+  it('on removes a leftover speculate-workspace server', async () => {
+    // A ≤0.10 install left the workspace server registered at local scope.
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            [WORKSPACE_SERVER_NAME]: { command: SELF.command, args: [...SELF.args, 'wrap', '--workspace', cwd] },
+          },
+        },
+      },
+    });
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+    expect(calls).toContainEqual(['claude', 'mcp', 'remove', WORKSPACE_SERVER_NAME, '-s', 'local']);
+    expect(readClaudeJson().projects?.[cwd]?.mcpServers?.[WORKSPACE_SERVER_NAME]).toBeUndefined();
+  });
+
+  it('on uninstalls the legacy plugin when plugin list reports it', async () => {
+    pluginSim = { installed: true, marketplace: true }; // ≤0.10 plugin still installed
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     const code = await speculateOn(opts());
     expect(code).toBe(0);
-    // Plugin installed through the host CLI, at local scope.
-    expect(pluginSim.installed).toBe(true);
-    expect(calls).toContainEqual(['claude', 'plugin', 'marketplace', 'add', 'lukebward/speculate']);
-    expect(calls).toContainEqual([
-      'claude', 'plugin', 'install', '-s', 'local', 'speculate@speculate',
-    ]);
-    // The plugin brings the workspace server — no separate local registration.
-    expect(readClaudeJson().projects?.[cwd]?.mcpServers?.[WORKSPACE_SERVER_NAME]).toBeUndefined();
-    // Recorded for exact restore.
-    const state = JSON.parse(readFileSync(statePath, 'utf8'));
-    const actions = Object.fromEntries(
-      state.projects[cwd].entries.map((e: AnyRecord) => [e.name, e.action]),
+    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']);
+    expect(pluginSim.installed).toBe(false);
+    expect(pluginSim.marketplace).toBe(false);
+  });
+
+  it('cleanup failures are logged, never fatal', async () => {
+    pluginSim = { installed: true, marketplace: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    const failingRunner: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'uninstall') {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'boom' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOn({ ...opts(), runner: failingRunner });
+    expect(code).toBe(0); // the unrelated github wrap still succeeded
+    expect(logs.join('\n')).toContain('plugin uninstall failed');
+    expect(readClaudeJson().mcpServers.github.command).toBe(SELF.command);
+  });
+
+  it('off with a ≤0.10 state file containing action:"plugin" still uninstalls', async () => {
+    pluginSim = { installed: true, marketplace: true };
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: 'speculate@speculate', scope: 'local', action: 'plugin' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
     );
-    expect(actions).toEqual({ github: 'rewrote', 'speculate@speculate': 'plugin' });
-    expect(state.marketplaceAddedByOn).toBe(true);
-  });
-
-  it('does not reinstall when the plugin is already there, and off leaves it alone', async () => {
-    pluginSim = { installed: true, marketplace: true }; // user installed it themselves
-    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    await speculateOn(opts());
-    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'install')).toEqual([]);
-
-    await speculateOff(opts());
-    // `on` didn't install it, so `off` must not uninstall it.
-    expect(pluginSim.installed).toBe(true);
-    expect(pluginSim.marketplace).toBe(true);
-  });
-
-  it('off uninstalls the plugin and removes the marketplace it added', async () => {
-    pluginSim = { installed: false, marketplace: false };
-    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    await speculateOn(opts());
-    expect(pluginSim.installed).toBe(true);
-
     const code = await speculateOff(opts());
     expect(code).toBe(0);
+    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']);
     expect(pluginSim.installed).toBe(false);
-    expect(pluginSim.marketplace).toBe(false); // last project let go → marketplace removed
-    expect(readClaudeJson().mcpServers.github).toEqual({ command: 'gh-server' });
-  });
-
-  it('--no-plugin (plugin: false) keeps the workspace-server behavior', async () => {
-    pluginSim = { installed: false, marketplace: false };
-    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    await speculateOn({ ...opts(), plugin: false });
-    expect(pluginSim.installed).toBe(false);
-    expect(readClaudeJson().projects[cwd].mcpServers[WORKSPACE_SERVER_NAME]).toBeDefined();
-  });
-
-  it('falls back to the workspace server when the plugin CLI is unavailable', async () => {
-    pluginSim = null; // old host: `claude plugin` doesn't exist
-    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    const code = await speculateOn(opts());
-    expect(code).toBe(0);
-    expect(readClaudeJson().projects[cwd].mcpServers[WORKSPACE_SERVER_NAME]).toBeDefined();
   });
 });
 
