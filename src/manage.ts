@@ -174,8 +174,20 @@ async function frontDoorAvailable(ctx: Ctx): Promise<boolean> {
 
 // -- legacy artifact cleanup (≤0.10 plugin + workspace server) -------------------
 
-/** Remove artifacts a ≤0.10 install left behind (plugin, workspace server). */
-export async function cleanupLegacyArtifacts(ctx: Ctx, view: ClaudeConfigView): Promise<void> {
+/**
+ * Remove artifacts a ≤0.10 install left behind (plugin, workspace server).
+ *
+ * Returns whether the plugin was confirmed uninstalled here, so callers
+ * with their own record of a legacy plugin install (off()'s `action:
+ * 'plugin'` state entries) know whether they still need to try themselves —
+ * detection can miss (older hosts with no `claude plugin` CLI at all, or a
+ * plugin id shape this substring check doesn't recognize), and a recorded
+ * install must never be silently dropped just because detection missed.
+ */
+export async function cleanupLegacyArtifacts(
+  ctx: Ctx,
+  view: ClaudeConfigView,
+): Promise<{ pluginUninstalled: boolean }> {
   if (effectiveServers(view.servers).has(WORKSPACE_SERVER_NAME)) {
     const res = await ctx.runner(
       ctx.claudeBin,
@@ -189,23 +201,28 @@ export async function cleanupLegacyArtifacts(ctx: Ctx, view: ClaudeConfigView): 
     );
   }
   const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
-  if (list.code === 0 && list.stdout.includes('"speculate"')) {
-    const un = await ctx.runner(
-      ctx.claudeBin,
-      ['plugin', 'uninstall', '-s', 'local', 'speculate'],
-      { cwd: ctx.cwd },
-    );
-    ctx.log(
-      un.code === 0
-        ? '[speculate] legacy: uninstalled the speculate plugin (Bash hook retired in 0.11)'
-        : `[speculate] legacy: plugin uninstall failed — remove manually: ${ctx.claudeBin} plugin uninstall -s local speculate`,
-    );
-    if (un.code === 0) {
-      await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'remove', 'speculate'], {
-        cwd: ctx.cwd,
-      });
-    }
+  // Match a bare `"speculate"` name field AND a `speculate@...` id (e.g.
+  // `speculate@speculate`) — hosts differ in which field they populate.
+  const detected =
+    list.code === 0 &&
+    (list.stdout.includes('"speculate"') || list.stdout.includes('speculate@'));
+  if (!detected) return { pluginUninstalled: false };
+  const un = await ctx.runner(
+    ctx.claudeBin,
+    ['plugin', 'uninstall', '-s', 'local', 'speculate'],
+    { cwd: ctx.cwd },
+  );
+  ctx.log(
+    un.code === 0
+      ? '[speculate] legacy: uninstalled the speculate plugin (Bash hook retired in 0.11)'
+      : `[speculate] legacy: plugin uninstall failed — remove manually: ${ctx.claudeBin} plugin uninstall -s local speculate`,
+  );
+  if (un.code === 0) {
+    await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'remove', 'speculate'], {
+      cwd: ctx.cwd,
+    });
   }
+  return { pluginUninstalled: un.code === 0 };
 }
 
 // -- on ---------------------------------------------------------------------------
@@ -317,8 +334,9 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     return 1;
   }
   const preView = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
+  let legacyCleanup: { pluginUninstalled: boolean } = { pluginUninstalled: false };
   try {
-    await cleanupLegacyArtifacts(ctx, preView);
+    legacyCleanup = await cleanupLegacyArtifacts(ctx, preView);
   } catch (err) {
     ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
   }
@@ -330,8 +348,26 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   for (const entry of record?.entries ?? []) {
     handled.add(entry.name);
     if (entry.action === 'plugin') {
-      // Legacy (≤0.10) record: cleanupLegacyArtifacts (above) already
-      // uninstalled the plugin via the host's own CLI if it was still there.
+      // Legacy (≤0.10) record. cleanupLegacyArtifacts (above) already
+      // uninstalled the plugin if its detection fired — don't double up.
+      // But detection can miss (older host with no `claude plugin` CLI, or
+      // a plugin id shape it doesn't recognize): a recorded install must
+      // never be silently dropped, so fall back to a direct attempt.
+      if (!legacyCleanup.pluginUninstalled) {
+        const res = await ctx.runner(
+          ctx.claudeBin,
+          ['plugin', 'uninstall', '-s', 'local', 'speculate'],
+          { cwd: ctx.cwd },
+        );
+        if (res.code !== 0) {
+          ctx.log(
+            `[speculate] plugin: uninstall failed: ${(res.stderr || res.stdout).trim()} — remove manually: ${ctx.claudeBin} plugin uninstall -s local speculate`,
+          );
+          failed++;
+        } else {
+          ctx.log('[speculate] plugin: uninstalled (this project)');
+        }
+      }
       continue;
     }
     if (entry.action === 'added' || entry.action === 'shadowed') {

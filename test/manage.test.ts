@@ -268,8 +268,61 @@ describe('legacy artifact cleanup', () => {
     );
     const code = await speculateOff(opts());
     expect(code).toBe(0);
-    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']);
+    // Detection fired in cleanupLegacyArtifacts, so off()'s own entry
+    // handling must not attempt a redundant second uninstall.
+    const uninstallCalls = calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall');
+    expect(uninstallCalls).toEqual([['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']]);
     expect(pluginSim.installed).toBe(false);
+  });
+
+  it('off still attempts uninstall directly when legacy detection is unavailable, and fails loud', async () => {
+    // pluginSim stays null: `claude plugin` doesn't exist on this host at
+    // all, so cleanupLegacyArtifacts's detection can't confirm anything —
+    // it must not cause a state-recorded plugin install to be silently
+    // dropped. off() has to attempt the uninstall itself and, on failure,
+    // log and count it, so the exit code reflects the failure.
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: 'speculate@speculate', scope: 'local', action: 'plugin' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const code = await speculateOff(opts());
+    expect(code).toBe(1);
+    const uninstallCalls = calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall');
+    expect(uninstallCalls).toEqual([['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']]);
+    expect(logs.join('\n')).toContain('uninstall failed');
+  });
+
+  it('detects a plugin identified only by id (speculate@speculate, no bare name field)', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    let installed = true;
+    const idOnlyRunner: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'list') {
+        calls.push([cmd, ...args]);
+        return {
+          code: 0,
+          stdout: JSON.stringify(installed ? [{ id: 'speculate@speculate' }] : []),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'plugin' && args[1] === 'uninstall') {
+        calls.push([cmd, ...args]);
+        installed = false;
+        return { code: 0, stdout: 'Uninstalled', stderr: '' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOn({ ...opts(), runner: idOnlyRunner });
+    expect(code).toBe(0);
+    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']);
+    expect(installed).toBe(false);
   });
 });
 
