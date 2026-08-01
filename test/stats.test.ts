@@ -67,6 +67,8 @@ const report: UsageReport = {
   }),
   bySource: {
     mcp: totals({ sessions: 1, estimatedSavedMs: 70_000 }),
+    // `cli` totals only ever come from <=0.10 records now (CLI speculation
+    // was retired in 0.11); the formatter must still render them.
     cli: totals({ sessions: 1, estimatedSavedMs: 20_000 }),
   },
   workspaces: [

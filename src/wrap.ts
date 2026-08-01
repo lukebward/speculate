@@ -20,8 +20,6 @@ export interface WrapArgs {
   mode: SpeculationMode;
   profile: string | null;
   allow: string[];
-  /** §13.11 catalog toggle; currently unused (kept pending shell-server removal). */
-  noAuto: boolean;
   /**
    * §13.12 protocol sniffing: engage the proxy only if the first client
    * line is an MCP initialize; otherwise degrade to a transparent pipe.
@@ -34,11 +32,10 @@ export interface WrapArgs {
 /** Substring → vetted profile, checked against the wrapped command line. */
 const PROFILE_AUTODETECT: [string, string][] = [
   ['github-mcp-server', 'github'],
-  ['speculate-shell', 'shell'],
 ];
 
 export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
-  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], noAuto: false, sniff: false, command: [] };
+  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], sniff: false, command: [] };
   let i = 0;
   for (; i < argv.length; i++) {
     const a = argv[i]!;
@@ -60,8 +57,6 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       const list = argv[++i];
       if (!list) return { error: '--allow requires a comma-separated tool list' };
       out.allow.push(...list.split(',').map((s) => s.trim()).filter(Boolean));
-    } else if (a === '--no-auto') {
-      out.noAuto = true;
     } else if (a === '--sniff') {
       out.sniff = true;
     } else {

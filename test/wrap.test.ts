@@ -22,7 +22,6 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
     mode: over.mode ?? 'annotated',
     profile: over.profile ?? null,
     allow: over.allow ?? [],
-    noAuto: over.noAuto ?? false,
     sniff: over.sniff ?? false,
     command: over.command ?? [],
   };
@@ -39,7 +38,6 @@ describe('parseWrapArgs', () => {
       mode: 'strict',
       profile: 'github',
       allow: ['a', 'b'],
-      noAuto: false,
       sniff: false,
       command: ['github-mcp-server', 'stdio'],
     });
@@ -63,7 +61,7 @@ describe('parseWrapArgs', () => {
     const e = err(parseWrapArgs(['--profile', 'gitlab', '--', 'srv']));
     expect(e).toContain("unknown profile 'gitlab'");
     expect(e).toContain('github');
-    expect(e).toContain('shell');
+    expect(e).toContain('filesystem');
   });
 
   it('parses --allow csv: trims spaces, drops empties', () => {
@@ -88,6 +86,11 @@ describe('parseWrapArgs', () => {
     expect('error' in r && r.error).toMatch(/unknown wrap argument '--commands'/);
   });
 
+  it('rejects the removed --no-auto flag', () => {
+    const r = parseWrapArgs(['--no-auto', '--', 'server']);
+    expect('error' in r && r.error).toMatch(/unknown wrap argument '--no-auto'/);
+  });
+
   it("leaves flag-looking tokens after -- to the wrapped command", () => {
     const args = ok(parseWrapArgs(['--', 'server', '--mode', 'x']));
     expect(args.command).toEqual(['server', '--mode', 'x']);
@@ -106,11 +109,6 @@ describe('buildWrapConfig', () => {
     expect(config.servers['upstream']!.profile).toBe('github');
   });
 
-  it('auto-detects the shell profile from speculate-shell in the command line', () => {
-    const { config } = buildWrapConfig(mkArgs({ command: ['node', '/opt/speculate-shell.js'] }));
-    expect(config.servers['upstream']!.profile).toBe('shell');
-  });
-
   it('sets no profile when nothing matches', () => {
     const { config } = buildWrapConfig(mkArgs({ command: ['my-server', 'stdio'] }));
     expect('profile' in config.servers['upstream']!).toBe(false);
@@ -118,9 +116,9 @@ describe('buildWrapConfig', () => {
 
   it('lets an explicit --profile win over autodetect', () => {
     const { config } = buildWrapConfig(
-      mkArgs({ profile: 'shell', command: ['github-mcp-server', 'stdio'] }),
+      mkArgs({ profile: 'filesystem', command: ['github-mcp-server', 'stdio'] }),
     );
-    expect(config.servers['upstream']!.profile).toBe('shell');
+    expect(config.servers['upstream']!.profile).toBe('filesystem');
   });
 
   it('places the allow list in allowTools (and omits the key when empty)', () => {

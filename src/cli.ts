@@ -19,12 +19,6 @@ import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
 import { parseTryArgs, runTry } from './tryRun.js';
 import { speculateOff, speculateOn, speculateStatus } from './manage.js';
-import { parseExecArgs, runExec } from './execClient.js';
-import {
-  DaemonAlreadyRunningError,
-  parseDaemonArgs,
-  startExecDaemon,
-} from './execDaemon.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
 import { createUsageRecorder } from './usage.js';
@@ -34,37 +28,26 @@ const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
 install-and-it-works (no config files edited by hand):
   speculate try [-- <claude args...>]      zero-write trial: launch Claude Code with every
-                                           MCP server wrapped + CLI speculation, this session only
-  speculate on [--mode <mode>] [--no-plugin]
-                                           the one command: wrap this project's MCP servers
-                                           (via 'claude mcp') AND install CLI speculation —
-                                           the plugin's workspace server + Bash hook
-                                           (--no-plugin: workspace server only, no hook)
+                                           MCP server wrapped, this session only
+  speculate on [--mode <mode>]             wrap this project's MCP servers via 'claude mcp'
   speculate off                            undo everything 'on' did (exact restore)
   speculate status                         what's wrapped here, and what drifted since 'on'
-  speculate stats [--json]                 cumulative MCP and CLI speculation usage
+  speculate stats [--json]                 cumulative speculation usage
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
                                            server any client launches, even ones added later
 
 manual wrapping:
   speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
-  speculate wrap --workspace <dir>                           zero config: CLI speculation for a repo
   speculate --config <path> [--mode strict|annotated|off]    run the proxy from a config file
   speculate init [path]                                      write a starter config
   speculate doctor --config <path>                           connect upstreams, explain
                                                              per-tool speculation eligibility
   speculate validate --config <path>                         validate the config and exit
 
-CLI speculation (used by the Claude Code plugin's Bash hook):
-  speculate exec [--cwd <dir>] -- <command...>   serve a vetted read-only command from the
-                                                 per-workspace daemon cache (fail-open)
-  speculate exec --stats                         daemon hit-rate for this workspace
-
 wrap flags (before the '--'):
   --mode <mode>       strict|annotated|off (default for wrap: annotated)
   --profile <name>    force a vetted profile (auto-detected for known servers)
   --allow <t1,t2>     extra read-only allowlist entries
-  --workspace <dir>   speculate the bundled read-only shell server for <dir>
   --sniff             engage only if the client speaks MCP; else byte-transparent pipe
 
 options:
@@ -84,8 +67,6 @@ const STARTER_CONFIG = `{
       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." },
       "profile": "github",
     },
-    // CLI speculation for a repo (git status/diff/log, ls, ripgrep):
-    // "workspace": { "command": "speculate-shell", "args": ["--cwd", "/path/to/repo"], "profile": "shell" },
   },
   // "persistence": { "enabled": false },
 }
@@ -103,8 +84,6 @@ interface Args {
     | 'off'
     | 'status'
     | 'stats'
-    | 'exec'
-    | 'exec-daemon'
     | 'shims';
   configPath: string;
   modeOverride: 'strict' | 'annotated' | 'off' | null;
@@ -119,8 +98,6 @@ const REST_COMMANDS = new Set([
   'off',
   'status',
   'stats',
-  'exec',
-  'exec-daemon',
   'shims',
 ] as const);
 
@@ -134,8 +111,8 @@ const REST_COMMANDS = new Set([
  *   which flushes stdout/stderr completely, however slow the consumer —
  *   the same blocking semantics as any ordinary CLI.
  * - Paths where live handles would hold the loop open forever (proxy
- *   transports and upstream children, the exec daemon's server, a piped
- *   stdin): exitWhenFlushed() hands process.exit() to the streams' write
+ *   transports and upstream children, a piped stdin): exitWhenFlushed()
+ *   hands process.exit() to the streams' write
  *   callbacks, which fire only after everything previously buffered has
  *   reached the OS. Exact, no timer.
  */
@@ -231,25 +208,6 @@ async function main(): Promise<void> {
     if ('error' in statsArgs) fail(`stats: ${statsArgs.error}`);
     process.exitCode = runStats(statsArgs);
     return;
-  }
-
-  if (args.command === 'exec') {
-    const execArgs = parseExecArgs(args.rest);
-    if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
-    process.exitCode = await runExec(execArgs);
-    return; // natural exit — a slow reader gets every byte
-  }
-
-  if (args.command === 'exec-daemon') {
-    const daemonArgs = parseDaemonArgs(args.rest);
-    if ('error' in daemonArgs) fail(`exec-daemon: ${daemonArgs.error}`);
-    try {
-      await startExecDaemon({ ...daemonArgs, onIdle: () => exitWhenFlushed(0) });
-    } catch (err) {
-      if (err instanceof DaemonAlreadyRunningError) return; // rendezvous won
-      throw err;
-    }
-    return; // stays alive serving the socket
   }
 
   if (args.command === 'shims') {

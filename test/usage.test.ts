@@ -85,7 +85,7 @@ describe('UsageRecorder', () => {
   it('writes an initial zero snapshot', () => {
     const directory = dir();
     new UsageRecorder({
-      source: 'cli',
+      source: 'mcp',
       workspace: '/workspace/a',
       directory,
       sessionId: 'a',
@@ -132,7 +132,7 @@ describe('UsageRecorder', () => {
       flushDelayMs: 0,
     });
     const b = new UsageRecorder({
-      source: 'cli',
+      source: 'mcp',
       workspace: '/workspace/b',
       directory,
       sessionId: 'b',
@@ -211,7 +211,12 @@ describe('UsageRecorder', () => {
 });
 
 describe('readUsageReport', () => {
-  it('aggregates sessions by source and workspace', () => {
+  // The `cli` snapshot below is a HISTORICAL record: CLI speculation was
+  // retired in 0.11, but stats files written by <=0.10 installs are still on
+  // disk and must keep reading back. This is the one case that pins that
+  // tolerance — `source: 'cli'` stays valid input even though nothing writes
+  // it any more (see UsageSource in src/usage.ts).
+  it('aggregates sessions by source and workspace, tolerating retired-tier records', () => {
     const directory = dir();
     writeSnapshot(
       directory,
