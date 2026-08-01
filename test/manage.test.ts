@@ -412,6 +412,112 @@ describe('legacy artifact cleanup', () => {
     expect(logs.join('\n')).not.toContain('failed');
   });
 
+  it("off's own direct-removal attempt fires when cleanup's view never saw the workspace server, but the host still has it", async () => {
+    // The legacy state record survives (as in the ≤0.10 upgrade case above),
+    // but this time cleanupLegacyArtifacts's own view of the host — built by
+    // parsing .claude.json — never included speculate-workspace at all (a
+    // stale/partial read, or a host quirk our parsing doesn't recognize), so
+    // its own removal is never attempted (workspaceServerRemovalAttempted
+    // stays false). The host itself, simulated here independently of that
+    // file, still has the server. This is off()'s own per-entry fallback —
+    // "cleanup never saw it in the host view" — which must attempt the
+    // removal directly rather than silently doing nothing.
+    writeClaudeJson({}); // no speculate-workspace entry visible to our parsing
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const hostStillHasIt: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'remove' && args[2] === WORKSPACE_SERVER_NAME) {
+        calls.push([cmd, ...args]);
+        return { code: 0, stdout: `Removed ${WORKSPACE_SERVER_NAME}`, stderr: '' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOff({ ...opts(), runner: hostStillHasIt });
+    expect(code).toBe(0);
+    // Exactly one removal attempt: cleanupLegacyArtifacts's own workspace
+    // check (based on its view) never fired, so off()'s per-entry direct
+    // attempt is the only one — not a redundant double-removal.
+    const removeCalls = calls.filter(
+      (c) => c[1] === 'mcp' && c[2] === 'remove' && c[3] === WORKSPACE_SERVER_NAME,
+    );
+    expect(removeCalls).toEqual([['claude', 'mcp', 'remove', WORKSPACE_SERVER_NAME, '-s', 'local']]);
+    expect(logs.join('\n')).toContain(`${WORKSPACE_SERVER_NAME}: removed`);
+    expect(logs.join('\n')).not.toContain('failed');
+  });
+
+  it('off\'s direct-removal attempt classifies "no such server" as success, not failure', async () => {
+    // Same unreachable-from-cleanup setup as above, but the host reports the
+    // server is already gone by the time off() attempts it directly (a race
+    // with a prior/parallel cleanup, or simply already removed by hand).
+    // That must be classified as success — the load-bearing
+    // /no\s+(mcp\s+)?server/i check.
+    writeClaudeJson({});
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const alreadyGone: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'remove' && args[2] === WORKSPACE_SERVER_NAME) {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'No MCP server found named speculate-workspace' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOff({ ...opts(), runner: alreadyGone });
+    expect(code).toBe(0);
+    expect(logs.join('\n')).not.toContain('failed');
+    expect(logs.join('\n')).not.toContain(`${WORKSPACE_SERVER_NAME}: removed`);
+    expect(logs.join('\n')).toContain('off: done.');
+  });
+
+  it("off's direct-removal attempt still fails loud on an unrelated removal error", async () => {
+    // Same setup again, but this time the direct removal fails for a reason
+    // that has nothing to do with "already gone" — must be counted and
+    // reported honestly, not swallowed by the success-classification regex.
+    writeClaudeJson({});
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const unrelatedFailure: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'remove' && args[2] === WORKSPACE_SERVER_NAME) {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'permission denied' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOff({ ...opts(), runner: unrelatedFailure });
+    expect(code).toBe(1);
+    expect(logs.join('\n')).toContain(`${WORKSPACE_SERVER_NAME}: remove failed: permission denied`);
+    expect(logs.join('\n')).toContain('off: done (1 failure(s))');
+  });
+
   it('on strips ≤0.10 legacy entries once cleanup has actually removed them', async () => {
     // A ≤0.10 managed.json carried a leftover workspace-server entry and a
     // plugin entry. Once cleanupLegacyArtifacts has really removed them from
