@@ -112,9 +112,9 @@ const REST_COMMANDS = new Set([
  *   the same blocking semantics as any ordinary CLI.
  * - Paths where live handles would hold the loop open forever (proxy
  *   transports and upstream children, a piped stdin): exitWhenFlushed()
- *   hands process.exit() to the streams' write
- *   callbacks, which fire only after everything previously buffered has
- *   reached the OS. Exact, no timer.
+ *   hands process.exit() to the streams' write callbacks, which fire only
+ *   after everything previously buffered has reached the OS. Exact, no
+ *   timer.
  */
 class ExitRequest {
   constructor(readonly code: number) {}

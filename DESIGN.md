@@ -451,6 +451,19 @@ Scenario coverage: S9 (priming curve across three restarts), S10/S11 (profile wo
 
 Known limits (v0.11 candidates): openers fire only on the MCP proxy path (the exec daemon's `cli` label doesn't record them); the 2-sighting opener threshold deliberately trades one cold session for evidence; opener recording keys on exact argument reprs, so a workspace whose opening reads vary (e.g. issue-of-the-day) never primes — by design, never by accident.
 
+## v0.11 (2026-08-01): MCP-only focus
+
+CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.
+Rationale: speculation value scales with upstream latency — MCP/SaaS reads
+(hundreds of ms) dominate local CLI reads (~30 ms, often net-negative after
+hook spawn overhead); read-only vetting of arbitrary argv has no
+deterministic cross-platform answer short of per-OS sandbox machinery,
+while MCP's readOnlyHint gives it for free; and the tier carried the
+project's POSIX-only surface (unix sockets, uid checks) plus a Windows
+.git/index watcher loop that flushed every prefetch. `on`/`off` now clean
+up artifacts a ≤0.10 install left behind. Full trail:
+docs/superpowers/specs/2026-08-01-focus-mcp-design.md.
+
 ---
 
 ## Appendix A. Market research & prior art

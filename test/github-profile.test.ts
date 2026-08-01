@@ -371,4 +371,12 @@ describe('githubProfile shape', () => {
     expect(githubProfile.name).toBe('github');
     expect(Object.keys(builtinProfiles)).toContain('github');
   });
+
+  it('registers exactly the three built-in profiles (no CLI-tier leftovers)', () => {
+    expect(Object.keys(builtinProfiles).sort()).toEqual([
+      'filesystem',
+      'github',
+      'slack',
+    ]);
+  });
 });

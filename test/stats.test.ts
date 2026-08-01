@@ -121,6 +121,17 @@ describe('formatUsageReport', () => {
     expect(output).toContain('Ignored records: 1');
   });
 
+  it('omits the CLI line when no CLI records exist (fresh 0.11 installs)', () => {
+    const fixture: UsageReport = {
+      ...report,
+      bySource: { ...report.bySource, cli: totals() },
+    };
+
+    const output = formatUsageReport(fixture);
+    expect(output).not.toContain('CLI:');
+    expect(output).toContain('MCP: 1m 10s saved');
+  });
+
   it.each([
     [999.4, '999ms'],
     [1500, '2s'],
