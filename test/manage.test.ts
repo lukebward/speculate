@@ -230,18 +230,22 @@ describe('legacy artifact cleanup', () => {
     pluginSim = { installed: true, marketplace: true }; // ≤0.10 plugin still installed
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     // ≤0.10's own `on` recorded that it added the marketplace registration
-    // itself — only then is it safe for cleanup to remove it.
+    // itself — only then is it safe for cleanup to remove it. That flag is
+    // host-global, so 0.10 wrote it at the top level of the state file, not
+    // per-project.
     writeFileSync(
       statePath,
       JSON.stringify({
         version: 1,
-        projects: { [cwd]: { entries: [], updatedAt: Date.now(), marketplaceAddedByOn: true } },
+        projects: { [cwd]: { entries: [], updatedAt: Date.now() } },
+        marketplaceAddedByOn: true,
       }),
     );
     const code = await speculateOn(opts());
     expect(code).toBe(0);
     // 0.10's PLUGIN_ID was the fully-qualified id; try that first.
     expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate']);
+    expect(calls).toContainEqual(['claude', 'plugin', 'marketplace', 'remove', 'speculate']);
     expect(pluginSim.installed).toBe(false);
     expect(pluginSim.marketplace).toBe(false);
   });

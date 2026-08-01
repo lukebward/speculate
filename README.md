@@ -82,7 +82,7 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 398 tests (392 passing, 6 skipped on this platform)
+npm test        # 404 tests (398 passing, 6 skipped on this platform)
 npm run bench   # speculation off vs on
 npm run demo    # the README demo, against the bundled mock (injected latency)
 ```

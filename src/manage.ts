@@ -80,27 +80,19 @@ export interface ManagedEntry {
 
 interface ManagedState {
   version: 1;
-  projects: Record<
-    string,
-    {
-      entries: ManagedEntry[];
-      updatedAt: number;
-      /**
-       * ≤0.10 only: true when that `on` run added the (host-global) plugin
-       * marketplace registration itself, as opposed to finding one already
-       * there. 0.11 never sets this — `on` no longer installs the plugin —
-       * but it's read tolerantly from old state files so cleanup never
-       * removes a marketplace registration it doesn't know it owns.
-       */
-      marketplaceAddedByOn?: boolean;
-    }
-  >;
+  projects: Record<string, { entries: ManagedEntry[]; updatedAt: number }>;
+  /**
+   * ≤0.10 only: true when that host's `on` run added the (host-global)
+   * plugin marketplace registration itself, as opposed to finding one
+   * already there. 0.11 never sets this — `on` no longer installs the
+   * plugin — but it's read tolerantly from old state files so cleanup never
+   * removes a marketplace registration it doesn't know it owns.
+   */
+  marketplaceAddedByOn?: boolean;
 }
 
-function readMarketplaceAddedByOn(
-  record: { entries: ManagedEntry[]; updatedAt: number; marketplaceAddedByOn?: boolean } | undefined,
-): boolean {
-  return record?.marketplaceAddedByOn === true;
+function readMarketplaceAddedByOn(state: ManagedState): boolean {
+  return (state as { marketplaceAddedByOn?: unknown }).marketplaceAddedByOn === true;
 }
 
 /** One human-readable record of everything `on` created, all projects. */
@@ -327,7 +319,7 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
   const record = state.projects[ctx.cwd] ?? { entries: [], updatedAt: Date.now() };
   try {
     await cleanupLegacyArtifacts(ctx, view, {
-      marketplaceAddedByOn: readMarketplaceAddedByOn(record),
+      marketplaceAddedByOn: readMarketplaceAddedByOn(state),
     });
   } catch (err) {
     ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
@@ -445,7 +437,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   };
   try {
     legacyCleanup = await cleanupLegacyArtifacts(ctx, preView, {
-      marketplaceAddedByOn: readMarketplaceAddedByOn(record),
+      marketplaceAddedByOn: readMarketplaceAddedByOn(state),
     });
   } catch (err) {
     ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
