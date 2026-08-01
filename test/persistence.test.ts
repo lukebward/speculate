@@ -29,18 +29,26 @@ function call(
 }
 
 describe('StateStore', () => {
-  it.skipIf(!hasPosixFileModes)('round-trips state atomically and owner-only', () => {
+  // Platform-neutral: this must be covered on every OS in the matrix, so the
+  // POSIX mode-bits assertion lives in its own skippable case below.
+  it('round-trips state atomically through a nested directory', () => {
     const path = join(dir(), 'nested', 'deeper', 'state.json');
     const store = new StateStore(path, () => 1234);
     expect(store.load()).toBeNull(); // first run: cold start
     expect(store.save({ learner: { transitions: [] }, ruleFeedback: { r: { hits: 1, wasted: 0, speculated: 2 } } })).toBe(true);
     expect(existsSync(`${path}.tmp`)).toBe(false); // renamed, not left behind
-    expect(statSync(path).mode & 0o777).toBe(0o600);
 
     const loaded = store.load();
     expect(loaded?.version).toBe(1);
     expect(loaded?.savedAt).toBe(1234);
     expect(loaded?.ruleFeedback['r']).toEqual({ hits: 1, wasted: 0, speculated: 2 });
+  });
+
+  it.skipIf(!hasPosixFileModes)('writes the state file owner-only', () => {
+    const path = join(dir(), 'state.json');
+    const store = new StateStore(path, () => 1234);
+    expect(store.save({ learner: {}, ruleFeedback: {} })).toBe(true);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 
   it('treats corrupt and version-mismatched files as cold starts', () => {

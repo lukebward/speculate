@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -227,9 +227,15 @@ describe('runStats', () => {
   it('rejects the retired CLI-speculation commands and flags (removed in v0.11)', async () => {
     const stateHome = mkdtempSync(join(tmpdir(), 'speculate-stats-cli-legacy-'));
     try {
+      // `exec` survives ONLY as the compatibility pass-through below: it
+      // still needs a command, and unknown flags are still usage errors.
       const exec = await runCli(['exec'], stateHome);
       expect(exec.code).toBe(2);
-      expect(exec.stderr).toContain("unknown argument 'exec'");
+      expect(exec.stderr).toContain("exec: expected '--' followed by a command");
+
+      const execFlag = await runCli(['exec', '--bogus', '--', 'true'], stateHome);
+      expect(execFlag.code).toBe(2);
+      expect(execFlag.stderr).toContain("unknown exec argument '--bogus'");
 
       const execDaemon = await runCli(['exec-daemon'], stateHome);
       expect(execDaemon.code).toBe(2);
@@ -240,6 +246,53 @@ describe('runStats', () => {
       expect(onNoPlugin.stderr).toContain("unknown on argument '--no-plugin'");
     } finally {
       rmSync(stateHome, { recursive: true, force: true });
+    }
+  });
+
+  it('exec is a thin pass-through for a stranded ≤0.10 Bash hook', async () => {
+    // A ≤0.10 plugin hook still rewrites the agent's `git status`/`rg`/`ls`
+    // to `speculate exec [--cwd <dir>] -- <argv...>` in every project the
+    // user hasn't cleaned up yet. Failing those calls breaks the agent's
+    // basic workflow, so exec stays as a verbatim pass-through (one stderr
+    // line names the retirement and the fix) until 0.12.
+    const stateHome = mkdtempSync(join(tmpdir(), 'speculate-exec-'));
+    const workDir = realpathSync(mkdtempSync(join(tmpdir(), 'speculate-exec-cwd-')));
+    try {
+      const ok = await runCli(
+        ['exec', '--', process.execPath, '-e', 'console.log("passed-through")'],
+        stateHome,
+      );
+      expect(ok.code).toBe(0);
+      expect(ok.stdout).toContain('passed-through');
+      expect(ok.stderr).toContain(
+        "[speculate] CLI speculation was retired in 0.11 — this is a compatibility pass-through; run 'speculate on' to remove the legacy hook.",
+      );
+
+      // The child's exit code is the CLI's exit code.
+      const failed = await runCli(
+        ['exec', '--', process.execPath, '-e', 'process.exit(3)'],
+        stateHome,
+      );
+      expect(failed.code).toBe(3);
+
+      // --cwd is honored (the hook passes the project directory).
+      const cwd = await runCli(
+        ['exec', '--cwd', workDir, '--', process.execPath, '-e', 'console.log(process.cwd())'],
+        stateHome,
+      );
+      expect(cwd.code).toBe(0);
+      expect(cwd.stdout.trim()).toBe(workDir);
+
+      // A command that cannot be spawned fails loudly, never silently.
+      const missing = await runCli(
+        ['exec', '--', 'speculate-no-such-binary-xyz'],
+        stateHome,
+      );
+      expect(missing.code).not.toBe(0);
+      expect(missing.stderr).toContain('speculate-no-such-binary-xyz');
+    } finally {
+      rmSync(stateHome, { recursive: true, force: true });
+      rmSync(workDir, { recursive: true, force: true });
     }
   });
 

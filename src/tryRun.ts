@@ -175,7 +175,7 @@ export async function runTry(args: TryArgs): Promise<number> {
 }
 
 /** Best-effort signal-name → number for conventional 128+n exit codes. */
-function nodeSignalNumber(sig: NodeJS.Signals): number | null {
+export function nodeSignalNumber(sig: NodeJS.Signals): number | null {
   const map: Partial<Record<NodeJS.Signals, number>> = {
     SIGHUP: 1,
     SIGINT: 2,

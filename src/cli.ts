@@ -9,6 +9,7 @@
  * When running the proxy, stdout carries the MCP protocol; all diagnostics
  * go to stderr. `doctor` and `validate` are human-facing and use stdout.
  */
+import { spawn } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import { loadConfig } from './config.js';
 import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
@@ -17,7 +18,7 @@ import { runDoctor } from './doctor.js';
 import { buildWrapConfig, parseWrapArgs } from './wrap.js';
 import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
-import { parseTryArgs, runTry } from './tryRun.js';
+import { nodeSignalNumber, parseTryArgs, runTry } from './tryRun.js';
 import { speculateOff, speculateOn, speculateStatus } from './manage.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
@@ -55,6 +56,10 @@ options:
   --mode <mode>     override the config's speculation mode for this run
   --version         print version and exit
   --help            show this help
+
+compatibility:
+  speculate exec [--cwd <dir>] -- <command...>   run <command> verbatim; kept only so a
+                                                stranded ≤0.10 Bash hook still works (removed in 0.12)
 `;
 
 const STARTER_CONFIG = `{
@@ -84,7 +89,8 @@ interface Args {
     | 'off'
     | 'status'
     | 'stats'
-    | 'shims';
+    | 'shims'
+    | 'exec';
   configPath: string;
   modeOverride: 'strict' | 'annotated' | 'off' | null;
   rest: string[];
@@ -99,6 +105,7 @@ const REST_COMMANDS = new Set([
   'status',
   'stats',
   'shims',
+  'exec',
 ] as const);
 
 /**
@@ -182,8 +189,75 @@ function parseArgs(argv: string[]): Args {
   return { command, configPath, modeOverride, rest: [] };
 }
 
+/**
+ * `speculate exec [--cwd <dir>] -- <command...>` — compatibility only.
+ *
+ * CLI speculation (and the ≤0.10 plugin's Bash hook that rewrote the agent's
+ * `git status`/`rg`/`ls` into `speculate exec -- …`) was retired in 0.11, but
+ * that hook stays installed per-project until `speculate on` cleans it up.
+ * Failing those calls would break the agent's basic workflow in every
+ * not-yet-cleaned project, so exec survives one release as a VERBATIM
+ * pass-through: no shell, no rewriting, the child's own exit code. Remove in
+ * 0.12.
+ */
+interface ExecArgs {
+  cwd: string | null;
+  argv: string[];
+}
+
+export function parseExecArgs(argv: string[]): ExecArgs | { error: string } {
+  let cwd: string | null = null;
+  let i = 0;
+  for (; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === '--') {
+      i++;
+      break;
+    }
+    if (a === '--cwd') {
+      const v = argv[++i];
+      if (!v) return { error: '--cwd requires a directory' };
+      cwd = v;
+    } else {
+      return { error: `unknown exec argument '${a}'` };
+    }
+  }
+  const rest = argv.slice(i);
+  if (rest.length === 0) return { error: "expected '--' followed by a command" };
+  return { cwd, argv: rest };
+}
+
+const EXEC_NOTICE =
+  "[speculate] CLI speculation was retired in 0.11 — this is a compatibility pass-through; run 'speculate on' to remove the legacy hook.";
+
+async function runExecPassThrough(execArgs: ExecArgs): Promise<number> {
+  process.stderr.write(`${EXEC_NOTICE}\n`);
+  const command = execArgs.argv[0]!;
+  return new Promise<number>((resolveExit) => {
+    const child = spawn(command, execArgs.argv.slice(1), {
+      cwd: execArgs.cwd ?? process.cwd(),
+      stdio: 'inherit',
+    });
+    child.on('error', (err) => {
+      process.stderr.write(`[speculate] exec: cannot run '${command}': ${err.message}\n`);
+      resolveExit(127);
+    });
+    child.on('exit', (code, signal) =>
+      resolveExit(signal ? 128 + (nodeSignalNumber(signal) ?? 1) : (code ?? 0)),
+    );
+  });
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.command === 'exec') {
+    const execArgs = parseExecArgs(args.rest);
+    if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
+    // stdio is inherited, so nothing of the child's is buffered here.
+    process.exitCode = await runExecPassThrough(execArgs);
+    return;
+  }
 
   if (args.command === 'init') {
     if (existsSync(args.configPath)) {

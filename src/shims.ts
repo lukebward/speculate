@@ -144,11 +144,27 @@ export interface ShimsOptions {
   rcPath?: string | null;
   noRc?: boolean;
   log?: (line: string) => void;
+  /** Injectable for tests; defaults to the running platform. */
+  platform?: NodeJS.Platform;
 }
+
+/**
+ * The shims are `#!/bin/sh` launchers on a PATH the shell reads at startup —
+ * neither exists on Windows. Say so once, plainly, instead of writing files
+ * Windows can't execute and an rc line Git Bash would split on the drive
+ * colon into two dead PATH entries.
+ */
+const WIN32_NOTE =
+  '[speculate] shims are POSIX-only (sh launchers) — not supported on Windows; ' +
+  "use 'speculate on' (or 'speculate try') instead";
 
 export function installShims(opts: ShimsOptions = {}): number {
   const home = opts.home ?? homedir();
   const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+  if ((opts.platform ?? process.platform) === 'win32') {
+    log(WIN32_NOTE);
+    return 2; // asked for something this platform cannot do — say so in $?
+  }
   const dir = shimsDir(home);
   mkdirSync(dir, { recursive: true, mode: 0o755 });
   for (const launcher of SHIMMED_LAUNCHERS) {
@@ -196,6 +212,11 @@ export function uninstallShims(opts: ShimsOptions = {}): number {
 export function shimsStatus(opts: ShimsOptions = {}): number {
   const home = opts.home ?? homedir();
   const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const platform = opts.platform ?? process.platform;
+  if (platform === 'win32') {
+    log(WIN32_NOTE);
+    return 0; // an honest report is not a failure
+  }
   const dir = shimsDir(home);
   const installed = SHIMMED_LAUNCHERS.filter((l) => existsSync(join(dir, l)));
   log(
@@ -203,6 +224,9 @@ export function shimsStatus(opts: ShimsOptions = {}): number {
       ? `[speculate] shims not installed (dir: ${dir})`
       : `[speculate] shims installed: ${installed.join(', ')} in ${dir}`,
   );
+  // Reached only on POSIX (win32 returned above), so ':' is the right
+  // separator here — on Windows it never was: every entry carries a drive
+  // colon, so this membership test could not match and always misreported.
   const onPath = (process.env.PATH ?? '').split(':').includes(dir);
   log(`[speculate] shim dir ${onPath ? 'IS' : 'is NOT'} on PATH in this shell`);
   return 0;
