@@ -224,6 +224,25 @@ describe('runStats', () => {
     }
   });
 
+  it('rejects the retired CLI-speculation commands and flags (removed in v0.11)', async () => {
+    const stateHome = mkdtempSync(join(tmpdir(), 'speculate-stats-cli-legacy-'));
+    try {
+      const exec = await runCli(['exec'], stateHome);
+      expect(exec.code).toBe(2);
+      expect(exec.stderr).toContain("unknown argument 'exec'");
+
+      const execDaemon = await runCli(['exec-daemon'], stateHome);
+      expect(execDaemon.code).toBe(2);
+      expect(execDaemon.stderr).toContain("unknown argument 'exec-daemon'");
+
+      const onNoPlugin = await runCli(['on', '--no-plugin'], stateHome);
+      expect(onNoPlugin.code).toBe(2);
+      expect(onNoPlugin.stderr).toContain("unknown on argument '--no-plugin'");
+    } finally {
+      rmSync(stateHome, { recursive: true, force: true });
+    }
+  });
+
   it('prints guidance when no snapshots exist', () => {
     let stdout = '';
 

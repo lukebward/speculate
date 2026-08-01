@@ -80,7 +80,27 @@ export interface ManagedEntry {
 
 interface ManagedState {
   version: 1;
-  projects: Record<string, { entries: ManagedEntry[]; updatedAt: number }>;
+  projects: Record<
+    string,
+    {
+      entries: ManagedEntry[];
+      updatedAt: number;
+      /**
+       * ≤0.10 only: true when that `on` run added the (host-global) plugin
+       * marketplace registration itself, as opposed to finding one already
+       * there. 0.11 never sets this — `on` no longer installs the plugin —
+       * but it's read tolerantly from old state files so cleanup never
+       * removes a marketplace registration it doesn't know it owns.
+       */
+      marketplaceAddedByOn?: boolean;
+    }
+  >;
+}
+
+function readMarketplaceAddedByOn(
+  record: { entries: ManagedEntry[]; updatedAt: number; marketplaceAddedByOn?: boolean } | undefined,
+): boolean {
+  return record?.marketplaceAddedByOn === true;
 }
 
 /** One human-readable record of everything `on` created, all projects. */
@@ -174,11 +194,42 @@ async function frontDoorAvailable(ctx: Ctx): Promise<boolean> {
 
 // -- legacy artifact cleanup (≤0.10 plugin + workspace server) -------------------
 
-/** The one `claude plugin uninstall` invocation, shared by cleanup and off()'s fallback. */
-async function runLegacyPluginUninstall(ctx: Ctx): Promise<CmdResult> {
-  return ctx.runner(ctx.claudeBin, ['plugin', 'uninstall', '-s', 'local', 'speculate'], {
-    cwd: ctx.cwd,
-  });
+/**
+ * IDs a ≤0.10 install may have registered the plugin under. 0.10's own
+ * PLUGIN_ID was the fully-qualified `speculate@speculate`; try that first,
+ * then fall back to the bare marketplace-less name some hosts also accept.
+ */
+const LEGACY_PLUGIN_IDS = ['speculate@speculate', 'speculate'] as const;
+
+/** The `claude plugin uninstall` invocation(s), shared by cleanup and off()'s fallback. */
+async function runLegacyPluginUninstall(ctx: Ctx): Promise<{ res: CmdResult; id: string }> {
+  let last: { res: CmdResult; id: string } = {
+    res: { code: 1, stdout: '', stderr: 'no id attempted' },
+    id: LEGACY_PLUGIN_IDS[0],
+  };
+  for (const id of LEGACY_PLUGIN_IDS) {
+    const res = await ctx.runner(ctx.claudeBin, ['plugin', 'uninstall', '-s', 'local', id], {
+      cwd: ctx.cwd,
+    });
+    last = { res, id };
+    if (res.code === 0) break;
+  }
+  return last;
+}
+
+/** Detect a still-installed legacy plugin via `claude plugin list --json`; fail-soft. */
+async function detectLegacyPlugin(ctx: Ctx): Promise<boolean> {
+  try {
+    const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
+    // Match a bare `"speculate"` name field AND a `speculate@...` id (e.g.
+    // `speculate@speculate`) — hosts differ in which field they populate.
+    return (
+      list.code === 0 &&
+      (list.stdout.includes('"speculate"') || list.stdout.includes('speculate@'))
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -192,43 +243,72 @@ async function runLegacyPluginUninstall(ctx: Ctx): Promise<CmdResult> {
  * substring check doesn't recognize), and a recorded install must never be
  * silently dropped just because detection missed. When an attempt was made
  * here and it failed, callers should also skip a duplicate attempt (it would
- * just fail again) but still count the failure — see off() below.
+ * just fail again) but still count the failure — see off() below. The same
+ * shape (removed-here vs attempted-here) is reported for the workspace
+ * server, so off()'s per-entry handling of a legacy `speculate-workspace`
+ * record never re-attempts a removal this function already ran.
  */
 export async function cleanupLegacyArtifacts(
   ctx: Ctx,
   view: ClaudeConfigView,
-): Promise<{ pluginUninstalled: boolean; pluginUninstallAttempted: boolean }> {
+  opts: { marketplaceAddedByOn: boolean } = { marketplaceAddedByOn: false },
+): Promise<{
+  pluginUninstalled: boolean;
+  pluginUninstallAttempted: boolean;
+  workspaceServerRemoved: boolean;
+  workspaceServerRemovalAttempted: boolean;
+}> {
+  let workspaceServerRemoved = false;
+  let workspaceServerRemovalAttempted = false;
   if (effectiveServers(view.servers).has(WORKSPACE_SERVER_NAME)) {
+    workspaceServerRemovalAttempted = true;
     const res = await ctx.runner(
       ctx.claudeBin,
       ['mcp', 'remove', WORKSPACE_SERVER_NAME, '-s', 'local'],
       { cwd: ctx.cwd },
     );
+    workspaceServerRemoved = res.code === 0;
     ctx.log(
       res.code === 0
         ? `[speculate] legacy: removed ${WORKSPACE_SERVER_NAME} (CLI speculation was retired in 0.11)`
         : `[speculate] legacy: could not remove ${WORKSPACE_SERVER_NAME}: ${(res.stderr || res.stdout).trim()}`,
     );
   }
-  const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
-  // Match a bare `"speculate"` name field AND a `speculate@...` id (e.g.
-  // `speculate@speculate`) — hosts differ in which field they populate.
-  const detected =
-    list.code === 0 &&
-    (list.stdout.includes('"speculate"') || list.stdout.includes('speculate@'));
-  if (!detected) return { pluginUninstalled: false, pluginUninstallAttempted: false };
-  const un = await runLegacyPluginUninstall(ctx);
+  const detected = await detectLegacyPlugin(ctx);
+  if (!detected) {
+    return {
+      pluginUninstalled: false,
+      pluginUninstallAttempted: false,
+      workspaceServerRemoved,
+      workspaceServerRemovalAttempted,
+    };
+  }
+  const { res: un, id } = await runLegacyPluginUninstall(ctx);
   ctx.log(
     un.code === 0
       ? '[speculate] legacy: uninstalled the speculate plugin (Bash hook retired in 0.11)'
-      : `[speculate] legacy: plugin uninstall failed — remove manually: ${ctx.claudeBin} plugin uninstall -s local speculate`,
+      : `[speculate] legacy: plugin uninstall failed (tried ${id}) — remove manually: ${ctx.claudeBin} plugin uninstall -s local ${id}`,
   );
-  if (un.code === 0) {
-    await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'remove', 'speculate'], {
+  // The marketplace registration is host-global, not per-project — only
+  // remove it when this project's own ≤0.10 state recorded that its `on`
+  // was the one that added it. Otherwise it may belong to another project,
+  // or the user added it by hand, and it's not ours to take.
+  if (un.code === 0 && opts.marketplaceAddedByOn) {
+    const rm = await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'remove', 'speculate'], {
       cwd: ctx.cwd,
     });
+    ctx.log(
+      rm.code === 0
+        ? '[speculate] legacy: removed the speculate marketplace registration'
+        : `[speculate] legacy: could not remove the speculate marketplace registration: ${(rm.stderr || rm.stdout).trim()}`,
+    );
   }
-  return { pluginUninstalled: un.code === 0, pluginUninstallAttempted: true };
+  return {
+    pluginUninstalled: un.code === 0,
+    pluginUninstallAttempted: true,
+    workspaceServerRemoved,
+    workspaceServerRemovalAttempted,
+  };
 }
 
 // -- on ---------------------------------------------------------------------------
@@ -243,14 +323,24 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
   }
   const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
   for (const w of view.warnings) ctx.log(`[speculate] warning: ${w}`);
+  const state = loadManagedState(ctx.statePath);
+  const record = state.projects[ctx.cwd] ?? { entries: [], updatedAt: Date.now() };
   try {
-    await cleanupLegacyArtifacts(ctx, view);
+    await cleanupLegacyArtifacts(ctx, view, {
+      marketplaceAddedByOn: readMarketplaceAddedByOn(record),
+    });
   } catch (err) {
     ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
   }
-  const state = loadManagedState(ctx.statePath);
-  const record = state.projects[ctx.cwd] ?? { entries: [], updatedAt: Date.now() };
-  const managed = new Map(record.entries.map((e) => [e.name, e]));
+  // ≤0.10 entries never belong in 0.11 state: cleanupLegacyArtifacts (above)
+  // already removed the workspace server and/or plugin from the HOST, so
+  // writing their managed.json records back would make `off` chase
+  // already-clean artifacts next time (spurious "remove failed").
+  const managed = new Map(
+    record.entries
+      .filter((e) => e.name !== WORKSPACE_SERVER_NAME && e.action !== 'plugin')
+      .map((e) => [e.name, e]),
+  );
   let changed = 0;
   let failed = 0;
 
@@ -340,22 +430,56 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     return 1;
   }
   const preView = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
-  let legacyCleanup: { pluginUninstalled: boolean; pluginUninstallAttempted: boolean } = {
+  const state = loadManagedState(ctx.statePath);
+  const record = state.projects[ctx.cwd];
+  let legacyCleanup: {
+    pluginUninstalled: boolean;
+    pluginUninstallAttempted: boolean;
+    workspaceServerRemoved: boolean;
+    workspaceServerRemovalAttempted: boolean;
+  } = {
     pluginUninstalled: false,
     pluginUninstallAttempted: false,
+    workspaceServerRemoved: false,
+    workspaceServerRemovalAttempted: false,
   };
   try {
-    legacyCleanup = await cleanupLegacyArtifacts(ctx, preView);
+    legacyCleanup = await cleanupLegacyArtifacts(ctx, preView, {
+      marketplaceAddedByOn: readMarketplaceAddedByOn(record),
+    });
   } catch (err) {
     ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
   }
-  const state = loadManagedState(ctx.statePath);
-  const record = state.projects[ctx.cwd];
   let failed = 0;
   const handled = new Set<string>();
 
   for (const entry of record?.entries ?? []) {
     handled.add(entry.name);
+    if (entry.name === WORKSPACE_SERVER_NAME) {
+      // Legacy (≤0.10) record for the retired workspace server.
+      // cleanupLegacyArtifacts (above) already removed it from the HOST if
+      // it was still there — don't chase an already-clean host (that just
+      // produces a spurious "remove failed" and a wrong exit code).
+      if (legacyCleanup.workspaceServerRemoved) {
+        // already confirmed removed — nothing more to do.
+      } else if (legacyCleanup.workspaceServerRemovalAttempted) {
+        // cleanup tried and failed — already logged; count it once.
+        failed++;
+      } else {
+        // cleanup never saw it in the host view (already gone before this
+        // run, or an older host with no `claude mcp` visibility of it) —
+        // attempt directly, but "no such server" here means someone (or a
+        // previous run) already cleaned up: that's success, not failure.
+        const res = await mcpRemove(ctx, entry.name, entry.scope);
+        if (res.code === 0) {
+          ctx.log(`[speculate] ${entry.name}: removed`);
+        } else if (!/no\s+(mcp\s+)?server/i.test(res.stderr || res.stdout)) {
+          ctx.log(`[speculate] ${entry.name}: remove failed: ${(res.stderr || res.stdout).trim()}`);
+          failed++;
+        }
+      }
+      continue;
+    }
     if (entry.action === 'plugin') {
       // Legacy (≤0.10) record. cleanupLegacyArtifacts (above) already
       // uninstalled the plugin if its detection fired — don't double up.
@@ -372,10 +496,10 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       } else if (legacyCleanup.pluginUninstallAttempted) {
         failed++;
       } else {
-        const res = await runLegacyPluginUninstall(ctx);
+        const { res, id } = await runLegacyPluginUninstall(ctx);
         if (res.code !== 0) {
           ctx.log(
-            `[speculate] plugin: uninstall failed: ${(res.stderr || res.stdout).trim()} — remove manually: ${ctx.claudeBin} plugin uninstall -s local speculate`,
+            `[speculate] plugin: uninstall failed: ${(res.stderr || res.stdout).trim()} — remove manually: ${ctx.claudeBin} plugin uninstall -s local ${id}`,
           );
           failed++;
         } else {
@@ -461,7 +585,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       }
       ctx.log(`[speculate] ${scoped.name}: unwrapped (${scoped.scope} scope, reconstructed)`);
     } else {
-      ctx.log(`[speculate] ${scoped.name}: workspace wrap removed`);
+      ctx.log(`[speculate] ${scoped.name}: wrap removed (no original command recorded)`);
     }
   }
 
@@ -486,6 +610,14 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
   const effective = effectiveServers(view.servers);
   if (effective.size === 0) ctx.log('[speculate] no MCP servers visible to Claude Code here');
   for (const [name, scoped] of effective) {
+    if (name === WORKSPACE_SERVER_NAME) {
+      // A leftover ≤0.10 artifact, not a healthy managed server — reporting
+      // it as "wrapped" would hide that CLI speculation was retired in 0.11.
+      ctx.log(
+        `[speculate]   ${name} (${scoped.scope}): legacy CLI-speculation server (retired in 0.11) — run 'speculate on' to remove`,
+      );
+      continue;
+    }
     let stateLabel: string;
     if (isWrappedEntry(scoped.entry)) {
       stateLabel = managedNames.has(name) ? 'wrapped (managed)' : 'wrapped';
@@ -503,6 +635,11 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
     );
   } else if (!record && unwrapped > 0) {
     ctx.log(`[speculate] run 'speculate on' to wrap them (or 'speculate try' for a zero-write trial)`);
+  }
+  if (await detectLegacyPlugin(ctx)) {
+    ctx.log(
+      `[speculate] legacy plugin installed (its Bash hook breaks 'git ...' commands under 0.11) — run 'speculate on' to remove`,
+    );
   }
   return 0;
 }

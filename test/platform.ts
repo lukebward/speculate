@@ -6,8 +6,6 @@
  * reason named at each call site — rather than weakened, so a run on a
  * machine lacking the capability reports honestly instead of erroring or
  * silently passing.
- *
- * See DESIGN.md "Platform support" for what is still POSIX-only and why.
  */
 
 export const isWindows = process.platform === 'win32';

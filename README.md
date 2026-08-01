@@ -29,9 +29,9 @@ Upgrading from ≤0.10? `speculate on` also removes the retired CLI-speculation 
 
 `speculate status` shows what's active and what drifted. `speculate off` restores everything exactly, even without its state file, since wrapped entries carry their original command line after the `--`.
 
-`speculate stats` shows cumulative estimated time saved, hit rate, waste, and per-workspace usage. Use `speculate stats --json` for structured output. Collection starts with this version; `speculate try` remains zero-write and is excluded.
+`speculate stats` shows cumulative estimated time saved, hit rate, waste, and per-workspace usage. Use `speculate stats --json` for structured output. Collection began in v0.10; `speculate try` remains zero-write and is excluded.
 
-No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed server still gets its vetted profile — GitHub, filesystem, and Slack ship built in), workspaces configure themselves by probing the repo, and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config. A restarted proxy prefetches your workflows from the first trigger — and once it has seen how your sessions open (twice), it prefetches those opening reads at launch, before your first request.
+No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed server still gets its vetted profile — GitHub, filesystem, and Slack ship built in), and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config. A restarted proxy prefetches your workflows from the first trigger — and once it has seen how your sessions open (twice), it prefetches those opening reads at launch, before your first request.
 
 <details>
 <summary><code>npm install -g</code> from git fails with <code>ENOTDIR … node_modules/speculate-mcp</code>?</summary>

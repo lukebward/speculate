@@ -449,7 +449,7 @@ Two additions on top of the durable usage stats work (§9, §13.6), both through
 
 Scenario coverage: S9 (priming curve across three restarts), S10/S11 (profile workloads vs the §10 criteria: both ~60% hit rate, ~58% tool-wait cut on the mock bench), S12 (durable receipts accumulate across sessions through `speculate stats --json`; usage snapshots verified aggregate-only — no tool names, arguments, or result text).
 
-Known limits (v0.11 candidates): openers fire only on the MCP proxy path (the exec daemon's `cli` label doesn't record them); the 2-sighting opener threshold deliberately trades one cold session for evidence; opener recording keys on exact argument reprs, so a workspace whose opening reads vary (e.g. issue-of-the-day) never primes — by design, never by accident.
+Known limits (v0.11 candidates): openers fire only on the MCP proxy path; the exec daemon that once carried the `cli` label was removed in v0.11. The 2-sighting opener threshold deliberately trades one cold session for evidence; opener recording keys on exact argument reprs, so a workspace whose opening reads vary (e.g. issue-of-the-day) never primes — by design, never by accident.
 
 ## v0.11 (2026-08-01): MCP-only focus
 

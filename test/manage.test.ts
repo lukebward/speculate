@@ -226,14 +226,37 @@ describe('legacy artifact cleanup', () => {
     expect(readClaudeJson().projects?.[cwd]?.mcpServers?.[WORKSPACE_SERVER_NAME]).toBeUndefined();
   });
 
-  it('on uninstalls the legacy plugin when plugin list reports it', async () => {
+  it('on uninstalls the legacy plugin when plugin list reports it, trying the qualified id first', async () => {
     pluginSim = { installed: true, marketplace: true }; // ≤0.10 plugin still installed
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    // ≤0.10's own `on` recorded that it added the marketplace registration
+    // itself — only then is it safe for cleanup to remove it.
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: { [cwd]: { entries: [], updatedAt: Date.now(), marketplaceAddedByOn: true } },
+      }),
+    );
     const code = await speculateOn(opts());
     expect(code).toBe(0);
-    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']);
+    // 0.10's PLUGIN_ID was the fully-qualified id; try that first.
+    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate']);
     expect(pluginSim.installed).toBe(false);
     expect(pluginSim.marketplace).toBe(false);
+  });
+
+  it('on leaves the marketplace registration alone when no state recorded owning it', async () => {
+    pluginSim = { installed: true, marketplace: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    // No state file at all (or none recording marketplaceAddedByOn): the
+    // marketplace registration might belong to another project or the user
+    // added it by hand — cleanup must not remove it.
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+    expect(pluginSim.installed).toBe(false); // plugin itself is always removed
+    expect(pluginSim.marketplace).toBe(true); // but the marketplace is left alone
+    expect(calls.some((c) => c[1] === 'plugin' && c[2] === 'marketplace')).toBe(false);
   });
 
   it('cleanup failures are logged, never fatal', async () => {
@@ -269,9 +292,10 @@ describe('legacy artifact cleanup', () => {
     const code = await speculateOff(opts());
     expect(code).toBe(0);
     // Detection fired in cleanupLegacyArtifacts, so off()'s own entry
-    // handling must not attempt a redundant second uninstall.
+    // handling must not attempt a redundant second uninstall. The qualified
+    // id (0.10's own PLUGIN_ID) is tried first and succeeds here.
     const uninstallCalls = calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall');
-    expect(uninstallCalls).toEqual([['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']]);
+    expect(uninstallCalls).toEqual([['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate']]);
     expect(pluginSim.installed).toBe(false);
   });
 
@@ -295,9 +319,15 @@ describe('legacy artifact cleanup', () => {
     );
     const code = await speculateOff(opts());
     expect(code).toBe(1);
+    // Both legacy ids are tried, in order, before giving up.
     const uninstallCalls = calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall');
-    expect(uninstallCalls).toEqual([['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']]);
+    expect(uninstallCalls).toEqual([
+      ['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate'],
+      ['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate'],
+    ]);
     expect(logs.join('\n')).toContain('uninstall failed');
+    // The remediation string names the id that actually failed last.
+    expect(logs.join('\n')).toContain('plugin uninstall -s local speculate');
   });
 
   it('detects a plugin identified only by id (speculate@speculate, no bare name field)', async () => {
@@ -321,8 +351,80 @@ describe('legacy artifact cleanup', () => {
     };
     const code = await speculateOn({ ...opts(), runner: idOnlyRunner });
     expect(code).toBe(0);
-    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate']);
+    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate']);
     expect(installed).toBe(false);
+  });
+
+  it('off with a ≤0.10 state entry for the leftover workspace server exits clean, not spuriously failed', async () => {
+    // A ≤0.10 state file recorded the workspace server as a plain wrapped
+    // ("added") entry, and the host still has it registered. cleanupLegacyArtifacts
+    // removes it from the HOST; off()'s own entry handling must recognize
+    // that and not re-attempt (and fail) the same removal.
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            [WORKSPACE_SERVER_NAME]: { command: SELF.command, args: [...SELF.args, 'wrap', '--workspace', cwd] },
+          },
+        },
+      },
+    });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const code = await speculateOff(opts());
+    expect(code).toBe(0);
+    const removeCalls = calls.filter(
+      (c) => c[1] === 'mcp' && c[2] === 'remove' && c[3] === WORKSPACE_SERVER_NAME,
+    );
+    expect(removeCalls).toEqual([['claude', 'mcp', 'remove', WORKSPACE_SERVER_NAME, '-s', 'local']]);
+    expect(logs.join('\n')).not.toContain('failed');
+  });
+
+  it('on strips ≤0.10 legacy entries (workspace server, plugin) out of the state it writes', async () => {
+    // A ≤0.10 managed.json carried a leftover workspace-server entry and a
+    // plugin entry. `on` must not write these back: doing so would make a
+    // later `off` chase artifacts cleanupLegacyArtifacts already removed
+    // from the host, producing spurious "remove failed"/"uninstall failed"
+    // lines and a wrong exit code.
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [
+              { name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' },
+              { name: 'speculate@speculate', scope: 'local', action: 'plugin' },
+            ],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const onCode = await speculateOn(opts());
+    expect(onCode).toBe(0);
+    const written = JSON.parse(readFileSync(statePath, 'utf8'));
+    const names = written.projects[cwd].entries.map((e: AnyRecord) => e.name);
+    expect(names).not.toContain(WORKSPACE_SERVER_NAME);
+    expect(written.projects[cwd].entries.some((e: AnyRecord) => e.action === 'plugin')).toBe(false);
+    expect(names).toContain('github');
+
+    // off() against the now-pruned state must also exit clean.
+    logs = [];
+    const offCode = await speculateOff(opts());
+    expect(offCode).toBe(0);
+    expect(logs.join('\n')).not.toContain('failed');
   });
 });
 
@@ -403,5 +505,36 @@ describe('speculate status', () => {
     expect(text).toContain('github (user): wrapped (managed)');
     expect(text).toContain('linear (user): NOT wrapped');
     expect(text).toContain("run it again");
+  });
+
+  it('flags a leftover ≤0.10 speculate-workspace server as legacy, not healthy', async () => {
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            [WORKSPACE_SERVER_NAME]: { command: SELF.command, args: [...SELF.args, 'wrap', '--workspace', cwd] },
+          },
+        },
+      },
+    });
+    const code = await speculateStatus(opts());
+    expect(code).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain(
+      `${WORKSPACE_SERVER_NAME} (local): legacy CLI-speculation server (retired in 0.11)`,
+    );
+    expect(text).toContain("run 'speculate on' to remove");
+    expect(text).not.toContain('wrapped (managed)');
+  });
+
+  it('flags a leftover ≤0.10 plugin install, whose Bash hook now breaks git commands', async () => {
+    pluginSim = { installed: true, marketplace: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    const code = await speculateStatus(opts());
+    expect(code).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain('legacy plugin installed');
+    expect(text).toContain("breaks 'git ...' commands");
+    expect(text).toContain("run 'speculate on' to remove");
   });
 });
