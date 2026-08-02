@@ -446,10 +446,20 @@ async function runProxy(
   const shutdown = async (): Promise<void> => {
     try {
       const s = proxy.metrics.statsSnapshot();
+      // §9 freshness: only shown once something was actually served from the
+      // buffer, so a session with no hits keeps the one-line summary short.
+      const age = s.ageAtHit;
+      const freshness =
+        age.count === 0 || age.p50Ms === null
+          ? ''
+          : `, prefetch age median ${(age.p50Ms / 1000).toFixed(1)}s / p95 ` +
+            `${((age.p95Ms ?? age.p50Ms) / 1000).toFixed(1)}s ` +
+            `(${Math.round((age.lastTtlQuarter ?? 0) * 100)}% served in the last quarter of their TTL)`;
       process.stderr.write(
         `[speculate] session summary: ${s.hits + s.joins} prefetch hits, ` +
           `${(s.estimatedSavedMs / 1000).toFixed(1)}s saved, ` +
-          `${s.wasted} wasted speculative call(s), ${s.realCalls} upstream call(s)\n`,
+          `${s.wasted} wasted speculative call(s), ${s.realCalls} upstream call(s)` +
+          `${freshness}\n`,
       );
       await proxy.close();
     } finally {

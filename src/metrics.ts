@@ -9,12 +9,32 @@
  */
 import process from 'node:process';
 import type {
+  AgeAtHitReport,
   DecisionEvent,
   RuleStats,
   SpeculationMode,
   StatsReport,
 } from './types.js';
 import type { UsageCounters } from './usage.js';
+
+/**
+ * Age-at-hit histogram resolution and reach (§9). 100 ms bins out to 60 s is
+ * 601 counters — nothing, and fine enough to read a median around one second
+ * against the 30 s default TTL. Anything older lands in the overflow bin;
+ * `maxMs` is tracked exactly, so a long tail is never rounded out of sight.
+ */
+const AGE_BIN_MS = 100;
+const AGE_BINS = 600;
+
+/** Reported age bands, as [label, exclusive upper bound in ms]. */
+const AGE_BANDS: ReadonlyArray<readonly [string, number]> = [
+  ['<1s', 1_000],
+  ['1-5s', 5_000],
+  ['5-15s', 15_000],
+  ['15-30s', 30_000],
+  ['30-60s', 60_000],
+  ['60s+', Number.POSITIVE_INFINITY],
+];
 
 interface PerServerCounters {
   speculativeCalls: number;
@@ -50,6 +70,17 @@ export class Metrics {
   private stdioDelays = 0;
   private estimatedSavedMs = 0;
   private readonly suppressedByReason = new Map<string, number>();
+
+  /**
+   * Freshness of what was actually served (§6.2/§9). Better prediction
+   * fetches earlier and further ahead, so entries are consumed OLDER; these
+   * are the only counters that would show it. Aggregate only: bin counts and
+   * durations, never a key, an argument, or a result.
+   */
+  private readonly ageBins = new Array<number>(AGE_BINS + 1).fill(0);
+  private ageCount = 0;
+  private ageMaxMs = 0;
+  private readonly ttlQuarters: [number, number, number, number] = [0, 0, 0, 0];
 
   private readonly perServer = new Map<string, PerServerCounters>();
   private readonly perRule = new Map<string, PerRuleCounters>();
@@ -147,6 +178,7 @@ export class Metrics {
         this.hits++;
         usageChanged = true;
         this.recordUse(event);
+        this.recordAge(event);
         break;
       case 'joined':
         this.joins++;
@@ -251,9 +283,84 @@ export class Metrics {
       ),
       estimatedSavedMs: this.estimatedSavedMs,
       wastePerHit: used === 0 ? null : this.wasted / used,
+      ageAtHit: this.ageAtHit(),
       perServer,
       perRule,
     };
+  }
+
+  /**
+   * Age-at-hit distribution (§9). A 'joined' call never sat in the buffer, so
+   * it contributes nothing here: folding it in as age 0 would drag the whole
+   * distribution towards "everything is fresh", which is exactly the
+   * comforting lie this metric exists to prevent.
+   */
+  private recordAge(event: DecisionEvent): void {
+    // INVARIANT: count === sum(ttlQuarters). The two numbers describe the
+    // same sample from two angles, so they are admitted together or not at
+    // all — the cache produces both in one branch, and letting a half-formed
+    // event into one and not the other would make `lastTtlQuarter` a share of
+    // a different population than `count`, which is unreadable without
+    // saying so. Pinned by test.
+    const { ageMs, ttlFraction } = event;
+    if (typeof ageMs !== 'number' || !Number.isFinite(ageMs) || ageMs < 0) return;
+    if (typeof ttlFraction !== 'number' || !Number.isFinite(ttlFraction)) return;
+
+    const bin = Math.min(AGE_BINS, Math.floor(ageMs / AGE_BIN_MS));
+    this.ageBins[bin]!++;
+    this.ageCount++;
+    if (ageMs > this.ageMaxMs) this.ageMaxMs = ageMs;
+    const quarter = Math.min(3, Math.max(0, Math.floor(ttlFraction * 4)));
+    this.ttlQuarters[quarter]!++;
+  }
+
+  private ageAtHit(): AgeAtHitReport {
+    const buckets: Record<string, number> = {};
+    for (const [label] of AGE_BANDS) buckets[label] = 0;
+    for (let bin = 0; bin <= AGE_BINS; bin++) {
+      const count = this.ageBins[bin]!;
+      if (count === 0) continue;
+      // The overflow bin is >= AGE_BINS * AGE_BIN_MS, i.e. always the top band.
+      const lower = bin * AGE_BIN_MS;
+      const band = AGE_BANDS.find(([, upper]) => lower < upper) ?? AGE_BANDS.at(-1)!;
+      buckets[band[0]]! += count;
+    }
+    return {
+      count: this.ageCount,
+      p50Ms: this.agePercentile(0.5),
+      p95Ms: this.agePercentile(0.95),
+      maxMs: this.ageCount === 0 ? null : this.ageMaxMs,
+      lastTtlQuarter: this.ageCount === 0 ? null : this.ttlQuarters[3] / this.ageCount,
+      buckets,
+      ttlQuarters: [...this.ttlQuarters],
+    };
+  }
+
+  /**
+   * Nearest-rank percentile over the histogram, reported as the bin midpoint
+   * (so ±AGE_BIN_MS/2); the overflow bin reports its lower edge, and `maxMs`
+   * carries the exact tail.
+   *
+   * The midpoint is clamped to the exact maximum, because a rounded-up
+   * percentile beside an exact maximum can otherwise report a median LARGER
+   * than the largest sample: two hits at 0 ms and 30 ms against a 100 ms bin
+   * read p50 = 50 ms, max = 30 ms. That is reachable against a fast local
+   * server, where every age lands in the first bin, and it makes the report
+   * look broken at exactly the moment it has the best news.
+   */
+  private agePercentile(p: number): number | null {
+    if (this.ageCount === 0) return null;
+    const rank = Math.max(1, Math.ceil(p * this.ageCount));
+    let seen = 0;
+    for (let bin = 0; bin <= AGE_BINS; bin++) {
+      seen += this.ageBins[bin]!;
+      if (seen >= rank) {
+        const estimate =
+          bin === AGE_BINS ? AGE_BINS * AGE_BIN_MS : bin * AGE_BIN_MS + AGE_BIN_MS / 2;
+        return Math.min(estimate, this.ageMaxMs);
+      }
+    }
+    return this.ageMaxMs;
   }
 
   /** Shared bookkeeping for 'hit' and 'joined'. */

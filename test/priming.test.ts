@@ -10,7 +10,7 @@ import type { ObservedCall } from '../src/types.js';
 
 // --- fixtures ---------------------------------------------------------------
 
-/** Fake clock for LRU recency; gap decisions use call timestamps. */
+/** Fake clock for decay/recency; gap decisions use call timestamps. */
 let t = 0;
 const now = () => t;
 

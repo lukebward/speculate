@@ -11,6 +11,39 @@ import { argsDistance, keyServer, keyTool, parseKeyArgs } from './keys.js';
 import type { CacheEntryMeta, CacheKey, CacheLookup } from './types.js';
 
 /**
+ * Last-resort TTL when neither the operator nor a profile says otherwise
+ * (DESIGN.md §6.2). Honestly, an UNMEASURED GUESS: it was chosen because the
+ * prefetch-to-use gap for intra-turn chains is seconds, not because anyone
+ * has measured how often a 30 s-old answer is wrong. See §13.19 for the
+ * (deliberately unbuilt) shadow-validation design that would replace it with
+ * a number.
+ */
+export const DEFAULT_TTL_MS = 30_000;
+
+/**
+ * TTL multiplier for long-horizon predictions (`Prediction.horizon ===
+ * 'standing'`) — those that read nothing off the call that just happened.
+ *
+ * **The default is the identity, and that is a measured decision, not an
+ * omission.** The premise of shortening it is that a standing bet waits
+ * longer in the buffer than a derived one and so is served closer to expiry.
+ * The eval measures the opposite: standing predictions are consumed at a
+ * lead of exactly 1.000 calls in every archetype that has any — the same
+ * instant as derived ones — so a fraction buys no measured freshness. It
+ * does cost: swept over inter-call spacing, a factor of 0.5 is free up to
+ * 10 s and then destroys the entire class (at 16 s spacing, 1265 hits → 1150;
+ * every standing hit becomes a miss). Unmeasured benefit against measured
+ * loss is not a trade worth a default.
+ *
+ * The lever stays because the argument for it is sound where the evidence is
+ * missing rather than contrary — §13.15 session openers, which the corpus
+ * cannot see. Operators set it per server via
+ * `speculation.longHorizonTtlFactor`; §13.19 records which counters have to
+ * move first (`expired`, and `perRule['opener:*'].wasted`).
+ */
+export const LONG_HORIZON_TTL_FACTOR = 1;
+
+/**
  * Terminal entry outcomes, reported to the metrics layer so waste is
  * countable (DESIGN.md §9): an entry emits at most one of these, ever.
  */
@@ -61,6 +94,8 @@ interface InFlightEntry extends EntryBase {
 interface ReadyEntry extends EntryBase {
   readonly state: 'ready';
   readonly result: CallToolResult;
+  /** When the result landed. TTL counts from completion, not issuance. */
+  readonly readyAt: number;
   /** Absolute ms deadline; TTL counts from completion, not issuance. */
   readonly expiresAt: number;
 }
@@ -136,8 +171,20 @@ export class SpeculationCache {
         return { outcome: 'joined', promise: entry.promise, meta: entry.meta };
       }
       this.entries.delete(key);
-      if (this.now() < entry.expiresAt) {
-        return { outcome: 'hit', result: entry.result, meta: entry.meta };
+      const t = this.now();
+      if (t < entry.expiresAt) {
+        // §9 staleness telemetry: how much of this entry's life had already
+        // elapsed. Measured from readyAt, the same instant the TTL counts
+        // from, so the fraction is exactly "how close to expiry".
+        const ageMs = Math.max(0, t - entry.readyAt);
+        const ttlMs = entry.expiresAt - entry.readyAt;
+        return {
+          outcome: 'hit',
+          result: entry.result,
+          meta: entry.meta,
+          ageMs,
+          ttlFraction: ttlMs > 0 ? Math.min(1, ageMs / ttlMs) : 0,
+        };
       }
       this.emit({ type: 'expired', key, meta: entry.meta });
     }
@@ -220,6 +267,7 @@ export class SpeculationCache {
       ...entry,
       state: 'ready',
       result,
+      readyAt: t,
       expiresAt: t + ttlMs,
     });
   }

@@ -11,9 +11,9 @@
 <circle cx="60" cy="17" r="5.5" fill="#28c840"/>
 <text x="390" y="21" text-anchor="middle" font-size="12" fill="#8b949e">npm run demo</text>
 <text class="l" style="animation-delay:0.53s" y="83" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  pass 1</tspan></text>
-<text class="l" style="animation-delay:1.30s" y="102" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    list_pull_requests    421 ms</tspan></text>
-<text class="l" style="animation-delay:2.05s" y="121" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    get_pull_request #7   404 ms</tspan></text>
-<text class="l" style="animation-delay:2.58s" y="159" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  pass 2</tspan></text>
-<text class="l" style="animation-delay:3.34s" y="178" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    list_pull_requests    404 ms   </tspan><tspan x="289.90999999999997" fill="#8b949e" xml:space="preserve">→ prefetches #7</tspan></text>
-<text class="l" style="animation-delay:3.69s" y="197" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    get_pull_request #7     1 ms   </tspan><tspan x="289.90999999999997" fill="#3fb950" xml:space="preserve">prefetched ✓ 295× faster</tspan></text>
+<text class="l" style="animation-delay:1.30s" y="102" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    list_pull_requests    420 ms</tspan></text>
+<text class="l" style="animation-delay:2.06s" y="121" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    get_pull_request #7   408 ms</tspan></text>
+<text class="l" style="animation-delay:2.59s" y="159" font-size="13"><tspan x="16" fill="#8b949e" xml:space="preserve">  pass 2</tspan></text>
+<text class="l" style="animation-delay:3.35s" y="178" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    list_pull_requests    410 ms   </tspan><tspan x="289.90999999999997" fill="#8b949e" xml:space="preserve">→ prefetches #7</tspan></text>
+<text class="l" style="animation-delay:3.70s" y="197" font-size="13"><tspan x="16" fill="#e6edf3" xml:space="preserve">    get_pull_request #7     1 ms   </tspan><tspan x="289.90999999999997" fill="#3fb950" xml:space="preserve">prefetched ✓ 275× faster</tspan></text>
 </svg>

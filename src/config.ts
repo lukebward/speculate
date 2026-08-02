@@ -24,6 +24,8 @@ const serverSchema = z
       .object({
         defaultTtlMs: z.number().int().nonnegative().optional(),
         ttlMsByTool: z.record(z.string(), z.number().int().nonnegative()).optional(),
+        /** §6.2: TTL multiplier for long-horizon predictions; 1 disables it. */
+        longHorizonTtlFactor: z.number().positive().max(1).optional(),
         maxPerMinute: z.number().int().positive().optional(),
         maxConcurrent: z.number().int().positive().optional(),
       })

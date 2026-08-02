@@ -150,7 +150,7 @@ Tier-1-shaped rules authored by the operator in `speculate.config.json` rather t
 
 ### 5.3 Tier 2 — Learned transition model (v0.2: session-scoped version implemented)
 
-A per-server bigram model over observed transitions: `P(next_tool | prev_tool)`, learned live from the session. Argument prediction via templates mined per transition — for each argument of the follow-up call, candidate sources (same-named trigger arg, path into the trigger's parsed result, constant) are intersected across observations; a transition predicts only when every argument remains derivable, with arguments resolved against the *current* call. Two consistent observations arm a transition; confidence ramps with count (capped at 0.55, below hand-written rules); the §5.6 feedback loop suppresses transitions that stop hitting. v0.2 scope: in-memory, per-session, LRU-bounded. Cross-session persistence (per-user/per-project priors) remains post-MVP.
+A per-server bigram model over observed transitions: `P(next_tool | prev_tool)`, learned live from the session. Argument prediction via templates mined per transition — for each argument of the follow-up call, candidate sources (same-named trigger arg, path into the trigger's parsed result, constant) are held as COMPETING hypotheses and scored against the traffic: every source that could have produced an observed value is credited, a value none of them explains is recorded as a miss and admits whatever new source does explain it, and the strongest few resolvable sources become several ranked argument sets from one transition (§13.18). One unexplainable value cannot disable the transition for good (§13.17). A transition predicts only when every argument remains derivable, with arguments resolved against the *current* call. Two consistent observations arm a transition; confidence ramps with count (capped at 0.55, below hand-written rules); ranking and eviction go by a time-decayed score rather than raw count (§13.16); the §5.6 feedback loop suppresses transitions that stop hitting. v0.2 scope: in-memory, per-session, capacity-bounded. Cross-session persistence (per-user/per-project priors) remains post-MVP.
 
 ### 5.4 Tier 3 — Small-LLM predictor (post-MVP, optional)
 
@@ -176,7 +176,9 @@ Key = `(server, tool, canonical_args)`. Canonicalization: JSON with sorted keys,
 
 ### 6.2 Freshness and invalidation
 
-- **Per-tool TTL** from the server profile, defaulting to **30 s**, capped at a few minutes. The prefetch-to-use gap for intra-turn chains is seconds, so short TTLs retain most of the win while bounding staleness.
+- **Per-tool TTL** from the server profile, defaulting to **30 s**, capped at a few minutes. The prefetch-to-use gap for intra-turn chains is seconds, so short TTLs retain most of the win while bounding staleness. **The 30 s is an unmeasured guess** — chosen from that gap, never validated against how often a 30 s-old answer is actually wrong; §13.19 records the shadow-validation experiment that would replace it with a number, and why it is deliberately unbuilt.
+- **A long-horizon TTL lever exists, and ships as the identity.** A prediction that reads *anything* off the call that just completed claims "this is the next call"; one where **no** argument does — every argument a remembered literal, or a §13.15 session opener with no trigger at all — claims only "you will ask for this at some point" (`Prediction.horizon === 'standing'`). Standing bets can be fetched at a fraction of the resolved TTL via `speculation.longHorizonTtlFactor`, applied to whatever the normal resolution order produced, so an operator's per-tool freshness decision still sets the ceiling and a per-tool TTL of 0 stays disabled rather than being revived. **`LONG_HORIZON_TTL_FACTOR` defaults to 1** — the premise that standing bets wait longer is measured false (§13.19: lead 1.000, identical to derived predictions) while the cost is measured real (a factor of 0.5 destroys the whole class once an agent's inter-call gap passes half the TTL). §13.19 records the counters that must move before turning it on.
+- **Age at consumption is measured, not assumed** (§9): every hit records how long the entry had been ready and what fraction of its TTL that was, because better prediction fires earlier and further ahead and can only push that number up.
 - **Mutation invalidation, conservatively classified:** any real call **not affirmatively classified read-only** (same classification machinery as §4 — allowlist/annotation) invalidates all cached entries for its server. Unknown tools are treated as writes. Coarse per-server invalidation is deliberate; per-resource invalidation is a profile-level refinement later.
 - **Writes outside the proxy are invisible — and for coding agents they're the common case.** An agent that runs `git push` in a shell and then reads the repo through a cached entry can see a pre-push snapshot up to one TTL old. The proxy cannot see non-MCP tools (shell, file edits, other harness tools). This is the sharpest staleness caveat in the design; it is bounded by the TTL, called out in user-facing docs, and per-tool TTL=0 exists for reads where even that is unacceptable.
 - **External writes are likewise invisible.** Someone else can merge the PR between prefetch and use; the agent sees a ≤TTL-stale snapshot. Same bound, same mitigations. Both cases are identical *in kind* to the race that already exists between a live tool call and the model acting on its result — the TTL widens that window, bounded and configurably to zero.
@@ -333,7 +335,7 @@ Follow-up to the question "how does this work for servers other than GitHub?" �
 
 1. **Generic result access.** Without a vetted parser, the predictor now uses `structuredContent` when present, else best-effort JSON-in-text extraction (fail closed, no `parser_miss` noise for genuinely-text results). This unlocks result-derived prediction on unprofiled servers, since most real servers serialize JSON into text blocks.
 2. **Declarative config rules (§5.2b).** Per-server `rules` in the config file, compiled to the standard `Rule` interface. Schema-validated at startup (unknown `$` directives, `$item` without `forEach`, and dead `forEach` literals are rejected with pointered errors).
-3. **Transition learner (§5.3).** Session-scoped, zero-config: two consistent observations of a transition arm it; argument templates (arg-copy / parsed-path / const, intersected across observations, fail-closed) generalize across argument values. Verified end-to-end: an unprofiled server in `annotated` mode reaches its first prefetch hit on the third occurrence of a repeated workflow step.
+3. **Transition learner (§5.3).** Session-scoped, zero-config: two consistent observations of a transition arm it; argument templates (arg-copy / parsed-path / const, scored as competing hypotheses, fail-closed) generalize across argument values. Verified end-to-end: an unprofiled server in `annotated` mode reaches its first prefetch hit on the third occurrence of a repeated workflow step.
 
 Safety posture for unprofiled servers is unchanged and now documented user-facing: `annotated` mode (trust `readOnlyHint`) or `strict` + per-server `allowTools`. Test suite: 216 tests (learner 30, config rules 30, plus two new end-to-end tests); the GitHub benchmark is unchanged (71% / −66% / 0 waste — learner transitions need two sightings, and the benchmark's workflow has none repeated).
 
@@ -344,10 +346,10 @@ Known limits recorded for v0.3: ~~learner state is per-session~~ (addressed in �
 The learner's model and per-rule feedback now survive restarts, so a proxy that has seen your workflows prefetches from its first trigger of a new session (verified end-to-end: session 2 hits on its first repeated-workflow trigger with no relearning).
 
 **What persists** — two things, in one versioned JSON state file:
-1. The transition model: (server, prevTool → nextTool) entries with observation counts and argument templates. Templates reference argument *provenance* (copy-this-arg, this-path-into-the-parsed-result) plus constant argument values by canonical repr. Chain heads and LRU recency are session-local and excluded.
+1. The transition model: (server, prevTool → nextTool) entries with observation counts, decayed evidence scores with the clock reading each was taken at (§13.16), and argument templates. Templates reference argument *provenance* (copy-this-arg, this-path-into-the-parsed-result) plus constant argument values by canonical repr. Chain heads are session-local and excluded.
 2. Per-rule feedback counters (hits/wasted/speculated), so suppression knowledge survives too.
 
-**What never persists:** tool results. The §6.4 memory-only cache promise is untouched — the state file contains tool names, argument-shape templates (including constant *argument* values, which is why the file is 0600 under a 0700 dir), and counters.
+**What never persists:** tool results. The §6.4 memory-only cache promise is untouched — the state file contains tool names, argument-shape templates (including constant *argument* values, which is why the file is 0600 under a 0700 dir), and counters. Since v0.13 a template keeps up to `MAX_SOURCES_PER_ARG` competing literals per argument rather than the single one the old intersection narrowed to, so more user-supplied values (paths, ids, search queries) now sit in that 0600 file than before: measured 419 to 1,207 bytes on a 12-transition workload, the same class of data inside the same boundary, and more of it.
 
 **Durable usage snapshots:** separate versioned session records are aggregate-only. Beyond schema version and opaque session identity, they contain only source, absolute workspace path, timestamps, and cumulative counters. They never contain command arguments, tool or server names, results, prediction templates, or cache contents; caches and results remain memory-only. `speculate stats` validates and aggregates these records across MCP and CLI sessions, while `speculate try` disables their creation to preserve its zero-write contract.
 
@@ -379,7 +381,7 @@ Two friction removals prompted by user feedback ("there's a lot of manual setup"
 
 **`speculate wrap` — zero config.** Instead of authoring a config file and re-pointing the host, users prefix their existing server command: `npx -y github:lukebward/speculate wrap -- <server cmd>` (npx installs from git; the prepare hook builds). Wrap defaults: mode `annotated` (there is no allowlist to consult — documented trade-off, `--mode`/`--allow` override), auto-detected vetted profiles for known server commands, persistence keyed by the wrapped command line. `wrap --workspace <dir>` spawns the bundled shell server for one-flag CLI speculation. Configs, when used, are now JSONC (comments + trailing commas), `speculate init` writes a commented starter, and the `speculate-mcp` bin alias matches the package name so bare `npx github:…` resolves.
 
-**Pre-loaded priors that adapt per user (learner priming).** The product now ships prediction knowledge that activates before any learning: (a) vetted profiles carry curated `primes` pairs; (b) on connect, lister→getter tool-name morphology (`list_X`→`get_X`, `search_X`→`get_X`, prefix and suffix forms, plural-tolerant stems) is detected on ANY server. A primed (server, prev, next) pair reaches the prediction threshold after **one** observed sighting instead of `minObservations` — a threshold change, not fabricated knowledge: argument templates still come exclusively from the user's real traffic, primes only target speculation-eligible tools, and once observed the transition is an ordinary learned one — it grows with use, gets suppressed by feedback if it doesn't match this user, persists per config (§13.6), and is LRU-bounded. Unobserved primes cost one Set entry and are recomputed per session from live tool lists (never persisted). `doctor` reports each server's primed pairs.
+**Pre-loaded priors that adapt per user (learner priming).** The product now ships prediction knowledge that activates before any learning: (a) vetted profiles carry curated `primes` pairs; (b) on connect, lister→getter tool-name morphology (`list_X`→`get_X`, `search_X`→`get_X`, prefix and suffix forms, plural-tolerant stems) is detected on ANY server. A primed (server, prev, next) pair reaches the prediction threshold after **one** observed sighting instead of `minObservations` — a threshold change, not fabricated knowledge: argument templates still come exclusively from the user's real traffic, primes only target speculation-eligible tools, and once observed the transition is an ordinary learned one — it grows with use, gets suppressed by feedback if it doesn't match this user, persists per config (§13.6), and is capacity-bounded (§13.16). Unobserved primes cost one Set entry and are recomputed per session from live tool lists (never persisted). `doctor` reports each server's primed pairs.
 
 Demo/readme: the benchmark is now rendered as an animated SVG terminal (generated by scripts/gen-demo-svg.mjs from captured ANSI output — svg-term-cli proved incompatible with modern casts) embedded at the top of the README alongside the numbers table.
 
@@ -450,6 +452,147 @@ Two additions on top of the durable usage stats work (§9, §13.6), both through
 Scenario coverage: S9 (priming curve across three restarts), S10/S11 (profile workloads vs the §10 criteria: both ~60% hit rate, ~58% tool-wait cut on the mock bench), S12 (durable receipts accumulate across sessions through `speculate stats --json`; usage snapshots verified aggregate-only — no tool names, arguments, or result text).
 
 Known limits (v0.11 candidates): openers fire only on the MCP proxy path; the exec daemon that once carried the `cli` label was removed in v0.11. The 2-sighting opener threshold deliberately trades one cold session for evidence; opener recording keys on exact argument reprs, so a workspace whose opening reads vary (e.g. issue-of-the-day) never primes — by design, never by accident.
+
+### 13.16 v0.13 — evidence decay and value-based eviction (2026-08-01)
+
+The learner scored purely by lifetime frequency and never forgot, so last quarter's finished project outranked this week's work indefinitely, and its transition cap evicted **FIFO** — the entry seen a hundred times at session start was dropped to make room for a one-off seen a second ago.
+
+Each transition and opener now carries a second number beside its count: a **decayed evidence score**, `score * e^(-elapsed/TAU)` with TAU = 14 days, aged to *now* and incremented by 1 on each new observation. It drives **ranking and eviction only**. `count` is untouched and keeps gating `minObservations` and feeding the confidence ramp: decaying it would have silently stopped stale-but-valid transitions from firing at all, which is a different (and unasked-for) behavior change. A transition proven a year ago is still real; it is just no longer topical.
+
+**Recency persists.** `(score, lastUpdated)` travel together in the state file (§13.6), undecayed, so the gap across a restart is charged on load instead of forgiven — without this the mechanism would reset every session and be cosmetic. Deserialization stays defensive and backward-compatible: a pre-existing file with neither field loads with `score = count` and `lastUpdated = now()`, a junk score falls back to `count`, and a stamp from a clock running ahead of ours is clamped to now (no entry buys permanent freshness).
+
+**Admission is an invariant, not a detail.** Ranking eviction by value must exempt the entry the current observation just wrote. Without that exemption a full table can never learn anything new: a first sighting scores 1, an incumbent with two recent sightings scores just under 2, so the newcomer is the weakest entry and is deleted by the same `observe()` that created it — then recreated and re-deleted on every later sighting, so it never reaches `minObservations`. That is the FIFO bug pointed the other way (FIFO discarded the *best* entry; unprotected value-eviction admits *nothing*), it fails silently as a frozen model rather than an error, and because `(score, lastUpdated)` persist, a saturated state file would carry the stall across restarts. Both caps — transitions and per-server openers — exempt the just-written key, and both have a regression test at the DEFAULT `minObservations`.
+
+Measured (offline recall@K harness, seeds 1,2,3, 1020 workflow pairs), decay on vs. the pre-decay learner on the same corpus:
+
+| archetype | no decay | with decay | Δ recall@3 |
+|---|---|---|---|
+| list-detail-varied | 0.430 | 0.423 | −0.007 |
+| return-visits | 0.497 | 0.497 | 0.000 |
+| multi-arg | 0.883 | 0.883 | 0.000 |
+| **regime-shift** | **0.000** | **0.900** | **+0.900** |
+| WORKFLOW (headline) | 0.532 | 0.636 | **+0.104** |
+| adversarial (floor) | 0.087 | 0.087 | 0.000 |
+
+The `regime-shift` archetype (a 45-day idle gap, then the workflow changes) is what makes staleness measurable at all: without decay it scores **0.000** at k=3 with *infinite* waste per hit, because the pre-gap regime's higher lifetime counts pin the top 3 forever. Its recall@**5** is 0.950 either way — the post-gap answer was always in the candidate set, just ranked below the cap — so on this corpus decay is a pure **ranking** win. The other three archetypes space sessions 600 s apart, deep inside a 14-day TAU, so they contain no stale evidence and show only tie-break jitter (−0.007 on one). TAU was not tuned to the fixture; 14 days comes from the deployment story above.
+
+Scope note: this corpus never reaches `maxTransitions`, so the eval exercises **ranking only** — the eviction policy and the admission invariant are covered by unit tests, not by these numbers.
+
+Composition note: the headline **+0.104 is a property of the corpus mix, not a transferable property of the learner**. `regime-shift` supplies 120 of the 1020 workflow pairs (11.8%) and moves +0.900, which is +0.106 of the total by arithmetic alone; the other three archetypes net −0.002. Give the fixture more phase-2 sessions and the same code change reports a bigger number. The per-archetype rows, not the pooled figure, are what attributes the change. `regime-shift` also has near-zero cross-seed variance by construction (the seed varies names and branches, never the transition structure), so running more seeds confirms determinism rather than robustness: the uncertainty in +0.104 lives in the fixture design, not in sampling.
+
+Reach note: the shipped `Predictor.selectBatch` ranks by `confidence × effectiveness`, and learner confidence is derived from the **undecayed** `count`. So decay decides which ≤3 transitions the learner *proposes*, and downstream it survives as the emission-order tie-break between candidates of equal `confidence × effectiveness`. That tie is not an edge case: `effectiveness` returns exactly 0.5 for every rule that has never fired, and learner confidence is two-valued (0.45 at count 2, capped 0.55 at count ≥ 3), so among equal-count learner candidates at cold start the product ties outright and decay orders the **whole** batch. The eval calls `learner.predict` directly, so the table above remains an upper bound on decay's reach in production, but the reach is wider than a tie-break note suggests.
+
+### 13.17 v0.13 — one underivable value no longer disables a transition (2026-08-02)
+
+An argument template was killed by a **single** observation it could not explain, forever. Two latches enforced it and only releasing both changes anything: `ArgTemplate.underivable` was sticky, and `updateTemplates` intersected the candidate sources with the ones that reproduced the new value, so an unexplainable value emptied the list — after which `resolveSources` failed and `materializeArgs` returned null whatever the boolean said. Releasing the boolean alone is a measured no-op. On the eval corpus this scored two whole list→detail legs at exactly **0.000**: an agent opening the second row of a list instead of the first, once, disabled the transition for the rest of the process's life.
+
+The boolean is now **evidence**: `derived` and `missed` counts per argument. An observation no candidate explains records a miss and **retains** the candidate list; an observation some candidate explains still intersects (the derivation narrows as before). An argument is underivable when it has never been derived (`derived === 0`, including the empty source set), when evidence is thin (< 4 observations) and there is any miss at all, or when the miss rate reaches 75% thereafter. The first clause is the fail-closed one and is absolute — **an argument no source has ever produced is never fabricated**, and a prediction whose arguments cannot all be resolved is still dropped. The thin-evidence clause keeps a template quiet while its rate is unmeasurable, so the change costs nothing at cold start; the rate clause bounds the waste a surviving template imposes **in the limit** at roughly three wasted predictions per hit (a derivation wrong at rate m costs m/(1−m) per hit).
+
+That bound is a lifetime average, not a cap, and it is the one soft spot worth naming: `derived`/`missed` are the only evidence in this file that does **not** decay, so a derivation that used to work must accumulate misses in proportion to its whole history before the gate closes — measured, a template with 200 clean derivations still fires after 400 consecutive wrong ones and needs 600 to cross 75%. The production backstop is the §5.6 feedback loop, which suppresses a learner ruleId after 8 speculations below 0.15 effectiveness and so reacts in tens of calls rather than hundreds; the offline eval does not model it, so the harness sees the pessimistic case. Decaying these counters is a candidate for the same treatment §13.16 gave the transition scores, deliberately not done here.
+
+`derived`/`missed` persist beside the sources. `underivable` is still written, carrying the current verdict for older builds, but a build that understands the counters recomputes the verdict from them — otherwise a rate-poisoned template would come back from disk permanently dead. A pre-v0.13 file (boolean, no counters) loads exactly as before: `underivable: true` stays sourceless and silent, `false` loads as one derivation and no misses.
+
+Measured (offline recall@K harness, seeds 1,2,3, 1020 workflow pairs):
+
+| archetype | before | after | Δ recall@3 |
+|---|---|---|---|
+| **list-detail-varied** | 0.423 | **0.527** | **+0.103** |
+| **return-visits** | 0.497 | **0.717** | **+0.220** |
+| multi-arg | 0.883 | 0.883 | 0.000 |
+| regime-shift | 0.900 | 0.900 | 0.000 |
+| WORKFLOW (headline) | 0.636 | **0.731** | **+0.095** |
+| adversarial (floor) | 0.087 | 0.087 | 0.000 |
+
+The attribution is the point: the movement is entirely in the two archetypes built around a moving list position (`board_list_cards→card_get` 0.000 → 0.207, `svc_list_alerts→alert_get` 0.000 → 0.440), the two that never had a latched template do not move at all, and the noise floor does not move — a change that merely made the learner fire harder would have lifted the floor first. Workflow waste per hit goes 1.45 → 1.54, which is the price: transitions that emitted nothing now emit something, and on these corpora they are right more often than the rate gate's worst case.
+
+Still capped at one hypothesis per transition. `board_list_cards→card_get` lands at 0.207 because the template keeps whichever row the first sighting used; emitting row 0/1/2 as competing hypotheses is a separate change — §13.18.
+
+### 13.18 v0.13 — argument sources compete, and a transition offers several (2026-08-02)
+
+§13.17 stopped one unexplainable value from killing a template, but the template could still hold only **one** answer per argument: `updateTemplates` intersected, so the candidate list only ever shrank, and `resolveSources` returned the first entry that resolved in a fixed arg-copy > parsed-path > const order. Two consequences, both structural. The surviving derivation was whichever row index the **first sighting** happened to use — measured, seed 1's survivor for `board_list_cards→card_get` was `cards.2.cardId` at a **90%** miss rate, gated off by the rate clause, while seeds 2/3 drew `cards.0.cardId` and scored. And one transition materialized exactly **one** argument set, so it could never offer index 0 *and* index 1: recall@K was pinned to recall@1 whatever the budget. PASTE (arXiv 2603.18897, Appendix A) infers arguments through the same shape and names the missing piece — choosing an element by index with a fallback: use the first result, and if it fails, try the next.
+
+Each source now carries its own evidence: a **decayed score** (the §13.16 helper, same 14-day TAU), the clock reading it was taken at, and a count of observations it explained **alone**. On each observation every stored source that would have produced the value is credited — not just the first one tried — and any source the observation *reveals* is admitted, evicting the weakest at the per-argument cap instead of refusing it (the §13.16 admission invariant, third site). `derived` still counts only what an **already-stored** source explained; crediting sources mined from the value itself would make every template trivially derivable and silently disable the fail-closed gate.
+
+On predict, each argument ranks its resolvable sources by decayed score, and a **beam** walks the lattice of choices best-first: the all-best combination, then the next-best substitution one argument at a time, ordered by the product of the per-argument weights, deduped by materialized args. The all-best combination weighs exactly 1, so a transition's first candidate ranks and scores exactly where it did before; variants rank below it, and the ranking is **global** across transitions, so a variant has to beat another transition's first choice to take its slot. Confidence is the existing ramp — same 0.55 ceiling, applied *before* the discount — times the combination's weight, so §5.6 sees a speculative third choice as the weaker candidate it is.
+
+**A hedge is weighted by its share of the argument's evidence, not by its distance from the leader.** Normalizing against the leader looks natural and is wrong: twelve one-off literals that all tie score the same as a genuine 25/9/5 split of a list position, so each would rank as though it were *the* answer and one transition would spend a whole batch on memorized junk. Measured, that cost `doc_read→doc_list_backlinks` −0.127 (it fell out of the top 3 while a transition with an underivable `query` argument hedged, in the window before the miss-rate gate closed on it); weighting a hedge as `score / Σ scores` over all admissible values leaves −0.025. The share is computed **before** anything truncates the options, and the option list itself is cut at a fixed `MAX_OPTIONS_PER_ARG` rather than at the caller's cap, so the weights and the lattice are both identical whatever the trigger is allowed: `predict` at k=3 is exactly the first three of `predict` at k=5, by construction rather than by observation, which is what makes an eval measured at k=5 a faithful reading of production at 3. Slicing the options to the caller's cap instead made the k=5 lattice a strict superset of the k=3 one, and since an incoherent combination is skipped but still expanded, a k=5 run could emit at rank 2 a value a k=3 run could not reach at all. Corpus impact was nil (0 divergences over 1,770 lockstep trigger comparisons across all seven archetypes and seeds 1,2,3), which is exactly why it needed fixing rather than recording: the eval measures at 5 and production runs at 3, and that equivalence is the instrument's load-bearing assumption. The counterexample is now a test.
+
+**A source may not answer for an argument just because it resolves.** The best-evidenced one always may; any other needs `solo ≥ 2` — two observations it explained when nothing else stored did. That single gate does two jobs: it demands recurrence (the same bar `minObservations` sets for transitions, so a literal seen once is a coincidence, not a hypothesis), and it rejects **domination** (a source that has only ever matched alongside a better one has no evidence of its own — whenever the two disagree, which is the only time offering it changes anything, the other has been right). Concretely: rows 0/1/2 of a list explain disjoint observations and each earn a slot; the const mined from a template's first sighting, which merely echoes an arg-copy, never does. Without the gate that const is a permanent fallback resolving on every call forever — a value seen *once*, months ago, answering for a derivation that found nothing today.
+
+**Fail-closed moved, in both directions, and the honest statement of it is narrower than "unchanged".** What is absolute and untouched: an argument no source has ever produced is never fabricated, and a prediction whose arguments cannot all be resolved is dropped whole — pinned by `still refuses to guess an argument it has never derived` and, for the beam specifically, by a case where three ranked ids are dropped because a second argument is absent. What *changed* is the rule one level down. "The derivation did not resolve, so predict nothing" is now "…so fall back to a literal that has **recurred**": a memorized value with `solo ≥ 2` may stand in when the best-evidenced source finds nothing on this call. Measured against the pre-§13.18 build, a template that derived six values from `rows.0.id` and then saw one unexplainable literal emits nothing on an empty list (as before); after that literal recurs *once*, it answers with it. That is the same mechanism that makes an entity the user keeps returning to predictable — it is what `svc_list_alerts→alert_get` 0.440 → 1.000 is made of — and it is looser than the old build, not tighter. `falls back to a memorized literal only once that literal has recurred` pins both sides of the line. The gate below is what keeps it at "recurred" rather than "seen once".
+
+Measured (offline recall@K harness, seeds 1,2,3, 1020 workflow pairs — the corpus as of this change, before `direct-recall` and `paired-args` were added):
+
+| archetype | before | after | Δ recall@3 | waste/hit |
+|---|---|---|---|---|
+| **list-detail-varied** | 0.527 | **0.727** | **+0.200** | 2.56 → 3.24 |
+| **return-visits** | 0.717 | **0.997** | **+0.280** | 1.27 → 1.26 |
+| multi-arg | 0.883 | 0.883 | 0.000 | 0.82 → 0.84 |
+| regime-shift | 0.900 | 0.900 | 0.000 | 2.33 → 2.33 |
+| WORKFLOW (headline) | 0.731 | **0.873** | **+0.141** | 1.54 → 1.75 |
+| adversarial (floor) | 0.087 | 0.087 | 0.000 | 9.08 → 9.08 |
+
+Eight seeds, re-measured at the two pinned trees (`967320c` and `d42b6c9`) rather than pooled from mixed builds, because this table is the only evidence that +0.141 is not a lucky draw: workflow **0.7353 → 0.8710**, recall@1 0.6000 → 0.6173, waste/hit 1.50 → 1.77, floor identical in every counter (720 issued, 647 wasted, both bands 0.0912). Per archetype: list-detail-varied 0.519 → 0.730, return-visits 0.746 → 0.999, multi-arg 0.875 → **0.873**, regime-shift 0.900 → 0.900.
+
+Per transition, the movement is *only* in the two legs built around a moving list position — `board_list_cards→card_get` 0.207 → 0.607 and `svc_list_alerts→alert_get` 0.440 → 1.000 — and every other transition in the corpus is unchanged to three decimals. Over 8 seeds one is not: `doc_read→doc_list_backlinks` 0.937 → 0.911 (−0.025 on 79 pairs, which is the whole of multi-arg's −0.002), a rare branch losing rank 3 to a hedge from a frequent one. recall@**1** rises too (0.607 → 0.626 at 3 seeds, 0.600 → 0.617 at 8): the ranking is not trading precision for recall. Per transition at 8 seeds, recall@1 goes `board_list_cards→card_get` 0.185 → **0.347** (evidence picks the row the agent actually opens, instead of the row the first sighting used) against `svc_list_alerts→alert_get` 0.495 → 0.455 — the one place rank 1 got worse, and it is a coin flip either way between two favourites that alternate 50/50, on a leg whose recall@3 went 0.495 → 1.000. The floor is byte-identical — 262 predictions issued, 236 wasted, 26 hits, before and after — because its ids never repeat, so no source ever accumulates evidence and every template stays gated.
+
+Waste is the price and it is not free: the workflow pool issues 1892 → 2449 predictions at the shipped cap of 3 for 746 → 890 hits, i.e. 1.54 → 1.75 wasted per hit. It is concentrated exactly where the recall came from (`list-detail-varied` 2.56 → 3.24, a leg that used to emit one candidate and now emits three), and `return-visits` bought its +0.280 while its waste/hit went *down*, because the second candidate it now offers is right almost every time. The §5.6 loop's arithmetic happens to come out roughly unchanged: effectiveness ≈ recall@K / K either way (0.207/1 before vs 0.607/3 after on the hard leg), so on these corpora the beam does not suppress itself. **Nothing enforces that**, and it is worth naming as a watch item rather than a property. Variants share the transition's ruleId, so a transition emitting three candidates for one hit runs at an effectiveness near 1/3 of its recall@K, against a 0.15 suppression floor at ≥8 speculations — a transition whose hedges are worthless drags its own first choice toward silence. The `solo ≥ 2` gate does *not* protect against that: it tests whether a hypothesis has ever explained something independently, never whether it has ever been RIGHT when predicted. A hedge that has explained history and keeps missing the future is exactly the case nothing currently catches, and per-variant feedback (a ruleId per source, at the cost of fragmenting §5.6 onto a moving target) is the obvious lever if it shows up in production.
+
+**Arguments that move together are one hypothesis, not two.** Ranking each argument on its own marginal evidence assumes they are independent, and when two arguments come off the same row of a list — a releaseId and its buildId, an id and its lane — the marginals lie: of the nine pairings three rows admit, only three have ever occurred, and the six that have not are the CHEAPEST substitutions in the lattice (one step from the best combination). So the batch fills with pairings that never happened and the one real alternative falls past the cap. Note what this is: the exact defect §13.18 set out to fix, reappearing one level up. Recall@3 collapses back onto recall@1 — measured **0.420 / 0.420 / 0.493** at k=1/3/5 on the new archetype's hard leg, the extra two slots buying literally nothing.
+
+The fix is provenance, not more ranking. Each source keeps a 32-bit window of *which* of the transition's last 32 observations it explained, shifted for every source of every argument on every observation so the bit positions mean the same thing across arguments. A substitution whose chosen values have non-overlapping windows has positive evidence of never having been right together, and is skipped — but still expanded, since the coherent pairing is only reachable through it. Two windows that do not overlap is evidence; a window that is empty (a pre-v0.13 file, or sightings aged out) is *not* evidence and never blocks anything, and the all-best combination is never skipped, so the check can only remove candidates that a strictly independent model would have invented. On the `paired-args` archetype: recall@3 **0.647 → 0.887**, recall@5 0.720 → 0.923, recall@1 unchanged at 0.537, and waste/hit **4.23 → 2.70**. Recall up and waste down together, which is the signature of removing combinations rather than adding them; every other archetype, including the floor, is unchanged to the unit.
+
+`paired-args` exists because nothing else in the corpus could see this: no other transition has two arguments with more than one live hypothesis each, so the whole class of bug reported 0.000 everywhere. A corpus test asserts the co-variation is real (the two ids always come from the same row, and row 0 is not always the one opened) rather than trusting the generator's comment.
+
+**The rate clause fires strictly less often, which was the open question from §13.17.** Terminal state after a seed-1 replay: `board_list_cards→card_get [cardId]` went from one source at a 90% miss rate (RATE-GATED, silenced) to three sources at **38%** (ok); `svc_list_alerts→alert_get [alertId]` from one memorized literal at 55% to both of the operator's two favourites plus two array paths at **3%**. Where it still fires it is for the right reason: `doc_read→space_search [query]` stays gated at 93%, because a brand-new search query is derivable from nothing and always was. A bad source now loses to a good one instead of dragging the whole template to silence.
+
+Costs, measured: `observe()` goes 2.9 µs → 7.2 µs per call (it now indexes the previous call's args and result paths once per observation and tests every stored source, instead of only mining on a first sighting) — irrelevant beside an MCP round trip, and the index is shared across the follow-up's arguments so a wide result is walked once rather than once per argument. A state file roughly doubles (the whole eval corpus: 15 KB → 30 KB) since templates now persist up to `MAX_SOURCES_PER_ARG` scored sources instead of the one they narrowed to. Back-compat: a source with no `score` loads with **zero** evidence rather than borrowed credit, which makes the old priority order the fallback ranking for a pre-scoring file and offers no variants until real traffic scores something. That cuts one way in particular and it is worth stating plainly: an upgraded file goes **quieter**, not louder. Its sources import with `solo = 0` and an empty provenance window, so a const that the pre-scoring build would have fallen back on when the derivation failed is withheld until traffic gives it standing — one observation is enough to start scoring it, and the fail-closed direction is the right one to err in. `a state file with no scores goes quieter, not louder, after the upgrade` pins it.
+
+One behaviour deliberately changed, with its test: a template whose constant goes stale can now learn the new one. `x1, x2, x2, x2` used to stay silent forever (the only candidate was the const from the first sighting, and it never produced `x2`); it now mints `x2` as a hypothesis when nothing else explains the value and speaks once it has recurred. That is the same mechanism that finds the operator's *second* favourite alert, and it is what makes `svc_list_alerts→alert_get` reach 1.000. It does not weaken fail-closed: a value that never repeats is never predicted, which `still refuses to guess an argument it has never derived` continues to pin over eight sightings of eight distinct values.
+
+**0.846 is an upper bound, and the DEFAULT transport may not reach it.** recall@3 is what a batch of three is worth once all three are actually issued, which is what an http server does and what the offline harness assumes; on stdio, speculation is serial and idle-only (§7), so the 2nd and 3rd candidates queue behind the 1st and `enqueue` evicts the lowest-confidence tail at the queue cap, which is precisely the beam's hedges. What decides it is how long the agent thinks between calls, measured end to end at seed 1 on stdio for list-detail-varied / paired-args / return-visits: **0.740 / 0.880 / 1.000** when the inter-call gap is 3x upstream latency or more (equal to the eval, and equal to http), 0.470 / 0.600 / 1.000 at 2x, and 0.420 / 0.590 / 0.940 at 1x. So the win converts fully once the agent's gap is roughly 3x upstream latency, and `queue-full` and `queue-expired` in `speculate_stats` are the two counters that say which regime a session is actually in. This is not a regression and the beam is not the cause: at the same 1x spacing a learner capped at one candidate, the pre-beam world, reads 0.360 / 0.560 / 0.600 against K=3's 0.420 / 0.590 / 0.940, so K=3 is ahead at every point. It matters because `speculate wrap` and the plugin both make stdio the default, so a tight-loop session is the shape most likely to read below the headline.
+
+### 13.19 v0.13 — measuring how stale a served prefetch was (2026-08-02)
+
+Prediction quality and freshness pull in **opposite directions**, and §13.16–§13.18 only improved one of them. Each of those changes makes the proxy prefetch more, earlier, and further ahead, which can only raise the **age of an entry at the moment it is consumed** — and every number in the report was age-blind, so the whole sequence could have been trading freshness for recall with nothing showing it. What already bounds the damage is unchanged: TTL from completion, single-use entries, a full per-server flush on any non-read-only call. What was missing was any measurement of the **distribution** inside that bound.
+
+**Runtime.** A cache hit now carries `ageMs` (how long the entry had been ready — the same instant the TTL counts from, so the payload itself is up to `upstreamLatencyMs` older) and `ttlFraction`. `Metrics` bins those into a 100 ms histogram out to 60 s and reports `ageAtHit` through the existing `speculate_stats` surface and the session summary: count, p50/p95 (bin midpoints; `maxMs` is exact so a tail is never rounded away), the share consumed in the **last quarter of their TTL**, counts per age band, and counts per TTL quarter. Aggregate only, like every other counter in §9 — durations and counts, never a key, an argument, or a result. A **joined** call contributes nothing: it never sat in the buffer, and folding it in as age 0 would drag the distribution toward "everything is fresh", which is the comforting lie the metric exists to prevent. `count` and the TTL quarters describe the same sample by construction — a hit missing either half of the measurement is admitted to neither — so every share reported is a share of the same denominator. **Scope, stated because it is easy to over-read:** `ageAtHit` measures what was *served*. An entry that expired unclaimed never appears in it; that cost lands in `expired` and per-rule `wasted`, and any question about entries that died before use has to be asked there.
+
+**Offline.** `eval/replay.ts` now replays the same predictions through a simulated speculation buffer alongside the rank scoring — single-use, TTL from completion, first-put-wins on a key (dedupe keeps the *older* entry, which is itself one of the mechanisms that raises age). It is strictly an observer: nothing it does feeds back into what the learner predicts, so recall is bit-identical with it and without it, which is pinned by test.
+
+Measured (seeds 1,2,3, 30 s TTL, 1.5 s between calls):
+
+| | hits | median | p95 | max | last TTL ¼ | mean lead | unclaimed |
+|---|---|---|---|---|---|---|---|
+| all | 1273 | 1460 ms | 1460 ms | 2960 ms | 0.000 | 1.006 | 2428 |
+| next-call | 1158 | 1460 ms | 1460 ms | 2960 ms | 0.000 | 1.007 | 1963 |
+| standing (memorized) | 115 | 1460 ms | 1460 ms | 1460 ms | 0.000 | 1.000 | 465 |
+| adversarial (floor) | 29 | 1460 ms | 2960 ms | 2960 ms | 0.000 | **1.276** | 117 |
+
+**On this corpus age is a restatement of lead, and the report says so.** Calls are a fixed 1 500 ms apart, so age = `lead × 1500 − 40` exactly: median, p95 and max carry no information the mean-lead column does not, and `last TTL ¼` cannot be non-zero below a lead of 15 at this spacing. Three columns of the same number read as three independent measurements, which is why the printed table now states the identity underneath itself. The floor is reported on its own row for the same reason: `adversarial` is the **only** archetype with any lead depth (1.276 against 1.000 everywhere else), and pooled into a population forty times its size it disappears.
+
+**The answer to the question the instrument was built to ask is: no, better prediction did not move entries toward expiry.** Against a deliberately narrower model (`maxPredictionsPerTrigger: 1`, roughly the pre-§13.18 one-candidate world) recall@3 is 0.571 vs 0.846 — and the age distribution is *identical*: p50/p95/max unchanged, mean lead 1.0092 → 1.0063, i.e. very slightly **fresher**. The extra hits are all claimed by the very next call (1265 of 1273 at lead 1, 8 at lead 2), so they arrive at the same 1460 ms as everything else. The suite pins that the ages do move when consumption is delayed (triple the spacing, triple the age) or the TTL is shrunk, so the flatness is a property of the corpus and not of the instrument.
+
+**The long-horizon TTL lever, and why it ships as the identity** (§6.2). `Prediction.horizon` is `'standing'` when **no** argument was read off the call that just happened — every argument a remembered literal — or when the prediction is a §13.15 session opener, which has no trigger at all. The test is `every`, not `some`, and that distinction is the whole classification: horizon is about whether the TARGET was derived from the trigger, not whether every argument was. `get_issue {repo, number: <from the trigger's result>, per_page: 100}` is a next-call prediction that happens to carry a constant, and real profiles are full of constant `per_page` / `state: 'open'` / `format` arguments — classifying on `some` caught the modal next-call prediction (measured: 243 of 1273 simulated hits, including *all* of `return-visits`, versus 115 under `every`).
+
+**One inconsistency survives that fix, and is recorded here rather than repaired.** An argument set that is entirely constant still classifies as `standing`, while a zero-argument one classifies as `next`, and the principle just stated says both are `next`: in each case nothing was read off the trigger, and the transition that fired is itself the derivation. The corpus sides with the principle rather than with the code, since the standing class is consumed at a lead of exactly 1.000 calls, the same instant as a derived one. It is inert at the shipped factor of 1, and it is not a one-line repair: making the learner consistent empties the class outright, leaving openers as the only standing bets, and takes with it the `standing (memorized)` row above and the sweep below that prices the lever. The narrower rule worth measuring first is one that separates an argument holding a single never-varying literal (`state: 'open'`) from one holding several competing memorized entities (an operator's two favourite alerts), since only the second is a bet on *which* thing rather than a fixed shape parameter. Left to whoever turns the factor down, which is the only person the difference can reach.
+
+The premise of shortening is that a standing bet waits longer in the buffer and so is served nearer expiry. **The corpus measures the opposite.** Standing predictions are consumed at a lead of exactly **1.000** calls in every archetype that has any — the same instant as derived ones. And the cost is not unmeasurable, as an earlier version of this note claimed; the harness has a `callSpacingMs` knob, so sweeping an agent's inter-call gap prices it directly (seeds 1,2,3, hits at factor 1 → factor 0.5):
+
+| spacing | 1.0 | 0.5 | standing hits at 0.5 |
+|---|---|---|---|
+| 1 500 ms | 1273 | 1273 | 115 |
+| 10 000 ms | 1273 | 1273 | 115 |
+| 16 000 ms | 1265 | **1150** | **0** |
+| 20 000 ms | 1265 | **1150** | **0** |
+
+A factor of 0.5 is free only while the gap stays under half the TTL, and the moment it passes, every standing bet expires before the call that wanted it. Unmeasured benefit against measured loss is not a trade worth a default, so `LONG_HORIZON_TTL_FACTOR` is **1** and the knob is the opt-in. The sweep above is a test, not a footnote.
+
+The argument survives for **openers**, where the evidence is missing rather than contrary: they fire in `proxy.start()` right after `connectUpstreams()`, before the MCP handshake finishes and before the user has typed, so proxy-start-to-first-call routinely exceeds 15 s and they are the class most likely to be served at 25–30 s of age. The corpus cannot see them (it has no proxy-start-to-first-call gap, and inventing one would just return the number chosen), and — correcting the same earlier note — **`ageAtHit` cannot settle it either**: it is fed on `outcome === 'hit'`, so an opener that expired before the agent's first call never appears in it at all. The instrument for that trade is `expired` and `perRule['opener:*'].wasted`, which is where an opener killed by a shorter TTL actually lands. Turning the factor down without watching those two would hide the entire cost of the change.
+
+**Shadow validation: recorded, deliberately unbuilt.** The way to replace the 30 s guess with a measured number is to re-issue a served prefetch immediately after serving it and compare the two results: the disagreement rate *as a function of age* is exactly the curve nobody has, and it would let per-tool TTLs be set from evidence instead of intuition (a `git_show` on an immutable sha never disagrees; a PR list disagrees within seconds). It is not built, for two reasons that are not fixable by implementing it more carefully. It **doubles upstream calls** on precisely the hot path speculation already spends quota on — the cost lands on the user whose quota it is, for a measurement that benefits the defaults. And it **detects a stale answer only after that answer was already served**, so it is a tuning instrument, never a correctness guarantee; a design that treated it as one would be strictly worse than the current honest bound. If it is ever built it belongs behind an explicit opt-in (a sampling rate, off by default), reporting only an aggregate disagreement rate per (tool, age bucket) — never the differing results, which is exactly the payload §9 has never logged. Until then the 30 s stays what it is: a guess, labelled as one in §6.2, with `ageAtHit` at least making its *consequences* visible.
+
+Unchanged on purpose: the safety policy, the budget, and the invalidation rules. And the sharpest staleness caveat in the design is untouched by any of this — mutations made outside the proxy (a teammate merges the PR, a file changes on disk) remain invisible to invalidation, bounded only by the TTL (§6.2, §11 risk 3). Measuring age does not narrow that window; it makes the width of it observable.
 
 ## v0.11 (2026-08-01): MCP-only focus
 
@@ -653,6 +796,189 @@ gets its already-approved servers wrapped automatically at that project's
 next session start, without `speculate on` ever having run there.
 
 Full trail: docs/superpowers/specs/2026-08-02-auto-wrap-design.md.
+
+## v0.13 (2026-08-02): prediction quality
+
+Five defects in the learner, each found by measurement rather than by reading
+the code. §13.16 through §13.19 carry the detail; this section is the ledger
+and the honest reading of the numbers.
+
+**The instrument came first, because the old headline was circular.**
+`npm run bench` replays a scripted 7-call GitHub session against the mock and
+reports hit rate, tool-wait cut and waste. What it measures is **prefetch
+mechanics**: whether a predicted call is issued early enough, completes in
+time, and is served rather than forwarded. It cannot measure prediction
+quality, because the script and the hand-written GitHub rules that predict it
+were authored together, so quoting its 71% as evidence that the learner
+predicts well was reasoning in a circle. The sharper form of the same point:
+the learner contributes **nothing** to that 71%, since a learned transition
+needs two sightings and the benchmark's workflow repeats none of its calls.
+`npm run eval` is the separate
+instrument, and it was built before any change to `src/`. It scores offline
+**recall@K over transition pairs**: one pair is a consecutive (call i-1, call
+i) inside a scored session, a hit requires tool **and** arguments to match
+under `canonicalKey` (the same key the cache uses, so a right tool with a
+wrong id is a miss), and recall@K is hits at rank ≤ K over pairs. It drives a
+real `TransitionLearner` and imports nothing else: no `ServerProfile`, no
+`Predictor`, so no hand-written rule can contribute a prediction by
+construction, and a test asserts no corpus tool name collides with the
+bundled github, filesystem or slack profiles. Seeds 1, 2 and 3 are pooled;
+the clock is injected and neither `Date.now` nor `Math.random` appears under
+`eval/`. Both commands still ship, and they answer different questions.
+
+**Where it ends up** (seeds 1,2,3; recall@3 is the headline band because 3 is
+the shipped per-trigger cap, §5.6; recall@5 is visible only because the
+harness raises the learner's cap to 5):
+
+| archetype | pairs | recall@1 | recall@3 | recall@5 | waste/hit |
+|---|---|---|---|---|---|
+| list-detail-varied | 300 | 0.373 | 0.727 | 0.790 | 3.24 |
+| return-visits | 300 | 0.593 | 0.997 | 0.997 | 1.26 |
+| multi-arg | 300 | 0.803 | 0.883 | 0.883 | 0.84 |
+| regime-shift | 120 | 0.900 | 0.900 | 0.950 | 2.33 |
+| direct-recall | 150 | 0.267 | 0.587 | 0.627 | 2.38 |
+| paired-args | 300 | 0.537 | 0.887 | 0.923 | 2.70 |
+| **WORKFLOW (headline)** | **1470** | **0.571** | **0.846** | **0.875** | **2.00** |
+| adversarial (floor) | 300 | 0.087 | 0.087 | 0.087 | 9.08 |
+
+**The adversarial floor sat at 0.087 through every task in this plan**, with
+its waste per hit pinned at 9.08 and, at several stages, byte-identical
+counters on both sides of a change. That is the control that makes every
+other number here mean anything. A learner that bought recall by firing more
+speculations at noise would have lifted the floor first, since the floor's
+entity ids are minted once and never repeated, so the flat floor establishes
+exactly this and no more: no gain below came from firing at noise. It is not
+the claim that the gains came without firing more, which would be false. The
+workflow pool went from 1,892 predictions issued to 2,449 over the same span,
+and that cost is priced in the waste column below. The floor is reported
+beside the headline, never pooled into it, and the two are only ever quoted
+together.
+
+**The headline is not one number improving in place, and the denominator is
+why.** The first pooled baseline this branch recorded was **0.6033 over 900
+pairs**; it now reads **0.8463 over 1470**. Three archetypes joined the
+corpus in between, each of them added because an existing defect was
+invisible without it, and each addition moved the headline on its own:
+`regime-shift` took 900 pairs to 1020 (0.6033 to 0.6363), `direct-recall`
+took 1020 to 1170 (0.8725 to 0.8359), and `paired-args` took
+1170 to 1470 (0.8359 to 0.797, both measured without the coherence check).
+The last two moved with no code changing at all; the first is the one place
+this paragraph has to qualify itself, because its two endpoints straddle
+Task 2's decay change as well as the corpus addition, and 0.002 of that
+0.6033 to 0.6363 is code rather than corpus. So the
+end state is a harder corpus **and** a better learner, and the pooled
+endpoints cannot separate the two. The attribution lives in the per-task
+deltas, each measured against a corpus held fixed across the change:
+
+| change | pairs | before | after | Δ recall@3 |
+|---|---|---|---|---|
+| Evidence decays, and eviction goes by value (§13.16) | 1020 | 0.532 | 0.636 | **+0.104** |
+| A template holds evidence, not a latch (§13.17) | 1020 | 0.636 | 0.731 | **+0.095** |
+| Sources compete, and a transition offers several (§13.18) | 1020 | 0.731 | 0.873 | **+0.141** |
+| Co-varying arguments are one hypothesis (§13.18) | 1470 | 0.797 | 0.846 | **+0.049** |
+
+The five defects those four rows close: lifetime-frequency ranking that never
+forgot, paired with FIFO eviction that dropped the best-evidenced entry to
+admit a one-off; a single unexplainable value latching a transition off
+permanently; one hypothesis per argument, fixed to whichever row index the
+first sighting happened to use; one argument set per transition, which pinned
+recall@K to recall@1 whatever the budget allowed; and two arguments read off
+the same row scored as independent, so the cheapest substitutions in the beam
+were pairings that had never occurred. A sixth was introduced and caught in
+review rather than shipped: value-based eviction let a brand-new transition
+be its own victim, freezing the model silently and, because the score
+persists, across restarts. Both eviction sites now exempt the key the current
+observation just wrote, with a regression test at the default
+`minObservations`.
+
+Waste is the price and it is visible: the workflow band reads 2.00 wasted
+predictions per hit against 1.27 at the first baseline, moved by the same mix
+of corpus growth and model change as the headline, and it is concentrated in
+the archetypes the recall came from. That column bills every prediction
+issued at the shipped cap, including the batch fired after each session's
+last call that nothing can ever claim, so it is a deliberately pessimistic
+production estimate and not the instrument §10's ≤2 per hit criterion was
+written against (the bench still reads 0.00). Even read that way it now sits
+exactly on that bar, which makes it the number to watch next rather than one
+with headroom left in it.
+
+**Calibration against PASTE, read the unflattering way.** PASTE (arXiv
+2603.18897) reports **27.8% top-1 and 43.9% top-3** predictor recall on Deep
+Research Bench, SWE Bench and ScholarQA, which are real traces. Our 0.571 and
+0.846 are on a corpus we wrote ourselves. These are not comparable numbers,
+and ours reading higher is most likely evidence that our corpus is easier,
+not that this learner is better: we authored the archetypes knowing what the
+learner can derive, and a synthetic workflow is predictable in ways real
+traffic is not. A real-trace figure for this learner would most likely land
+somewhere between our floor of 0.087 and our headline of 0.846, and nothing
+measured here establishes where. Two differences do run in our favour, and
+they are facts about scope rather than about accuracy: PASTE describes no
+staleness or invalidation mechanism, and no decay, since its patterns are
+mined once and applied uniformly. One runs the other way: it has a string
+formatting and normalization transform as a third kind of argument source,
+where we have only argument copy, parsed result path and memorized constant,
+and it launches greedily on utility rather than against a fixed cap. Real
+numbers for this proxy still come from §9 telemetry, not from either corpus.
+
+**What did not ship, recorded because the plan called for it.**
+
+- **Widening the learnable array-index window** (indices 0..2 to 0..7,
+  `pushArrayPaths`) is **deferred**, measured at **+0.003** (3 pairs of 900),
+  not the ~0.06 first estimated. Under a per-trigger cap of 3 and a
+  monotonically decreasing index distribution, the top three indices by
+  frequency are always {0,1,2}. `src/learner.ts` still reads
+  `Math.min(arr.length, 3)`.
+- **Entity frecency** as a separate mechanism is **dropped**: Task 3's
+  per-source scoring already implements it generically. The `direct-recall`
+  archetype was authored as a negative control, isolating the case where the
+  target id appears nowhere in the trigger's arguments or result (verified 0
+  of 180 sessions) while six wrong ids sit at enumerable array positions. It
+  came back positive at 0.835 recall@3 on its common leg, with the transition
+  holding four `const` sources, one per pinned entity, ranked by decayed
+  score. The control on the control, the same shape with entities never
+  reused, scores 0.000 at zero waste. What remains is scope, not memory:
+  constants are keyed per (server, prevTool, nextTool, argName), so the same
+  entities reached from a rarer trigger get nothing (0.733 / 0.667 / 0.389 /
+  0.000 as that trigger thins from every 2 to every 16 sessions), priced at
+  about +0.03 on the headline.
+- **Utility ranking** (PASTE's `p·T`, cutting the per-trigger cap on expected
+  time saved rather than probability) landed and was **reverted** as a
+  measured no-op. Two reasons, both measured: the bundled bench injects one
+  latency for every tool, so `score × ms` is `score` times a constant and the
+  ranking is provably identical, and the per-trigger cap never binds on the
+  bundled profile (zero cap-suppression events across a full session, since
+  it offers at most 2 to 3 candidates against a cap of 3). Only a constructed
+  heterogeneous workload at cap 1 moved it, 4.50 s to 4.05 s. The eval was
+  unchanged to every digit. The plan's own rule is that a change which does
+  not move the measurement does not land; it is worth revisiting once the cap
+  starts binding, which the beam makes likelier.
+- **The long-horizon TTL lever ships inert.** `speculation.longHorizonTtlFactor`
+  exists per server and `LONG_HORIZON_TTL_FACTOR` defaults to **1**, so
+  nothing is shortened unless someone asks for it. Shortening bought zero
+  measured freshness (standing bets are consumed at a lead of exactly 1.000
+  calls, the same instant as derived ones) and cost about 9% of all hits once
+  inter-call spacing passed roughly half the TTL (1265 to 1150 at factor 0.5
+  from 16 s spacing, with the standing class going to zero). The
+  instrumentation it was built alongside did ship: `ageAtHit` reports median,
+  p95 and max age at consumption, the share consumed in the last quarter of
+  their TTL, and mean lead, in both the runtime and the offline replay.
+
+**What the numbers still do not cover.** The corpus is synthetic and
+authored, not sampled traffic. `derived`/`missed` are the only evidence in
+the learner that does not decay, so a derivation that stops working must
+accumulate misses in proportion to its whole history before the rate gate
+closes; the §5.6 feedback loop is the production backstop and the offline
+harness does not model it. No surviving array-index derivation remains in the
+corpus, so if `pushArrayPaths` broke outright the headline would not move.
+Session-start openers (§13.15) do not fit a recall@K-over-pairs frame and are
+unmeasured. `return-visits` has saturated at 0.997 and no longer discriminates
+anything.
+
+Two corrections to the record above. The v0.11 note said §10 item 8's
+adversarial floor remained unwritten, so no measured lower bound existed;
+that is no longer true, and the floor is the 0.087 row. The v0.12 note said
+the `speculate exec` compatibility pass-through would be removed in 0.13.
+That did not happen either, and 0.13 still ships it.
 
 ---
 

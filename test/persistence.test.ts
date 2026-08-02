@@ -92,6 +92,54 @@ describe('TransitionLearner export/import', () => {
     expect(out[0]!.ruleId).toBe('learned:srv:list→get');
   });
 
+  it('carries per-template evidence across a restart', () => {
+    const a = new TransitionLearner({ now: () => 0 });
+    const pair = (listed: number, opened: number, t: number): void => {
+      a.observe(call('srv', 'list', {}, { items: [{ id: listed }] }, t));
+      a.observe(call('srv', 'get', { id: opened }, null, t + 100));
+    };
+    pair(1, 1, 0);
+    pair(2, 2, 1_000);
+    pair(3, 999, 2_000); // the one instance no source explains
+    pair(4, 4, 3_000);
+    pair(5, 5, 4_000);
+
+    const exported = JSON.parse(JSON.stringify(a.exportState())) as {
+      transitions: Array<{
+        nextTool: string;
+        templates: Array<{ name: string; underivable: boolean; derived?: number; missed?: number }>;
+      }>;
+    };
+    const tpl = exported.transitions
+      .find((x) => x.nextTool === 'get')!
+      .templates.find((x) => x.name === 'id')!;
+    expect({ derived: tpl.derived, missed: tpl.missed }).toEqual({ derived: 4, missed: 1 });
+    expect(tpl.underivable).toBe(false);
+
+    // The miss must not re-poison the template on the way back in.
+    const b = new TransitionLearner({ now: () => 0 });
+    b.importState(exported);
+    const out = b.predict(call('srv', 'list', {}, { items: [{ id: 42 }] }, 5_000));
+    expect(out.some((p) => p.tool === 'get' && p.args['id'] === 42)).toBe(true);
+  });
+
+  it('keeps a pre-v0.13 underivable template silent, evidence fields or not', () => {
+    const l = new TransitionLearner({ now: () => 0 });
+    l.importState({
+      transitions: [
+        {
+          server: 's',
+          prevTool: 'a',
+          nextTool: 'b',
+          count: 9,
+          // Old files carry the sticky boolean alone, and never with sources.
+          templates: [{ name: 'x', underivable: true, sources: [] }],
+        },
+      ],
+    });
+    expect(l.predict(call('s', 'a', {}, null, 0))).toEqual([]);
+  });
+
   it('revision changes when transitions change (dirty tracking)', () => {
     const l = new TransitionLearner({ now: () => 0 });
     const r0 = l.revision;
@@ -120,6 +168,132 @@ describe('TransitionLearner export/import', () => {
     const out = l.predict(call('s', 'a', {}, null, 0));
     expect(out).toHaveLength(1); // only the one valid transition survived
     expect(out[0]!.args).toEqual({ x: 'v' });
+  });
+
+  it('persists lastUpdated so decay survives a reload', () => {
+    const DAY_MS = 24 * 3600_000;
+    let t = 0;
+    const a = new TransitionLearner({ now: () => t });
+    // Same prev tool, same count (2 each), 60 days apart.
+    a.observe(call('srv', 'a', {}, null, 0));
+    a.observe(call('srv', 'b', {}, null, 100));
+    a.observe(call('srv', 'a', {}, null, 200));
+    a.observe(call('srv', 'b', {}, null, 300));
+    t = 60 * DAY_MS;
+    a.observe(call('srv', 'a', {}, null, t));
+    a.observe(call('srv', 'z', {}, null, t + 100));
+    a.observe(call('srv', 'a', {}, null, t + 200));
+    a.observe(call('srv', 'z', {}, null, t + 300));
+
+    const exported = JSON.parse(JSON.stringify(a.exportState())) as {
+      transitions: Array<{ nextTool: string; count: number; score?: number; lastUpdated?: number }>;
+    };
+    const stale = exported.transitions.find((x) => x.nextTool === 'b')!;
+    const fresh = exported.transitions.find((x) => x.nextTool === 'z')!;
+    expect(stale.count).toBe(2);
+    expect(stale.lastUpdated).toBe(0); // recency travels with the snapshot
+    expect(fresh.lastUpdated).toBe(60 * DAY_MS);
+    expect(stale.score).toBeCloseTo(2);
+
+    // Reload "at" the same instant the fresh transition was last seen: the
+    // stale one must still read as stale, not be restamped to now().
+    const b = new TransitionLearner({ now: () => 60 * DAY_MS });
+    b.importState(exported);
+    const preds = b.predict(call('srv', 'a', {}, null, 0));
+    expect(preds.map((p) => p.tool)).toEqual(['z', 'b']);
+  });
+
+  it('loads a pre-existing state file with no score/lastUpdated fields', () => {
+    const l = new TransitionLearner({ now: () => 5_000 });
+    expect(() =>
+      l.importState({
+        transitions: [
+          {
+            server: 's',
+            prevTool: 'a',
+            nextTool: 'b',
+            count: 2,
+            templates: [
+              { name: 'x', underivable: false, sources: [{ kind: 'const', repr: '"v"' }] },
+            ],
+          },
+          {
+            server: 's',
+            prevTool: 'a',
+            nextTool: 'z',
+            count: 5,
+            templates: [
+              { name: 'x', underivable: false, sources: [{ kind: 'const', repr: '"v"' }] },
+            ],
+          },
+        ],
+        openers: [{ server: 's', tool: 'o', argsRepr: '{"a":1}', count: 4 }],
+      }),
+    ).not.toThrow();
+
+    const out = l.predict(call('s', 'a', {}, null, 0));
+    expect(out).toHaveLength(2);
+    expect(out[0]!.args).toEqual({ x: 'v' });
+    // Score defaults to count, so the pre-existing ordering is preserved.
+    expect(out.map((p) => p.tool)).toEqual(['z', 'b']);
+    expect(out[1]!.confidence).toBeCloseTo(0.45); // count 2 survived the load
+    expect(l.openerPredictions('s')).toHaveLength(1);
+  });
+
+  it('an oversized snapshot keeps its most valuable transitions', () => {
+    const sources = [{ kind: 'const', repr: '"v"' }];
+    const l = new TransitionLearner({ now: () => 0, maxTransitions: 2 });
+    l.importState({
+      transitions: ['hot', 'mid', 'cold'].map((prevTool, i) => ({
+        server: 's',
+        prevTool,
+        nextTool: 'b',
+        count: [9, 5, 2][i],
+        templates: [{ name: 'x', underivable: false, sources }],
+      })),
+    });
+    // FIFO drops the first entry listed, which is the strongest one here.
+    expect(l.predict(call('s', 'hot', {}, null, 0))).toHaveLength(1);
+    expect(l.predict(call('s', 'mid', {}, null, 0))).toHaveLength(1);
+    expect(l.predict(call('s', 'cold', {}, null, 0))).toEqual([]);
+  });
+
+  it('trims an oversized opener list to the live per-server cap', () => {
+    const l = new TransitionLearner({ now: () => 0 });
+    l.importState({
+      transitions: [],
+      openers: Array.from({ length: 40 }, (_, i) => ({
+        server: 's',
+        tool: `t${i}`,
+        argsRepr: '{}',
+        count: i + 2,
+      })),
+    });
+    const kept = l.exportState().openers ?? [];
+    expect(kept).toHaveLength(8); // MAX_OPENERS_PER_SERVER, enforced on load
+    expect(Math.min(...kept.map((o) => o.count))).toBe(34); // the strongest 8
+  });
+
+  it('ignores hostile score and lastUpdated values without dropping the entry', () => {
+    const l = new TransitionLearner({ now: () => 5_000 });
+    l.importState({
+      transitions: [
+        {
+          server: 's',
+          prevTool: 'a',
+          nextTool: 'b',
+          count: 2,
+          score: 'lots',
+          lastUpdated: NaN,
+          templates: [
+            { name: 'x', underivable: false, sources: [{ kind: 'const', repr: '"v"' }] },
+          ],
+        },
+      ],
+    });
+    const out = l.predict(call('s', 'a', {}, null, 0));
+    expect(out).toHaveLength(1);
+    expect(out[0]!.confidence).toBeCloseTo(0.45); // count still gates and scores
   });
 
   it('importState never throws on hostile input', () => {

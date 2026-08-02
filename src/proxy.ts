@@ -156,7 +156,13 @@ export class SpeculateProxy {
     // §13.6 persistence: learned transitions + rule feedback survive
     // restarts. Tool results never touch disk (§6.4). Every load failure is
     // a cold start, never an error.
-    this.learner = new TransitionLearner({ now });
+    // The cap belongs to the learner as much as to the predictor: it is what
+    // sizes the beam (§13.18), so a proxy configured for a wider batch has to
+    // say so here too or the knob widens nothing.
+    this.learner = new TransitionLearner({
+      now,
+      maxPredictionsPerTrigger: config.maxPredictionsPerTrigger,
+    });
     this.store = opts.statePath ? new StateStore(opts.statePath, now) : null;
     if (this.store) {
       const state = this.store.load();
@@ -405,7 +411,7 @@ export class SpeculateProxy {
     out.push({
       name: STATS_TOOL,
       description:
-        'Speculate proxy statistics: hit rate, wasted speculative calls, estimated time saved, suppression reasons, cache occupancy, per-rule effectiveness.',
+        'Speculate proxy statistics: hit rate, wasted speculative calls, estimated time saved, how stale served prefetches were (age at hit), suppression reasons, cache occupancy, per-rule effectiveness.',
       inputSchema: { type: 'object', properties: {} },
       outputSchema: {
         type: 'object',
@@ -425,6 +431,20 @@ export class SpeculateProxy {
           suppressed: { type: 'object', additionalProperties: { type: 'number' } },
           estimatedSavedMs: { type: 'number' },
           wastePerHit: { type: ['number', 'null'] },
+          ageAtHit: {
+            type: 'object',
+            description:
+              'how stale served prefetches were: median/p95 age in ms, the share consumed in the last quarter of their TTL, and counts per age band',
+            properties: {
+              count: { type: 'number' },
+              p50Ms: { type: ['number', 'null'] },
+              p95Ms: { type: ['number', 'null'] },
+              maxMs: { type: ['number', 'null'] },
+              lastTtlQuarter: { type: ['number', 'null'] },
+              buckets: { type: 'object', additionalProperties: { type: 'number' } },
+              ttlQuarters: { type: 'array', items: { type: 'number' } },
+            },
+          },
           perServer: { type: 'object' },
           perRule: { type: 'array' },
           cache: {
@@ -646,6 +666,9 @@ export class SpeculateProxy {
           tool,
           ruleId: found.meta.ruleId,
           savedMs: found.meta.upstreamLatencyMs ?? 0,
+          // §9: how stale the answer we just served actually was.
+          ageMs: found.ageMs,
+          ttlFraction: found.ttlFraction,
         });
       } else if (found.outcome === 'joined') {
         const tJoin = this.now();

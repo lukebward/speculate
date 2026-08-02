@@ -58,7 +58,7 @@ No install and no Claude Code required: prefix the server command already in you
 }
 ```
 
-The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate and time saved; `speculate stats` reports durable cumulative usage.
+The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate, time saved, and `ageAtHit`, how stale the served prefetches were. `speculate stats` reports durable cumulative usage.
 
 ## Safety
 
@@ -80,12 +80,13 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 npm install     # builds dist/ via the prepare hook
 npm test        # unit and end-to-end suite
 npm run bench   # speculation off vs on
+npm run eval    # offline prediction recall, headline and floor
 npm run demo    # the README demo, against the bundled mock
 ```
 
 Running the test suite needs Node >= 20.19 (vitest's native rolldown binding; npm silently skips it on older Node). The runtime floor for *using* speculate is unchanged at Node >= 18.
 
-Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation + drain queue), `src/predictor.ts`/`learner.ts`/`priming.ts` (prediction), `src/cache.ts`, `src/policy.ts`/`budget.ts` (safety and limits), `src/manage.ts`/`tryRun.ts` (on/off/try), `mock/`, `bench/`.
+Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation + drain queue), `src/predictor.ts`/`learner.ts`/`priming.ts` (prediction), `src/cache.ts`, `src/policy.ts`/`budget.ts` (safety and limits), `src/manage.ts`/`tryRun.ts` (on/off/try), `mock/`, `bench/`, `eval/`.
 
 ## Non-goals
 

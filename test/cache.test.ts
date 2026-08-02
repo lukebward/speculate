@@ -91,6 +91,29 @@ describe('hit semantics', () => {
     expect(events).toEqual([]);
   });
 
+  it('reports how much of the entry TTL had elapsed when it was consumed', async () => {
+    // §9 staleness telemetry: the whole point of measuring age is that better
+    // prediction fetches earlier, so entries are consumed later in their life.
+    const { cache, setTime } = makeCache();
+    setTime(100);
+    cache.putInFlight(K1, meta(), Promise.resolve(res('x')), 1000);
+    await tick(); // ready at t=100, expires at t=1100
+
+    setTime(850);
+    const hit = asHit(cache.lookup(K1));
+    expect(hit.ageMs).toBe(750);
+    expect(hit.ttlFraction).toBeCloseTo(0.75, 10);
+  });
+
+  it('reports a fresh hit as age 0, not as a fraction of nothing', async () => {
+    const { cache } = makeCache();
+    cache.putInFlight(K1, meta(), Promise.resolve(res('x')), 1000);
+    await tick();
+    const hit = asHit(cache.lookup(K1));
+    expect(hit.ageMs).toBe(0);
+    expect(hit.ttlFraction).toBe(0);
+  });
+
   it('a hit consumes the entry: the second lookup is a miss', async () => {
     const { cache } = makeCache();
     cache.putInFlight(K1, meta(), Promise.resolve(res('x')), 1000);
