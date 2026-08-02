@@ -1,5 +1,7 @@
 # Speculate
 
+> Built with heavy use of AI coding agents. Everything here is reviewed and tested, and the test suite runs on Linux, macOS, and Windows, but weigh that as you would any other statement about how software was made.
+
 Speculative prefetching for coding agents. Speculate sits between your MCP client (Claude Code, Cursor, any host) and its MCP servers, predicts the next read-only call, runs it early, and serves the result the moment it's asked for. Like Gmail preloading your inbox, applied to tool calls.
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
