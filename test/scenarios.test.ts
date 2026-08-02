@@ -306,6 +306,18 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
     expect(stats.wastePerHit ?? 0, '§10: waste ≤ 2 per hit').toBeLessThanOrEqual(2);
     expect(spendPerHit, 'unused speculative spend ≤ 2 per hit').toBeLessThanOrEqual(2);
     expect(stats.estimatedSavedMs).toBeGreaterThan(0);
+
+    // §6.2/§9 freshness, through the real proxy and a real clock: every
+    // ready-hit is measured (a joined call sat in no buffer, so it is not),
+    // and this script's think() gaps are hundreds of ms against a 30 s TTL,
+    // so nothing should be anywhere near the edge.
+    expect(stats.ageAtHit.count, 'every ready-hit carries an age').toBe(stats.hits);
+    // Real elapsed time, not a constant: the script's shortest hit-producing
+    // gap is a 400 ms think against 200 ms of upstream latency, so an entry
+    // that measured 0 ms would mean the clock was never consulted.
+    expect(stats.ageAtHit.maxMs!, 'entries aged while the agent thought').toBeGreaterThan(50);
+    expect(stats.ageAtHit.maxMs!).toBeLessThan(30_000);
+    expect(stats.ageAtHit.lastTtlQuarter, 'nothing served near expiry').toBe(0);
   }, 120_000);
 
   it('S2 adversarial floor: unpredictable session must not get slower', async () => {

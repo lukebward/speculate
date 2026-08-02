@@ -26,7 +26,7 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { SESSIONS_PER_ARCHETYPE, WARMUP_SESSIONS } from './corpus.js';
-import { baselineLine, detail, notes, table } from './format.js';
+import { ageTable, baselineLine, detail, notes, table } from './format.js';
 import { DEFAULT_SEEDS, MAX_K, PRODUCTION_K, runEvalDetailed } from './replay.js';
 import type { EvalRun } from './replay.js';
 
@@ -107,6 +107,8 @@ function main(): void {
   console.log();
   for (const line of table(run, { compare: comparison() })) console.log(indent(line));
   console.log();
+  for (const line of ageTable(run)) console.log(indent(line));
+  console.log();
   for (const line of notes(run)) console.log(indent(line));
   if (notes(run).length > 0) console.log();
   if (process.argv.includes('--detail')) {
@@ -123,6 +125,9 @@ function main(): void {
   );
   console.log('  waste/hit bills every prediction issued at the shipped cap, including the');
   console.log("  batch fired after each session's last call, which nothing can ever claim.");
+  console.log('  age at consumption replays the same predictions through a simulated');
+  console.log('  speculation buffer: recall is age-blind, so it is the only line here that');
+  console.log('  would move if better prediction started serving staler answers.');
   console.log();
 }
 

@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { SpeculationExecutor } from '../src/executor.js';
 import { SpeculationCache } from '../src/cache.js';
+import { canonicalKey } from '../src/keys.js';
 import { SafetyPolicy } from '../src/policy.js';
 import { BudgetManager } from '../src/budget.js';
 import { Metrics } from '../src/metrics.js';
@@ -41,7 +42,10 @@ function profile(): ServerProfile {
   };
 }
 
-function makeHarness(transport: 'stdio' | 'http') {
+function makeHarness(
+  transport: 'stdio' | 'http',
+  serverConfig: import('../src/types.js').ServerConfig = {},
+) {
   let t = 0;
   const now = () => t;
   const advance = (ms: number) => {
@@ -80,7 +84,12 @@ function makeHarness(transport: 'stdio' | 'http') {
     budget,
     metrics,
     profiles: { github: profile() },
-    config: { mode: 'strict', maxPredictionsPerTrigger: 3, servers: { github: {} }, log: 'off' },
+    config: {
+      mode: 'strict',
+      maxPredictionsPerTrigger: 3,
+      servers: { github: serverConfig },
+      log: 'off',
+    },
     now,
   });
   return { executor, calls, advance, metrics, budget, cache };
@@ -95,6 +104,71 @@ const pred = (tool: string, confidence: number): Prediction => ({
 });
 
 const settle = () => new Promise((r) => setImmediate(r));
+
+// --- TTL and the long-horizon multiplier (DESIGN.md §6.2) ---------------------
+
+describe('long-horizon TTL', () => {
+  /** Fires one prediction and reports the entry's remaining life, in ms. */
+  async function lifetime(
+    horizon: Prediction['horizon'],
+    serverConfig?: import('../src/types.js').ServerConfig,
+  ): Promise<number> {
+    const { executor, calls, advance, cache } = makeHarness('http', serverConfig);
+    executor.submit([{ ...pred('a', 0.9), horizon }]);
+    calls[0]!.deferred.resolve();
+    await settle();
+    const key = canonicalKey('github', 'a', { tool: 'a' });
+    // Binary-search the expiry instant by advancing until the entry is gone.
+    let alive = 0;
+    for (let step = 0; step < 400; step++) {
+      if (!cache.has(key)) break;
+      advance(250);
+      alive += 250;
+    }
+    return alive;
+  }
+
+  it('halves the TTL of a standing bet, and leaves a next-call prediction alone', async () => {
+    // Same server, same tool, same resolved TTL: only the horizon differs.
+    expect(await lifetime('next')).toBe(30_000);
+    expect(await lifetime('standing')).toBe(15_000);
+  });
+
+  it('treats an unclassified prediction as next-call, not as a standing bet', async () => {
+    // Hand-written profile rules emit no horizon at all; shortening their TTL
+    // silently would be a freshness change nobody asked for.
+    expect(await lifetime(undefined)).toBe(30_000);
+  });
+
+  it('lets an operator turn the shortening off', async () => {
+    const off = { speculation: { longHorizonTtlFactor: 1 } };
+    expect(await lifetime('standing', off)).toBe(30_000);
+  });
+
+  it('applies the factor to the resolved TTL, whatever resolved it', async () => {
+    // The operator per-tool TTL wins the resolution (§6.2); the multiplier
+    // then applies to THAT, not to the profile default it beat.
+    const cfg = { speculation: { ttlMsByTool: { a: 10_000 } } };
+    expect(await lifetime('next', cfg)).toBe(10_000);
+    expect(await lifetime('standing', cfg)).toBe(5_000);
+  });
+
+  it('never turns a live TTL into a dead one', async () => {
+    // Rounding a tiny TTL down to 0 would make the entry dead on arrival and
+    // silently convert every standing bet into pure waste.
+    const cfg = { speculation: { ttlMsByTool: { a: 1 } } };
+    expect(await lifetime('standing', cfg)).toBeGreaterThan(0);
+  });
+
+  it('leaves an operator TTL of 0 disabled rather than reviving it', async () => {
+    const { executor, calls, metrics } = makeHarness('http', {
+      speculation: { ttlMsByTool: { a: 0 } },
+    });
+    executor.submit([{ ...pred('a', 0.9), horizon: 'standing' }]);
+    expect(calls.length).toBe(0);
+    expect(metrics.statsSnapshot().suppressed['ttl-zero']).toBe(1);
+  });
+});
 
 describe('executor drain queue', () => {
   it('stdio: queues over-budget predictions and fires them in confidence order', async () => {

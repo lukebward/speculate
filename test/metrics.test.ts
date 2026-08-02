@@ -155,6 +155,104 @@ describe('Metrics — counter accumulation', () => {
   });
 });
 
+describe('Metrics — age at hit', () => {
+  const hit = (ageMs: number, ttlFraction: number): DecisionEvent => ({
+    type: 'hit',
+    server: 'gh',
+    tool: 't',
+    ruleId: 'r1',
+    savedMs: 10,
+    ageMs,
+    ttlFraction,
+  });
+
+  it('is empty, not zero, before anything has hit', () => {
+    const age = recorded([]).statsSnapshot().ageAtHit;
+    expect(age.count).toBe(0);
+    expect(age.p50Ms).toBeNull();
+    expect(age.p95Ms).toBeNull();
+    expect(age.maxMs).toBeNull();
+    expect(age.lastTtlQuarter).toBeNull();
+    expect(age.ttlQuarters).toEqual([0, 0, 0, 0]);
+  });
+
+  it('reports the median and p95 of the ages it was given', () => {
+    // 100 hits: ninety at 1 s, ten at 25 s. The median must sit in the fresh
+    // mass and p95 out in the tail — if either collapsed to the mean, a small
+    // population of near-expiry serves would be invisible, which is the exact
+    // failure this instrument exists to prevent.
+    const events: DecisionEvent[] = [];
+    for (let i = 0; i < 90; i++) events.push(hit(1_000, 1_000 / 30_000));
+    for (let i = 0; i < 10; i++) events.push(hit(25_000, 25_000 / 30_000));
+    const age = recorded(events).statsSnapshot().ageAtHit;
+    expect(age.count).toBe(100);
+    expect(age.p50Ms).toBeGreaterThanOrEqual(1_000);
+    expect(age.p50Ms).toBeLessThan(1_200);
+    expect(age.p95Ms).toBeGreaterThan(20_000);
+    expect(age.maxMs).toBe(25_000); // exact, so the tail is never rounded away
+  });
+
+  it('moves when consumption is delayed — the property the metric rests on', () => {
+    const fresh = recorded([hit(200, 0.01), hit(300, 0.01)]).statsSnapshot().ageAtHit;
+    const stale = recorded([hit(20_000, 0.7), hit(21_000, 0.7)]).statsSnapshot().ageAtHit;
+    expect(stale.p50Ms!).toBeGreaterThan(fresh.p50Ms!);
+    expect(stale.maxMs!).toBeGreaterThan(fresh.maxMs!);
+  });
+
+  it('counts the share consumed in the last quarter of the TTL', () => {
+    const age = recorded([
+      hit(1_000, 0.03),
+      hit(12_000, 0.4),
+      hit(23_000, 0.77),
+      hit(29_000, 0.97),
+    ]).statsSnapshot().ageAtHit;
+    // A fraction lands in the quarter it falls INSIDE: 0.4 is second-quarter,
+    // and the boundary 0.75 would be last-quarter, not third.
+    expect(age.ttlQuarters).toEqual([1, 1, 0, 2]);
+    expect(age.lastTtlQuarter).toBe(0.5);
+  });
+
+  it('buckets by age band', () => {
+    const age = recorded([
+      hit(10, 0.001),
+      hit(900, 0.03),
+      hit(4_000, 0.13),
+      hit(20_000, 0.66),
+      hit(90_000, 0.5),
+    ]).statsSnapshot().ageAtHit;
+    expect(age.buckets['<1s']).toBe(2);
+    expect(age.buckets['1-5s']).toBe(1);
+    expect(age.buckets['5-15s']).toBe(0);
+    expect(age.buckets['15-30s']).toBe(1);
+    expect(age.buckets['60s+']).toBe(1);
+    expect(Object.values(age.buckets).reduce((a, b) => a + b, 0)).toBe(5);
+  });
+
+  it('ignores hits with no measured age instead of counting them as fresh', () => {
+    // A joined call never sat in the buffer, and a hit recorded without an
+    // age is unknown, not zero. Counting either as 0 ms would dilute the
+    // distribution towards "everything is fresh".
+    const age = recorded([
+      { type: 'hit', server: 'gh', tool: 't', savedMs: 1 },
+      { type: 'joined', server: 'gh', tool: 't', savedMs: 1 },
+      hit(5_000, 0.16),
+    ]).statsSnapshot().ageAtHit;
+    expect(age.count).toBe(1);
+    expect(age.maxMs).toBe(5_000);
+  });
+
+  it('rejects nonsense ages rather than skewing the distribution', () => {
+    const age = recorded([
+      hit(Number.NaN, 0.5),
+      hit(-1, 0.5),
+      hit(Number.POSITIVE_INFINITY, 0.5),
+      hit(7_000, 0.23),
+    ]).statsSnapshot().ageAtHit;
+    expect(age.count).toBe(1);
+    expect(age.maxMs).toBe(7_000);
+  });
+});
+
 describe('Metrics — wastePerHit', () => {
   it('is wasted / (hits + joins)', () => {
     expect(recorded().statsSnapshot().wastePerHit).toBe(3 / 2);
@@ -278,6 +376,7 @@ describe('Metrics — statsSnapshot shape', () => {
         'suppressed',
         'estimatedSavedMs',
         'wastePerHit',
+        'ageAtHit',
         'perServer',
         'perRule',
       ].sort(),

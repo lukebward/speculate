@@ -6,7 +6,14 @@
  * import cannot have one.
  */
 import { ARCHETYPE_TIMING, FLOOR_ARCHETYPES } from './corpus.js';
-import type { ArchetypeResult, EvalRun, RecallReport, ReplayTotals } from './replay.js';
+import { toAgeReport } from './replay.js';
+import type {
+  AgeTotals,
+  ArchetypeResult,
+  EvalRun,
+  RecallReport,
+  ReplayTotals,
+} from './replay.js';
 
 interface Column {
   head: string;
@@ -125,6 +132,55 @@ export function table(run: EvalRun, opts: TableOptions = {}): string[] {
     lines.push(row(r, delta(result.report)));
   }
   return lines;
+}
+
+const AGE_COLUMNS: readonly Column[] = [
+  { head: 'class', width: 22 },
+  { head: 'hits', width: 7 },
+  { head: 'median', width: 10 },
+  { head: 'p95', width: 10 },
+  { head: 'max', width: 10 },
+  { head: 'last TTL 1/4', width: 14 },
+  { head: 'mean lead', width: 11 },
+  { head: 'unclaimed', width: 11 },
+];
+
+function ageRow(label: string, totals: AgeTotals): string {
+  const a = toAgeReport(totals);
+  const ms = (v: number | null): string => (v === null ? '-' : `${v}ms`);
+  const cells = [
+    label.padEnd(AGE_COLUMNS[0]!.width),
+    String(a.hits).padStart(AGE_COLUMNS[1]!.width),
+    ms(a.p50Ms).padStart(AGE_COLUMNS[2]!.width),
+    ms(a.p95Ms).padStart(AGE_COLUMNS[3]!.width),
+    ms(a.maxMs).padStart(AGE_COLUMNS[4]!.width),
+    (a.lastQuarterShare === null ? '-' : a.lastQuarterShare.toFixed(3)).padStart(
+      AGE_COLUMNS[5]!.width,
+    ),
+    (a.meanLead === null ? '-' : a.meanLead.toFixed(3)).padStart(AGE_COLUMNS[6]!.width),
+    String(a.unconsumed).padStart(AGE_COLUMNS[7]!.width),
+  ];
+  return cells.join('');
+}
+
+/**
+ * Freshness of what the simulated buffer served (§6.2). Recall says whether
+ * the right call was predicted; this says how OLD the answer was when it was
+ * handed over — the number that better prediction can only push upward, and
+ * which no other line in this report would show moving.
+ */
+export function ageTable(run: EvalRun): string[] {
+  const width = AGE_COLUMNS.reduce((a, c) => a + c.width, 0);
+  return [
+    `age at consumption (${run.ttlMs} ms TTL, single-use buffer, halved for standing bets)`,
+    AGE_COLUMNS.map((c, i) =>
+      i === 0 ? c.head.padEnd(c.width) : c.head.padStart(c.width),
+    ).join(''),
+    '-'.repeat(width),
+    ageRow('all', run.age.all),
+    ageRow('next-call', run.age.next),
+    ageRow('standing (memorized)', run.age.standing),
+  ];
 }
 
 /**

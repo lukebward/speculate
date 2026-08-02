@@ -391,7 +391,12 @@ function effectiveness(fb: RuleFeedback): number {
  */
 function validatePrediction(raw: unknown, server: string, ruleId: string): Prediction | null {
   if (raw === null || typeof raw !== 'object') return null;
-  const p = raw as { tool?: unknown; args?: unknown; confidence?: unknown };
+  const p = raw as {
+    tool?: unknown;
+    args?: unknown;
+    confidence?: unknown;
+    horizon?: unknown;
+  };
   if (typeof p.tool !== 'string' || p.tool.length === 0) return null;
   if (typeof p.args !== 'object' || p.args === null || Array.isArray(p.args)) return null;
   if (typeof p.confidence !== 'number' || Number.isNaN(p.confidence)) return null;
@@ -401,6 +406,13 @@ function validatePrediction(raw: unknown, server: string, ruleId: string): Predi
     args: p.args as Record<string, unknown>,
     confidence: Math.min(1, Math.max(0, p.confidence)),
     ruleId,
+    // §6.2: only the two known classes survive validation. Anything else —
+    // including nothing, which is what every hand-written rule emits — is
+    // left unset, which the executor reads as a trigger-derived next-call
+    // prediction on the normal TTL.
+    ...(p.horizon === 'standing' || p.horizon === 'next'
+      ? { horizon: p.horizon }
+      : {}),
   };
 }
 

@@ -8,7 +8,7 @@
  * QUEUE_MAX_AGE_MS so a stale prediction never fires long after its trigger.
  * (Refinement discovered during MVP benchmarking; see DESIGN.md §3.1.)
  */
-import type { SpeculationCache } from './cache.js';
+import { DEFAULT_TTL_MS, LONG_HORIZON_TTL_FACTOR, type SpeculationCache } from './cache.js';
 import type { SafetyPolicy } from './policy.js';
 import type { BudgetManager } from './budget.js';
 import type { Metrics } from './metrics.js';
@@ -116,7 +116,7 @@ export class SpeculationExecutor {
       return 'dropped';
     }
 
-    const ttlMs = this.resolveTtl(p.server, p.tool);
+    const ttlMs = this.resolveTtl(p.server, p.tool, p.horizon);
     if (ttlMs <= 0) {
       this.suppress(p, 'ttl-zero');
       return 'dropped';
@@ -222,19 +222,34 @@ export class SpeculationExecutor {
     });
   }
 
-  private resolveTtl(server: string, tool: string): number {
+  /**
+   * The TTL this prediction is fetched with (§6.2). Resolution order is
+   * unchanged — operator per-tool, profile per-tool, operator default,
+   * profile default, hardcoded fallback — and a long-horizon prediction then
+   * gets a FRACTION of whatever won, so an operator's per-tool freshness
+   * decision still sets the ceiling.
+   */
+  private resolveTtl(
+    server: string,
+    tool: string,
+    horizon: Prediction['horizon'],
+  ): number {
     const { profiles, config } = this.deps;
     const serverCfg = config.servers[server];
     const profile = profiles[server];
     const cfgByTool = serverCfg?.speculation?.ttlMsByTool;
     const operatorTtl =
       cfgByTool && Object.hasOwn(cfgByTool, tool) ? cfgByTool[tool] : undefined;
-    return (
+    const base =
       operatorTtl ?? // operator per-tool beats everything (incl. 0 = never)
       profileTtlMs(profile, tool) ??
       serverCfg?.speculation?.defaultTtlMs ??
       profile?.defaultTtlMs ??
-      30_000
-    );
+      DEFAULT_TTL_MS;
+    if (horizon !== 'standing' || base <= 0) return base; // 0 stays disabled
+    const factor = serverCfg?.speculation?.longHorizonTtlFactor ?? LONG_HORIZON_TTL_FACTOR;
+    // At least 1 ms: rounding a live TTL down to 0 would make the entry dead
+    // on arrival, quietly turning every standing bet into pure waste.
+    return Math.max(1, Math.round(base * factor));
   }
 }

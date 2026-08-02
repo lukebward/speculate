@@ -11,6 +11,26 @@ import { argsDistance, keyServer, keyTool, parseKeyArgs } from './keys.js';
 import type { CacheEntryMeta, CacheKey, CacheLookup } from './types.js';
 
 /**
+ * Last-resort TTL when neither the operator nor a profile says otherwise
+ * (DESIGN.md §6.2). Honestly, an UNMEASURED GUESS: it was chosen because the
+ * prefetch-to-use gap for intra-turn chains is seconds, not because anyone
+ * has measured how often a 30 s-old answer is wrong. See §13.19 for the
+ * (deliberately unbuilt) shadow-validation design that would replace it with
+ * a number.
+ */
+export const DEFAULT_TTL_MS = 30_000;
+
+/**
+ * TTL multiplier for long-horizon predictions (`Prediction.horizon ===
+ * 'standing'`). Those bet that the agent will ask for something at SOME
+ * point rather than next, so they sit in the buffer longest and are the
+ * likeliest to be served near the TTL edge — the guesses whose staleness
+ * risk is worst-evidenced expire soonest. Operator-overridable per server
+ * via `speculation.longHorizonTtlFactor`.
+ */
+export const LONG_HORIZON_TTL_FACTOR = 0.5;
+
+/**
  * Terminal entry outcomes, reported to the metrics layer so waste is
  * countable (DESIGN.md §9): an entry emits at most one of these, ever.
  */
@@ -61,6 +81,8 @@ interface InFlightEntry extends EntryBase {
 interface ReadyEntry extends EntryBase {
   readonly state: 'ready';
   readonly result: CallToolResult;
+  /** When the result landed. TTL counts from completion, not issuance. */
+  readonly readyAt: number;
   /** Absolute ms deadline; TTL counts from completion, not issuance. */
   readonly expiresAt: number;
 }
@@ -136,8 +158,20 @@ export class SpeculationCache {
         return { outcome: 'joined', promise: entry.promise, meta: entry.meta };
       }
       this.entries.delete(key);
-      if (this.now() < entry.expiresAt) {
-        return { outcome: 'hit', result: entry.result, meta: entry.meta };
+      const t = this.now();
+      if (t < entry.expiresAt) {
+        // §9 staleness telemetry: how much of this entry's life had already
+        // elapsed. Measured from readyAt, the same instant the TTL counts
+        // from, so the fraction is exactly "how close to expiry".
+        const ageMs = Math.max(0, t - entry.readyAt);
+        const ttlMs = entry.expiresAt - entry.readyAt;
+        return {
+          outcome: 'hit',
+          result: entry.result,
+          meta: entry.meta,
+          ageMs,
+          ttlFraction: ttlMs > 0 ? Math.min(1, ageMs / ttlMs) : 0,
+        };
       }
       this.emit({ type: 'expired', key, meta: entry.meta });
     }
@@ -220,6 +254,7 @@ export class SpeculationCache {
       ...entry,
       state: 'ready',
       result,
+      readyAt: t,
       expiresAt: t + ttlMs,
     });
   }

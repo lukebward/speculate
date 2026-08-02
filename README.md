@@ -58,7 +58,7 @@ No install and no Claude Code required: prefix the server command already in you
 }
 ```
 
-The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate and time saved; `speculate stats` reports durable cumulative usage.
+The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate, time saved, and **how stale the served prefetches were** — `ageAtHit` reports the median and p95 age of what was handed over, and the share consumed in the last quarter of their TTL, so you can see whether hits are fresh or scraping the edge. `speculate stats` reports durable cumulative usage.
 
 ## Safety
 

@@ -439,6 +439,68 @@ describe('Predictor.observe', () => {
 
 // --- parseResult helper -------------------------------------------------------
 
+// --- freshness classification (§6.2) -----------------------------------------
+
+describe('prediction horizon passes through validation', () => {
+  const profile = makeProfile({});
+
+  function withLearner(predictions: Prediction[], openers: Prediction[] = []) {
+    const metrics = makeMetrics();
+    const predictor = new Predictor({
+      profiles: { [SERVER]: profile },
+      maxPerTrigger: 3,
+      metrics,
+      learner: {
+        observe: () => {},
+        predict: () => predictions,
+        openerPredictions: () => openers,
+      },
+    });
+    return predictor;
+  }
+
+  it('carries a standing bet through to the executor', () => {
+    // The whole TTL shortening hangs off this field surviving validation:
+    // validatePrediction rebuilds the object, so an unpropagated field is a
+    // silent no-op nobody would notice.
+    const p = predictor(withLearner([{ ...pred('t', {}, 0.5, 'learned:x'), horizon: 'standing' }]));
+    expect(p[0]!.horizon).toBe('standing');
+  });
+
+  it('carries a next-call classification through unchanged', () => {
+    const p = predictor(withLearner([{ ...pred('t', {}, 0.5, 'learned:x'), horizon: 'next' }]));
+    expect(p[0]!.horizon).toBe('next');
+  });
+
+  it('leaves a rule that says nothing about horizon unclassified', () => {
+    const p = predictor(withLearner([pred('t', {}, 0.5, 'learned:x')]));
+    expect(p[0]!.horizon).toBeUndefined();
+  });
+
+  it('drops a horizon it does not recognise instead of trusting it', () => {
+    const raw = { ...pred('t', {}, 0.5, 'learned:x'), horizon: 'forever' } as unknown as Prediction;
+    const p = predictor(withLearner([raw]));
+    expect(p[0]!.horizon).toBeUndefined();
+  });
+
+  it('classifies session openers as standing bets', () => {
+    const p = withLearner([], [{ ...pred('o', {}, 0.4, 'opener:srv:o'), horizon: 'standing' }]);
+    expect(p.sessionStart(SERVER)[0]!.horizon).toBe('standing');
+  });
+
+  /** One observe() round against a predictor wired with a fake learner. */
+  function predictor(p: Predictor): Prediction[] {
+    return p.observe({
+      server: SERVER,
+      tool: 'trigger',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 1_000,
+    });
+  }
+});
+
 describe('parseResult', () => {
   const profile = makeProfile({
     parsers: {

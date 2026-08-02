@@ -460,6 +460,10 @@ export class TransitionLearner {
           args: jsonCopyRecord(args),
           confidence: Math.min(0.5, 0.2 + 0.1 * o.count),
           ruleId: `opener:${server}:${o.tool}`,
+          // The longest horizon there is (§6.2): fired before the agent has
+          // made a single call, so nothing at all derives it and the wait to
+          // the claiming call is the whole session start.
+          horizon: 'standing',
         });
       }
       return out;
@@ -675,6 +679,7 @@ export class TransitionLearner {
       score: number;
       weight: number;
       args: Record<string, unknown>;
+      memorized: boolean;
     }> = [];
     for (const state of this.transitions.values()) {
       if (state.server !== call.server || state.prevTool !== call.tool) continue;
@@ -684,7 +689,14 @@ export class TransitionLearner {
       const ruleId = `learned:${state.server}:${state.prevTool}→${state.nextTool}`;
       const score = decayedScore(state.score, state.lastUpdated, now);
       for (const c of materializeCombos(state, call, now, this.maxPredictionsPerTrigger)) {
-        candidates.push({ state, ruleId, score: score * c.weight, weight: c.weight, args: c.args });
+        candidates.push({
+          state,
+          ruleId,
+          score: score * c.weight,
+          weight: c.weight,
+          args: c.args,
+          memorized: c.memorized,
+        });
       }
     }
     // One ranking over everything on offer, so a transition's second-choice
@@ -723,6 +735,11 @@ export class TransitionLearner {
         // exactly 1, so a single-candidate transition is unchanged.
         confidence: Math.min(0.55, 0.25 + 0.1 * c.state.count) * c.weight,
         ruleId: c.ruleId,
+        // §6.2: a call carrying a remembered literal is a bet on "at some
+        // point", not on "next", so the executor fetches it with a shorter
+        // TTL. Classified per argument SOURCE, so two candidates for the
+        // same tool in the same batch can differ.
+        horizon: c.memorized ? 'standing' : 'next',
       });
     }
     return out;
@@ -1190,6 +1207,12 @@ interface ArgOption {
   repr: string;
   /** Decayed evidence for this VALUE: the best admissible source producing it. */
   score: number;
+  /**
+   * True when the value came from a `const` source — remembered, not read off
+   * the call that just happened. That is the freshness distinction (§6.2):
+   * a derived argument says "next", a memorized one says "at some point".
+   */
+  memorized: boolean;
 }
 
 /**
@@ -1231,7 +1254,12 @@ function argOptions(tpl: ArgTemplate, call: ObservedCall, now: number): ArgOptio
     // two slots on one answer.
     if (seen.has(repr)) continue;
     seen.add(repr);
-    out.push({ value: res.value, repr, score: entry.score });
+    out.push({
+      value: res.value,
+      repr,
+      score: entry.score,
+      memorized: entry.src.s.kind === 'const',
+    });
   }
   return out.length > 0 ? out : null;
 }
@@ -1260,6 +1288,13 @@ interface ArgCombo {
   args: Record<string, unknown>;
   /** Product of the per-argument normalized scores; the best combo is 1. */
   weight: number;
+  /**
+   * At least one argument is a remembered literal, so this call is a standing
+   * bet rather than a derivation from the trigger (§6.2 freshness). One
+   * memorized argument is enough: the CALL is only as derived as its least
+   * derived part.
+   */
+  memorized: boolean;
 }
 
 /**
@@ -1314,12 +1349,14 @@ function materializeCombos(
   const combo = (idx: number[]): ArgCombo => {
     const args: Record<string, unknown> = {};
     let weight = 1;
+    let memorized = false;
     for (let a = 0; a < n; a++) {
       const option = options[a]![idx[a]!]!;
       args[names[a]!] = option.value;
       weight *= weights[a]![idx[a]!]!;
+      if (option.memorized) memorized = true;
     }
-    return { args, weight };
+    return { args, weight, memorized };
   };
 
   // Best-first over the lattice of per-argument choices. Every step

@@ -25,7 +25,13 @@ import {
   warmupFor,
 } from '../eval/corpus.js';
 import { baselineLine, table } from '../eval/format.js';
-import { DEFAULT_SEEDS, replayArchetype, runEval, runEvalDetailed } from '../eval/replay.js';
+import {
+  DEFAULT_SEEDS,
+  replayArchetype,
+  runEval,
+  runEvalDetailed,
+  toAgeReport,
+} from '../eval/replay.js';
 import type { RecallReport } from '../eval/replay.js';
 
 /** Seeds the floor and rank-band properties are checked over. */
@@ -292,6 +298,80 @@ describe('direct-recall', () => {
     expect(common[0]!.pairs).toBeGreaterThan(rare.reduce((a, t) => a + t.pairs, 0));
     // No rare trigger may become common enough to memorize the ids by itself.
     for (const t of rare) expect(t.pairs).toBeLessThan(common[0]!.pairs / 4);
+  });
+});
+
+// --- age at consumption -------------------------------------------------------
+
+describe('age at consumption', () => {
+  it('measures every simulated hit and reports a distribution, not just a mean', () => {
+    const run = runEvalDetailed(DEFAULT_SEEDS);
+    const age = toAgeReport(run.age.all);
+    expect(age.hits).toBeGreaterThan(0);
+    expect(age.p50Ms).not.toBeNull();
+    expect(age.p95Ms).not.toBeNull();
+    expect(age.p95Ms!).toBeGreaterThanOrEqual(age.p50Ms!);
+    expect(age.maxMs!).toBeGreaterThanOrEqual(age.p95Ms!);
+    // Nothing can be consumed after it expires, by construction.
+    expect(age.maxMs!).toBeLessThan(run.ttlMs);
+    expect(age.lastQuarterShare).toBeGreaterThanOrEqual(0);
+    expect(age.lastQuarterShare).toBeLessThanOrEqual(1);
+  });
+
+  it('splits the buffer into the classes that get different TTLs', () => {
+    const run = runEvalDetailed(DEFAULT_SEEDS);
+    expect(run.age.next.hits + run.age.standing.hits).toBe(run.age.all.hits);
+    expect(run.age.all.ages).toHaveLength(run.age.all.hits);
+    // Both classes must stay populated or the comparison is vacuous.
+    expect(run.age.next.hits).toBeGreaterThan(0);
+    expect(run.age.standing.hits).toBeGreaterThan(0);
+  });
+
+  it('MOVES when consumption is delayed — the property the metric rests on', () => {
+    // An age metric that reads the same however far apart the calls are would
+    // be measuring the corpus's shape, not staleness. Tripling the spacing
+    // must triple the ages.
+    const base = runEvalDetailed(DEFAULT_SEEDS);
+    const slow = runEvalDetailed(DEFAULT_SEEDS, { callSpacingMs: 4_500 });
+    const b = toAgeReport(base.age.all);
+    const s = toAgeReport(slow.age.all);
+    expect(s.p50Ms!).toBeGreaterThan(b.p50Ms! * 2);
+    expect(s.lastQuarterShare!).toBeGreaterThanOrEqual(b.lastQuarterShare!);
+  });
+
+  it('MOVES when the TTL shrinks — entries land nearer the edge of a shorter life', () => {
+    const long = runEvalDetailed(DEFAULT_SEEDS);
+    const short = runEvalDetailed(DEFAULT_SEEDS, { ttlMs: 3_000 });
+    expect(toAgeReport(short.age.all).lastQuarterShare!).toBeGreaterThan(
+      toAgeReport(long.age.all).lastQuarterShare!,
+    );
+  });
+
+  it('counts a lead of 1 for an entry the very next call claims', () => {
+    const run = runEvalDetailed(DEFAULT_SEEDS);
+    // leadCounts[0] is unused: a prediction cannot be claimed by the call
+    // that triggered it.
+    expect(run.age.all.leadCounts[0] ?? 0).toBe(0);
+    expect(run.age.all.leadCounts[1]!).toBeGreaterThan(0);
+    const total = run.age.all.leadCounts.reduce((a, b) => a + b, 0);
+    expect(total).toBe(run.age.all.hits);
+  });
+
+  it('leaves recall alone: the sim observes the buffer, it does not feed it', () => {
+    // The eval scores rank-of-actual-call and is age-blind by design. If
+    // instrumenting the buffer moved recall, the instrument would be
+    // participating in the thing it measures.
+    const withSim = runEvalDetailed(DEFAULT_SEEDS);
+    const otherTtl = runEvalDetailed(DEFAULT_SEEDS, { ttlMs: 1 });
+    expect(otherTtl.workflow.hitsAt3).toBe(withSim.workflow.hitsAt3);
+    expect(otherTtl.workflow.pairs).toBe(withSim.workflow.pairs);
+    expect(otherTtl.floor.hitsAt3).toBe(withSim.floor.hitsAt3);
+  });
+
+  it('honours single use: one prediction is consumed at most once', () => {
+    const run = runEvalDetailed(DEFAULT_SEEDS);
+    // Every hit removes an entry, so hits can never exceed what was issued.
+    expect(run.age.all.hits).toBeLessThanOrEqual(run.workflow.issued + run.floor.issued);
   });
 });
 

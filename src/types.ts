@@ -53,6 +53,17 @@ export interface Prediction {
    * falls back to computing it.
    */
   key?: CacheKey;
+  /**
+   * How far ahead this prediction is betting (§6.2 freshness). The default,
+   * `'next'`, is derived from the call that just happened: "given what you
+   * just saw, this is the next call." `'standing'` is a memorized bet — at
+   * least one argument comes from a remembered literal rather than from the
+   * trigger, or the prediction has no trigger at all (session openers) — and
+   * so claims only "you will ask for this at some point." Standing bets wait
+   * longer in the buffer before anything claims them, so the executor fetches
+   * them with a shortened TTL (§6.2, LONG_HORIZON_TTL_FACTOR).
+   */
+  horizon?: 'next' | 'standing';
 }
 
 /** A Tier-1 co-occurrence rule (DESIGN.md §5.2). */
@@ -125,7 +136,20 @@ export interface CacheEntryMeta {
 }
 
 export type CacheLookup =
-  | { outcome: 'hit'; result: CallToolResult; meta: CacheEntryMeta }
+  | {
+      outcome: 'hit';
+      result: CallToolResult;
+      meta: CacheEntryMeta;
+      /**
+       * How long the entry had been READY when it was consumed — the same
+       * instant the TTL counts from, so `ageMs / ttl` is exactly how much of
+       * the entry's life had elapsed. The payload itself is up to
+       * `meta.upstreamLatencyMs` older than this (§9 staleness telemetry).
+       */
+      ageMs: number;
+      /** `ageMs` as a fraction of this entry's TTL, in [0,1). */
+      ttlFraction: number;
+    }
   | { outcome: 'joined'; promise: Promise<CallToolResult>; meta: CacheEntryMeta }
   | { outcome: 'miss'; /** top-level arg-key distance to nearest same-tool entry, for near-miss telemetry; undefined when no same-tool entries exist */ nearMissDistance?: number };
 
@@ -170,6 +194,10 @@ export interface DecisionEvent {
   savedMs?: number;
   /** For miss: near-miss key distance when computable. */
   nearMissDistance?: number;
+  /** For hit: ms the entry had been ready when the agent consumed it (§9). */
+  ageMs?: number;
+  /** For hit: `ageMs` as a fraction of that entry's TTL, in [0,1). */
+  ttlFraction?: number;
   latencyMs?: number;
   timestamp?: number;
 }
@@ -181,6 +209,34 @@ export interface RuleStats {
   hits: number; // hit + joined
   wasted: number;
   suppressedByFeedback: number;
+}
+
+/**
+ * How stale served prefetches actually were (DESIGN.md §9). Better
+ * prediction fires earlier and further ahead, which raises the AGE of an
+ * entry at the moment it is consumed; nothing else in the report would show
+ * that. Aggregate only, like every other counter here: durations and counts,
+ * never keys, arguments, or results.
+ */
+export interface AgeAtHitReport {
+  /** Hits with a measured age. */
+  count: number;
+  /**
+   * Median and 95th percentile age in ms, to AGE_BIN_MS resolution (bin
+   * midpoints); null when nothing has hit yet. `maxMs` is exact.
+   */
+  p50Ms: number | null;
+  p95Ms: number | null;
+  maxMs: number | null;
+  /**
+   * Share of hits consumed in the LAST QUARTER of their TTL — the honest
+   * "are we scraping the edge?" number. Null before the first hit.
+   */
+  lastTtlQuarter: number | null;
+  /** Hits per age band, ascending. Keys are stable labels ('<1s', '1-5s', …). */
+  buckets: Record<string, number>;
+  /** Hits per quarter of TTL elapsed: [0-25%, 25-50%, 50-75%, 75-100%]. */
+  ttlQuarters: [number, number, number, number];
 }
 
 export interface StatsReport {
@@ -201,6 +257,8 @@ export interface StatsReport {
   suppressed: Record<string, number>;
   estimatedSavedMs: number;
   wastePerHit: number | null;
+  /** Freshness of what was actually served (§6.2/§9). */
+  ageAtHit: AgeAtHitReport;
   perServer: Record<
     string,
     { speculativeCalls: number; hits: number; wasted: number; specErrors: number }
@@ -234,6 +292,11 @@ export interface ServerConfig {
     defaultTtlMs?: number;
     /** Per-tool TTL overrides (operator wins over profile); 0 disables. */
     ttlMsByTool?: Record<string, number>;
+    /**
+     * TTL multiplier for long-horizon ('standing') predictions, in (0,1].
+     * Default LONG_HORIZON_TTL_FACTOR (0.5); 1 disables the shortening.
+     */
+    longHorizonTtlFactor?: number;
     maxPerMinute?: number;
     maxConcurrent?: number;
   };

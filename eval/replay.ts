@@ -23,7 +23,25 @@
  *     call that actually happened; the rest are waste. The predictions fired
  *     after a session's LAST call are billed too — nothing can ever claim
  *     them — so waste/hit is a production estimate rather than a lower bound.
+ *
+ * AGE AT CONSUMPTION (§6.2 freshness). Recall is age-blind: it asks whether
+ * the right call was predicted, never how old the answer was when it was
+ * served. But better prediction fires more, earlier, and further ahead, which
+ * can only raise the age of an entry at the moment it is consumed — so a run
+ * of "improvements" could be quietly serving staler answers with no number
+ * moving. The replay therefore also simulates the production speculation
+ * buffer alongside the rank scoring: predictions enter it when their trigger
+ * completes, and a later real call consumes at most one of them, single-use
+ * and TTL-bounded, exactly as src/cache.ts does. The buffer is an OBSERVER —
+ * nothing it does feeds back into what the learner predicts or how a pair is
+ * ranked, so instrumenting it cannot move recall.
+ *
+ * What it does NOT model: session openers (§13.15 fires those at proxy start,
+ * and the corpus has no proxy-start-to-first-call gap to fire them into), and
+ * mutation invalidation (the corpus is all reads). Both would only ever
+ * shorten the lives measured here.
  */
+import { DEFAULT_TTL_MS, LONG_HORIZON_TTL_FACTOR } from '../src/cache.js';
 import { canonicalKey } from '../src/keys.js';
 import { TransitionLearner } from '../src/learner.js';
 import type { TransitionLearnerOptions } from '../src/learner.js';
@@ -52,7 +70,13 @@ export const DEFAULT_SEEDS: readonly number[] = [1, 2, 3];
 /** The per-trigger cap Speculate actually ships with (§5.6); waste is billed here. */
 export const PRODUCTION_K = 3;
 /** Spacing between calls inside one session (well under the learner's maxGapMs). */
-const CALL_SPACING_MS = 1_500;
+export const CALL_SPACING_MS = 1_500;
+/**
+ * Upstream latency assumed for every call, real or speculative. A
+ * speculative call issued at T is therefore READY at T + this, which is the
+ * instant its TTL starts counting from (src/cache.ts settles the same way).
+ */
+const CALL_LATENCY_MS = 40;
 /**
  * Spacing between sessions. Larger than the learner's default maxGapMs
  * (120 s), so a session boundary breaks the transition chain exactly as an
@@ -86,9 +110,55 @@ export interface TransitionStat {
   hitsAt5: number;
 }
 
+/**
+ * Age-at-consumption counters for one class of prediction. Ages are kept raw
+ * rather than binned so the percentiles are exact — the population is one
+ * number per simulated hit, a few thousand at most across the whole corpus.
+ */
+export interface AgeTotals {
+  /** Entries a later real call actually consumed. */
+  hits: number;
+  /** Age in ms at the moment of consumption, one per hit. */
+  ages: number[];
+  /** Hits consumed in the LAST QUARTER of their own TTL. */
+  lastQuarter: number;
+  /** leadCounts[n] = hits claimed n calls after the prediction fired (n >= 1). */
+  leadCounts: number[];
+  /** Entries that expired (or were dropped at a session boundary) unclaimed. */
+  unconsumed: number;
+}
+
+/**
+ * The buffer split by the classes that get DIFFERENT TTLs in production
+ * (§6.2): `next` is derived from the trigger, `standing` carries a memorized
+ * argument and so bets on "at some point" rather than "next". Pooling them
+ * would hide exactly the difference the shortened TTL is aimed at.
+ */
+export interface AgeBreakdown {
+  all: AgeTotals;
+  next: AgeTotals;
+  standing: AgeTotals;
+}
+
+/** Readable view of AgeTotals: the distribution, not the raw sample. */
+export interface AgeReport {
+  hits: number;
+  /** Exact percentiles over the raw ages; null when nothing was consumed. */
+  p50Ms: number | null;
+  p95Ms: number | null;
+  maxMs: number | null;
+  /** Share of hits consumed in the last quarter of their TTL. */
+  lastQuarterShare: number | null;
+  /** Mean number of calls between a prediction firing and being claimed. */
+  meanLead: number | null;
+  unconsumed: number;
+}
+
 export interface ArchetypeResult {
   report: RecallReport;
   totals: ReplayTotals;
+  /** Freshness of what the simulated buffer served (§6.2). */
+  age: AgeBreakdown;
   /** Scored pairs grouped by transition, most frequent first. */
   byTransition: TransitionStat[];
   /** Sessions replayed per seed (archetypes are not all the same length). */
@@ -111,6 +181,10 @@ export interface EvalRun {
   floor: ReplayTotals;
   /** Everything pooled, for reference only. */
   overall: ReplayTotals;
+  /** Age at consumption, pooled over every archetype (§6.2 freshness). */
+  age: AgeBreakdown;
+  /** The TTL the buffer simulation ran with, so the ages are interpretable. */
+  ttlMs: number;
 }
 
 export interface ReplayOptions {
@@ -130,6 +204,112 @@ export interface ReplayOptions {
    * time (i.e. decay) rather than anything else about the corpus.
    */
   idleGapMs?: number;
+  /**
+   * TTL the simulated buffer holds entries for. Default DEFAULT_TTL_MS — the
+   * production fallback, and an unmeasured guess (see src/cache.ts).
+   */
+  ttlMs?: number;
+  /** TTL multiplier for standing bets. Default LONG_HORIZON_TTL_FACTOR. */
+  standingTtlFactor?: number;
+  /**
+   * Spacing between calls inside a session. Default CALL_SPACING_MS.
+   * Raising it delays consumption without changing what is predicted, which
+   * is how the suite proves the age numbers measure elapsed time.
+   */
+  callSpacingMs?: number;
+}
+
+/** One live entry in the simulated speculation buffer. */
+interface SimEntry {
+  /** When the speculative result landed; the TTL counts from here. */
+  readyAt: number;
+  expiresAt: number;
+  /** Index of the call whose completion triggered this prediction. */
+  issuedAfterCall: number;
+  standing: boolean;
+}
+
+/**
+ * The production speculation buffer, as much of it as the corpus can speak
+ * to: single-use entries, TTL from completion, first-put-wins on a key.
+ *
+ * Deliberately an OBSERVER. It reads the predictions the learner already
+ * made and the calls that already happened; it never changes either, so the
+ * recall numbers are bit-identical with or without it.
+ */
+class SimBuffer {
+  private readonly entries = new Map<string, SimEntry>();
+
+  constructor(
+    private readonly ttlMs: number,
+    private readonly standingFactor: number,
+    private readonly age: AgeBreakdown,
+  ) {}
+
+  /** Admit the batch a completed call triggered, at the shipped cap. */
+  issue(
+    predictions: readonly { server: string; tool: string; args: Record<string, unknown>; horizon?: string }[],
+    callIndex: number,
+    completedAt: number,
+  ): void {
+    for (const p of predictions.slice(0, PRODUCTION_K)) {
+      const standing = p.horizon === 'standing';
+      const ttl = standing ? Math.max(1, Math.round(this.ttlMs * this.standingFactor)) : this.ttlMs;
+      const readyAt = completedAt + CALL_LATENCY_MS;
+      let key: string;
+      try {
+        key = canonicalKey(p.server, p.tool, p.args);
+      } catch {
+        continue; // unkeyable args never reach the cache in production either
+      }
+      const existing = this.entries.get(key);
+      // First put wins while the incumbent is alive — and the incumbent is
+      // the OLDER entry, so dedupe is itself one of the mechanisms that
+      // raises the age at which something is finally consumed.
+      if (existing && completedAt < existing.expiresAt) continue;
+      if (existing) this.drop(existing);
+      this.entries.set(key, {
+        readyAt,
+        expiresAt: readyAt + ttl,
+        issuedAfterCall: callIndex,
+        standing,
+      });
+    }
+  }
+
+  /** A real call: consume a live entry for its key, if there is one. */
+  consume(key: string, callIndex: number, at: number): void {
+    const entry = this.entries.get(key);
+    if (entry === undefined) return;
+    this.entries.delete(key);
+    if (at >= entry.expiresAt) {
+      this.drop(entry);
+      return;
+    }
+    const ageMs = Math.max(0, at - entry.readyAt);
+    const ttl = entry.expiresAt - entry.readyAt;
+    const lead = callIndex - entry.issuedAfterCall;
+    for (const totals of [this.age.all, entry.standing ? this.age.standing : this.age.next]) {
+      totals.hits++;
+      totals.ages.push(ageMs);
+      if (ttl > 0 && ageMs / ttl >= 0.75) totals.lastQuarter++;
+      totals.leadCounts[lead] = (totals.leadCounts[lead] ?? 0) + 1;
+    }
+  }
+
+  /**
+   * End of session. The next session is SESSION_SPACING_MS away — far past
+   * any TTL — so everything still held is dead, and counted as such.
+   */
+  endSession(): void {
+    for (const entry of this.entries.values()) this.drop(entry);
+    this.entries.clear();
+  }
+
+  private drop(entry: SimEntry): void {
+    this.age.all.unconsumed++;
+    (entry.standing ? this.age.standing : this.age.next).unconsumed++;
+  }
 }
 
 /** Replay one archetype end to end against a fresh learner. */
@@ -141,6 +321,7 @@ export function replayArchetype(
   const warmup = opts.warmupSessions ?? warmupFor(archetype.name);
   const idleGap = ARCHETYPE_TIMING.get(archetype.name)?.idleGap;
   const idleGapMs = opts.idleGapMs ?? idleGap?.ms ?? 0;
+  const spacingMs = opts.callSpacingMs ?? CALL_SPACING_MS;
   const sessions = archetype.sessions(seed);
 
   // The injected clock drives decay and recency only; feeding it the call
@@ -154,6 +335,12 @@ export function replayArchetype(
 
   const totals = emptyTotals();
   const byTransition = new Map<string, TransitionStat>();
+  const age = emptyAgeBreakdown();
+  const buffer = new SimBuffer(
+    opts.ttlMs ?? DEFAULT_TTL_MS,
+    opts.standingTtlFactor ?? LONG_HORIZON_TTL_FACTOR,
+    age,
+  );
 
   for (let s = 0; s < sessions.length; s++) {
     const session = sessions[s]!;
@@ -165,7 +352,7 @@ export function replayArchetype(
     let prev: ObservedCall | null = null;
 
     for (let i = 0; i < session.calls.length; i++) {
-      const call = toObserved(session, i, base + i * CALL_SPACING_MS);
+      const call = toObserved(session, i, base + i * spacingMs);
       if (prev) {
         const predictions = learner.predict(prev);
         const rank = rankOf(predictions, call);
@@ -179,7 +366,15 @@ export function replayArchetype(
           stat.pairs++;
           scoreRank(stat, rank);
           byTransition.set(key, stat);
+
+          // Freshness, in the same order production runs it: the batch the
+          // previous call triggered lands in the buffer, and only then does
+          // this call look for something to claim.
+          buffer.issue(predictions, i - 1, prev.timestamp);
         }
+      }
+      if (scored) {
+        buffer.consume(canonicalKey(call.server, call.tool, call.args), i, call.timestamp);
       }
       clock = call.timestamp;
       learner.observe(call);
@@ -191,12 +386,18 @@ export function replayArchetype(
     // It scores no pair (there is no next call to rank) but it is real waste,
     // so it is billed. Excluding it would understate production waste by
     // roughly the reciprocal of the session length.
-    if (scored && prev) bill(totals, learner.predict(prev).length, false);
+    if (scored && prev) {
+      const trailing = learner.predict(prev);
+      bill(totals, trailing.length, false);
+      buffer.issue(trailing, session.calls.length - 1, prev.timestamp);
+    }
+    buffer.endSession();
   }
 
   return {
     report: toReport(archetype.name, totals),
     totals,
+    age,
     byTransition: [...byTransition.values()].sort(
       (a, b) => b.pairs - a.pairs || (a.transition < b.transition ? -1 : 1),
     ),
@@ -212,12 +413,14 @@ export function replayArchetypeSeeds(
   opts: ReplayOptions = {},
 ): ArchetypeResult {
   const totals = emptyTotals();
+  const age = emptyAgeBreakdown();
   const merged = new Map<string, TransitionStat>();
   let shape = { sessions: 0, warmupSessions: 0 };
   for (const seed of seeds) {
     const result = replayArchetype(archetype, seed, opts);
     shape = { sessions: result.sessions, warmupSessions: result.warmupSessions };
     addTotals(totals, result.totals);
+    addAge(age, result.age);
     for (const stat of result.byTransition) {
       const into = merged.get(stat.transition) ?? blankStat(stat.transition);
       into.pairs += stat.pairs;
@@ -230,6 +433,7 @@ export function replayArchetypeSeeds(
   return {
     report: toReport(archetype.name, totals),
     totals,
+    age,
     byTransition: [...merged.values()].sort(
       (a, b) => b.pairs - a.pairs || (a.transition < b.transition ? -1 : 1),
     ),
@@ -260,11 +464,16 @@ export function runEvalDetailed(
   const workflow = emptyTotals();
   const floor = emptyTotals();
   const overall = emptyTotals();
+  const age = emptyAgeBreakdown();
   for (const archetype of ARCHETYPES) {
     const result = replayArchetypeSeeds(archetype, list, opts);
     byArchetype.push(result);
     addTotals(overall, result.totals);
     addTotals(FLOOR_ARCHETYPES.has(archetype.name) ? floor : workflow, result.totals);
+    // Freshness pools over EVERYTHING: staleness is a property of the buffer,
+    // not of how predictable an archetype is, and the floor's entries are
+    // just as capable of being served late as any other.
+    addAge(age, result.age);
   }
   return {
     seeds: list,
@@ -273,6 +482,64 @@ export function runEvalDetailed(
     workflow,
     floor,
     overall,
+    age,
+    ttlMs: opts.ttlMs ?? DEFAULT_TTL_MS,
+  };
+}
+
+function emptyAge(): AgeTotals {
+  return { hits: 0, ages: [], lastQuarter: 0, leadCounts: [], unconsumed: 0 };
+}
+
+function emptyAgeBreakdown(): AgeBreakdown {
+  return { all: emptyAge(), next: emptyAge(), standing: emptyAge() };
+}
+
+function addAge(into: AgeBreakdown, from: AgeBreakdown): void {
+  for (const k of ['all', 'next', 'standing'] as const) {
+    const a = into[k];
+    const b = from[k];
+    a.hits += b.hits;
+    a.ages.push(...b.ages);
+    a.lastQuarter += b.lastQuarter;
+    a.unconsumed += b.unconsumed;
+    for (let i = 0; i < b.leadCounts.length; i++) {
+      a.leadCounts[i] = (a.leadCounts[i] ?? 0) + (b.leadCounts[i] ?? 0);
+    }
+  }
+}
+
+/**
+ * Distribution view of the raw ages. Median and p95 are exact (nearest-rank
+ * over the sorted sample), because the whole point is to see the TAIL: a
+ * mean would hide a small population of near-expiry serves, which is exactly
+ * the failure this instrument exists to catch.
+ */
+export function toAgeReport(t: AgeTotals): AgeReport {
+  if (t.hits === 0) {
+    return {
+      hits: 0,
+      p50Ms: null,
+      p95Ms: null,
+      maxMs: null,
+      lastQuarterShare: null,
+      meanLead: null,
+      unconsumed: t.unconsumed,
+    };
+  }
+  const sorted = [...t.ages].sort((a, b) => a - b);
+  const at = (p: number): number =>
+    sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1))]!;
+  let leadSum = 0;
+  for (let i = 0; i < t.leadCounts.length; i++) leadSum += i * (t.leadCounts[i] ?? 0);
+  return {
+    hits: t.hits,
+    p50Ms: at(0.5),
+    p95Ms: at(0.95),
+    maxMs: sorted[sorted.length - 1]!,
+    lastQuarterShare: t.lastQuarter / t.hits,
+    meanLead: leadSum / t.hits,
+    unconsumed: t.unconsumed,
   };
 }
 
@@ -363,6 +630,6 @@ function toObserved(session: EvalSession, index: number, timestamp: number): Obs
     result: { content: [{ type: 'text', text: JSON.stringify(call.parsed) }] },
     parsed: call.parsed,
     timestamp,
-    latencyMs: 40,
+    latencyMs: CALL_LATENCY_MS,
   };
 }

@@ -212,6 +212,89 @@ describe('parsed-path templates', () => {
   });
 });
 
+// --- prediction horizon (§6.2 freshness) --------------------------------------
+
+describe('prediction horizon', () => {
+  it('marks a prediction derived entirely from the trigger as next-call', () => {
+    const learner = new TransitionLearner({ now });
+    for (let i = 0; i < 2; i++) {
+      observePair(
+        learner,
+        'gh',
+        { tool: 'get_issue', args: { repo: `r${i}` } },
+        { tool: 'get_comments', args: { repo: `r${i}` } },
+      );
+    }
+    const preds = learner.predict(mkCall('gh', 'get_issue', { repo: 'r9' }));
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ repo: 'r9' });
+    expect(preds[0]!.horizon).toBe('next');
+  });
+
+  it('marks a prediction carrying a memorized literal as a standing bet', () => {
+    // The value is not in the trigger at all — the learner is betting the
+    // agent will ask for it at some point, which is a longer-horizon claim
+    // than "this is the next call" and so gets a shortened TTL (§6.2).
+    const learner = new TransitionLearner({ now });
+    for (const q of ['foo', 'bar']) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'search', args: { q } },
+        { tool: 'list_prs', args: { state: 'open' } },
+      );
+    }
+    const preds = learner.predict(mkCall('srv', 'search', { q: 'baz' }));
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ state: 'open' });
+    expect(preds[0]!.horizon).toBe('standing');
+  });
+
+  it('marks a transition-derived and a memorized prediction for the SAME tool differently', () => {
+    // Both predict `get`, from the same trigger, in the same batch: the
+    // classification has to be per-argument-source, not per tool or per rule.
+    const learner = new TransitionLearner({ now });
+    const seen = (id: number, memo: string): void =>
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', parsed: { items: [{ id }] } },
+        { tool: 'get', args: { id, tag: memo } },
+      );
+    seen(1, 'pinned');
+    seen(2, 'pinned');
+
+    const preds = learner.predict(mkCall('srv', 'list', {}, { items: [{ id: 3 }] }));
+    expect(preds).toHaveLength(1);
+    // `id` came from the trigger's parsed result, `tag` from memory — one
+    // memorized argument is enough to make the whole call a standing bet.
+    expect(preds[0]!.args).toEqual({ id: 3, tag: 'pinned' });
+    expect(preds[0]!.horizon).toBe('standing');
+
+    const derived = new TransitionLearner({ now });
+    for (const id of [1, 2]) {
+      observePair(
+        derived,
+        'srv',
+        { tool: 'list', parsed: { items: [{ id }] } },
+        { tool: 'get', args: { id } },
+      );
+    }
+    const clean = derived.predict(mkCall('srv', 'list', {}, { items: [{ id: 3 }] }));
+    expect(clean[0]!.tool).toBe('get');
+    expect(clean[0]!.horizon).toBe('next');
+  });
+
+  it('calls a session opener a standing bet — it has no trigger at all', () => {
+    const learner = new TransitionLearner({ now, minObservations: 2 });
+    learner.recordOpener('srv', 'list', { scope: 'mine' });
+    learner.recordOpener('srv', 'list', { scope: 'mine' });
+    const openers = learner.openerPredictions('srv');
+    expect(openers).toHaveLength(1);
+    expect(openers[0]!.horizon).toBe('standing');
+  });
+});
+
 describe('const templates and poisoning', () => {
   it('reproduces an arg constant across observations', () => {
     const learner = new TransitionLearner({ now });
