@@ -287,6 +287,25 @@ it('caps entity predictions per trigger', () => { /* gate (c) */ });
 - [ ] **Step 5: Run `npm run eval`**, record the delta, expecting movement on `return-visits` specifically.
 - [ ] **Step 6: Commit** `feat: predict entities you keep returning to`.
 
+### Task 5c: Rank by expected value, not probability alone
+
+From PASTE (arXiv 2603.18897), which the project already cites as the closest
+published analogue. It does not fix K. It ranks candidates by a utility score
+`U = (p · T) / (c · d)` (probability times time saved, over cost) and
+"launched greedily as long as sufficient slack resources remain."
+
+Speculate currently ranks by `confidence × ruleEffectiveness`
+(`src/predictor.ts:291-293`) and caps at 3, so a 50 ms call at 0.8 confidence
+outranks a 2 s call at 0.3 even though the second is worth roughly ten times
+more wall-clock. The data to fix this already exists: `upstreamLatencyMs` is
+recorded per cache entry (`src/cache.ts`) and flows through metrics.
+
+- [ ] **Step 1:** Track a decayed mean upstream latency per `(server, tool)`, reusing the Task 2 decay helper so a tool that got slower recently is weighted as such.
+- [ ] **Step 2:** Rank by `score × expectedLatencyMs`, falling back to the current ordering when a tool has no latency history yet (cold start must not regress).
+- [ ] **Step 3:** Keep the hard cap as a backstop, but let the effective K shrink when candidates are cheap and grow when they are expensive, bounded by the existing idle-only budget in `src/budget.ts`. Do not remove the budget; it is the safety gate.
+- [ ] **Step 4:** `npm run eval -- --compare`. **Expect no movement**: the eval scores rank-of-actual-call and is latency-blind, so this cannot show up there. Justify it on the bench instead (`npm run bench` measures wall-clock) and say plainly that the eval is the wrong instrument for this change.
+- [ ] **Step 5:** Commit `feat: rank speculations by expected time saved, not probability alone`.
+
 ### Task 5b: Staleness, because better prediction makes it worse
 
 Prediction quality and freshness pull in **opposite directions**, and this
@@ -332,5 +351,6 @@ sharpest staleness caveat in the design.
 - [ ] **Step 1:** `npm version 0.13.0 --no-git-tag-version`, and bump the plugin manifest in the same commit.
 - [ ] **Step 2: DESIGN.md** gets a `## v0.13 (2026-08-02): prediction quality` section recording: the five defects fixed, the decay model with its TAU, the beam emission, and **the measured recall table before and after, including the adversarial floor**. State plainly that the floor exists and what it is. Do not use em dashes.
 - [ ] **Step 3:** Note in the same section that `npm run eval` is now the instrument for prediction quality, and that `npm run bench` measures prefetch mechanics only, which is what made the older headline number circular.
+- [ ] **Step 3b: Calibrate against PASTE honestly.** PASTE (arXiv 2603.18897) reports **27.8% top-1 and 43.9% top-3** on Deep Research Bench, SWE Bench and ScholarQA, which are real traces. Our numbers come from a corpus we authored. If ours read higher, the likely explanation is that our corpus is easier, not that the learner is better, and the section must say so rather than inviting the flattering reading. Record two genuine differences in our favour as facts, not boasts: PASTE describes no staleness or invalidation mechanism, and no decay (patterns are mined once and applied uniformly). Also record what it has that we lack: a string formatting/normalization transform as a third argument-source kind, and utility-based greedy launch, which Task 5c adopts.
 - [ ] **Step 4: Verify** `npx tsc --noEmit`, full `npx vitest run`, `npm run eval`, `npm run bench`, `npm run demo`.
 - [ ] **Step 5: Commit** `docs: v0.13 prediction quality, with measured recall`.
