@@ -35,11 +35,29 @@ function indent(line: string): string {
   return line === '' ? '' : `  ${line}`;
 }
 
-/** `--flag value` lookup; undefined when the flag is absent. */
+/**
+ * `--flag value` lookup. A flag present but missing its value (last on the
+ * line, or followed by another flag) is a mistake, not a default: silently
+ * falling back would mean `--json` prints the table and writes no snapshot,
+ * and the operator would not find out until `--compare` failed later.
+ */
 function flag(name: string): string | undefined {
   const i = process.argv.indexOf(name);
-  return i === -1 ? undefined : process.argv[i + 1];
+  if (i === -1) return undefined;
+  const value = process.argv[i + 1];
+  if (value === undefined || value.startsWith('--')) {
+    console.error(`eval: ${name} needs a value, e.g. ${name} ${EXAMPLES[name] ?? 'VALUE'}`);
+    process.exit(1);
+  }
+  return value;
 }
+
+const EXAMPLES: Record<string, string> = {
+  '--json': 'before.json',
+  '--compare': 'before.json',
+  '--seeds': '1,2,3',
+  '--seed': '1',
+};
 
 function seeds(): number[] {
   const raw = flag('--seeds') ?? flag('--seed');
@@ -48,7 +66,11 @@ function seeds(): number[] {
     .split(',')
     .map((s) => Math.trunc(Number(s.trim())))
     .filter((n) => Number.isFinite(n));
-  return parsed.length > 0 ? parsed : [...DEFAULT_SEEDS];
+  if (parsed.length === 0) {
+    console.error(`eval: could not read any seed from "${raw}", expected e.g. 1,2,3`);
+    process.exit(1);
+  }
+  return parsed;
 }
 
 /** Per-archetype recall@3 from a `--json` snapshot, for the delta column. */

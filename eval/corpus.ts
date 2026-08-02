@@ -18,6 +18,15 @@
  * derive and a leg it cannot, so the score sits in a sensitive middle band
  * instead of saturating at 0 or 100.
  *
+ * KNOWN BLIND SPOT — array-index parsed paths. No archetype has a SURVIVING
+ * `hits.0.docId`-style derivation: both list→detail legs are poisoned by
+ * design (they are the improvement targets), and multi-arg resolves through
+ * the nested-object path `suggested.docId` so that it does not smuggle in the
+ * "the agent opens the top of the list" assumption. Consequence: if
+ * `pushArrayPaths` in src/learner.ts broke outright, this eval would not
+ * notice — the headline would not move. Do not treat a green eval as
+ * validation of array-path work; test/learner.test.ts is where that lives.
+ *
  * Determinism: every draw comes from the seeded PRNG below. No ambient
  * randomness and no ambient clock is reachable from this package —
  * test/eval.test.ts greps the sources to keep it that way.

@@ -160,21 +160,29 @@ describe('sensitivity', () => {
     }
   });
 
-  it('moves when the model moves', () => {
-    const base = runEvalDetailed(1).overall;
-    // Starving the transition table is a strictly worse model; the score must
-    // notice. (The knob is the harness's A/B affordance, not a shipped one.)
-    const starved = ARCHETYPES.reduce(
-      (acc, a) => {
-        const { totals } = replayArchetype(a, 1, { learner: { maxTransitions: 4 } });
-        acc.pairs += totals.pairs;
-        acc.hitsAt3 += totals.hitsAt3;
-        return acc;
-      },
-      { pairs: 0, hitsAt3: 0 },
+  it('moves the headline when ranking gets worse, and leaves the floor alone', () => {
+    // THE property the whole instrument rests on. Tightening the per-trigger
+    // cap is a strictly worse ranking and nothing else: candidates past rank 1
+    // stop being issued, so a model that ranked well loses hits and a corpus
+    // of noise — where the only materializable candidate was already alone at
+    // rank 1 — loses nothing.
+    //
+    // Knobs like maxTransitions/minObservations are NOT used here: measured
+    // per archetype they move the floor more than the workflow rows, so an
+    // assertion built on them is carried by the noise archetype and proves
+    // "fires more aggressively", not "predicts better".
+    const base = runEvalDetailed(DEFAULT_SEEDS);
+    const worse = runEvalDetailed(DEFAULT_SEEDS, {
+      learner: { maxPredictionsPerTrigger: 1 },
+    });
+
+    expect(worse.workflow.pairs).toBe(base.workflow.pairs);
+    expect(worse.workflow.hitsAt3 / worse.workflow.pairs).toBeLessThan(
+      base.workflow.hitsAt3 / base.workflow.pairs,
     );
-    expect(starved.pairs).toBe(base.pairs);
-    expect(starved.hitsAt3 / starved.pairs).toBeLessThan(base.hitsAt3 / base.pairs);
+    // The other half, and the one that makes the first half mean anything.
+    expect(worse.floor.pairs).toBe(base.floor.pairs);
+    expect(worse.floor.hitsAt3).toBe(base.floor.hitsAt3);
   });
 
   it('pools seeds instead of trusting one draw', () => {
