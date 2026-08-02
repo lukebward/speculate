@@ -25,9 +25,11 @@ speculate on                                # enable it for the current project
 
 One command, one project, every MCP server the agent uses: your MCP servers are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
 
+`on` also installs auto-wrap: a small, hook-only plugin at Claude Code's user scope, installed once and shared by every project. Its single `SessionStart` hook runs `speculate sync`, which wraps any already-approved MCP servers added since the last run. Claude Code snapshots MCP config before `SessionStart` hooks fire, so a server added right now is wrapped at your *next* session start, not this one: a one-session lag, not instant pickup. Because the plugin lives at user scope, opening a brand-new project also gets its approved servers wrapped automatically, with no `speculate on` needed there; consent is unchanged either way, so a server still pending approval in `.mcp.json` stays skipped regardless of project.
+
 Upgrading from ≤0.10? `speculate on` also removes the retired CLI-speculation plugin and workspace server. Until you run it, `speculate exec` stays as a compatibility pass-through so that plugin's still-installed Bash hook keeps working. Compatibility only, for one release: it is removed in 0.12.
 
-`speculate status` shows what's active and what drifted. `speculate off` restores everything exactly, even without its state file, since wrapped entries carry their original command line after the `--`.
+`speculate status` shows what's active and what drifted, including whether auto-wrap is installed. `speculate off` restores this project exactly, even without its state file, since wrapped entries carry their original command line after the `--`; it also opts this project out of auto-wrap, so the global hook never silently re-wraps it here, and prints the two commands to remove auto-wrap everywhere, not just for this project: `claude plugin uninstall -s user speculate-autowrap` for the plugin, and `claude plugin marketplace remove speculate-mcp` for the registration it came from. Neither touches the staged plugin copy `on` wrote under Speculate's own state directory; that copy is inert once the plugin is uninstalled and safe to delete by hand.
 
 `speculate stats` shows cumulative estimated time saved, hit rate, waste, and per-workspace usage. Use `speculate stats --json` for structured output. Collection began in v0.10; `speculate try` remains zero-write and is excluded.
 

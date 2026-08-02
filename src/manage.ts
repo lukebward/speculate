@@ -900,6 +900,14 @@ function packageRoot(): string | null {
  * that deletes the interpreter the hook was pinned to. `ctx.self.command` is
  * therefore intentionally unused here; only its ARGS are baked.
  *
+ * This is a trade, not a strict improvement: a GUI-launched host (e.g. a
+ * desktop app opened from a dock/Start Menu icon) inherits whatever PATH the
+ * OS session set up, which may lack the nvm/fnm shim directory entirely, and
+ * a bare `node` there resolves to nothing or the wrong interpreter, whereas
+ * a baked `process.execPath` would have kept working. PATH resolution wins
+ * the common case (a terminal-launched host, where version managers live)
+ * at the cost of that less common one.
+ *
  * `${CLAUDE_PLUGIN_ROOT}` is the host's own expansion for the INSTALLED plugin
  * directory and has to be used for the wrapper, because `claude plugin
  * install` COPIES the plugin: a path into the npm package is precisely the
@@ -996,6 +1004,13 @@ function shippedPluginVersion(root: string): string | null {
  * version nor an install path, or an install path we cannot read, leaves a
  * working install alone: reinstalling on every `on` would be worse than the
  * problem.
+ *
+ * Repeated refreshes on every `on` are expected, not a bug, in two narrow
+ * cases: a host that does not round-trip the version string it was given
+ * (so `installed.version` never matches `shipped`, forever); and a developer
+ * who runs `speculate on` from both a source checkout and a global install
+ * (`selfCommand` differs between the two, so the baked hook command flips
+ * back and forth and each run sees the other's copy as stale).
  */
 function autowrapInstallIsCurrent(ctx: Ctx, root: string, installed: AutowrapInstall): boolean {
   const shipped = shippedPluginVersion(root);
@@ -1057,7 +1072,7 @@ async function installAutowrapPlugin(ctx: Ctx): Promise<void> {
       ctx.pluginList = undefined;
       if (un.code !== 0) {
         ctx.log(
-          `[speculate] auto-wrap: could not refresh the installed hook (${(un.stderr || un.stdout).trim() || `exit ${un.code}`}) — reinstall with: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}`,
+          `[speculate] auto-wrap: could not refresh the installed hook (${(un.stderr || un.stdout).trim() || `exit ${un.code}`}) — refresh it manually with: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID} && speculate on`,
         );
         return;
       }

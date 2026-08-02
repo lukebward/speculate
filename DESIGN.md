@@ -488,6 +488,93 @@ skipped on Windows. The §10 caveat still governs: this is a scripted,
 workflow-shaped ceiling, and §10 item 8's adversarial floor script remains
 unwritten, so no measured lower bound exists yet.
 
+## v0.12 (2026-08-02): auto-wrap
+
+`speculate on` now also installs a second, minimal plugin at Claude Code's
+user scope: `speculate-autowrap`, shipping exactly one `SessionStart` hook
+that runs a new `speculate sync` command. Unlike the wrap `on` performs on
+the spot, sync targets servers added to any project after the fact, without
+a person ever running `on` there again.
+
+**The one-session lag is measured, not assumed.** Testing against Claude
+Code on Windows with an isolated `CLAUDE_CONFIG_DIR` established: a
+`SessionStart` command hook fires before auth completes; `claude mcp
+add-json` run from inside that hook succeeds; but the server it adds does
+not launch in the current session, only in the next one. Claude Code
+snapshots MCP config before running `SessionStart` hooks, so no hook,
+however early, can make a wrap take effect in the session that triggered it.
+A server added now runs unwrapped, exactly as if speculation were off, for
+one more session, then wraps starting the session after. Both the plugin's
+own summary line and `speculate status` state this plainly rather than
+implying instant pickup.
+
+**Sync is cheap on the common path and fails open on every other one.**
+Before spawning anything, it hashes the project's effective server set
+(name, scope, approval state, and canonicalized entry for every server) and
+compares it to a stored per-project hash; when they match, which is the
+overwhelming majority of session starts since most sessions add no server,
+sync returns after a couple of file reads: no subprocess, no lock. Only a
+changed hash proceeds to acquire a host-wide lock file, one per state
+directory rather than per project, because every session ultimately
+read-modifies-writes the same global `~/.claude.json`; a session that
+cannot get the lock exits immediately and leaves the work for whichever
+session next finds the config unlocked, which costs nothing given the lag
+already puts everything one session behind. The wrap pass itself runs under
+a cooperative deadline, 5 s by default: checked only between servers, never
+between one server's `remove` and its paired `add-json`, so a session that
+runs out of budget mid-list leaves a clean host, nothing deleted without a
+replacement, rather than a fully wrapped one. Every failure path returns
+success and sync prints at most one summary line: a session start must
+never be blocked or sprayed with diagnostics on auto-wrap's account, so
+`speculate status` remains the place to look when something needs
+attention.
+
+**`off` opts a project out; it does not uninstall the plugin.** Running
+`speculate off` records a per-project opt-out that sync's hash check
+consults before anything else, so the global hook will not silently
+re-wrap that project again, even though the plugin stays installed for
+every other project on the machine. `off` prints the command to remove the
+plugin everywhere (`claude plugin uninstall -s user speculate-autowrap`)
+for anyone who wants auto-wrap gone entirely, plus the command to remove
+the marketplace registration that supplied it (`claude plugin marketplace
+remove speculate-mcp`), since a host-global registration is exactly the
+kind of artifact `off`'s per-project framing could otherwise leave
+unmentioned. What `off` still does not touch or mention is the staged
+plugin copy under `<state>/autowrap` (the same directory that holds
+`managed.json`) that `on` wrote in order to install the plugin in the
+first place; that copy is inert once the plugin is uninstalled, since
+nothing on the host points at it any more, and is safe to delete by hand
+alongside the uninstall.
+
+**Install repairs itself by uninstalling first.** Measured against the
+real host: with the plugin already installed, `claude plugin install`
+no-ops ("already installed") and `plugin update` reports "already at the
+latest version"; neither re-copies a cached plugin. So when the staged
+hook command or the plugin's own version no longer matches what is
+installed, for example after an npm move changed the baked CLI path, or
+after a new Speculate release, `on` uninstalls the old copy first and
+immediately reinstalls the current one; a plain install or update cannot
+get there, since both treat "already installed" as done. If the uninstall
+half of that repair fails, `on` aborts rather than attempting the install
+against an unknown state, and prints the exact recipe to finish the job by
+hand:
+`claude plugin uninstall -s user speculate-autowrap && speculate on`.
+The honest cost of that abort: between the failure and someone
+running the recipe, the user has no auto-wrap plugin installed at all,
+which is a worse position than the stale copy they started with, and
+exactly the reason the message names the fix instead of only the
+uninstall half of it.
+
+Consent is unchanged throughout: sync wraps only servers
+`wrapEffectiveServers` would already wrap through `on`, including the
+`.mcp.json` approval gate, so nothing sync does can turn a pending server
+into a running one. The one honest new consent-adjacent fact: because the
+plugin installs at user scope, opening a brand-new project also gets its
+already-approved servers wrapped automatically at that project's next
+session start, without `speculate on` ever having run there.
+
+Full trail: docs/superpowers/specs/2026-08-02-auto-wrap-design.md.
+
 ---
 
 ## Appendix A. Market research & prior art

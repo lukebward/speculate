@@ -913,6 +913,19 @@ describe('speculate off', () => {
     expect(logs.join('\n')).not.toContain('auto-wrap is still installed globally');
   });
 
+  it('off names the marketplace-removal command alongside the plugin uninstall', async () => {
+    // `off` only uninstalls this project's wraps and opts it out of sync; a
+    // fully-honest goodbye also names the two host-global artifacts left
+    // behind: the plugin itself and the marketplace registration it came from.
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    const code = await speculateOff(opts());
+    expect(code).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain('remove it everywhere with: claude plugin uninstall -s user speculate-autowrap');
+    expect(text).toContain('and its marketplace: claude plugin marketplace remove speculate-mcp');
+  });
+
   it('on clears the sync opt-out for this project', async () => {
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     writeFileSync(
@@ -1381,7 +1394,12 @@ describe('the auto-wrap plugin', () => {
     // told exactly what to run.
     expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'install')).toEqual([]);
     expect(logs.join('\n')).toContain('could not refresh');
-    expect(logs.join('\n')).toContain('plugin uninstall -s user speculate-autowrap');
+    // The hint must be a full repair recipe, not just the uninstall half: a
+    // user who only runs the uninstall lands in the exact no-plugin state
+    // this abort exists to avoid.
+    expect(logs.join('\n')).toContain(
+      'refresh it manually with: claude plugin uninstall -s user speculate-autowrap && speculate on',
+    );
   });
 
   it('on leaves a matching install alone (no reinstall churn)', async () => {
