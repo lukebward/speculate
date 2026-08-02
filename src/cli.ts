@@ -322,15 +322,22 @@ async function main(): Promise<void> {
     // BETWEEN servers so a wrap is never cut in half. This timer is only the
     // last resort for a hang no layer below can end (every `claude mcp` call
     // already carries its own 30s execFile timeout): far enough out that it
-    // CANNOT fire in the window between a server's `mcp remove` and the `mcp
-    // add-json` that puts it back — killing the process THERE would leave the
-    // server deleted with no restore and no state record. 100s is the 5s
-    // budget plus three consecutive 30s execFile timeouts, so even a `remove`
-    // and an `add-json` that both hang to their own timeout finish inside it
-    // (60s was not: the budget plus two hangs already reached it, landing the
-    // hard exit exactly in that window). Unref'd so it never keeps an idle
-    // process alive.
-    const timer = setTimeout(() => process.exit(0), 100_000).unref();
+    // does not fire in the window between a server's `mcp remove` and the
+    // `mcp add-json` that puts it back — killing the process THERE would
+    // leave the server deleted with no restore and no state record. 120s is
+    // the 5s budget plus three 30s execFile timeouts, with slack because that
+    // 30s is NOT a hard bound: execFile's timeout sends SIGTERM and then
+    // waits for stdio to close, so a child that ignores SIGTERM stretches
+    // past it (60s, then 100s, were both close enough to the arithmetic to
+    // put the hard exit back inside the restore window). Unref'd so it never
+    // keeps an idle process alive.
+    //
+    // Arithmetic is the weak form of this guarantee. The strong one is a
+    // marker file (or an in-memory flag plus a crash-recovery pass) held
+    // across the remove→add pair, so the exit can simply refuse to fire while
+    // one is open, and the restore is replayable if the process dies anyway.
+    // That is the right long-term fix; this timer is the interim.
+    const timer = setTimeout(() => process.exit(0), 120_000).unref();
     try {
       process.exitCode = await speculateSync({ self: selfCommand(), mode: null });
     } catch {

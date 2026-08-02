@@ -23,13 +23,15 @@
  * Why the summary goes to stdout as a `systemMessage` JSON object: on exit 0 a
  * hook's stderr is invisible to the user, and for SessionStart plain stdout is
  * injected into the MODEL's context. `systemMessage` is the documented channel
- * for a line the USER should see. It is emitted only when `sync` actually
- * wrapped something, which is rare; the fast path prints nothing at all.
+ * for text the USER should see. It is emitted only when `sync` actually
+ * changed something, which is rare; the fast path prints nothing at all.
  *
  * And ONLY then. The child's stderr also carries Node warnings, tsx notices
  * and, on a broken install, stack traces — none of which a user should meet at
- * every session start. So the line is taken by prefix rather than by position,
- * and only from a run that exited 0.
+ * every session start. So the lines are taken by prefix rather than by
+ * position, and only from a run that exited 0. Every matching line is kept:
+ * `sync` emits up to two (a wrap and a shadow removal can happen in one pass),
+ * and forwarding only the last silently swallowed the other.
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -61,14 +63,18 @@ child.on('close', (code) => {
   // A run that failed has nothing to tell the user: it is a bug report, not a
   // status line, and `speculate status` is where diagnosis lives.
   if (code !== 0) return;
-  // `sync` is silent unless it wrapped something; its summary is one line, and
-  // every line it writes is prefixed.
-  const line = note
+  // `sync` is silent unless it changed something, and every line it writes is
+  // prefixed. There can be MORE THAN ONE — a single pass can both wrap new
+  // servers and remove a shadow whose .mcp.json licence is gone — so every
+  // matching line is kept and joined. Taking the last one dropped the "wrapped
+  // N new servers" notice in exactly the session it was earned.
+  const lines = note
     .split('\n')
     .map((l) => l.trim())
-    .filter((l) => l.startsWith('[speculate]'))
-    .pop();
-  if (line) process.stdout.write(`${JSON.stringify({ systemMessage: line })}\n`);
+    .filter((l) => l.startsWith('[speculate]'));
+  if (lines.length > 0) {
+    process.stdout.write(`${JSON.stringify({ systemMessage: lines.join('\n') })}\n`);
+  }
   // No process.exit(): returning lets the write flush, and the exit code is
   // 0 regardless of how the child fared.
 });

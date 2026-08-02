@@ -25,7 +25,7 @@ speculate on                                # enable it for the current project
 
 One command, one project, every MCP server the agent uses: your MCP servers are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
 
-`on` also installs auto-wrap: a small, hook-only plugin at Claude Code's user scope, installed once and shared by every project. Its single `SessionStart` hook runs `speculate sync`, which wraps any already-approved MCP servers added since the last run. Claude Code snapshots MCP config before `SessionStart` hooks fire, so a server added right now is wrapped at your *next* session start, not this one: a one-session lag, not instant pickup. The hook is also scoped to `startup` sessions, so if you live in `claude --resume` / `--continue`, it never fires and auto-wrap never runs for you — `speculate on` still wraps on the spot. Because the plugin lives at user scope, opening a brand-new project also gets its approved servers wrapped automatically, with no `speculate on` needed there; consent is unchanged either way, so a server still pending approval in `.mcp.json` stays skipped regardless of project, and revoking an approval you had given removes the wrapped copy again at the next session start.
+`on` also installs auto-wrap: a small, hook-only plugin at Claude Code's user scope, installed once and shared by every project. Its single `SessionStart` hook runs `speculate sync`, which wraps any already-approved MCP servers added since the last run. Claude Code snapshots MCP config before `SessionStart` hooks fire, so a server added right now is wrapped at your *next* session start, not this one: a one-session lag, not instant pickup. The hook is also scoped to `startup` sessions, so if you live in `claude --resume` / `--continue`, it never fires and auto-wrap never runs for you — `speculate on` still wraps on the spot. Because the plugin lives at user scope, opening a brand-new project also gets its approved servers wrapped automatically, with no `speculate on` needed there; consent is unchanged either way, so a server still pending approval in `.mcp.json` stays skipped regardless of project. Consent is also honoured in reverse: revoke an approval you had given, or drop the server from `.mcp.json` entirely, and the wrapped copy is removed at the next session start — as long as Speculate's own state file still records that it created that copy. Lose or corrupt that file and the copy is left alone rather than guessed at — the same conservative stance `off` takes when it cannot prove a local entry was Speculate's doing.
 
 Upgrading from ≤0.10? `speculate on` also removes the retired CLI-speculation plugin and workspace server. Until you run it, `speculate exec` stays as a compatibility pass-through so that plugin's still-installed Bash hook keeps working. Compatibility only: it is slated for removal in 0.13.
 
@@ -84,7 +84,7 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 500 tests (493 passing, 7 skipped on this platform)
+npm test        # 504 tests (497 passing, 7 skipped on this platform)
 npm run bench   # speculation off vs on
 npm run demo    # the README demo, against the bundled mock (injected latency)
 ```

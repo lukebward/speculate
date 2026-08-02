@@ -1286,10 +1286,9 @@ describe('the auto-wrap plugin', () => {
     // The wrapper is addressed through the host's own expansion for the
     // INSTALLED copy — a path into the npm package is the one that vanishes.
     expect(entry.command).toContain('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs');
-    // Must outlast sync's own last-resort 100s exit (the 5s budget plus three
-    // consecutive 30s execFile timeouts), or the host kills a wrap mid-flight
-    // and reopens the window the cooperative deadline closed.
-    expect(entry.timeout).toBeGreaterThan(100);
+    // Must outlast sync's own last-resort 120s exit, or the host kills a wrap
+    // mid-flight and reopens the window the cooperative deadline closed.
+    expect(entry.timeout).toBeGreaterThan(120);
     expect(stagedHooks().hooks.SessionStart[0].matcher).toBe('startup');
     // The staged tree is what the host was pointed at, and it carries the
     // wrapper (the package dir may be root-owned or read-only).
@@ -1338,6 +1337,26 @@ describe('the auto-wrap plugin', () => {
     expect(quiet.code).toBe(0);
     expect(quiet.stdout).toBe('');
     expect(quiet.stderr).toBe('');
+  });
+
+  it('the hook wrapper keeps every summary line, not just the last', async () => {
+    // `sync` can report two things in one run — a wrap and the removal of a
+    // shadow whose approval was revoked. Taking the LAST matching line
+    // silently dropped the "wrapped N new servers" notice in exactly that
+    // session, which is the one session it mattered in.
+    const twoLineCli = join(home, 'two-line-cli.mjs');
+    writeFileSync(
+      twoLineCli,
+      "process.stderr.write('[speculate] wrapped 1 new server (github); speculation active next session\\n');\n" +
+        "process.stderr.write('[speculate] removed 1 wrapped .mcp.json shadow whose approval was revoked\\n');\n",
+    );
+    const res = await runWrapper([twoLineCli]);
+    expect(res.code).toBe(0);
+    expect(JSON.parse(res.stdout)).toEqual({
+      systemMessage:
+        '[speculate] wrapped 1 new server (github); speculation active next session\n' +
+        '[speculate] removed 1 wrapped .mcp.json shadow whose approval was revoked',
+    });
   });
 
   it('the hook wrapper exits 0 when the CLI itself fails', async () => {
@@ -1536,7 +1555,7 @@ describe('the auto-wrap plugin', () => {
     expect(entry.command).toContain('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs');
     // Same floor as the generated copy: the shipped template must not be the
     // one that kills a wrap between a `remove` and its `add-json`.
-    expect(entry.timeout).toBeGreaterThan(100);
+    expect(entry.timeout).toBeGreaterThan(120);
   });
 });
 

@@ -547,6 +547,89 @@ describe('speculate sync', () => {
     expect(calls).toEqual([]);
   });
 
+  it('removes its own shadow when the server disappears from .mcp.json', async () => {
+    // The commoner trigger of the same family as a revoke: a git pull, a
+    // branch switch, or an edit drops the server from the file. The shadow
+    // wins the scope contest, so nothing else would ever notice — Claude Code
+    // would keep launching a server the project no longer declares.
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { team: { command: 'team-server', args: [] }, other: { command: 'other' } },
+      }),
+    );
+    writeClaudeJson({ projects: { [cwd]: { enabledMcpjsonServers: ['team'] } } });
+    expect(await speculateSync(opts())).toBe(0);
+    expect(readClaudeJson().projects[cwd].mcpServers.team.command).toBe(SELF.command);
+
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { other: { command: 'other' } } }),
+    );
+    calls = [];
+    logs = [];
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(calls.map((c) => `${c[2]} ${c[3]}`)).toEqual(['remove team']);
+    expect(readClaudeJson().projects[cwd].mcpServers?.team).toBeUndefined();
+    expect(readState().projects[cwd]).toBeUndefined();
+  });
+
+  it('removes its own shadow when .mcp.json is deleted entirely', async () => {
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { team: { command: 'team-server', args: [] } } }),
+    );
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+    expect(await speculateSync(opts())).toBe(0);
+    expect(readClaudeJson().projects[cwd].mcpServers.team.command).toBe(SELF.command);
+
+    rmSync(join(cwd, '.mcp.json'));
+    calls = [];
+    logs = [];
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(calls.map((c) => `${c[2]} ${c[3]}`)).toEqual(['remove team']);
+    expect(readClaudeJson().projects[cwd].mcpServers?.team).toBeUndefined();
+  });
+
+  it('says nothing at all on a partly failed pass, removals included', async () => {
+    // The wrap line is gated on a clean pass; the removal line must be too,
+    // or a run that failed half its work still reports the half it liked.
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { team: { command: 'team-server', args: [] } } }),
+    );
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+    expect(await speculateSync(opts())).toBe(0);
+    const hashBefore = readState().syncHashes[cwd];
+
+    // Approval revoked AND a new user-scope server that the host refuses to
+    // wrap: one removal succeeds, one wrap fails, in the same pass.
+    const config = readClaudeJson();
+    config.projects[cwd].disabledMcpjsonServers = ['team'];
+    config.mcpServers = { slack: { command: 'slack-server' } };
+    writeClaudeJson(config);
+    calls = [];
+    logs = [];
+    const failsToWrap: CmdRunner = async (cmd, args, o) => {
+      if (args[1] === 'add-json' && args[3]!.includes('"wrap"')) {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'host is having a bad day' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+
+    expect(await speculateSync({ ...opts(), runner: failsToWrap })).toBe(0);
+    expect(logs).toEqual([]);
+    // The removal still happened — consent is not negotiable on a bad day.
+    expect(readClaudeJson().projects[cwd].mcpServers?.team).toBeUndefined();
+    // … and an unfinished pass never claims "nothing changed": the stored
+    // hash is still the stale one, so the next session retries slack.
+    expect(readState().syncHashes[cwd]).toBe(hashBefore);
+    expect(readState().syncHashes[cwd]).not.toBe(currentHash());
+  });
+
   it('leaves a local shadow it did not create alone', async () => {
     // Same revoke, but the wrapped local entry is the USER's own (no managed
     // record of a shadow Speculate created). Never remove what we didn't add.

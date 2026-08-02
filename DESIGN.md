@@ -535,17 +535,30 @@ before saving and touches only this project's own two keys. Writing its
 whole in-memory copy back silently reverted an `off` that completed in
 another project mid-sync, erasing the opt-out that `off` had just recorded
 and resurrecting the project record it had just deleted, so the project the
-user had turned off was re-wrapped at its next session start. The wrap pass itself runs under
+user had turned off was re-wrapped at its next session start. One residual
+is recorded rather than fixed: since `on`/`off` still take no lock, an `off`
+in the SAME project as an in-flight sync can still have its project record
+resurrected by that sync's merge. The opt-out itself now survives, so the
+consequence is a stale entry list, and a later `off` reporting spurious
+failures as it chases servers that are already unwrapped — not a project
+that gets re-wrapped. Closing it properly means `on`/`off` taking the lock,
+which trades a silent data race for a person waiting on a background hook. The wrap pass itself runs under
 a cooperative deadline, 5 s by default: checked only between servers, never
 between one server's `remove` and its paired `add-json`, so a session that
 runs out of budget mid-list leaves a clean host, nothing deleted without a
 replacement, rather than a fully wrapped one. Above that sits a last-resort
-process exit for a hang no layer below can end, set at 100 s — the 5 s
-budget plus three consecutive 30 s `execFile` timeouts — so that even a
-`remove` and its paired `add-json` both hanging to their own timeouts
-finish before it fires; the plugin's own hook timeout (120 s) is kept above
-that, since a host-side kill lands wherever it lands, including in exactly
-the window the cooperative deadline exists to protect. Every failure path returns
+process exit for a hang no layer below can end, set at 120 s — the 5 s
+budget plus three 30 s `execFile` timeouts, with slack, because that 30 s is
+not a hard bound: `execFile` SIGTERMs and then waits for stdio to close, so a
+child that ignores SIGTERM runs past it. The plugin's own hook timeout
+(150 s) and the stale-lock window (180 s) are stacked above that in turn,
+since a host-side kill lands wherever it lands, including in exactly the
+window the cooperative deadline exists to protect, and a lock holder that
+legitimately runs to either cap must not look stale to the next session.
+Arithmetic is the weak form of this guarantee, and the code says so: the
+strong form is a marker held across the `remove`→`add-json` pair, so the
+exit can refuse to fire while one is open and the restore is replayable if
+the process dies anyway. That is the right long-term fix. Every failure path returns
 success and sync prints at most one summary line: a session start must
 never be blocked or sprayed with diagnostics on auto-wrap's account, so
 `speculate status` remains the place to look when something needs
@@ -623,10 +636,18 @@ scope that has no approval gate at all. That was already true of `on` in
 projects where nobody ever ran `speculate on`. Both halves are fixed: the
 hash covers a shadowed project entry as well as the effective one, so a
 revoke moves it, and `sync`/`on` then REMOVE a shadow whose `.mcp.json`
-counterpart is no longer approved, leaving the pending entry in effect and
-unwrapped. Only shadows Speculate created are removed — the managed state
-records those with action `shadowed` — so a local entry the user wrapped
-themselves is never touched. The other honest consent-adjacent fact:
+counterpart is no longer *both present and approved*, leaving whatever the
+project actually declares — a pending entry, or nothing at all — as the only
+thing left. Present matters as much as approved: a server dropped from
+`.mcp.json` by a pull, a branch switch, an edit, or a deleted file is the
+commoner trigger, and it used to leave the wrapped shadow running forever
+for a server the project no longer declares. Only shadows Speculate created
+are removed — the managed state records those with action `shadowed`, and
+the entry must still be a Speculate wrap — so a local entry the user wrapped
+themselves is never touched, and neither is one whose record has been lost
+with the state file. That last case is deliberately conservative: without the
+record there is no proof the entry is ours, which is exactly the stance `off`
+takes in the same situation. The other honest consent-adjacent fact:
 because the plugin installs at user scope, opening a brand-new project also
 gets its already-approved servers wrapped automatically at that project's
 next session start, without `speculate on` ever having run there.

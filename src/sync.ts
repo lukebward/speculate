@@ -54,13 +54,13 @@ const DEFAULT_BUDGET_MS = 5_000;
 
 /**
  * A lock older than this belonged to a session that died mid-sync (the CLI's
- * last-resort cap kills one at 100s, and the host's own hook timeout at 120s).
+ * last-resort cap kills one at 120s, and the host's own hook timeout at 150s).
  * It MUST exceed both: a holder that legitimately runs to either would
  * otherwise look stale to a second session, which would seize the lock and
  * write concurrently — the exact race the lock exists to prevent. Short enough
  * that a crash still costs at most one more session.
  */
-const LOCK_STALE_MS = 150_000;
+const LOCK_STALE_MS = 180_000;
 
 /**
  * Concurrent sessions all read-modify-write the same global `~/.claude.json`
@@ -102,12 +102,15 @@ function acquireLock(path: string): (() => void) | null {
   }
 }
 
-/** Always resolves 0. Silent unless it wrapped something. */
+/** Always resolves 0. Silent unless it actually changed something. */
 export async function speculateSync(opts: SyncOptions): Promise<number> {
   // `makeCtx` defaults `log` to a stderr write, and `wrapEffectiveServers`
   // logs one line per server. A session-start hook must not spray that into
   // the user's terminal, so the ctx logger is silenced and `sync` emits only
-  // its own one-line summary through `report`.
+  // its own summary through `report`: AT MOST TWO lines, since one pass can
+  // both wrap new servers and remove a shadow whose licence is gone. The hook
+  // wrapper (plugin/hooks/autowrap.mjs) forwards every line it is given, not
+  // just the last — dropping one was a real bug.
   const report = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   try {
     const ctx = makeCtx({ ...opts, log: () => {} });
@@ -164,7 +167,7 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
       // possible. Nothing wrapped and nothing removed means nothing to
       // record: writing an empty entry list would make `status` report drift
       // "since 'speculate on'" in a project where `on` has never run.
-      if (wrapped.length > 0 || outcome.revoked > 0) {
+      if (wrapped.length > 0 || outcome.shadowsRemoved > 0) {
         const entries = [...managed.values()];
         if (entries.length > 0) merged.projects[ctx.cwd] = { entries, updatedAt: Date.now() };
         else delete merged.projects[ctx.cwd];
@@ -176,20 +179,29 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
       // Report what really happened, including on a run that ran out of
       // time: those servers ARE wrapped, and they do take effect next
       // session. The rest are simply the next run's work.
-      if (wrapped.length > 0 && outcome.failed === 0) {
-        report(
-          `[speculate] wrapped ${wrapped.length} new server${wrapped.length > 1 ? 's' : ''} ` +
-            `(${wrapped.join(', ')}); speculation active next session`,
-        );
-      }
-      // Consent moving the other way is the one other thing worth a line: a
-      // revoked .mcp.json approval takes a running server away, and silence
-      // there would look like Speculate ignored the revoke.
-      if (outcome.revoked > 0) {
-        report(
-          `[speculate] removed ${outcome.revoked} wrapped .mcp.json shadow` +
-            `${outcome.revoked > 1 ? 's' : ''} whose approval was revoked`,
-        );
+      //
+      // Both lines carry the SAME gate. A pass with failures says nothing at
+      // all — a half-failed run is a bug report, not a status line, and
+      // `speculate status` is where diagnosis lives — so reporting the
+      // removals while swallowing the wraps would be the one shape that
+      // makes a bad run look tidy.
+      if (outcome.failed === 0) {
+        if (wrapped.length > 0) {
+          report(
+            `[speculate] wrapped ${wrapped.length} new server${wrapped.length > 1 ? 's' : ''} ` +
+              `(${wrapped.join(', ')}); speculation active next session`,
+          );
+        }
+        // Consent moving the other way is the one other thing worth a line:
+        // it takes a running server away, and silence there would look like
+        // Speculate had ignored the revoke (or the deletion).
+        if (outcome.shadowsRemoved > 0) {
+          report(
+            `[speculate] removed ${outcome.shadowsRemoved} wrapped .mcp.json shadow` +
+              `${outcome.shadowsRemoved > 1 ? 's' : ''} ` +
+              '(approval revoked, or the server is gone from .mcp.json)',
+          );
+        }
       }
     } finally {
       release();

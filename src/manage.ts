@@ -680,12 +680,13 @@ export interface WrapOutcome {
   changed: number;
   failed: number;
   /**
-   * How many Speculate-owned local shadows were REMOVED because the
-   * `.mcp.json` approval they stood on was revoked. Counted separately from
-   * `changed` so `sync` knows its managed record needs rewriting even on a
-   * pass that wrapped nothing.
+   * How many Speculate-owned local shadows were REMOVED because the approved
+   * `.mcp.json` entry they stood on is gone — approval revoked, or the server
+   * no longer in the file at all. Counted separately from `changed` so `sync`
+   * knows its managed record needs rewriting even on a pass that wrapped
+   * nothing.
    */
-  revoked: number;
+  shadowsRemoved: number;
   /**
    * True when the pass stopped early because `opts.deadline` had passed, so
    * servers were left unvisited. The pass is INCOMPLETE: callers must not
@@ -718,7 +719,7 @@ export async function wrapEffectiveServers(
 ): Promise<WrapOutcome> {
   let changed = 0;
   let failed = 0;
-  let revoked = 0;
+  let shadowsRemoved = 0;
   const projectScopeNames = new Set(
     view.servers.filter((s) => s.scope === 'project').map((s) => s.name),
   );
@@ -726,7 +727,7 @@ export async function wrapEffectiveServers(
   for (const [name, scoped] of effectiveServers(view.servers)) {
     if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
       ctx.log(`[speculate] out of time before ${name} — the next run picks it up`);
-      return { changed, failed, revoked, timedOut: true };
+      return { changed, failed, shadowsRemoved, timedOut: true };
     }
     if (name === WORKSPACE_SERVER_NAME) continue;
     if (name.startsWith('-')) {
@@ -735,20 +736,26 @@ export async function wrapEffectiveServers(
       ctx.log(`[speculate] ${name}: skipped (name starts with '-')`);
       continue;
     }
-    // Consent revoked: this local entry is a shadow WE registered for an
-    // approved .mcp.json server, and that approval is gone. Nothing else
-    // would notice — the shadow wins the scope contest, so the pending
-    // project entry never becomes effective again on its own, and local
-    // scope has no approval gate to stop it. Remove the shadow so the
-    // .mcp.json entry (pending, unwrapped, not running) is what's left.
+    // The shadow's licence is gone: this local entry is a wrapped copy WE
+    // registered for an APPROVED .mcp.json server, and that server is no
+    // longer both present and approved. Two ways it gets there, and they are
+    // one condition, not two — the approval was revoked, or the server left
+    // `.mcp.json` altogether (a git pull, a branch switch, an edit, or the
+    // file deleted). Nothing else would notice either: the shadow wins the
+    // scope contest, so it stays registered and running at a scope with no
+    // approval gate, for a server the project no longer declares. Remove it,
+    // leaving whatever the project actually declares (a pending entry, or
+    // nothing at all) as the only thing left.
     //
     // Strictly "our own": the managed record says WE created this shadow
-    // (action 'shadowed'). A local entry the user wrapped themselves is
-    // theirs, and stays exactly where they put it.
+    // (action 'shadowed') and it is still a Speculate wrap. A local entry the
+    // user wrapped themselves is theirs, and stays exactly where they put it.
+    // The corollary is conservative by design — with the state file lost or
+    // corrupt there is no record, so the shadow survives, the same stance
+    // `off` takes when it cannot prove a local entry was a shadow.
     if (
       scoped.scope === 'local' &&
-      projectScopeNames.has(name) &&
-      !view.approvedProjectServers.has(name) &&
+      !(projectScopeNames.has(name) && view.approvedProjectServers.has(name)) &&
       managed.get(managedKey('local', name))?.action === 'shadowed' &&
       // Still OUR shadow, not something the user has since replaced it with:
       // a record plus an entry that is no longer a Speculate wrap means the
@@ -763,9 +770,11 @@ export async function wrapEffectiveServers(
       }
       managed.delete(managedKey('local', name));
       ctx.log(
-        `[speculate] ${name}: .mcp.json approval revoked — wrapped shadow removed (pending again)`,
+        projectScopeNames.has(name)
+          ? `[speculate] ${name}: .mcp.json approval revoked — wrapped shadow removed (pending again)`
+          : `[speculate] ${name}: gone from .mcp.json — wrapped shadow removed`,
       );
-      revoked++;
+      shadowsRemoved++;
       changed++;
       continue;
     }
@@ -835,7 +844,7 @@ export async function wrapEffectiveServers(
     changed++;
   }
 
-  return { changed, failed, revoked, timedOut: false };
+  return { changed, failed, shadowsRemoved, timedOut: false };
 }
 
 // -- the auto-wrap plugin -------------------------------------------------------
@@ -862,16 +871,17 @@ const AUTOWRAP_MARKETPLACE_ID = 'speculate-mcp';
 
 /**
  * How long the host lets the hook run, in SECONDS. It must exceed `sync`'s own
- * last-resort exit (100s, itself the 5s budget plus three consecutive 30s
- * execFile timeouts): a shorter host-side timeout kills a wrap in flight,
- * reopening the very window — a server deleted between `mcp remove` and `mcp
- * add-json` — that the cooperative deadline exists to close. It is a ceiling
- * that should never be approached: the fast path costs two file reads.
+ * last-resort exit (120s — see the comment on that timer in cli.ts, including
+ * why the arithmetic is only the weak form of the guarantee): a shorter
+ * host-side timeout kills a wrap in flight, reopening the very window — a
+ * server deleted between `mcp remove` and `mcp add-json` — that the
+ * cooperative deadline exists to close. It is a ceiling that should never be
+ * approached: the fast path costs two file reads.
  *
  * Kept in step with the shipped plugin/hooks/hooks.json template, which the
  * generator below overwrites at install time (a test pins the two together).
  */
-const AUTOWRAP_HOOK_TIMEOUT_S = 120;
+const AUTOWRAP_HOOK_TIMEOUT_S = 150;
 
 /**
  * The ids a host may report our plugin under. `claude plugin list --json`
