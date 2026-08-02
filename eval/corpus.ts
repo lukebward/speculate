@@ -418,7 +418,7 @@ const REGIME_PHASE1_SESSIONS = 40;
 const REGIME_PHASE2_SESSIONS = 40;
 /**
  * Idle time between the two phases. Must be several multiples of the
- * learner's evidence half-life (TAU, 14 days at time of writing) for phase-1
+ * learner's evidence time constant (TAU, 14 days at time of writing; the half-life is TAU*ln2, about 9.7 days) for phase-1
  * evidence to be genuinely stale rather than merely old.
  */
 export const REGIME_IDLE_GAP_MS = 45 * 24 * 3600_000;
@@ -443,7 +443,7 @@ export const REGIME_IDLE_GAP_MS = 45 * 24 * 3600_000;
  * merely ranked fourth. Time-decayed evidence answers "what they do now".
  *
  * This archetype exists because the rest of the corpus cannot ask that
- * question: its sessions are 600 s apart against a 14-day half-life, so
+ * question: its sessions are 600 s apart against a 14-day TAU, so
  * nothing in it is ever stale and decay can only perturb tie-breaks. Judging
  * a staleness change against an instrument blind to staleness is the circular
  * benchmark mistake wearing a different hat.
