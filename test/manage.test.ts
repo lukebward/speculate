@@ -29,8 +29,13 @@ let cwd: string;
 let statePath: string;
 let calls: string[][];
 let logs: string[];
-/** Simulated `claude plugin` state; null = plugin CLI unavailable (old host). */
-let pluginSim: { installed: boolean; marketplace: boolean } | null;
+/**
+ * Simulated `claude plugin` state; null = plugin CLI unavailable (old host).
+ * `autowrap` simulates the (separate, task-4) `speculate-autowrap` plugin
+ * being installed globally — independent of the legacy `speculate` plugin
+ * `installed`/`marketplace` already track.
+ */
+let pluginSim: { installed: boolean; marketplace: boolean; autowrap?: boolean } | null;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'speculate-mhome-'));
@@ -64,13 +69,10 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
   if (args[0] === 'plugin') {
     if (!pluginSim) return { code: 2, stdout: '', stderr: 'unknown command plugin' };
     if (args[1] === 'list') {
-      return {
-        code: 0,
-        stdout: JSON.stringify(
-          pluginSim.installed ? [{ name: 'speculate', marketplace: 'speculate' }] : [],
-        ),
-        stderr: '',
-      };
+      const list: AnyRecord[] = [];
+      if (pluginSim.installed) list.push({ name: 'speculate', marketplace: 'speculate' });
+      if (pluginSim.autowrap) list.push({ name: 'speculate-autowrap', marketplace: 'speculate' });
+      return { code: 0, stdout: JSON.stringify(list), stderr: '' };
     }
     if (args[1] === 'marketplace' && args[2] === 'list') {
       return {
@@ -815,6 +817,49 @@ describe('speculate off', () => {
     // .mcp.json untouched; the project entry is back in effect.
     expect(JSON.parse(readFileSync(join(cwd, '.mcp.json'), 'utf8'))).toEqual(mcpJson);
     expect(logs.join('\n')).toContain('shadow removed');
+  });
+
+  it('off records a sync opt-out for this project', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    logs = [];
+    const code = await speculateOff(opts());
+    expect(code).toBe(0);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.syncOptOut).toEqual({ [cwd]: true });
+    // No auto-wrap plugin is installed in this test — the "still installed
+    // globally" message must not fire.
+    expect(logs.join('\n')).not.toContain('auto-wrap is still installed globally');
+  });
+
+  it('on clears the sync opt-out for this project', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {},
+        // A prior `off` opted this project out; an unrelated project's
+        // opt-out is also present and must survive untouched.
+        syncOptOut: { [cwd]: true, '/some/other/project': true },
+      }),
+    );
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.syncOptOut[cwd]).toBeUndefined();
+    expect(state.syncOptOut['/some/other/project']).toBe(true);
+  });
+
+  it('off says auto-wrap is still active globally when the plugin is installed', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    logs = [];
+    const code = await speculateOff(opts());
+    expect(code).toBe(0);
+    expect(logs.join('\n')).toContain('auto-wrap');
+    expect(logs.join('\n')).toContain('claude plugin uninstall');
   });
 });
 

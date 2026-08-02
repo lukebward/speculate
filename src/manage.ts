@@ -227,6 +227,16 @@ interface ManagedState {
    * and there is nothing to migrate.
    */
   syncHashes?: Record<string, string>;
+  /**
+   * cwd -> true for projects where `off` opted out of auto-wrap: the
+   * user-scope auto-wrap plugin's session-start hook runs `speculate sync`
+   * globally, and without this flag it would silently re-wrap a project
+   * right after `off` unwrapped it, on the next session start. `off` sets
+   * the flag for its own project; `on` clears it. A later task makes `sync`
+   * honor it. Absent from every file written before this field existed —
+   * `loadManagedState` must keep loading those unchanged.
+   */
+  syncOptOut?: Record<string, true>;
 }
 
 function readMarketplaceAddedByOn(state: ManagedState): boolean {
@@ -734,6 +744,9 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
   // The ownership flag authorized exactly one host-global removal; consume it
   // so a future run never claims a registration the user re-added by hand.
   if (legacy.marketplaceRemoved) state.marketplaceAddedByOn = false;
+  // `on` opts this project back into a later `sync`'s auto-wrap (see
+  // ManagedState.syncOptOut) — undoing whatever `off` last recorded here.
+  delete state.syncOptOut?.[ctx.cwd];
   saveManagedState(ctx.statePath, state);
   ctx.log(
     `[speculate] on: ${changed} change(s)${failed ? `, ${failed} failure(s)` : ''}. Undo anytime with 'speculate off'.`,
@@ -742,6 +755,52 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
 }
 
 // -- off --------------------------------------------------------------------------
+
+/**
+ * The (task-4) user-scope auto-wrap plugin's id. `off` only needs to know
+ * whether it's installed, to tell the user their opt-out is per-project
+ * while the plugin itself is not. This is deliberately a narrow, local
+ * check — not routed through LEGACY_PLUGIN_IDS/LEGACY_PLUGIN_MATCH, which
+ * name only the retired ≤0.10 plugin — so a later task adding real
+ * plugin-list plumbing (shared with `sync`) can replace it outright rather
+ * than untangle it from legacy-plugin detection.
+ */
+const AUTOWRAP_PLUGIN_ID = 'speculate-autowrap';
+
+/**
+ * Fail-soft check (same shape as detectLegacyPlugin, matching a different
+ * id): is `speculate-autowrap` in `claude plugin list --json`? A missing
+ * plugin CLI, nonzero exit, or unparseable output all mean "not detected",
+ * never a guess.
+ */
+async function detectAutowrapPlugin(ctx: Ctx): Promise<boolean> {
+  try {
+    const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
+    if (list.code !== 0) return false;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(list.stdout);
+    } catch {
+      return false;
+    }
+    const named = (item: unknown): boolean => {
+      if (typeof item === 'string') return item === AUTOWRAP_PLUGIN_ID;
+      if (!item || typeof item !== 'object') return false;
+      const rec = item as Record<string, unknown>;
+      return rec['id'] === AUTOWRAP_PLUGIN_ID || rec['name'] === AUTOWRAP_PLUGIN_ID;
+    };
+    if (Array.isArray(parsed)) return parsed.some(named);
+    if (parsed && typeof parsed === 'object') {
+      const rec = parsed as Record<string, unknown>;
+      return (
+        Object.keys(rec).includes(AUTOWRAP_PLUGIN_ID) || Object.values(rec).some(named)
+      );
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 export async function speculateOff(opts: ManageOptions): Promise<number> {
   const ctx = makeCtx(opts);
@@ -912,7 +971,19 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   if (record) delete state.projects[ctx.cwd];
   // Consume the marketplace-ownership flag exactly once (see on()).
   if (legacyCleanup.marketplaceRemoved) state.marketplaceAddedByOn = false;
-  if (record || legacyCleanup.marketplaceRemoved) saveManagedState(ctx.statePath, state);
+  // Opt this project out of a later `sync`'s auto-wrap (see ManagedState.
+  // syncOptOut) — the global plugin, if installed, would otherwise re-wrap
+  // it at the next session start. `on` clears this.
+  state.syncOptOut = { ...(state.syncOptOut ?? {}), [ctx.cwd]: true };
+  if (await detectAutowrapPlugin(ctx)) {
+    ctx.log(
+      '[speculate] auto-wrap is still installed globally (this project is now opted out).',
+    );
+    ctx.log(
+      '[speculate]   remove it everywhere with: claude plugin uninstall -s user speculate-autowrap',
+    );
+  }
+  saveManagedState(ctx.statePath, state);
   ctx.log(`[speculate] off: done${failed ? ` (${failed} failure(s))` : ''}.`);
   return failed > 0 ? 1 : 0;
 }
