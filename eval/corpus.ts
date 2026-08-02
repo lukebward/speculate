@@ -173,7 +173,9 @@ const listDetailVaried: Archetype = {
       ];
 
       // Branching follow-up: the learner must rank four armed transitions.
-      switch (rng.weighted([52, 22, 14, 12])) {
+      // The weights are spread so the fourth-ranked one still draws enough
+      // pairs to be measurable past the shipped cap of 3.
+      switch (rng.weighted([40, 28, 18, 14])) {
         case 0:
           calls.push({
             tool: 'card_get_activity',
@@ -298,9 +300,15 @@ const returnVisits: Archetype = {
 /**
  * A follow-up whose two arguments come from two DIFFERENT sources: `space` is
  * an arg-copy of the search call's argument, `docId` only exists inside the
- * parsed result (`hits.0.docId`). Both the space and the doc ids vary across
- * sessions, so the const fallback dies and the learner has to keep the real
- * derivations to predict at all.
+ * parsed result. Both the space and the doc ids vary across sessions, so the
+ * const fallback dies and the learner has to keep the real derivations to
+ * predict at all.
+ *
+ * The doc that gets opened is the server's own `suggested` best match, whose
+ * position inside `hits` is drawn from a skew — so the derivation runs through
+ * a NESTED OBJECT path (`suggested.docId`), not an array index, and no
+ * "the agent always opens the top of the list" assumption is embedded here.
+ * A rule that predicted `hits[0]` would miss most of these sessions.
  *
  * The third call is a two-way branch plus a genuinely unpredictable move (a
  * brand-new search query, derivable from nothing), so this archetype cannot
@@ -322,33 +330,45 @@ const multiArg: Archetype = {
         title: phrase(rng),
         score: 90 - i * 7 - rng.int(3),
       }));
-      const found = { space, query, hits, took: rng.int(40) };
-      const top = hits[0]!;
-      const detail = {
-        docId: top.docId,
+      // The server's best match is usually, but not always, the first row.
+      // `suggested` is declared before `hits` so the stable nested path is
+      // also the one enumerateParsedPaths reaches first.
+      const opened = hits[rng.weighted([40, 25, 15, 12, 8])]!;
+      const found = {
         space,
-        title: top.title,
+        query,
+        suggested: { docId: opened.docId, title: opened.title },
+        hits,
+        took: rng.int(40),
+      };
+      const detail = {
+        docId: opened.docId,
+        space,
+        title: opened.title,
         updatedBy: `user-${rng.int(5)}`,
       };
 
       const calls: EvalSession['calls'] = [
         { tool: 'space_search', args: { space, query }, parsed: found },
-        { tool: 'doc_read', args: { space, docId: top.docId }, parsed: detail },
+        { tool: 'doc_read', args: { space, docId: opened.docId }, parsed: detail },
       ];
 
       switch (rng.weighted([55, 20, 25])) {
         case 0:
           calls.push({
             tool: 'doc_read_comments',
-            args: { space, docId: top.docId },
-            parsed: { docId: top.docId, comments: [{ by: 'user-1', body: phrase(rng) }] },
+            args: { space, docId: opened.docId },
+            parsed: {
+              docId: opened.docId,
+              comments: [{ by: 'user-1', body: phrase(rng) }],
+            },
           });
           break;
         case 1:
           calls.push({
             tool: 'doc_list_backlinks',
-            args: { docId: top.docId },
-            parsed: { docId: top.docId, backlinks: [doc()] },
+            args: { docId: opened.docId },
+            parsed: { docId: opened.docId, backlinks: [doc()] },
           });
           break;
         default: {
@@ -360,10 +380,17 @@ const multiArg: Archetype = {
             title: phrase(rng),
             score: 88 - i * 6,
           }));
+          const pick = more[rng.weighted([40, 25, 15, 12, 8])]!;
           calls.push({
             tool: 'space_search',
             args: { space, query: next },
-            parsed: { space, query: next, hits: more, took: rng.int(40) },
+            parsed: {
+              space,
+              query: next,
+              suggested: { docId: pick.docId, title: pick.title },
+              hits: more,
+              took: rng.int(40),
+            },
           });
           break;
         }
@@ -405,7 +432,9 @@ const adversarial: Archetype = {
 
     for (let s = 0; s < SESSIONS_PER_ARCHETYPE; s++) {
       const calls: EvalSession['calls'] = [];
-      for (let i = 0; i < 4; i++) {
+      // Same length as every other archetype: the floor must not outweigh the
+      // rest of the corpus just because its sessions are longer.
+      for (let i = 0; i < 3; i++) {
         const spec = tools[rng.int(tools.length)]!;
         const args: Record<string, unknown> = spec.arg ? { [spec.arg]: entity() } : {};
         // The parsed result shares nothing with any later call's arguments:
@@ -429,3 +458,17 @@ export const ARCHETYPES: readonly Archetype[] = [
   multiArg,
   adversarial,
 ];
+
+/**
+ * Archetypes that are floors, not targets. They are reported next to the
+ * headline but never pooled INTO it: a change that fires more aggressively on
+ * noise would otherwise move the headline while predicting nothing better.
+ * Their job is the opposite — to catch exactly that change, via recall staying
+ * near zero while waste/hit climbs.
+ */
+export const FLOOR_ARCHETYPES: ReadonlySet<string> = new Set(['adversarial']);
+
+/** Archetypes pooled into the headline number. */
+export const WORKFLOW_ARCHETYPES: readonly Archetype[] = ARCHETYPES.filter(
+  (a) => !FLOOR_ARCHETYPES.has(a.name),
+);

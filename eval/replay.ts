@@ -20,13 +20,15 @@
  *     therefore the production-faithful headline.
  *   - Waste is accounted at PRODUCTION_K (3), the real per-trigger cap: each
  *     scored pair issues up to 3 predictions, at most one of which can be the
- *     call that actually happened; the rest are waste.
+ *     call that actually happened; the rest are waste. The predictions fired
+ *     after a session's LAST call are billed too — nothing can ever claim
+ *     them — so waste/hit is a production estimate rather than a lower bound.
  */
 import { canonicalKey } from '../src/keys.js';
 import { TransitionLearner } from '../src/learner.js';
 import type { TransitionLearnerOptions } from '../src/learner.js';
 import type { ObservedCall } from '../src/types.js';
-import { ARCHETYPES, WARMUP_SESSIONS } from './corpus.js';
+import { ARCHETYPES, FLOOR_ARCHETYPES, WARMUP_SESSIONS } from './corpus.js';
 import type { Archetype, EvalSession } from './corpus.js';
 
 export interface RecallReport {
@@ -40,6 +42,13 @@ export interface RecallReport {
 
 /** Deepest rank the harness can score. Also the learner's per-trigger cap here. */
 export const MAX_K = 5;
+/**
+ * Seeds the BASELINE pools over by default. One seed is not enough: the
+ * cross-seed spread of a single-seed headline is about 0.03, the same order as
+ * the movement a real model change produces, so a one-seed number cannot
+ * distinguish a win from a draw. A full three-seed run costs ~10 ms.
+ */
+export const DEFAULT_SEEDS: readonly number[] = [1, 2, 3];
 /** The per-trigger cap Speculate actually ships with (§5.6); waste is billed here. */
 export const PRODUCTION_K = 3;
 /** Spacing between calls inside one session (well under the learner's maxGapMs). */
@@ -85,11 +94,18 @@ export interface ArchetypeResult {
 }
 
 export interface EvalRun {
-  seed: number;
+  seeds: number[];
   reports: RecallReport[];
   /** Full per-archetype results, including the per-transition breakdown. */
   byArchetype: ArchetypeResult[];
-  /** Pooled over every archetype, weighted by pairs. */
+  /**
+   * THE HEADLINE: pooled over the workflow archetypes only. The floor is
+   * excluded on purpose — see FLOOR_ARCHETYPES in corpus.ts.
+   */
+  workflow: ReplayTotals;
+  /** The floor archetypes, pooled. Read next to the headline, never into it. */
+  floor: ReplayTotals;
+  /** Everything pooled, for reference only. */
   overall: ReplayTotals;
 }
 
@@ -123,14 +139,7 @@ export function replayArchetype(
     now: () => clock,
   });
 
-  const totals: ReplayTotals = {
-    pairs: 0,
-    hitsAt1: 0,
-    hitsAt3: 0,
-    hitsAt5: 0,
-    issued: 0,
-    wasted: 0,
-  };
+  const totals = emptyTotals();
   const byTransition = new Map<string, TransitionStat>();
 
   for (let s = 0; s < sessions.length; s++) {
@@ -146,28 +155,13 @@ export function replayArchetype(
         const rank = rankOf(predictions, call);
         if (scored) {
           totals.pairs++;
-          const hit3 = rank !== null && rank <= PRODUCTION_K;
-          if (rank !== null) {
-            if (rank <= 1) totals.hitsAt1++;
-            if (rank <= 5) totals.hitsAt5++;
-          }
-          if (hit3) totals.hitsAt3++;
-          const issued = Math.min(predictions.length, PRODUCTION_K);
-          totals.issued += issued;
-          totals.wasted += hit3 ? issued - 1 : issued;
+          const hit = scoreRank(totals, rank);
+          bill(totals, predictions.length, hit);
 
           const key = `${prev.tool}->${call.tool}`;
-          const stat = byTransition.get(key) ?? {
-            transition: key,
-            pairs: 0,
-            hitsAt1: 0,
-            hitsAt3: 0,
-            hitsAt5: 0,
-          };
+          const stat = byTransition.get(key) ?? blankStat(key);
           stat.pairs++;
-          if (rank !== null && rank <= 1) stat.hitsAt1++;
-          if (hit3) stat.hitsAt3++;
-          if (rank !== null && rank <= 5) stat.hitsAt5++;
+          scoreRank(stat, rank);
           byTransition.set(key, stat);
         }
       }
@@ -175,6 +169,13 @@ export function replayArchetype(
       learner.observe(call);
       prev = call;
     }
+
+    // The session's LAST call also triggers a prediction in production, and
+    // nothing ever claims it — the next session is 600 s away, past any TTL.
+    // It scores no pair (there is no next call to rank) but it is real waste,
+    // so it is billed. Excluding it would understate production waste by
+    // roughly the reciprocal of the session length.
+    if (scored && prev) bill(totals, learner.predict(prev).length, false);
   }
 
   return {
@@ -186,33 +187,108 @@ export function replayArchetype(
   };
 }
 
-/** Every archetype, in corpus order. The number later tasks are measured on. */
+/** As `replayArchetype`, with the counters pooled over several seeds. */
+export function replayArchetypeSeeds(
+  archetype: Archetype,
+  seeds: readonly number[],
+  opts: ReplayOptions = {},
+): ArchetypeResult {
+  const totals = emptyTotals();
+  const merged = new Map<string, TransitionStat>();
+  for (const seed of seeds) {
+    const result = replayArchetype(archetype, seed, opts);
+    addTotals(totals, result.totals);
+    for (const stat of result.byTransition) {
+      const into = merged.get(stat.transition) ?? blankStat(stat.transition);
+      into.pairs += stat.pairs;
+      into.hitsAt1 += stat.hitsAt1;
+      into.hitsAt3 += stat.hitsAt3;
+      into.hitsAt5 += stat.hitsAt5;
+      merged.set(stat.transition, into);
+    }
+  }
+  return {
+    report: toReport(archetype.name, totals),
+    totals,
+    byTransition: [...merged.values()].sort(
+      (a, b) => b.pairs - a.pairs || (a.transition < b.transition ? -1 : 1),
+    ),
+  };
+}
+
+/**
+ * Every archetype, in corpus order, for ONE seed. Signature fixed by the
+ * task brief; `runEvalDetailed` is the multi-seed entry point.
+ */
 export function runEval(seed: number): RecallReport[] {
   return runEvalDetailed(seed).reports;
 }
 
-/** As `runEval`, plus the raw counters the printed totals row needs. */
-export function runEvalDetailed(seed: number, opts: ReplayOptions = {}): EvalRun {
+/**
+ * As `runEval`, plus the raw counters and the headline/floor split. Accepts
+ * a list of seeds and pools the counters across them: the cross-seed spread
+ * of a single-seed run is the same order of magnitude as the movement a real
+ * model change produces, so a one-seed headline cannot tell them apart.
+ */
+export function runEvalDetailed(
+  seeds: number | readonly number[],
+  opts: ReplayOptions = {},
+): EvalRun {
+  const list = typeof seeds === 'number' ? [seeds] : [...seeds];
   const byArchetype: ArchetypeResult[] = [];
-  const overall: ReplayTotals = {
-    pairs: 0,
-    hitsAt1: 0,
-    hitsAt3: 0,
-    hitsAt5: 0,
-    issued: 0,
-    wasted: 0,
-  };
+  const workflow = emptyTotals();
+  const floor = emptyTotals();
+  const overall = emptyTotals();
   for (const archetype of ARCHETYPES) {
-    const result = replayArchetype(archetype, seed, opts);
+    const result = replayArchetypeSeeds(archetype, list, opts);
     byArchetype.push(result);
-    overall.pairs += result.totals.pairs;
-    overall.hitsAt1 += result.totals.hitsAt1;
-    overall.hitsAt3 += result.totals.hitsAt3;
-    overall.hitsAt5 += result.totals.hitsAt5;
-    overall.issued += result.totals.issued;
-    overall.wasted += result.totals.wasted;
+    addTotals(overall, result.totals);
+    addTotals(FLOOR_ARCHETYPES.has(archetype.name) ? floor : workflow, result.totals);
   }
-  return { seed, reports: byArchetype.map((r) => r.report), byArchetype, overall };
+  return {
+    seeds: list,
+    reports: byArchetype.map((r) => r.report),
+    byArchetype,
+    workflow,
+    floor,
+    overall,
+  };
+}
+
+function emptyTotals(): ReplayTotals {
+  return { pairs: 0, hitsAt1: 0, hitsAt3: 0, hitsAt5: 0, issued: 0, wasted: 0 };
+}
+
+function blankStat(transition: string): TransitionStat {
+  return { transition, pairs: 0, hitsAt1: 0, hitsAt3: 0, hitsAt5: 0 };
+}
+
+function addTotals(into: ReplayTotals, from: ReplayTotals): void {
+  into.pairs += from.pairs;
+  into.hitsAt1 += from.hitsAt1;
+  into.hitsAt3 += from.hitsAt3;
+  into.hitsAt5 += from.hitsAt5;
+  into.issued += from.issued;
+  into.wasted += from.wasted;
+}
+
+/** Credits one scored pair to the rank bands; returns "hit within the cap". */
+function scoreRank(
+  bands: { hitsAt1: number; hitsAt3: number; hitsAt5: number },
+  rank: number | null,
+): boolean {
+  if (rank === null) return false;
+  if (rank <= 1) bands.hitsAt1++;
+  if (rank <= PRODUCTION_K) bands.hitsAt3++;
+  if (rank <= MAX_K) bands.hitsAt5++;
+  return rank <= PRODUCTION_K;
+}
+
+/** Bills the predictions a trigger issued at the shipped cap. */
+function bill(totals: ReplayTotals, predicted: number, hit: boolean): void {
+  const issued = Math.min(predicted, PRODUCTION_K);
+  totals.issued += issued;
+  totals.wasted += hit ? issued - 1 : issued;
 }
 
 /**

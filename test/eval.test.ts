@@ -6,19 +6,31 @@
  * numbers by design, and a test that pins them would just have to be edited
  * every time, which is the same as having no test. What is asserted here is
  * structural: the same seed replays identically, the low-predictability
- * archetype scores strictly worse than the workflow-shaped one, the corpus is
- * not secretly shaped to the hand-written GitHub rules, and the score is not
- * saturated at either end (a saturated metric cannot detect an improvement).
+ * archetype scores strictly worse than the workflow-shaped ones and stays out
+ * of the headline, the corpus is not secretly shaped to the hand-written
+ * GitHub rules, and the score is not saturated at either end (a saturated
+ * metric cannot detect an improvement).
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { githubProfile } from '../src/profiles/github.js';
-import { ARCHETYPES, SESSIONS_PER_ARCHETYPE, WARMUP_SESSIONS } from '../eval/corpus.js';
-import { replayArchetype, runEval, runEvalDetailed } from '../eval/replay.js';
+import {
+  ARCHETYPES,
+  FLOOR_ARCHETYPES,
+  SESSIONS_PER_ARCHETYPE,
+  WARMUP_SESSIONS,
+  WORKFLOW_ARCHETYPES,
+} from '../eval/corpus.js';
+import { baselineLine, table } from '../eval/format.js';
+import { DEFAULT_SEEDS, replayArchetype, runEval, runEvalDetailed } from '../eval/replay.js';
 import type { RecallReport } from '../eval/replay.js';
 
-const EVAL_SOURCES = ['corpus.ts', 'replay.ts', 'eval.ts'] as const;
+/** Seeds the floor and rank-band properties are checked over. */
+const SEEDS = [1, 2, 3, 7, 42];
+
+const EVAL_DIR = fileURLToPath(new URL('../eval/', import.meta.url));
 
 function byName(reports: RecallReport[], name: string): RecallReport {
   const found = reports.find((r) => r.archetype === name);
@@ -26,15 +38,12 @@ function byName(reports: RecallReport[], name: string): RecallReport {
   return found;
 }
 
-function readEvalSource(file: string): string {
-  return readFileSync(fileURLToPath(new URL(`../eval/${file}`, import.meta.url)), 'utf8');
-}
-
 // --- determinism --------------------------------------------------------------
 
 describe('determinism', () => {
   it('produces an identical report for the same seed', () => {
     expect(runEval(11)).toEqual(runEval(11));
+    expect(runEvalDetailed([1, 2])).toEqual(runEvalDetailed([1, 2]));
   });
 
   it('generates identical sessions for the same seed', () => {
@@ -54,8 +63,12 @@ describe('determinism', () => {
   });
 
   it('draws no randomness from the ambient clock or Math.random', () => {
-    for (const file of EVAL_SOURCES) {
-      const src = readEvalSource(file);
+    // Every .ts under eval/, discovered rather than listed: a file added by a
+    // later task must not escape this guard by not being on a hardcoded list.
+    const files = readdirSync(EVAL_DIR).filter((f) => f.endsWith('.ts'));
+    expect(files.length).toBeGreaterThanOrEqual(4);
+    for (const file of files) {
+      const src = readFileSync(join(EVAL_DIR, file), 'utf8');
       expect(src, `${file} must not call Math.random`).not.toContain('Math.random');
       expect(src, `${file} must not call Date.now`).not.toContain('Date.now');
     }
@@ -65,25 +78,49 @@ describe('determinism', () => {
 // --- the adversarial floor ----------------------------------------------------
 
 describe('adversarial floor', () => {
-  it('scores strictly below the workflow-shaped archetype', () => {
+  it('scores strictly below every workflow archetype', () => {
     // Checked across several seeds so the floor is a property of the corpus,
     // not of one lucky draw.
-    for (const seed of [1, 2, 3, 7, 42]) {
+    for (const seed of SEEDS) {
       const reports = runEval(seed);
       const adversarial = byName(reports, 'adversarial');
-      const varied = byName(reports, 'list-detail-varied');
-      expect(adversarial.recallAt3, `seed ${seed}`).toBeLessThan(varied.recallAt3);
-      expect(adversarial.recallAt5, `seed ${seed}`).toBeLessThan(varied.recallAt5);
+      for (const workflow of WORKFLOW_ARCHETYPES) {
+        const report = byName(reports, workflow.name);
+        expect(adversarial.recallAt3, `${workflow.name} seed ${seed}`).toBeLessThan(
+          report.recallAt3,
+        );
+        expect(adversarial.recallAt5, `${workflow.name} seed ${seed}`).toBeLessThan(
+          report.recallAt5,
+        );
+      }
     }
   });
 
-  it('costs more waste per hit than every workflow-shaped archetype', () => {
+  it('costs more waste per hit than every workflow archetype', () => {
     const reports = runEval(1);
     const adversarial = byName(reports, 'adversarial');
-    for (const report of reports) {
-      if (report.archetype === 'adversarial') continue;
-      expect(report.wastePerHit).toBeLessThan(adversarial.wastePerHit);
+    for (const workflow of WORKFLOW_ARCHETYPES) {
+      expect(byName(reports, workflow.name).wastePerHit).toBeLessThan(
+        adversarial.wastePerHit,
+      );
     }
+  });
+
+  it('stays out of the headline entirely', () => {
+    const run = runEvalDetailed(DEFAULT_SEEDS);
+    const workflowPairs = run.byArchetype
+      .filter((r) => !FLOOR_ARCHETYPES.has(r.report.archetype))
+      .reduce((a, r) => a + r.totals.pairs, 0);
+    const floorPairs = run.byArchetype
+      .filter((r) => FLOOR_ARCHETYPES.has(r.report.archetype))
+      .reduce((a, r) => a + r.totals.pairs, 0);
+    expect(run.workflow.pairs).toBe(workflowPairs);
+    expect(run.floor.pairs).toBe(floorPairs);
+    expect(run.overall.pairs).toBe(workflowPairs + floorPairs);
+    expect(run.floor.pairs).toBeGreaterThan(0);
+    // A floor that outweighs the archetypes it is a control for would drag
+    // any pooled number around on its own.
+    expect(run.floor.pairs).toBeLessThanOrEqual(run.workflow.pairs / 2);
   });
 });
 
@@ -97,22 +134,30 @@ describe('sensitivity', () => {
   });
 
   it('is saturated at neither 0 nor 1, so movement in either direction shows', () => {
-    const { overall } = runEvalDetailed(1);
-    const recallAt3 = overall.hitsAt3 / overall.pairs;
+    const { workflow } = runEvalDetailed(DEFAULT_SEEDS);
+    const recallAt3 = workflow.hitsAt3 / workflow.pairs;
     expect(recallAt3).toBeGreaterThan(0.05);
     expect(recallAt3).toBeLessThan(0.95);
   });
 
-  it('separates the rank bands: @1 < @3 < @5 somewhere in the corpus', () => {
-    const reports = runEval(1);
-    for (const report of reports) {
-      expect(report.recallAt1).toBeLessThanOrEqual(report.recallAt3);
-      expect(report.recallAt3).toBeLessThanOrEqual(report.recallAt5);
+  it('separates the rank bands on every checked seed', () => {
+    for (const seed of SEEDS) {
+      const reports = runEval(seed);
+      for (const report of reports) {
+        expect(report.recallAt1).toBeLessThanOrEqual(report.recallAt3);
+        expect(report.recallAt3).toBeLessThanOrEqual(report.recallAt5);
+      }
+      // Ranking is live (candidates compete) and the per-trigger cap costs
+      // something (a real follow-up sits past rank 3).
+      expect(
+        reports.some((r) => r.recallAt1 < r.recallAt3),
+        `ranking flat at seed ${seed}`,
+      ).toBe(true);
+      expect(
+        reports.some((r) => r.recallAt3 < r.recallAt5),
+        `cap costs nothing at seed ${seed}`,
+      ).toBe(true);
     }
-    // Ranking is live (candidates compete) and the per-trigger cap costs
-    // something (a real follow-up sits past rank 3).
-    expect(reports.some((r) => r.recallAt1 < r.recallAt3)).toBe(true);
-    expect(reports.some((r) => r.recallAt3 < r.recallAt5)).toBe(true);
   });
 
   it('moves when the model moves', () => {
@@ -130,6 +175,46 @@ describe('sensitivity', () => {
     );
     expect(starved.pairs).toBe(base.pairs);
     expect(starved.hitsAt3 / starved.pairs).toBeLessThan(base.hitsAt3 / base.pairs);
+  });
+
+  it('pools seeds instead of trusting one draw', () => {
+    expect(DEFAULT_SEEDS.length).toBeGreaterThan(1);
+    const pooled = runEvalDetailed([1, 2, 3]);
+    const single = runEvalDetailed(1);
+    expect(pooled.seeds).toEqual([1, 2, 3]);
+    expect(pooled.workflow.pairs).toBe(single.workflow.pairs * 3);
+  });
+});
+
+// --- the printed artifact -----------------------------------------------------
+
+describe('report rendering', () => {
+  it('prints a BASELINE line in the shape later tasks diff against', () => {
+    const run = runEvalDetailed(DEFAULT_SEEDS);
+    const line = baselineLine(run);
+    expect(line).toMatch(
+      /^BASELINE recall@3 \d\.\d{4} seeds=\d+(,\d+)* pairs=\d+ waste\/hit=(\d+\.\d{2}|inf) \(workflow\) \| floor recall@3 \d\.\d{4} pairs=\d+ waste\/hit=(\d+\.\d{2}|inf)$/,
+    );
+    // The headline is the workflow pool, not the whole corpus.
+    expect(line).toContain((run.workflow.hitsAt3 / run.workflow.pairs).toFixed(4));
+    expect(line).toContain(`pairs=${run.workflow.pairs}`);
+    expect(line).not.toContain(`pairs=${run.overall.pairs}`);
+  });
+
+  it('attributes an A/B per archetype instead of pooling it', () => {
+    const run = runEvalDetailed(1);
+    const compare = new Map(run.reports.map((r) => [r.archetype, r.recallAt3 - 0.1]));
+    const rows = table(run, { compare });
+    expect(rows.some((r) => r.includes('d recall@3'))).toBe(true);
+    // Every archetype row carries its own delta, so a pooled claim can be
+    // decomposed instead of taken on faith.
+    for (const archetype of WORKFLOW_ARCHETYPES) {
+      expect(
+        rows.find((r) => r.startsWith(archetype.name)),
+        archetype.name,
+      ).toContain('+0.100');
+    }
+    expect(table(run).some((r) => r.includes('d recall@3'))).toBe(false);
   });
 });
 
@@ -152,6 +237,26 @@ describe('warm-up', () => {
   });
 });
 
+// --- waste accounting ---------------------------------------------------------
+
+describe('waste accounting', () => {
+  it("bills the batch fired after a session's last call", () => {
+    // Nothing can ever claim it, so leaving it out would understate
+    // production waste by roughly one prediction per session.
+    for (const archetype of ARCHETYPES) {
+      const { totals } = replayArchetype(archetype, 1);
+      const scoredSessions = SESSIONS_PER_ARCHETYPE - WARMUP_SESSIONS;
+      const callsPerSession = archetype.sessions(1)[0]!.calls.length;
+      // One scored pair per scored call after the first.
+      expect(totals.pairs).toBe(scoredSessions * (callsPerSession - 1));
+      // Triggers outnumber pairs, because the last call of each session is a
+      // trigger with no pair — that is the batch being billed.
+      expect(totals.issued).toBeGreaterThan(0);
+      expect(totals.wasted).toBeGreaterThan(0);
+    }
+  });
+});
+
 // --- the corpus must not be shaped to the hand-written rules ------------------
 
 describe('corpus independence', () => {
@@ -171,12 +276,38 @@ describe('corpus independence', () => {
     }
   });
 
+  it('never assumes the agent opens the top of a list', () => {
+    // The one assumption the hand-written `gh:pr-list->pr` rule encodes. Every
+    // workflow archetype opens something other than row 0 in a good share of
+    // its sessions, so a corpus-wide "just predict element 0" shortcut cannot
+    // score well here.
+    for (const archetype of WORKFLOW_ARCHETYPES) {
+      const sessions = archetype.sessions(1);
+      let offTop = 0;
+      for (const session of sessions) {
+        const listed = session.calls[0]!.parsed as Record<string, unknown>;
+        const rows = Object.values(listed).find(
+          (v): v is Array<Record<string, unknown>> =>
+            Array.isArray(v) && v.length > 0 && typeof v[0] === 'object',
+        );
+        if (!rows) continue;
+        const openedValues = new Set(Object.values(session.calls[1]!.args));
+        const opensRowZero = Object.values(rows[0]!).some((v) => openedValues.has(v));
+        if (!opensRowZero) offTop++;
+      }
+      // A quarter of sessions is well past what a top-of-list rule could
+      // shrug off, and far past sampling noise at 60 sessions.
+      expect(offTop, `${archetype.name} nearly always opens row 0`).toBeGreaterThan(
+        sessions.length / 4,
+      );
+    }
+  });
+
   it('exercises the learner with results the parsed-path search can walk', () => {
-    // Every non-adversarial session must carry at least one array-of-objects
-    // result: that is the shape `enumerateParsedPaths` indexes (0..2), and a
-    // corpus of flat constants would test nothing.
-    for (const archetype of ARCHETYPES) {
-      if (archetype.name === 'adversarial') continue;
+    // Every workflow session must carry at least one array-of-objects result:
+    // that is the shape `enumerateParsedPaths` indexes (0..2), and a corpus of
+    // flat constants would test nothing.
+    for (const archetype of WORKFLOW_ARCHETYPES) {
       for (const session of archetype.sessions(1)) {
         const hasList = session.calls.some((c) => {
           const parsed = c.parsed as Record<string, unknown> | null;

@@ -7,95 +7,98 @@
  * predictions are right — this measures whether the predictions are right at
  * all, with no profile, no rules, and no server.
  *
- * Usage: npm run eval [-- --seed 1] [-- --detail]
+ *   npm run eval                           pooled over the default seeds
+ *   npm run eval -- --seeds 1,2,3,4        pool over other seeds
+ *   npm run eval -- --detail               per-transition breakdown
+ *   npm run eval -- --json before.json     machine-readable snapshot
+ *   npm run eval -- --compare before.json  add a per-archetype delta column
  *
- * `--detail` adds the per-transition breakdown: which (prevTool → nextTool)
- * pairs the model gets and which it does not. That is what tells a later
- * change whether it moved the number for the reason it thinks it did.
+ * `--json` takes a path rather than writing to stdout: `npm run` prints its
+ * own banner there, so a redirect would produce a file that is not JSON.
+ *
+ * The compare flow is the point: a claim that a model change helped must be
+ * ATTRIBUTED to archetypes, not pooled into one number. A change that only
+ * makes the learner fire harder on noise moves the floor row, and the
+ * headline (workflow archetypes only) will not move with it.
  *
  * Output is deliberately plain ASCII: the table gets pasted verbatim into
  * task reports as the baseline every later change is diffed against.
  */
-import { WARMUP_SESSIONS, SESSIONS_PER_ARCHETYPE } from './corpus.js';
-import { MAX_K, PRODUCTION_K, runEvalDetailed, toReport } from './replay.js';
-import type { RecallReport } from './replay.js';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { SESSIONS_PER_ARCHETYPE, WARMUP_SESSIONS } from './corpus.js';
+import { baselineLine, detail, table } from './format.js';
+import { DEFAULT_SEEDS, MAX_K, PRODUCTION_K, runEvalDetailed } from './replay.js';
+import type { EvalRun } from './replay.js';
 
-const COLUMNS: Array<{ head: string; width: number }> = [
-  { head: 'archetype', width: 20 },
-  { head: 'pairs', width: 7 },
-  { head: 'recall@1', width: 10 },
-  { head: 'recall@3', width: 10 },
-  { head: 'recall@5', width: 10 },
-  { head: 'waste/hit', width: 11 },
-];
-
-function row(report: RecallReport): string {
-  const cells = [
-    report.archetype.padEnd(COLUMNS[0]!.width),
-    String(report.pairs).padStart(COLUMNS[1]!.width),
-    report.recallAt1.toFixed(3).padStart(COLUMNS[2]!.width),
-    report.recallAt3.toFixed(3).padStart(COLUMNS[3]!.width),
-    report.recallAt5.toFixed(3).padStart(COLUMNS[4]!.width),
-    fmtWaste(report.wastePerHit).padStart(COLUMNS[5]!.width),
-  ];
-  return cells.join('');
+/** Indents a report line, leaving blank separators genuinely blank. */
+function indent(line: string): string {
+  return line === '' ? '' : `  ${line}`;
 }
 
-function fmtWaste(v: number): string {
-  return Number.isFinite(v) ? v.toFixed(2) : 'inf';
+/** `--flag value` lookup; undefined when the flag is absent. */
+function flag(name: string): string | undefined {
+  const i = process.argv.indexOf(name);
+  return i === -1 ? undefined : process.argv[i + 1];
+}
+
+function seeds(): number[] {
+  const raw = flag('--seeds') ?? flag('--seed');
+  if (raw === undefined) return [...DEFAULT_SEEDS];
+  const parsed = raw
+    .split(',')
+    .map((s) => Math.trunc(Number(s.trim())))
+    .filter((n) => Number.isFinite(n));
+  return parsed.length > 0 ? parsed : [...DEFAULT_SEEDS];
+}
+
+/** Per-archetype recall@3 from a `--json` snapshot, for the delta column. */
+function comparison(): Map<string, number> | undefined {
+  const path = flag('--compare');
+  if (path === undefined) return undefined;
+  // A snapshot written by an editor or a PowerShell redirect may carry a BOM.
+  const prior = JSON.parse(readFileSync(path, 'utf8').replace(/^﻿/, '')) as EvalRun;
+  const map = new Map<string, number>();
+  for (const report of prior.reports) map.set(report.archetype, report.recallAt3);
+  if (prior.workflow.pairs > 0) {
+    map.set('WORKFLOW (headline)', prior.workflow.hitsAt3 / prior.workflow.pairs);
+  }
+  return map;
 }
 
 function main(): void {
-  const seedArg = process.argv.indexOf('--seed');
-  const requested = seedArg !== -1 ? Number(process.argv[seedArg + 1]) : 1;
-  const seed = Number.isFinite(requested) ? Math.trunc(requested) : 1;
+  const run = runEvalDetailed(seeds());
 
-  const run = runEvalDetailed(seed);
-  const width = COLUMNS.reduce((a, c) => a + c.width, 0);
+  const jsonPath = flag('--json');
+  if (jsonPath !== undefined) {
+    writeFileSync(jsonPath, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+    console.log(`wrote ${jsonPath}`);
+    return;
+  }
 
   console.log();
   console.log('  Speculate prediction eval - offline recall@K, generic TransitionLearner');
   console.log(
-    `  seed ${seed} | ${SESSIONS_PER_ARCHETYPE} sessions/archetype ` +
+    `  seeds ${run.seeds.join(',')} | ${SESSIONS_PER_ARCHETYPE} sessions/archetype/seed ` +
       `(${WARMUP_SESSIONS} warm-up: learned, not scored) | ` +
       `hit = tool AND args match under the canonical cache key`,
   );
   console.log();
-  console.log('  ' + COLUMNS.map((c, i) => (i === 0 ? c.head.padEnd(c.width) : c.head.padStart(c.width))).join(''));
-  console.log('  ' + '-'.repeat(width));
-  for (const report of run.reports) console.log('  ' + row(report));
-  console.log('  ' + '-'.repeat(width));
-  console.log('  ' + row(toReport('overall', run.overall)));
+  for (const line of table(run, { compare: comparison() })) console.log(indent(line));
   console.log();
-
   if (process.argv.includes('--detail')) {
-    for (const result of run.byArchetype) {
-      console.log(`  ${result.report.archetype}   (transition, pairs, recall@1/@3/@5)`);
-      for (const t of result.byTransition) {
-        console.log(
-          `    ${t.transition.padEnd(42)}${String(t.pairs).padStart(6)}` +
-            `${(t.hitsAt1 / t.pairs).toFixed(3).padStart(9)}` +
-            `${(t.hitsAt3 / t.pairs).toFixed(3).padStart(9)}` +
-            `${(t.hitsAt5 / t.pairs).toFixed(3).padStart(9)}`,
-        );
-      }
-      console.log();
-    }
+    for (const line of detail(run)) console.log(indent(line));
   }
-  console.log(
-    `  BASELINE recall@3 ${run.overall.pairs > 0 ? (run.overall.hitsAt3 / run.overall.pairs).toFixed(4) : '0.0000'}` +
-      ` seed=${seed} pairs=${run.overall.pairs} waste/hit=${fmtWaste(toReport('overall', run.overall).wastePerHit)}`,
-  );
+  console.log('  ' + baselineLine(run));
   console.log();
+  console.log('  headline = workflow archetypes only; the floor sits beside it, never in it.');
   console.log(
-    `  recall@3 is the headline: ${PRODUCTION_K} is the shipped per-trigger cap (DESIGN.md 5.6).`,
+    `  recall@3 is the headline band: ${PRODUCTION_K} is the shipped per-trigger cap (DESIGN.md 5.6).`,
   );
   console.log(
     `  recall@5 is measurable only because the eval raises the learner's cap to ${MAX_K}.`,
   );
-  console.log(
-    `  waste/hit counts predictions issued at the shipped cap that no real call claimed.`,
-  );
+  console.log('  waste/hit bills every prediction issued at the shipped cap, including the');
+  console.log("  batch fired after each session's last call, which nothing can ever claim.");
   console.log();
 }
 
