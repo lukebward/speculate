@@ -117,9 +117,44 @@ it('loads a pre-existing state file with no score/lastUpdated fields', () => {
 - [ ] **Step 5: Run `npm run eval`** and record the delta against Task 1's baseline in the report.
 - [ ] **Step 6: Commit** `feat: decay stale learner evidence and evict by value`.
 
+### Task 2b: Stop one underivable value from poisoning a template forever
+
+Found by the Task 1 harness, not predicted by the spec: **100 of 450 corpus
+pairs score exactly 0.000** because `ArgTemplate.underivable` is sticky. One
+value the learner cannot derive permanently disables the whole transition, and
+`materializeArgs` (`src/learner.ts:670-684`) then bails on every future
+prediction. The Task 1 report estimates that fixing this alone takes overall
+recall@3 from 0.44 to roughly 0.66, which makes it the single largest recall
+win available and larger than anything else in this plan.
+
+**Files:**
+- Modify: `src/learner.ts`
+- Test: `test/learner.test.ts`
+
+- [ ] **Step 1: Write failing tests.**
+
+```ts
+it('recovers after a single underivable observation', () => {
+  // observe a transition twice with a derivable arg, once with a value that
+  // has no source, then twice more derivable
+  // assert predict() still offers the transition afterwards
+});
+
+it('still refuses to guess an argument it has never derived', () => {
+  // the fail-closed half must survive: an arg with NO successful derivation
+  // must not be fabricated
+});
+```
+
+- [ ] **Step 2:** Run → FAIL (today the first observation poisons it permanently).
+- [ ] **Step 3: Implement.** Replace the sticky boolean with evidence: track derivable and underivable observation counts per argument, and treat the argument as underivable only when it has never been derived, or when its failure rate stays above a threshold across a minimum number of observations. **Preserve the fail-closed property**: an argument with no successful derivation is still never fabricated, and a prediction whose arguments cannot all be resolved is still dropped. This is loosening a permanent latch, not removing a safety gate.
+- [ ] **Step 4:** Focused tests pass, `npx tsc --noEmit` clean, full suite green.
+- [ ] **Step 5: Run `npm run eval`**, record the delta. Expect the largest single jump in this plan; if overall recall@3 does not move well above 0.44, stop and report rather than proceeding.
+- [ ] **Step 6: Commit** `fix: one underivable value no longer disables a transition forever`.
+
 ### Task 3: Per-source scoring and multi-candidate emission
 
-This is the task that lifts recall@K above recall@1. Expect the largest delta here.
+This is the task that lifts recall@K above recall@1. Expect the largest delta here after Task 2b.
 
 **Files:**
 - Modify: `src/learner.ts`
@@ -210,6 +245,43 @@ it('caps entity predictions per trigger', () => { /* gate (c) */ });
 - [ ] **Step 4:** Focused tests pass, full suite green.
 - [ ] **Step 5: Run `npm run eval`**, record the delta, expecting movement on `return-visits` specifically.
 - [ ] **Step 6: Commit** `feat: predict entities you keep returning to`.
+
+### Task 5b: Staleness, because better prediction makes it worse
+
+Prediction quality and freshness pull in **opposite directions**, and this
+plan only improves one of them. Every task above makes the proxy prefetch
+more, earlier, and further ahead, which raises the age of an entry at the
+moment it is consumed. Nothing currently measures that, so this plan could
+improve recall while quietly serving staler answers and no metric would show
+it.
+
+What already bounds staleness: a TTL resolved through operator per-tool,
+profile per-tool, operator default, profile default, then a hardcoded
+**30 s** fallback (`src/executor.ts:225-239`); single-use entries; and a full
+per-server cache flush on any non-read-only call (`src/proxy.ts:618`, `:702`).
+The worst-case age is therefore already capped. What changes is the
+distribution: more entries consumed near the TTL edge rather than immediately.
+
+Two honest gaps, neither of which this task can fully close, but both of
+which it must surface: the 30 s default is an **unmeasured guess**, and
+mutations made outside the proxy (a teammate merges the PR, a file changes on
+disk) are invisible to invalidation, which `DESIGN.md:181` already calls the
+sharpest staleness caveat in the design.
+
+**Files:**
+- Modify: `eval/replay.ts`, `eval/eval.ts`, `src/metrics.ts`, `src/learner.ts` (entity TTL hint only)
+- Test: `test/eval.test.ts`, `test/metrics.test.ts`
+
+- [ ] **Step 1: Measure age at consumption.** Extend the eval report with the distribution of entry age when a prediction is consumed: median and p95, plus the share consumed in the last quarter of their TTL. Re-run the earlier tasks' scenarios so the plan can state whether improving recall moved entries closer to expiry. Report the before/after.
+
+- [ ] **Step 2: Surface it at runtime too.** Add an age-at-hit histogram to `src/metrics.ts` alongside the existing counters, reported through the existing stats surface. A user should be able to see whether their hits are fresh or scraping the TTL edge. Keep it aggregate-only, consistent with the existing privacy stance (counters and templates, never results).
+
+- [ ] **Step 3: Give entity-frecency predictions a shorter TTL.** Task 5's entity candidates are speculative about a **longer horizon** than transition candidates: they predict "you will reopen this at some point," not "this is the next call." Fetching them with the same TTL is what would actually make staleness worse. Add a TTL multiplier (default 0.5) applied to entity-derived predictions only, so the longest-horizon guesses expire soonest. Test that a transition-derived and an entity-derived prediction for the same tool get different TTLs.
+
+- [ ] **Step 4: Do NOT implement shadow validation in this task.** Comparing a served prefetch against a live re-fetch would measure the real staleness rate, but it doubles upstream calls and only detects a stale answer *after* it was served, so it is a tuning instrument rather than a correctness guarantee. Record it in DESIGN.md as the way to replace the 30 s guess with a measured number, and leave it unbuilt.
+
+- [ ] **Step 5:** `npx tsc --noEmit` clean, full suite green, `npm run eval` recorded.
+- [ ] **Step 6: Commit** `feat: measure prefetch age, and expire long-horizon guesses sooner`.
 
 ### Task 6: Honest numbers and docs
 
