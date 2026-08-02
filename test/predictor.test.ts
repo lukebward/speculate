@@ -72,13 +72,26 @@ function makeMetrics(feedback: Record<string, Feedback> = {}) {
 
 function setup(
   profile: ServerProfile,
-  opts: { maxPerTrigger?: number; feedback?: Record<string, Feedback> } = {},
+  opts: {
+    maxPerTrigger?: number;
+    feedback?: Record<string, Feedback>;
+    /** Expected upstream ms per tool; absent tools have no history. */
+    latencyMsByTool?: Record<string, number>;
+  } = {},
 ) {
   const metrics = makeMetrics(opts.feedback);
   const predictor = new Predictor({
     profiles: { [SERVER]: profile },
     maxPerTrigger: opts.maxPerTrigger ?? 3,
     metrics,
+    ...(opts.latencyMsByTool
+      ? {
+          latency: {
+            expected: (_server: string, tool: string): number | undefined =>
+              opts.latencyMsByTool?.[tool],
+          },
+        }
+      : {}),
   });
   const observe = (tool: string, args: Record<string, unknown>, result: CallToolResult) =>
     predictor
@@ -434,6 +447,124 @@ describe('Predictor.observe', () => {
 
     expect(out).toEqual([]);
     expect(metrics.events).toEqual([]);
+  });
+});
+
+// --- expected-value ranking (§5.6, Appendix A / PASTE) -----------------------
+
+describe('ranking by expected time saved', () => {
+  /** Three candidates, deliberately ordered cheap-and-likely first. */
+  const profile = makeProfile({
+    rules: [
+      { id: 'r-cheap', trigger: 'list', predict: () => [pred('cheap', {}, 0.8, 'r-cheap')] },
+      { id: 'r-mid', trigger: 'list', predict: () => [pred('mid', {}, 0.5, 'r-mid')] },
+      { id: 'r-slow', trigger: 'list', predict: () => [pred('slow', {}, 0.3, 'r-slow')] },
+    ],
+  });
+
+  it('ranks by confidence × effectiveness alone with no latency history', () => {
+    // Cold start: the exact ordering this predictor has always produced.
+    const { observe } = setup(profile);
+    expect(observe('list', {}, jsonResult({})).map((p) => p.tool)).toEqual([
+      'cheap',
+      'mid',
+      'slow',
+    ]);
+  });
+
+  it('is byte-identical to the no-oracle path when the oracle knows nothing', () => {
+    const { observe } = setup(profile, { latencyMsByTool: {} });
+    expect(observe('list', {}, jsonResult({})).map((p) => p.tool)).toEqual([
+      'cheap',
+      'mid',
+      'slow',
+    ]);
+  });
+
+  it('gives the last slot to a slower call worth more wall clock', () => {
+    // score × ms: slow 0.3×0.5×2000 = 300, mid 0.5×0.5×400 = 100,
+    // cheap 0.8×0.5×50 = 20. The cheap 0.8 is ten times likelier and still
+    // worth a fifteenth as much waiting, so it is the one that gets cut.
+    const { observe, metrics } = setup(profile, {
+      maxPerTrigger: 2,
+      latencyMsByTool: { cheap: 50, mid: 400, slow: 2_000 },
+    });
+
+    const out = observe('list', {}, jsonResult({}));
+    expect(new Set(out.map((p) => p.tool))).toEqual(new Set(['slow', 'mid']));
+    expect(metrics.events.filter((e) => e.type === 'suppressed')).toEqual([
+      expect.objectContaining({ ruleId: 'r-cheap', reason: 'per-trigger-cap', tool: 'cheap' }),
+    ]);
+  });
+
+  it('cuts by confidence alone when latencies are uniform', () => {
+    const { observe } = setup(profile, {
+      maxPerTrigger: 2,
+      latencyMsByTool: { cheap: 400, mid: 400, slow: 400 },
+    });
+    expect(observe('list', {}, jsonResult({})).map((p) => p.tool)).toEqual(['cheap', 'mid']);
+  });
+
+  it('issues the surviving batch in probability order, not value order', () => {
+    // Membership is an expected-value question (a slot spent is a slot
+    // spent); firing ORDER is a time question, and on a serial upstream the
+    // greedy ratio (p×T)/T is p. So `slow` earns its slot but `mid` still
+    // goes first.
+    const { observe } = setup(profile, {
+      maxPerTrigger: 2,
+      latencyMsByTool: { cheap: 50, mid: 400, slow: 2_000 },
+    });
+    expect(observe('list', {}, jsonResult({})).map((p) => p.tool)).toEqual(['mid', 'slow']);
+  });
+
+  it('never issues more than the hard cap however expensive the candidates', () => {
+    const { observe } = setup(profile, {
+      maxPerTrigger: 1,
+      latencyMsByTool: { cheap: 50_000, mid: 50_000, slow: 50_000 },
+    });
+    expect(observe('list', {}, jsonResult({}))).toHaveLength(1);
+  });
+
+  it('keeps rule feedback in the ranking rather than replacing it', () => {
+    // r-slow is a proven waster: effectiveness (0+1)/(0+6+2) = 0.125, so its
+    // expected value falls to 0.3×0.125×2000 = 75, under mid's
+    // 0.5×0.5×400 = 100. Being expensive does not buy a rule out of the
+    // feedback loop — with one slot to give, mid takes it.
+    const { observe, metrics } = setup(profile, {
+      maxPerTrigger: 1,
+      latencyMsByTool: { cheap: 50, mid: 400, slow: 2_000 },
+      feedback: { 'r-slow': { hits: 0, wasted: 6, speculated: 6 } },
+    });
+    expect(observe('list', {}, jsonResult({})).map((p) => p.tool)).toEqual(['mid']);
+    expect(
+      metrics.events
+        .filter((e) => e.type === 'suppressed')
+        .map((e) => e.tool)
+        .sort(),
+    ).toEqual(['cheap', 'slow']);
+  });
+
+  it('survives an oracle that throws', () => {
+    const metrics = makeMetrics();
+    const predictor = new Predictor({
+      profiles: { [SERVER]: profile },
+      maxPerTrigger: 3,
+      metrics,
+      latency: {
+        expected: () => {
+          throw new Error('oracle exploded');
+        },
+      },
+    });
+    const out = predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 1,
+    });
+    expect(out.map((p) => p.tool)).toEqual(['cheap', 'mid', 'slow']);
   });
 });
 

@@ -8,6 +8,12 @@
  * Env knobs:
  *   SPECULATE_MOCK_LATENCY_MS  per-call injected latency in ms (default 300),
  *                              awaited by every tool handler before returning.
+ *   SPECULATE_MOCK_LATENCY_BY_TOOL
+ *                              JSON object of tool name -> ms, overriding the
+ *                              flat latency for those tools only. Real servers
+ *                              are not uniform (a PR diff is not a get_issue),
+ *                              and a uniform mock has nothing to prioritize.
+ *                              Unset (the default) leaves behaviour identical.
  *   SPECULATE_MOCK_CALL_LOG    when set, appends one JSON line per tool call
  *                              ({"tool", "args", "t"}) BEFORE the latency delay.
  *
@@ -43,7 +49,31 @@ function resolveLatencyMs(): number {
   return Math.max(0, parsed);
 }
 
+/** Per-tool overrides; malformed input is ignored (the flat latency stands). */
+function resolveLatencyByTool(): Record<string, number> {
+  const raw = process.env.SPECULATE_MOCK_LATENCY_BY_TOOL;
+  if (raw === undefined || raw === '') return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, number> = {};
+    for (const [tool, ms] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) out[tool] = ms;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 const LATENCY_MS = resolveLatencyMs();
+const LATENCY_BY_TOOL = resolveLatencyByTool();
+
+function latencyFor(tool: string): number {
+  return Object.prototype.hasOwnProperty.call(LATENCY_BY_TOOL, tool)
+    ? LATENCY_BY_TOOL[tool]!
+    : LATENCY_MS;
+}
 
 function logCall(tool: string, args: Record<string, unknown>): void {
   const logPath = process.env.SPECULATE_MOCK_CALL_LOG;
@@ -52,8 +82,8 @@ function logCall(tool: string, args: Record<string, unknown>): void {
   appendFileSync(logPath, `${JSON.stringify({ tool, args, t: Date.now() })}\n`);
 }
 
-function delay(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, LATENCY_MS));
+function delay(tool: string): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, latencyFor(tool)));
 }
 
 function ok(payload: unknown): CallToolResult {
@@ -78,7 +108,7 @@ async function respond(
   produce: () => CallToolResult,
 ): Promise<CallToolResult> {
   logCall(tool, args);
-  await delay();
+  await delay(tool);
   return produce();
 }
 

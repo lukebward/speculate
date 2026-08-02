@@ -19,14 +19,17 @@ const RESULT: CallToolResult = { content: [{ type: 'text', text: '{}' }] };
 interface Deferred {
   promise: Promise<CallToolResult>;
   resolve: () => void;
+  reject: (err: Error) => void;
 }
 
 function deferred(): Deferred {
   let resolve!: () => void;
-  const promise = new Promise<CallToolResult>((r) => {
+  let reject!: (err: Error) => void;
+  const promise = new Promise<CallToolResult>((r, j) => {
     resolve = () => r(RESULT);
+    reject = j;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function profile(): ServerProfile {
@@ -45,6 +48,10 @@ function profile(): ServerProfile {
 function makeHarness(
   transport: 'stdio' | 'http',
   serverConfig: import('../src/types.js').ServerConfig = {},
+  latency?: {
+    expected(server: string, tool: string): number | undefined;
+    record(server: string, tool: string, ms: number): void;
+  },
 ) {
   let t = 0;
   const now = () => t;
@@ -91,6 +98,7 @@ function makeHarness(
       log: 'off',
     },
     now,
+    ...(latency ? { latency } : {}),
   });
   return { executor, calls, advance, metrics, budget, cache };
 }
@@ -235,6 +243,25 @@ describe('executor drain queue', () => {
     expect(h.calls.map((c) => c.tool)).toEqual(['a']); // b dropped, not fired
   });
 
+  it('stays in confidence order even when latencies are known', async () => {
+    // Deliberate: the per-trigger cap cuts on expected value, but a BUSY
+    // slot rations upstream time rather than launches, and under a time
+    // budget the greedy ratio (p×T)/T is p. Firing the expensive bet first
+    // would starve the likelier cheap one for no gain, because a real call
+    // arriving mid-flight is credited the work already done either way.
+    const ms: Record<string, number> = { b: 4_000, c: 500 };
+    const { executor, calls } = makeHarness('stdio', {}, {
+      expected: (_server, tool) => ms[tool],
+      record: () => {},
+    });
+    executor.submit([pred('a', 0.9), pred('b', 0.4), pred('c', 0.6)]);
+    expect(calls.map((c) => c.tool)).toEqual(['a']); // idle-only: one in flight
+
+    calls[0]!.deferred.resolve();
+    await settle();
+    expect(calls.map((c) => c.tool)).toEqual(['a', 'c']); // c 0.6 before b 0.4
+  });
+
   it('never exceeds the queue cap', async () => {
     const { executor, calls, metrics } = makeHarness('stdio');
     const many = Array.from({ length: 12 }, (_, i) => pred(`a`, 0.9 - i * 0.01));
@@ -246,5 +273,43 @@ describe('executor drain queue', () => {
       .statsSnapshot()
       .perRule.filter((r) => r.suppressedByFeedback === 0).length;
     expect(suppressed).toBeGreaterThan(0); // queue-full drops recorded
+  });
+});
+
+// --- latency measurement (§5.6, Appendix A) ----------------------------------
+
+describe('executor latency measurement', () => {
+  function recorder() {
+    const seen: { server: string; tool: string; ms: number }[] = [];
+    return {
+      seen,
+      expected: (): number | undefined => undefined,
+      record(server: string, tool: string, ms: number): void {
+        seen.push({ server, tool, ms });
+      },
+    };
+  }
+
+  it('records the full upstream duration of a speculative call', async () => {
+    const rec = recorder();
+    const { executor, calls, advance } = makeHarness('http', {}, rec);
+    executor.submit([pred('a', 0.9)]);
+    advance(750);
+    calls[0]!.deferred.resolve();
+    await settle();
+    expect(rec.seen).toEqual([{ server: 'github', tool: 'a', ms: 750 }]);
+  });
+
+  it('records nothing when the upstream never answered', async () => {
+    // A timeout or transport failure is not a measurement of how long this
+    // tool takes; it would poison the mean with the speculative timeout.
+    const rec = recorder();
+    const upstreamFails = { ...rec };
+    const { executor, calls, advance } = makeHarness('http', {}, upstreamFails);
+    executor.submit([pred('a', 0.9)]);
+    advance(30_000);
+    calls[0]!.deferred.reject(new Error('timeout'));
+    await settle();
+    expect(rec.seen).toEqual([]);
   });
 });
