@@ -110,7 +110,11 @@ describe('wrap --sniff end to end', () => {
   }, 30_000);
 
   it('propagates a non-zero exit code in pipe mode', async () => {
-    const child = spawn(TSX, [TSX_CLI, CLI, 'wrap', '--sniff', '--', 'false'], {
+    // Was POSIX `false`, which stock Windows has no equivalent of at all —
+    // the spawn failed with ENOENT and the test asserted 127 ≠ 1 on any
+    // machine without Git-Bash's coreutils on PATH. Node exiting 1 is the
+    // same fixture ("a non-MCP command that fails") and runs everywhere.
+    const child = spawn(TSX, [TSX_CLI, CLI, 'wrap', '--sniff', '--', TSX, '-e', 'process.exit(1)'], {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     child.stdin.end('not mcp\n');

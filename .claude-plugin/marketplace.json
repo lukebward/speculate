@@ -1,0 +1,6 @@
+{
+  "name": "speculate-mcp",
+  "owner": { "name": "Luke Ward", "url": "https://github.com/lukebward" },
+  "description": "Speculate's session-start auto-wrap hook.",
+  "plugins": [{ "name": "speculate-autowrap", "source": "./plugin" }]
+}

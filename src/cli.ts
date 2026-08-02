@@ -20,6 +20,7 @@ import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
 import { nodeSignalNumber, parseTryArgs, runTry } from './tryRun.js';
 import { speculateOff, speculateOn, speculateStatus } from './manage.js';
+import { speculateSync } from './sync.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
 import { createUsageRecorder } from './usage.js';
@@ -33,6 +34,7 @@ install-and-it-works (no config files edited by hand):
   speculate on [--mode <mode>]             wrap this project's MCP servers via 'claude mcp'
   speculate off                            undo everything 'on' did (exact restore)
   speculate status                         what's wrapped here, and what drifted since 'on'
+  speculate sync                           wrap MCP servers added since the last run (run by the auto-wrap hook)
   speculate stats [--json]                 cumulative speculation usage
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
                                            server any client launches, even ones added later
@@ -59,7 +61,7 @@ options:
 
 compatibility:
   speculate exec [--cwd <dir>] -- <command...>   run <command> verbatim; kept only so a
-                                                stranded ≤0.10 Bash hook still works (removed in 0.12)
+                                                stranded ≤0.10 Bash hook still works (removed in 0.13)
 `;
 
 const STARTER_CONFIG = `{
@@ -88,6 +90,7 @@ interface Args {
     | 'on'
     | 'off'
     | 'status'
+    | 'sync'
     | 'stats'
     | 'shims'
     | 'exec';
@@ -103,6 +106,7 @@ const REST_COMMANDS = new Set([
   'on',
   'off',
   'status',
+  'sync',
   'stats',
   'shims',
   'exec',
@@ -197,8 +201,9 @@ function parseArgs(argv: string[]): Args {
  * that hook stays installed per-project until `speculate on` cleans it up.
  * Failing those calls would break the agent's basic workflow in every
  * not-yet-cleaned project, so exec survives one release as a VERBATIM
- * pass-through: no shell, no rewriting, the child's own exit code. Remove in
- * 0.12.
+ * pass-through: no shell, no rewriting, the child's own exit code. 0.12 kept
+ * it (a ≤0.10 hook can still sit in a project nobody has run `on` in yet);
+ * removal moves to 0.13.
  */
 interface ExecArgs {
   cwd: string | null;
@@ -308,6 +313,40 @@ async function main(): Promise<void> {
           ? uninstallShims(opts)
           : shimsStatus(opts);
     process.exitCode = code;
+    return;
+  }
+
+  if (args.command === 'sync') {
+    if (args.rest.length > 0) fail(`unknown sync argument '${args.rest[0]}'`);
+    // The real budget is COOPERATIVE and lives in speculateSync, which stops
+    // BETWEEN servers so a wrap is never cut in half. This timer is only the
+    // last resort for a hang no layer below can end (every `claude mcp` call
+    // already carries its own 30s execFile timeout): far enough out that it
+    // does not fire in the window between a server's `mcp remove` and the
+    // `mcp add-json` that puts it back — killing the process THERE would
+    // leave the server deleted with no restore and no state record. 120s is
+    // the 5s budget plus three 30s execFile timeouts, with slack because that
+    // 30s is NOT a hard bound: execFile's timeout sends SIGTERM and then
+    // waits for stdio to close, so a child that ignores SIGTERM stretches
+    // past it (60s, then 100s, were both close enough to the arithmetic to
+    // put the hard exit back inside the restore window). Unref'd so it never
+    // keeps an idle process alive.
+    //
+    // Arithmetic is the weak form of this guarantee. The strong one is a
+    // marker file (or an in-memory flag plus a crash-recovery pass) held
+    // across the remove→add pair, so the exit can simply refuse to fire while
+    // one is open, and the restore is replayable if the process dies anyway.
+    // That is the right long-term fix; this timer is the interim.
+    const timer = setTimeout(() => process.exit(0), 120_000).unref();
+    try {
+      process.exitCode = await speculateSync({ self: selfCommand(), mode: null });
+    } catch {
+      // selfCommand() throws when the entrypoint can't be located (a
+      // half-removed install with the plugin still there). The hook must
+      // still exit 0 silently rather than error on every launch forever.
+      process.exitCode = 0;
+    }
+    clearTimeout(timer);
     return;
   }
 

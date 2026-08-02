@@ -1,6 +1,6 @@
 {
   "name": "speculate-mcp",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Speculative-prefetching MCP proxy: make your agent's next tool call instant",
   "main": "dist/src/cli.js",
   "scripts": {
@@ -41,6 +41,8 @@
   },
   "files": [
     "dist/src",
+    "plugin",
+    ".claude-plugin",
     "README.md",
     "DESIGN.md",
     "LICENSE"

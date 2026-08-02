@@ -23,9 +23,18 @@
  * in place with no state at all.
  */
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   WORKSPACE_SERVER_NAME,
   effectiveServers,
@@ -37,7 +46,9 @@ import {
   type ClaudeConfigView,
   type ClaudeScope,
   type McpServerEntry,
+  type ScopedServer,
 } from './hostConfig.js';
+import type { SpeculationMode } from './types.js';
 
 export interface CmdResult {
   code: number;
@@ -202,11 +213,11 @@ export interface ManagedEntry {
  * name alone made the second `on` overwrite the first record and let `off`
  * leave a still-wrapped entry behind while reporting success.
  */
-function managedKey(scope: ClaudeScope, name: string): string {
+export function managedKey(scope: ClaudeScope, name: string): string {
   return `${scope}\u0000${name}`;
 }
 
-interface ManagedState {
+export interface ManagedState {
   version: 1;
   projects: Record<string, { entries: ManagedEntry[]; updatedAt: number }>;
   /**
@@ -217,6 +228,24 @@ interface ManagedState {
    * removes a marketplace registration it doesn't know it owns.
    */
   marketplaceAddedByOn?: boolean;
+  /**
+   * `speculate sync`'s cheap "did anything change?" check: cwd ->
+   * effectiveServerHash(view) as of the last sync for that project. Absent
+   * from every file written before this field existed — `loadManagedState`
+   * must keep loading those unchanged, since the hash is keyed per project
+   * and there is nothing to migrate.
+   */
+  syncHashes?: Record<string, string>;
+  /**
+   * cwd -> true for projects where `off` opted out of auto-wrap: the
+   * user-scope auto-wrap plugin's session-start hook runs `speculate sync`
+   * globally, and without this flag it would silently re-wrap a project
+   * right after `off` unwrapped it, on the next session start. `off` sets
+   * the flag for its own project; `on` clears it. A later task makes `sync`
+   * honor it. Absent from every file written before this field existed —
+   * `loadManagedState` must keep loading those unchanged.
+   */
+  syncOptOut?: Record<string, true>;
 }
 
 function readMarketplaceAddedByOn(state: ManagedState): boolean {
@@ -235,7 +264,7 @@ export function managedStatePath(): string {
   return join(stateHome, 'speculate', 'managed.json');
 }
 
-function loadManagedState(path: string): ManagedState {
+export function loadManagedState(path: string): ManagedState {
   try {
     const data = JSON.parse(readFileSync(path, 'utf8')) as ManagedState;
     if (data && typeof data === 'object' && data.version === 1 && data.projects) {
@@ -247,16 +276,89 @@ function loadManagedState(path: string): ManagedState {
   return { version: 1, projects: {} };
 }
 
-function saveManagedState(path: string, state: ManagedState): void {
+export function saveManagedState(path: string, state: ManagedState): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
   renameSync(tmp, path);
 }
 
+/**
+ * Recursively sort OBJECT keys so `JSON.stringify` of the result is
+ * insensitive to source field order — but never reorder ARRAY elements,
+ * whose order is semantically meaningful (an entry's `args` is a command
+ * line). Entries reach effectiveServerHash straight from `JSON.parse` of
+ * the host config, which preserves whatever field order the file happens
+ * to have; `claude mcp add-json` rewriting `~/.claude.json` can change that
+ * order for a server whose meaning didn't change at all, and the hash must
+ * not misfire (and trigger a pointless sync) over that.
+ */
+function canonicalizeForHash(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeForHash);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalizeForHash((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Stable hash of the effective server set (names + command lines + the
+ * approval state of .mcp.json servers) for a project: `speculate sync`'s
+ * fast path spawns no subprocess, so this is the whole "did anything change
+ * since last sync?" check.
+ *
+ * Approval belongs in the hash because approving a .mcp.json server in
+ * Claude Code writes the host's approval record, NOT the server entry: a
+ * hash over entries alone is identical before and after, so the fast path
+ * would fire and a server the user JUST approved would never be wrapped.
+ * Only project-scope entries carry the flag, since they're the only ones
+ * with an approval gate.
+ *
+ * A project entry that has been SHADOWED (by the wrapped local copy `on`
+ * and `sync` register for it) is hashed too, even though it is no longer
+ * the effective server. It has to be: the moment the shadow exists,
+ * `effectiveServers` resolves the name to the local entry, the project
+ * entry's approval flag drops out of the hash, and REVOKING that approval
+ * changes nothing the fast path can see — so sync would make zero calls
+ * while the wrapped shadow stayed registered and running at a scope with no
+ * approval gate at all. Consent still hangs on the .mcp.json record, so the
+ * hash has to keep watching it. Sorted by name
+ * so key order in the source config can never change the hash — the state
+ * (which scope won, and its exact entry) is what must be stable, not the
+ * order the host happened to enumerate servers in. Each entry is
+ * canonicalized before stringifying so an entry's own field order (and any
+ * nested object's, e.g. `env`) can't change the hash either — only array
+ * order (e.g. `args`) is preserved, since that's semantically meaningful.
+ * The parts are hashed as a JSON array, not delimiter-joined, so two
+ * different server sets can never concatenate to the same string.
+ */
+export function effectiveServerHash(view: ClaudeConfigView): string {
+  const part = (scoped: ScopedServer): string => {
+    const approval =
+      scoped.scope === 'project' ? (view.approvedProjectServers.has(scoped.name) ? '+' : '-') : '';
+    return `${scoped.scope}${approval} ${scoped.name} ${JSON.stringify(canonicalizeForHash(scoped.entry))}`;
+  };
+  const shadowedProjectEntries = new Map(
+    view.servers.filter((s) => s.scope === 'project').map((s) => [s.name, s]),
+  );
+  const parts: string[] = [];
+  for (const [name, scoped] of [...effectiveServers(view.servers)].sort((a, b) =>
+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+  )) {
+    parts.push(part(scoped));
+    const shadowed = scoped.scope === 'project' ? undefined : shadowedProjectEntries.get(name);
+    if (shadowed) parts.push(part(shadowed));
+  }
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
 // -- the claude mcp front door ---------------------------------------------------
 
-interface Ctx {
+export interface Ctx {
   home: string;
   cwd: string;
   self: { command: string; args: string[] };
@@ -264,6 +366,8 @@ interface Ctx {
   claudeBin: string;
   statePath: string;
   log: (line: string) => void;
+  /** Memoized `claude plugin list --json`; see fetchPluginList. */
+  pluginList?: Promise<unknown | null>;
 }
 
 async function mcpAddJson(
@@ -294,16 +398,22 @@ export interface ManageOptions {
   mode?: 'strict' | 'annotated' | 'off' | null;
 }
 
-function makeCtx(opts: ManageOptions): Ctx {
+export function makeCtx(opts: ManageOptions): Ctx {
+  // An explicitly passed bin is used verbatim (callers — and tests — that
+  // name one mean it); only the default/env name gets PATHEXT resolution,
+  // and only on first USE. That resolution is a synchronous PATH × PATHEXT
+  // existsSync walk, which `sync`'s fast path — the common case, run at
+  // every session start — must not pay for a subprocess it never spawns.
+  let bin = opts.claudeBin;
   return {
     home: opts.home ?? homedir(),
     cwd: resolve(opts.cwd ?? process.cwd()),
     self: opts.self,
     runner: opts.runner ?? execFileRunner,
-    // An explicitly passed bin is used verbatim (callers — and tests — that
-    // name one mean it); only the default/env name gets PATHEXT resolution.
-    claudeBin:
-      opts.claudeBin ?? resolveClaudeBin(process.env.SPECULATE_CLAUDE_BIN ?? 'claude'),
+    get claudeBin(): string {
+      bin ??= resolveClaudeBin(process.env.SPECULATE_CLAUDE_BIN ?? 'claude');
+      return bin;
+    },
     statePath: opts.statePath ?? managedStatePath(),
     log: opts.log ?? ((line) => process.stderr.write(`${line}\n`)),
   };
@@ -370,6 +480,9 @@ async function runLegacyPluginUninstall(
     last = { res, id };
     if (res.code === 0) break;
   }
+  // The installed set just changed: drop the memoized list so a later
+  // detector re-reads the host instead of trusting a pre-uninstall answer.
+  ctx.pluginList = undefined;
   return last;
 }
 
@@ -387,34 +500,55 @@ function isLegacyPluginRecord(item: unknown): boolean {
 }
 
 /**
- * Detect a still-installed legacy plugin via `claude plugin list --json`.
- * Parses the JSON (hosts emit either an array of records or an id-keyed
- * object) and matches ids/names exactly. Fail-soft in every direction: a
- * missing plugin CLI, a nonzero exit, or unparseable output means "not
- * detected", never a guess — callers with their own ≤0.10 record still act.
+ * The one `claude plugin list --json` every detector reads (`off` used to
+ * spawn it twice: once for the legacy plugin, once for the auto-wrap one).
+ * Memoized on the ctx, which lives exactly as long as a single command run.
+ * Anything that CHANGES the installed set clears the memo (see
+ * runLegacyPluginUninstall), so staleness is prevented by construction
+ * rather than by an argument about which ids each detector matches.
+ *
+ * Fail-soft in every direction: a missing plugin CLI, a nonzero exit, or
+ * unparseable output all yield null, which every caller reads as "not
+ * detected", never a guess.
+ */
+function fetchPluginList(ctx: Ctx): Promise<unknown | null> {
+  ctx.pluginList ??= (async () => {
+    try {
+      const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
+      if (list.code !== 0) return null;
+      try {
+        return JSON.parse(list.stdout) as unknown;
+      } catch {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  })();
+  return ctx.pluginList;
+}
+
+/**
+ * Does a parsed `plugin list --json` payload name a plugin `matches` accepts?
+ * Hosts emit either an array of records or an id-keyed object; both shapes
+ * are matched exactly (never by substring — a user's unrelated
+ * `speculate-tools` is someone else's plugin).
+ */
+function pluginListHas(parsed: unknown, matches: (item: unknown) => boolean): boolean {
+  if (Array.isArray(parsed)) return parsed.some(matches);
+  if (parsed && typeof parsed === 'object') {
+    const rec = parsed as Record<string, unknown>;
+    return Object.keys(rec).some((k) => matches(k)) || Object.values(rec).some(matches);
+  }
+  return false;
+}
+
+/**
+ * Detect a still-installed legacy plugin. Fail-soft: "not detected" is the
+ * answer for every unknown — callers with their own ≤0.10 record still act.
  */
 async function detectLegacyPlugin(ctx: Ctx): Promise<boolean> {
-  try {
-    const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
-    if (list.code !== 0) return false;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(list.stdout);
-    } catch {
-      return false;
-    }
-    if (Array.isArray(parsed)) return parsed.some(isLegacyPluginRecord);
-    if (parsed && typeof parsed === 'object') {
-      const rec = parsed as Record<string, unknown>;
-      return (
-        Object.keys(rec).some((k) => LEGACY_PLUGIN_MATCH.has(k)) ||
-        Object.values(rec).some(isLegacyPluginRecord)
-      );
-    }
-    return false;
-  } catch {
-    return false;
-  }
+  return pluginListHas(await fetchPluginList(ctx), isLegacyPluginRecord);
 }
 
 /**
@@ -520,6 +654,11 @@ export async function cleanupLegacyArtifacts(
       cwd: ctx.cwd,
     });
     marketplaceRemoved = rm.code === 0;
+    // What a marketplace offers changes what `plugin list` can report, so the
+    // memo is dropped here too — the docstring on fetchPluginList claims
+    // staleness is prevented by construction, and this is one of the sites
+    // that has to be true for.
+    ctx.pluginList = undefined;
     ctx.log(
       rm.code === 0
         ? '[speculate] legacy: removed the speculate marketplace registration'
@@ -533,6 +672,527 @@ export async function cleanupLegacyArtifacts(
     workspaceServerRemovalAttempted,
     marketplaceRemoved,
   };
+}
+
+// -- shared wrap path ---------------------------------------------------------
+
+export interface WrapOutcome {
+  changed: number;
+  failed: number;
+  /**
+   * How many Speculate-owned local shadows were REMOVED because the approved
+   * `.mcp.json` entry they stood on is gone — approval revoked, or the server
+   * no longer in the file at all. Counted separately from `changed` so `sync`
+   * knows its managed record needs rewriting even on a pass that wrapped
+   * nothing.
+   */
+  shadowsRemoved: number;
+  /**
+   * True when the pass stopped early because `opts.deadline` had passed, so
+   * servers were left unvisited. The pass is INCOMPLETE: callers must not
+   * record anything that claims the whole set was handled (`sync`'s hash).
+   */
+  timedOut: boolean;
+}
+
+/**
+ * Wraps every eligible server in `view` into `managed`, applying all consent
+ * gates. Mutates `managed` in place. Used by both `on` and `sync`.
+ *
+ * `onWrapped` fires once per server actually wrapped here, so `sync` can name
+ * them in its one-line summary without re-deriving the set from the config it
+ * just rewrote. `on` passes nothing (it logs each server as it goes).
+ *
+ * `deadline` (a `performance.now()` timestamp) makes the pass COOPERATIVELY
+ * interruptible for `sync`, whose session-start budget is finite. It is
+ * checked only at the top of an iteration, never between a server's `mcp
+ * remove` and the `mcp add-json` that puts it back — killing the process in
+ * that window would leave the host with the server deleted, no restore, and
+ * no state record. Stopping between servers costs at most one unvisited
+ * server, which the next run picks up.
+ */
+export async function wrapEffectiveServers(
+  ctx: Ctx,
+  view: ClaudeConfigView,
+  managed: Map<string, ManagedEntry>,
+  opts: { mode?: SpeculationMode; onWrapped?: (name: string) => void; deadline?: number },
+): Promise<WrapOutcome> {
+  let changed = 0;
+  let failed = 0;
+  let shadowsRemoved = 0;
+  const projectScopeNames = new Set(
+    view.servers.filter((s) => s.scope === 'project').map((s) => s.name),
+  );
+
+  for (const [name, scoped] of effectiveServers(view.servers)) {
+    if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
+      ctx.log(`[speculate] out of time before ${name} — the next run picks it up`);
+      return { changed, failed, shadowsRemoved, timedOut: true };
+    }
+    if (name === WORKSPACE_SERVER_NAME) continue;
+    if (name.startsWith('-')) {
+      // `claude mcp remove/add-json` take the name positionally; a leading
+      // dash would be parsed as an option. Leave such servers untouched.
+      ctx.log(`[speculate] ${name}: skipped (name starts with '-')`);
+      continue;
+    }
+    // The shadow's licence is gone: this local entry is a wrapped copy WE
+    // registered for an APPROVED .mcp.json server, and that server is no
+    // longer both present and approved. Two ways it gets there, and they are
+    // one condition, not two — the approval was revoked, or the server left
+    // `.mcp.json` altogether (a git pull, a branch switch, an edit, or the
+    // file deleted). Nothing else would notice either: the shadow wins the
+    // scope contest, so it stays registered and running at a scope with no
+    // approval gate, for a server the project no longer declares. Remove it,
+    // leaving whatever the project actually declares (a pending entry, or
+    // nothing at all) as the only thing left.
+    //
+    // Strictly "our own": the managed record says WE created this shadow
+    // (action 'shadowed') and it is still a Speculate wrap. A local entry the
+    // user wrapped themselves is theirs, and stays exactly where they put it.
+    // The corollary is conservative by design — with the state file lost or
+    // corrupt there is no record, so the shadow survives, the same stance
+    // `off` takes when it cannot prove a local entry was a shadow.
+    if (
+      scoped.scope === 'local' &&
+      !(projectScopeNames.has(name) && view.approvedProjectServers.has(name)) &&
+      managed.get(managedKey('local', name))?.action === 'shadowed' &&
+      // Still OUR shadow, not something the user has since replaced it with:
+      // a record plus an entry that is no longer a Speculate wrap means the
+      // local entry stopped being ours, whatever the state file remembers.
+      isWrappedEntry(scoped.entry)
+    ) {
+      const res = await mcpRemove(ctx, name, 'local');
+      if (res.code !== 0) {
+        ctx.log(`[speculate] ${name}: shadow removal failed: ${(res.stderr || res.stdout).trim()}`);
+        failed++;
+        continue;
+      }
+      managed.delete(managedKey('local', name));
+      ctx.log(
+        projectScopeNames.has(name)
+          ? `[speculate] ${name}: .mcp.json approval revoked — wrapped shadow removed (pending again)`
+          : `[speculate] ${name}: gone from .mcp.json — wrapped shadow removed`,
+      );
+      shadowsRemoved++;
+      changed++;
+      continue;
+    }
+    if (isWrappedEntry(scoped.entry)) {
+      ctx.log(`[speculate] ${name}: already wrapped — skipping`);
+      continue;
+    }
+    if (!isStdioEntry(scoped.entry)) {
+      ctx.log(`[speculate] ${name}: ${scoped.entry.url ? 'http/sse' : 'non-stdio'} — passed through unwrapped`);
+      continue;
+    }
+    const wrapped = wrapEntry(scoped.entry, ctx.self, { mode: opts.mode ?? undefined });
+
+    if (scoped.scope === 'project') {
+      // Never touch the checked-in file; shadow at local scope instead —
+      // but only for servers the user has already approved in Claude Code.
+      // When approval state is unknown (a fresh clone, or the host's
+      // enabled/disabled lists are empty — the COMMON case), the safe
+      // default is to leave it pending, exactly as `try` does. Wrapping it
+      // would register it at local scope, where it runs with no approval
+      // gate at all: that would widen consent, which Speculate never does.
+      if (!view.approvedProjectServers.has(name)) {
+        ctx.log(`[speculate] ${name}: .mcp.json server not approved in Claude Code — skipping`);
+        continue;
+      }
+      const res = await mcpAddJson(ctx, name, wrapped, 'local');
+      if (res.code !== 0) {
+        ctx.log(`[speculate] ${name}: shadow failed: ${(res.stderr || res.stdout).trim()}`);
+        failed++;
+        continue;
+      }
+      managed.set(managedKey('local', name), { name, scope: 'local', action: 'shadowed' });
+      ctx.log(`[speculate] ${name}: wrapped via local shadow (.mcp.json untouched; local wins)`);
+      opts.onWrapped?.(name);
+      changed++;
+      continue;
+    }
+
+    // user/local scope: re-register wrapped in place, original recorded.
+    const removed = await mcpRemove(ctx, name, scoped.scope);
+    if (removed.code !== 0) {
+      ctx.log(`[speculate] ${name}: remove failed: ${(removed.stderr || removed.stdout).trim()}`);
+      failed++;
+      continue;
+    }
+    const added = await mcpAddJson(ctx, name, wrapped, scoped.scope);
+    if (added.code !== 0) {
+      // Put the original back rather than leave the server missing.
+      const restored = await mcpAddJson(ctx, name, scoped.entry, scoped.scope);
+      ctx.log(
+        `[speculate] ${name}: wrap failed (${(added.stderr || added.stdout).trim()}); ` +
+          (restored.code === 0
+            ? 'original restored'
+            : `RESTORE ALSO FAILED — re-add manually: claude mcp add-json ${name} '${JSON.stringify(scoped.entry)}' -s ${scoped.scope}`),
+      );
+      failed++;
+      continue;
+    }
+    managed.set(managedKey(scoped.scope, name), {
+      name,
+      scope: scoped.scope,
+      action: 'rewrote',
+      original: scoped.entry,
+    });
+    ctx.log(`[speculate] ${name}: wrapped (${scoped.scope} scope)`);
+    opts.onWrapped?.(name);
+    changed++;
+  }
+
+  return { changed, failed, shadowsRemoved, timedOut: false };
+}
+
+// -- the auto-wrap plugin -------------------------------------------------------
+
+/**
+ * The auto-wrap plugin's id. Its whole content is ONE SessionStart hook that
+ * runs `speculate sync`, so MCP servers added after `speculate on` are wrapped
+ * without anyone remembering to re-run it. Installed at USER scope by `on`.
+ *
+ * Deliberately disjoint from LEGACY_PLUGIN_IDS/LEGACY_PLUGIN_MATCH, which name
+ * only the retired ≤0.10 plugin: were the two sets ever to overlap, cleanup
+ * would uninstall the plugin `on` had just installed.
+ */
+export const AUTOWRAP_PLUGIN_ID = 'speculate-autowrap';
+
+/**
+ * The marketplace `.claude-plugin/marketplace.json` declares. NOT `speculate`
+ * — that name belongs to the retired ≤0.10 registration, which cleanup removes
+ * when this project's state claims it and `status` tells everyone else to
+ * remove by hand. Sharing the name would make `on` re-add what cleanup had
+ * just removed, and turn that status hint into advice that breaks auto-wrap.
+ */
+const AUTOWRAP_MARKETPLACE_ID = 'speculate-mcp';
+
+/**
+ * How long the host lets the hook run, in SECONDS. It must exceed `sync`'s own
+ * last-resort exit (120s — see the comment on that timer in cli.ts, including
+ * why the arithmetic is only the weak form of the guarantee): a shorter
+ * host-side timeout kills a wrap in flight, reopening the very window — a
+ * server deleted between `mcp remove` and `mcp add-json` — that the
+ * cooperative deadline exists to close. It is a ceiling that should never be
+ * approached: the fast path costs two file reads.
+ *
+ * Kept in step with the shipped plugin/hooks/hooks.json template, which the
+ * generator below overwrites at install time (a test pins the two together).
+ */
+const AUTOWRAP_HOOK_TIMEOUT_S = 150;
+
+/**
+ * The ids a host may report our plugin under. `claude plugin list --json`
+ * emits records identified ONLY by `id`, and that id is
+ * `<plugin>@<marketplace>` (measured) — so the qualified form has to be
+ * matched or the plugin `on` just installed reads back as absent. Matched
+ * exactly, never by substring: a stranger's `speculate-autowrap-fork` is
+ * someone else's plugin.
+ */
+const AUTOWRAP_PLUGIN_MATCH: ReadonlySet<string> = new Set([
+  AUTOWRAP_PLUGIN_ID,
+  `${AUTOWRAP_PLUGIN_ID}@${AUTOWRAP_MARKETPLACE_ID}`,
+]);
+
+/** Does one `plugin list --json` record name the auto-wrap plugin (exactly)? */
+function isAutowrapRecord(item: unknown): boolean {
+  if (typeof item === 'string') return AUTOWRAP_PLUGIN_MATCH.has(item);
+  if (!item || typeof item !== 'object') return false;
+  const rec = item as Record<string, unknown>;
+  for (const field of ['id', 'name'] as const) {
+    const value = rec[field];
+    if (typeof value === 'string' && AUTOWRAP_PLUGIN_MATCH.has(value)) return true;
+  }
+  return false;
+}
+
+/** What the host reports about an installed copy; both fields are optional. */
+interface AutowrapInstall {
+  version?: string;
+  installPath?: string;
+}
+
+/**
+ * The host's record for our plugin, or null when it isn't installed. Same
+ * two payload shapes `pluginListHas` handles, but the RECORD is kept: `on`
+ * needs the reported `version` and `installPath` to tell a current install
+ * from one it has to refresh.
+ */
+function autowrapRecord(parsed: unknown): AutowrapInstall | null {
+  const fields = (item: unknown): AutowrapInstall => {
+    const rec = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+    return {
+      ...(typeof rec['version'] === 'string' ? { version: rec['version'] } : {}),
+      ...(typeof rec['installPath'] === 'string' ? { installPath: rec['installPath'] } : {}),
+    };
+  };
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) if (isAutowrapRecord(item)) return fields(item);
+    return null;
+  }
+  if (parsed && typeof parsed === 'object') {
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (isAutowrapRecord(key) || isAutowrapRecord(value)) return fields(value);
+    }
+  }
+  return null;
+}
+
+/**
+ * Fail-soft check (same shared plugin list as detectLegacyPlugin, matching a
+ * different, disjoint id): is the auto-wrap plugin installed?
+ */
+async function detectAutowrapPlugin(ctx: Ctx): Promise<boolean> {
+  return autowrapRecord(await fetchPluginList(ctx)) !== null;
+}
+
+/**
+ * The installed package root — the directory that ships `plugin/`. Resolved by
+ * walking up from THIS module so it works from `src/manage.ts` (a checkout)
+ * and `dist/src/manage.js` (an npm install) alike. Not derived from
+ * `ctx.self`, which in a source checkout points at tsx's entrypoint, not ours.
+ */
+function packageRoot(): string | null {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    if (existsSync(join(dir, 'plugin', 'hooks', 'autowrap.mjs'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * The hook's command line, with both file paths baked at install time.
+ *
+ * Never a bare `speculate`: Claude Code cannot exec a `.cmd` shim as a hook on
+ * Windows, and npm installs `speculate` as one. `node` by NAME is a different
+ * case and is deliberate: node/node.exe is a real executable, so PATH
+ * resolution works where a shim would not — and it self-heals the one thing a
+ * baked `process.execPath` cannot survive, an nvm/fnm/volta version switch
+ * that deletes the interpreter the hook was pinned to. `ctx.self.command` is
+ * therefore intentionally unused here; only its ARGS are baked.
+ *
+ * This is a trade, not a strict improvement: a GUI-launched host (e.g. a
+ * desktop app opened from a dock/Start Menu icon) inherits whatever PATH the
+ * OS session set up, which may lack the nvm/fnm shim directory entirely, and
+ * a bare `node` there resolves to nothing or the wrong interpreter, whereas
+ * a baked `process.execPath` would have kept working. PATH resolution wins
+ * the common case (a terminal-launched host, where version managers live)
+ * at the cost of that less common one.
+ *
+ * `${CLAUDE_PLUGIN_ROOT}` is the host's own expansion for the INSTALLED plugin
+ * directory and has to be used for the wrapper, because `claude plugin
+ * install` COPIES the plugin: a path into the npm package is precisely the
+ * path that disappears on `npm uninstall`, which is the case the wrapper
+ * exists to survive. The CLI path after it may well disappear too — the
+ * wrapper checks it and exits 0 silently.
+ */
+function autowrapHookCommand(self: { command: string; args: string[] }): string {
+  const quoted = (s: string): string => `"${s}"`;
+  return [
+    'node',
+    quoted('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs'),
+    ...self.args.map(quoted),
+  ].join(' ');
+}
+
+function autowrapHooksJson(self: { command: string; args: string[] }): string {
+  return `${JSON.stringify(
+    {
+      hooks: {
+        SessionStart: [
+          {
+            matcher: 'startup',
+            hooks: [
+              {
+                type: 'command',
+                command: autowrapHookCommand(self),
+                timeout: AUTOWRAP_HOOK_TIMEOUT_S,
+              },
+            ],
+          },
+        ],
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+/**
+ * Stage a complete, self-contained copy of the plugin (plus its one-plugin
+ * marketplace) next to the managed state, with the hook command generated for
+ * THIS install, and return the directory to hand `plugin marketplace add`.
+ *
+ * The shipped copy inside the package is the template, never the target: a
+ * global npm install is frequently root-owned or otherwise read-only, and
+ * writing a generated hook command into it would fail exactly where auto-wrap
+ * matters most. Staging also keeps `speculate on` from dirtying an npm package
+ * (or, in a checkout, the working tree).
+ */
+function stageAutowrapPlugin(ctx: Ctx, root: string): string {
+  const dest = join(dirname(ctx.statePath), 'autowrap');
+  // 0o700, like every other creator of the state directory: on a first-ever
+  // `on` this runs BEFORE the first saveManagedState, so it is what CREATES
+  // that directory, and a default 0755 here would be the one path that left
+  // it world-readable for good.
+  mkdirSync(join(dest, '.claude-plugin'), { recursive: true, mode: 0o700 });
+  mkdirSync(join(dest, 'plugin', '.claude-plugin'), { recursive: true, mode: 0o700 });
+  mkdirSync(join(dest, 'plugin', 'hooks'), { recursive: true, mode: 0o700 });
+  copyFileSync(
+    join(root, '.claude-plugin', 'marketplace.json'),
+    join(dest, '.claude-plugin', 'marketplace.json'),
+  );
+  copyFileSync(
+    join(root, 'plugin', '.claude-plugin', 'plugin.json'),
+    join(dest, 'plugin', '.claude-plugin', 'plugin.json'),
+  );
+  copyFileSync(
+    join(root, 'plugin', 'hooks', 'autowrap.mjs'),
+    join(dest, 'plugin', 'hooks', 'autowrap.mjs'),
+  );
+  writeFileSync(join(dest, 'plugin', 'hooks', 'hooks.json'), autowrapHooksJson(ctx.self));
+  return dest;
+}
+
+/** The version the shipped plugin manifest declares, or null if unreadable. */
+function shippedPluginVersion(root: string): string | null {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(join(root, 'plugin', '.claude-plugin', 'plugin.json'), 'utf8'),
+    ) as { version?: unknown };
+    return typeof manifest.version === 'string' ? manifest.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is the copy the host already has still the one THIS Speculate would install?
+ *
+ * Two ways it stops being: `claude plugin install` caches per version, so a
+ * newer plugin never reaches anyone who already has an older one; and the hook
+ * command bakes this install's absolute CLI path, which an npm move (or a
+ * checkout that became a global install) invalidates. Either way the hook
+ * would keep running the OLD copy forever, so `on` reinstalls.
+ *
+ * Only positive evidence of staleness counts. A host that reports neither a
+ * version nor an install path, or an install path we cannot read, leaves a
+ * working install alone: reinstalling on every `on` would be worse than the
+ * problem.
+ *
+ * Repeated refreshes on every `on` are expected, not a bug, in two narrow
+ * cases: a host that does not round-trip the version string it was given
+ * (so `installed.version` never matches `shipped`, forever); and a developer
+ * who runs `speculate on` from both a source checkout and a global install
+ * (`selfCommand` differs between the two, so the baked hook command flips
+ * back and forth and each run sees the other's copy as stale).
+ */
+function autowrapInstallIsCurrent(ctx: Ctx, root: string, installed: AutowrapInstall): boolean {
+  const shipped = shippedPluginVersion(root);
+  if (shipped !== null && installed.version !== undefined && installed.version !== shipped) {
+    return false;
+  }
+  if (installed.installPath !== undefined) {
+    try {
+      const hooks = JSON.parse(
+        readFileSync(join(installed.installPath, 'hooks', 'hooks.json'), 'utf8'),
+      ) as { hooks?: { SessionStart?: { hooks?: { command?: unknown }[] }[] } };
+      const command = hooks.hooks?.SessionStart?.[0]?.hooks?.[0]?.command;
+      if (typeof command === 'string' && command !== autowrapHookCommand(ctx.self)) return false;
+    } catch {
+      // Unreadable: no evidence either way, so nothing to act on.
+    }
+  }
+  return true;
+}
+
+/**
+ * Install (or refresh) the auto-wrap plugin at user scope. Every step is
+ * fail-soft: a failure logs ONE line and never aborts `on`, whose real work —
+ * wrapping this project's servers — has nothing to do with it.
+ *
+ * User scope, not local, because the point is to catch servers added in
+ * projects where nobody thought to run `speculate on`. `off` opts a single
+ * project out through the state file rather than uninstalling this.
+ */
+async function installAutowrapPlugin(ctx: Ctx): Promise<void> {
+  try {
+    const installed = autowrapRecord(await fetchPluginList(ctx));
+    const root = packageRoot();
+    if (installed && (root === null || autowrapInstallIsCurrent(ctx, root, installed))) {
+      ctx.log(
+        '[speculate] auto-wrap: already installed (new servers wrap at the next session start)',
+      );
+      return;
+    }
+    if (root === null) {
+      ctx.log(
+        "[speculate] auto-wrap: plugin files not found — skipped ('speculate on' still wraps this project)",
+      );
+      return;
+    }
+    const source = stageAutowrapPlugin(ctx, root);
+    if (installed) {
+      // Measured: with the plugin already installed, `plugin install` is a
+      // no-op ("is already installed") and `plugin update` reports "already at
+      // the latest version" — NEITHER re-copies the plugin. Only an uninstall
+      // first actually replaces the stale copy. This is the one place
+      // Speculate uninstalls its own plugin, and it is gated on positive
+      // evidence of staleness and immediately followed by the install below.
+      const un = await ctx.runner(
+        ctx.claudeBin,
+        ['plugin', 'uninstall', '-s', 'user', AUTOWRAP_PLUGIN_ID],
+        { cwd: ctx.cwd },
+      );
+      ctx.pluginList = undefined;
+      if (un.code !== 0) {
+        ctx.log(
+          // Two lines, not one `&&` chain: PowerShell 5.1 (the default shell
+          // on stock Windows) parse-errors on `&&`, so a chained recipe would
+          // run NEITHER command at the moment the user is already stuck.
+          `[speculate] auto-wrap: could not refresh the installed hook (${(un.stderr || un.stdout).trim() || `exit ${un.code}`}). Refresh it manually by running these in order:\n` +
+            `[speculate]   ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}\n` +
+            `[speculate]   speculate on`,
+        );
+        return;
+      }
+    }
+    // Measured: adding an already-registered marketplace exits 0 ("already on
+    // disk"), so this is expected to succeed on every run after the first. The
+    // detail is kept anyway and reported only if the install that depends on
+    // it fails.
+    const add = await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'add', source], {
+      cwd: ctx.cwd,
+    });
+    const ins = await ctx.runner(
+      ctx.claudeBin,
+      ['plugin', 'install', '-s', 'user', AUTOWRAP_PLUGIN_ID],
+      { cwd: ctx.cwd },
+    );
+    // The installed set just changed: drop the memoized list (see
+    // fetchPluginList) so a later detector doesn't read the pre-install answer.
+    ctx.pluginList = undefined;
+    if (ins.code === 0) {
+      ctx.log(
+        installed
+          ? '[speculate] auto-wrap: refreshed — the installed hook now matches this install'
+          : '[speculate] auto-wrap: installed — servers added later wrap at the next session start',
+      );
+      return;
+    }
+    const detail = (ins.stderr || ins.stdout).trim() || `exit ${ins.code}`;
+    const addDetail = add.code === 0 ? '' : `; marketplace: ${(add.stderr || add.stdout).trim()}`;
+    ctx.log(
+      `[speculate] auto-wrap: not installed (${detail}${addDetail}) — 'speculate on' still wraps this project`,
+    );
+  } catch (err) {
+    ctx.log(`[speculate] auto-wrap: install skipped (${(err as Error).message})`);
+  }
 }
 
 // -- on ---------------------------------------------------------------------------
@@ -576,85 +1236,35 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
       })
       .map((e) => [managedKey(e.scope, e.name), e]),
   );
-  let changed = 0;
-  let failed = 0;
-
-  for (const [name, scoped] of effectiveServers(view.servers)) {
-    if (name === WORKSPACE_SERVER_NAME) continue;
-    if (name.startsWith('-')) {
-      // `claude mcp remove/add-json` take the name positionally; a leading
-      // dash would be parsed as an option. Leave such servers untouched.
-      ctx.log(`[speculate] ${name}: skipped (name starts with '-')`);
-      continue;
-    }
-    if (isWrappedEntry(scoped.entry)) {
-      ctx.log(`[speculate] ${name}: already wrapped — skipping`);
-      continue;
-    }
-    if (!isStdioEntry(scoped.entry)) {
-      ctx.log(`[speculate] ${name}: ${scoped.entry.url ? 'http/sse' : 'non-stdio'} — passed through unwrapped`);
-      continue;
-    }
-    const wrapped = wrapEntry(scoped.entry, ctx.self, { mode: opts.mode ?? undefined });
-
-    if (scoped.scope === 'project') {
-      // Never touch the checked-in file; shadow at local scope instead —
-      // but only for servers the user has already approved in Claude Code.
-      // When approval state is unknown (a fresh clone, or the host's
-      // enabled/disabled lists are empty — the COMMON case), the safe
-      // default is to leave it pending, exactly as `try` does. Wrapping it
-      // would register it at local scope, where it runs with no approval
-      // gate at all: that would widen consent, which Speculate never does.
-      if (!view.approvedProjectServers.has(name)) {
-        ctx.log(`[speculate] ${name}: .mcp.json server not approved in Claude Code — skipping`);
-        continue;
-      }
-      const res = await mcpAddJson(ctx, name, wrapped, 'local');
-      if (res.code !== 0) {
-        ctx.log(`[speculate] ${name}: shadow failed: ${(res.stderr || res.stdout).trim()}`);
-        failed++;
-        continue;
-      }
-      managed.set(managedKey('local', name), { name, scope: 'local', action: 'shadowed' });
-      ctx.log(`[speculate] ${name}: wrapped via local shadow (.mcp.json untouched; local wins)`);
-      changed++;
-      continue;
-    }
-
-    // user/local scope: re-register wrapped in place, original recorded.
-    const removed = await mcpRemove(ctx, name, scoped.scope);
-    if (removed.code !== 0) {
-      ctx.log(`[speculate] ${name}: remove failed: ${(removed.stderr || removed.stdout).trim()}`);
-      failed++;
-      continue;
-    }
-    const added = await mcpAddJson(ctx, name, wrapped, scoped.scope);
-    if (added.code !== 0) {
-      // Put the original back rather than leave the server missing.
-      const restored = await mcpAddJson(ctx, name, scoped.entry, scoped.scope);
-      ctx.log(
-        `[speculate] ${name}: wrap failed (${(added.stderr || added.stdout).trim()}); ` +
-          (restored.code === 0
-            ? 'original restored'
-            : `RESTORE ALSO FAILED — re-add manually: claude mcp add-json ${name} '${JSON.stringify(scoped.entry)}' -s ${scoped.scope}`),
-      );
-      failed++;
-      continue;
-    }
-    managed.set(managedKey(scoped.scope, name), {
-      name,
-      scope: scoped.scope,
-      action: 'rewrote',
-      original: scoped.entry,
-    });
-    ctx.log(`[speculate] ${name}: wrapped (${scoped.scope} scope)`);
-    changed++;
-  }
+  // `changed` counts a revoked shadow's removal too: it is a change `on`
+  // made to the host, and the summary line must not under-report it.
+  const { changed, failed } = await wrapEffectiveServers(ctx, view, managed, {
+    mode: opts.mode ?? undefined,
+  });
+  // Servers added AFTER this run are the auto-wrap plugin's job. Installed
+  // after the wrap so its one line lands with the summary rather than in the
+  // middle of the per-server output — and it can never fail `on`.
+  await installAutowrapPlugin(ctx);
 
   state.projects[ctx.cwd] = { entries: [...managed.values()], updatedAt: Date.now() };
   // The ownership flag authorized exactly one host-global removal; consume it
   // so a future run never claims a registration the user re-added by hand.
   if (legacy.marketplaceRemoved) state.marketplaceAddedByOn = false;
+  // `on` opts this project back into a later `sync`'s auto-wrap (see
+  // ManagedState.syncOptOut) — undoing whatever `off` last recorded here.
+  delete state.syncOptOut?.[ctx.cwd];
+  // Seed sync's fast-path hash from the config AS `on` LEFT IT. Without this
+  // the session right after every `on` found no hash for the project, took
+  // the slow path — lock, full pass, one `claude mcp` probe per server — and
+  // discovered there was nothing to do. Same rule as sync: only a pass with
+  // no failures may claim "nothing has changed since this hash", or a
+  // transient failure would be frozen in by a hash that skips the retry.
+  if (failed === 0) {
+    state.syncHashes = {
+      ...(state.syncHashes ?? {}),
+      [ctx.cwd]: effectiveServerHash(readClaudeServers({ home: ctx.home, cwd: ctx.cwd })),
+    };
+  }
   saveManagedState(ctx.statePath, state);
   ctx.log(
     `[speculate] on: ${changed} change(s)${failed ? `, ${failed} failure(s)` : ''}. Undo anytime with 'speculate off'.`,
@@ -685,6 +1295,13 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
   }
   let failed = 0;
+  /**
+   * How many USER-scope servers this run unwrapped. They are host-global —
+   * every project sees them — while the opt-out `off` records is per project,
+   * so this number is exactly the part of `off` that another project can
+   * undo. See the note it prints below.
+   */
+  let userScopeUnwrapped = 0;
   const handled = new Set<string>();
 
   for (const entry of record?.entries ?? []) {
@@ -778,6 +1395,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       failed++;
       continue;
     }
+    if (entry.scope === 'user') userScopeUnwrapped++;
     ctx.log(`[speculate] ${entry.name}: unwrapped (${entry.scope} scope)`);
   }
 
@@ -824,8 +1442,10 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
         failed++;
         continue;
       }
+      if (scoped.scope === 'user') userScopeUnwrapped++;
       ctx.log(`[speculate] ${scoped.name}: unwrapped (${scoped.scope} scope, reconstructed)`);
     } else {
+      if (scoped.scope === 'user') userScopeUnwrapped++;
       ctx.log(`[speculate] ${scoped.name}: wrap removed (no original command recorded)`);
     }
   }
@@ -833,7 +1453,43 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   if (record) delete state.projects[ctx.cwd];
   // Consume the marketplace-ownership flag exactly once (see on()).
   if (legacyCleanup.marketplaceRemoved) state.marketplaceAddedByOn = false;
-  if (record || legacyCleanup.marketplaceRemoved) saveManagedState(ctx.statePath, state);
+  // Opt this project out of a later `sync`'s auto-wrap (see ManagedState.
+  // syncOptOut) — the global plugin, if installed, would otherwise re-wrap
+  // it at the next session start. `on` clears this.
+  state.syncOptOut = { ...(state.syncOptOut ?? {}), [ctx.cwd]: true };
+  // What `off` cannot do, said plainly. The servers it just unwrapped at USER
+  // scope are shared by every project on this machine, while the opt-out it
+  // records covers this project only — so the next session start in ANY other
+  // project re-wraps them at user scope, and they come back wrapped here too,
+  // within one session. Nothing short of removing the plugin stops that.
+  if (userScopeUnwrapped > 0) {
+    ctx.log(
+      `[speculate] note: ${userScopeUnwrapped} of those live at USER scope, shared by every project — ` +
+        'this opt-out covers this project only, so any other project’s next session start re-wraps them ' +
+        'and they are wrapped here again.',
+    );
+  }
+  if (await detectAutowrapPlugin(ctx)) {
+    ctx.log(
+      '[speculate] auto-wrap is still installed globally (this project is now opted out).',
+    );
+    ctx.log(
+      `[speculate]   remove it everywhere with: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}`,
+    );
+    // Uninstalling the plugin leaves the registration that supplied it behind,
+    // pointing at a staged directory nothing else uses. Naming it here is the
+    // difference between "removed" and "removed, mostly".
+    ctx.log(
+      `[speculate]   and its marketplace: ${ctx.claudeBin} plugin marketplace remove ${AUTOWRAP_MARKETPLACE_ID}`,
+    );
+  } else if (userScopeUnwrapped > 0) {
+    // Detection is fail-soft (an older host has no `claude plugin` CLI at
+    // all), so the one command that really stops it is named either way.
+    ctx.log(
+      `[speculate]   the only thing that stops that everywhere: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}`,
+    );
+  }
+  saveManagedState(ctx.statePath, state);
   ctx.log(`[speculate] off: done${failed ? ` (${failed} failure(s))` : ''}.`);
   return failed > 0 ? 1 : 0;
 }
@@ -876,6 +1532,20 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
     );
   } else if (!record && unwrapped > 0) {
     ctx.log(`[speculate] run 'speculate on' to wrap them (or 'speculate try' for a zero-write trial)`);
+  }
+  if (await detectAutowrapPlugin(ctx)) {
+    // The plugin being installed is only half the answer: `off` records a
+    // per-project opt-out that `sync` honors before anything else, so in an
+    // opted-out project "new servers wrap at the next session start" is
+    // actively false — and this is the only place the opt-out surfaces at
+    // all. Otherwise, say the quiet part out loud: the wrap a session-start
+    // hook performs lands in the NEXT session, because the host snapshots
+    // MCP config before running the hook. Measured, inherent, not hidden.
+    ctx.log(
+      state.syncOptOut?.[ctx.cwd]
+        ? "[speculate]   auto-wrap: installed, but this project is opted out ('speculate off' did that) — run 'speculate on' here to re-enable"
+        : '[speculate]   auto-wrap: installed (new servers wrap at the next session start)',
+    );
   }
   if (await detectLegacyPlugin(ctx)) {
     ctx.log(
