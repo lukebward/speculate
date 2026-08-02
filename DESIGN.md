@@ -459,7 +459,24 @@ Each transition and opener now carries a second number beside its count: a **dec
 
 **Recency persists.** `(score, lastUpdated)` travel together in the state file (§13.6), undecayed, so the gap across a restart is charged on load instead of forgiven — without this the mechanism would reset every session and be cosmetic. Deserialization stays defensive and backward-compatible: a pre-existing file with neither field loads with `score = count` and `lastUpdated = now()`, a junk score falls back to `count`, and a stamp from a clock running ahead of ours is clamped to now (no entry buys permanent freshness).
 
-Measured (offline recall@K harness, seeds 1–8, 2400 workflow pairs): recall@**5** and predictions issued are **identical** to the pre-change run — decay changes no candidate *set*, only the order within it — while recall@3 moves −0.001 (3 pairs) as recency replaces the alphabetical ruleId tie-break at the k=3 cut. The corpus spaces sessions 600 s apart, deep inside a 14-day TAU, so it cannot express the case decay exists for (evidence months old); the justification is unit-level, not corpus-level, and TAU was deliberately not tuned to manufacture a corpus delta.
+**Admission is an invariant, not a detail.** Ranking eviction by value must exempt the entry the current observation just wrote. Without that exemption a full table can never learn anything new: a first sighting scores 1, an incumbent with two recent sightings scores just under 2, so the newcomer is the weakest entry and is deleted by the same `observe()` that created it — then recreated and re-deleted on every later sighting, so it never reaches `minObservations`. That is the FIFO bug pointed the other way (FIFO discarded the *best* entry; unprotected value-eviction admits *nothing*), it fails silently as a frozen model rather than an error, and because `(score, lastUpdated)` persist, a saturated state file would carry the stall across restarts. Both caps — transitions and per-server openers — exempt the just-written key, and both have a regression test at the DEFAULT `minObservations`.
+
+Measured (offline recall@K harness, seeds 1,2,3, 1020 workflow pairs), decay on vs. the pre-decay learner on the same corpus:
+
+| archetype | no decay | with decay | Δ recall@3 |
+|---|---|---|---|
+| list-detail-varied | 0.430 | 0.423 | −0.007 |
+| return-visits | 0.497 | 0.497 | 0.000 |
+| multi-arg | 0.883 | 0.883 | 0.000 |
+| **regime-shift** | **0.000** | **0.900** | **+0.900** |
+| WORKFLOW (headline) | 0.532 | 0.636 | **+0.104** |
+| adversarial (floor) | 0.087 | 0.087 | 0.000 |
+
+The `regime-shift` archetype (a 45-day idle gap, then the workflow changes) is what makes staleness measurable at all: without decay it scores **0.000** at k=3 with *infinite* waste per hit, because the pre-gap regime's higher lifetime counts pin the top 3 forever. Its recall@**5** is 0.950 either way — the post-gap answer was always in the candidate set, just ranked below the cap — so on this corpus decay is a pure **ranking** win. The other three archetypes space sessions 600 s apart, deep inside a 14-day TAU, so they contain no stale evidence and show only tie-break jitter (−0.007 on one). TAU was not tuned to the fixture; 14 days comes from the deployment story above.
+
+Scope note: this corpus never reaches `maxTransitions`, so the eval exercises **ranking only** — the eviction policy and the admission invariant are covered by unit tests, not by these numbers.
+
+Reach note: the shipped `Predictor.selectBatch` ranks by `confidence × effectiveness`, and learner confidence is derived from the **undecayed** `count`. So decay decides which ≤3 transitions the learner *proposes*, and survives downstream only as the emission-order tie-break between candidates of equal `confidence × effectiveness` (which is exactly the equal-count case decay is for). The eval calls `learner.predict` directly, so the table above is an upper bound on decay's reach in production.
 
 ## v0.11 (2026-08-01): MCP-only focus
 

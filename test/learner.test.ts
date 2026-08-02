@@ -1,7 +1,7 @@
 /**
  * TransitionLearner tests (DESIGN.md §5.3): transition chaining, argument
  * templates (arg-copy / parsed-path / const), fail-closed poisoning, gap
- * handling, server isolation, ranking/cap, LRU eviction, and robustness
+ * handling, server isolation, ranking/cap, decay, value-based eviction, and robustness
  * against weird parsed shapes.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -12,7 +12,7 @@ const DAY_MS = 24 * 3600_000;
 
 // --- fixtures ---------------------------------------------------------------
 
-/** Fake clock for LRU recency. Gap decisions must use call timestamps. */
+/** Fake clock for decay/recency. Gap decisions must use call timestamps. */
 let t = 0;
 const now = () => t;
 
@@ -432,6 +432,18 @@ describe('time decay', () => {
     expect(decayedScore(4, 0, 28 * DAY_MS)).toBeLessThan(aged);
   });
 
+  it('fails toward less evidence on degenerate inputs, never more', () => {
+    // An unreadable stamp must read as maximally stale. Failing open here
+    // would let an infinitely old entry outrank a genuinely recent one.
+    expect(decayedScore(4, -Infinity, 0)).toBe(0);
+    expect(decayedScore(4, 0, Infinity)).toBe(0);
+    expect(decayedScore(4, NaN, 0)).toBe(0);
+    // A stamp from the future is clamped to "no decay", never amplified.
+    expect(decayedScore(4, 100, 0)).toBe(4);
+    // A disabled tau is a no-op, not a wipe.
+    expect(decayedScore(4, 0, 14 * DAY_MS, 0)).toBe(4);
+  });
+
   it('ranks a recently used transition above an equally frequent stale one', () => {
     const learner = new TransitionLearner({ now });
     t = 0;
@@ -473,6 +485,42 @@ describe('value-based eviction', () => {
     expect(learner.predict(mkCall('srv', 'hot'))).toHaveLength(1);
     expect(learner.predict(mkCall('srv', 'c1'))).toEqual([]); // weakest and stalest
     expect(learner.predict(mkCall('srv', 'c4'))).toHaveLength(1);
+  });
+
+  it('still admits a brand-new transition once the cap is full', () => {
+    // DEFAULT minObservations (2) on purpose: a newcomer needs to SURVIVE
+    // its first sighting to ever reach the threshold. Ranking eviction by
+    // value without exempting the entry just written makes the newcomer its
+    // own victim — score 1 against incumbents sitting just under 2 — so it
+    // is deleted by the same observe() that created it, forever.
+    const learner = new TransitionLearner({ now, maxTransitions: 5 });
+    t = 1;
+    for (const incumbent of ['i1', 'i2', 'i3', 'i4', 'i5']) {
+      for (let i = 0; i < 2; i++) {
+        observePair(learner, 'srv', { tool: incumbent }, { tool: 'x' });
+      }
+    }
+    for (let i = 0; i < 2; i++) observePair(learner, 'srv', { tool: 'new' }, { tool: 'y' });
+
+    expect(learner.predict(mkCall('srv', 'new'))).toHaveLength(1);
+    // The cap still holds, and it is paid for by the weakest incumbent.
+    expect(learner.predict(mkCall('srv', 'i1'))).toEqual([]);
+  });
+
+  it('still admits a brand-new opener once the per-server cap is full', () => {
+    const learner = new TransitionLearner({ now });
+    t = 1;
+    for (let n = 0; n < 8; n++) {
+      for (let i = 0; i < 3; i++) learner.recordOpener('srv', `incumbent_${n}`, {});
+    }
+    for (let i = 0; i < 2; i++) learner.recordOpener('srv', 'newcomer', { a: 1 });
+
+    // Admission, not ranking: the newcomer must still be TRACKED. Whether it
+    // makes the 3-prediction output cap against stronger incumbents is a
+    // separate question; being deleted by its own recordOpener is not.
+    const tracked = learner.exportState().openers ?? [];
+    expect(tracked).toHaveLength(8); // cap held, paid for by an incumbent
+    expect(tracked.find((o) => o.tool === 'newcomer')?.count).toBe(2);
   });
 
   it('evicts the least-recently-updated transition at maxTransitions', () => {

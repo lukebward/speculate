@@ -143,7 +143,7 @@ export function replayArchetype(
   const idleGapMs = opts.idleGapMs ?? idleGap?.ms ?? 0;
   const sessions = archetype.sessions(seed);
 
-  // The injected clock drives LRU recency only; feeding it the call
+  // The injected clock drives decay and recency only; feeding it the call
   // timestamps keeps the run free of wall-clock nondeterminism.
   let clock = 0;
   const learner = new TransitionLearner({

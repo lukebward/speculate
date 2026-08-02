@@ -36,11 +36,15 @@ const DEFAULT_MIN_OBSERVATIONS = 2;
 const DEFAULT_MAX_PREDICTIONS_PER_TRIGGER = 3;
 const DEFAULT_MAX_TRANSITIONS = 500;
 /**
- * Evidence half-life constant (§5.3): a score loses 1/e of its weight per
- * TAU of silence. 14 days is long enough that a workflow paused over a
- * holiday still ranks, short enough that a project finished last quarter
- * stops outranking this week's. Ranking and eviction only — `count` never
- * decays, so the minObservations gate keeps its meaning.
+ * Evidence decay time constant (§5.3) — the 1/e time, NOT the half-life:
+ * after one TAU of silence a score RETAINS ~37% of its weight, and the
+ * half-life is TAU*ln2 ≈ 9.7 days. Tune from those two numbers, not from
+ * "14 days is the half-life", which is off by ~1.44x.
+ *
+ * 14 days is long enough that a workflow paused over a holiday still ranks,
+ * short enough that a project finished last quarter stops outranking this
+ * week's. Ranking and eviction only — `count` never decays, so the
+ * minObservations gate keeps its meaning.
  */
 const TAU_MS = 14 * 24 * 3600_000;
 /** Persisted observation counts are clamped here on import (sanity bound). */
@@ -58,10 +62,17 @@ const MAX_IMPORTED_OPENER_COUNT = 1_000;
 /**
  * Exponential time decay of an evidence score: `score * e^(-elapsed/tau)`.
  *
- * Exported for tests. Total by construction — a non-finite or negative
- * elapsed time (clock skew, a state file from a machine set to the future)
- * decays nothing rather than amplifying anything, and a non-positive tau
- * simply disables decay.
+ * Exported for tests. Total by construction, and every degenerate input
+ * fails toward LESS evidence, never more:
+ *   - unusable score or a non-positive one -> 0
+ *   - non-finite tau or tau <= 0 -> decay disabled, score unchanged
+ *   - a stamp that is not a finite number -> 0, i.e. maximally stale. An
+ *     unreadable stamp must never read as perfectly fresh; that is how an
+ *     infinitely old entry would outrank a real one.
+ *   - `to` before `from` (clock skew, a state file from a machine set to
+ *     the future) -> score unchanged, never amplified.
+ * An elapsed time that overflows to +Infinity needs no special case:
+ * e^(-Infinity) is 0, which is the correct limit.
  */
 export function decayedScore(
   score: number,
@@ -71,8 +82,9 @@ export function decayedScore(
 ): number {
   if (!Number.isFinite(score) || score <= 0) return 0;
   if (!Number.isFinite(tauMs) || tauMs <= 0) return score;
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return 0;
   const elapsed = to - from;
-  if (!Number.isFinite(elapsed) || elapsed <= 0) return score;
+  if (elapsed <= 0) return score;
   return score * Math.exp(-elapsed / tauMs);
 }
 
@@ -301,17 +313,9 @@ export class TransitionLearner {
           score: 1,
           lastUpdated: now,
         });
-        const mine = [...this.openers.entries()].filter(([, o]) => o.server === server);
-        if (mine.length > MAX_OPENERS_PER_SERVER) {
-          // Evict the weakest opener (lowest decayed score, then stalest).
-          mine.sort(
-            (a, b) =>
-              decayedScore(a[1].score, a[1].lastUpdated, now) -
-                decayedScore(b[1].score, b[1].lastUpdated, now) ||
-              a[1].lastUpdated - b[1].lastUpdated,
-          );
-          this.openers.delete(mine[0]![0]);
-        }
+        // Evict the weakest opener (lowest decayed score, then stalest),
+        // never the one just recorded.
+        this.evictOpeners(server, now, key);
       }
       this.mutations++;
     } catch {
@@ -418,11 +422,17 @@ export class TransitionLearner {
       // keeps its most valuable entries rather than its last-listed ones.
       this.evictTransitions(now);
       if (Array.isArray(root.openers)) {
+        const servers = new Set<string>();
         for (const raw of root.openers) {
           const o = deserializeOpener(raw, now);
           if (!o) continue; // malformed openers are skipped, never fatal
           this.openers.set(`${o.server}\x00${o.tool}\x00${o.argsRepr}`, o);
+          servers.add(o.server);
         }
+        // A snapshot carrying more openers for a server than the live cap
+        // allows must not load them all: trim to the same bound recording
+        // enforces, keeping the strongest.
+        for (const server of servers) this.evictOpeners(server, now);
       }
       this.mutations++;
     } catch {
@@ -475,7 +485,7 @@ export class TransitionLearner {
       };
     }
     this.transitions.set(key, state);
-    this.evictTransitions(now);
+    this.evictTransitions(now, key);
   }
 
   /**
@@ -485,19 +495,69 @@ export class TransitionLearner {
    * FIFO threw away the transition seen a hundred times at session start to
    * make room for a one-off seen a second ago.
    *
-   * Ranking once rather than rescanning per victim keeps a bulk import
-   * (which can overflow the cap by thousands at a stroke) linearithmic.
+   * `protectKey` is the entry this observation just wrote, and it is NEVER
+   * a candidate. Without that exemption a full table can never learn
+   * anything new: a first sighting scores 1, every incumbent with two
+   * recent sightings scores just under 2, so the newcomer is the weakest
+   * entry and is deleted by the same observe() that created it — then
+   * recreated and re-deleted on every later sighting, so it can never reach
+   * minObservations. That is the FIFO bug pointed the other way (FIFO
+   * discarded the best entry; unprotected value-eviction admits nothing),
+   * and it fails silently: prediction quality simply freezes.
    */
-  private evictTransitions(now: number): void {
+  private evictTransitions(now: number, protectKey?: string): void {
     const overflow = this.transitions.size - this.maxTransitions;
     if (overflow <= 0) return;
-    const ranked = [...this.transitions.entries()].sort(
-      (a, b) =>
-        decayedScore(a[1].score, a[1].lastUpdated, now) -
-          decayedScore(b[1].score, b[1].lastUpdated, now) ||
-        a[1].lastUpdated - b[1].lastUpdated,
-    );
-    for (let i = 0; i < overflow; i++) this.transitions.delete(ranked[i]![0]);
+    const weakerFirst = (a: TransitionState, b: TransitionState): number =>
+      decayedScore(a.score, a.lastUpdated, now) -
+        decayedScore(b.score, b.lastUpdated, now) || a.lastUpdated - b.lastUpdated;
+
+    if (overflow === 1) {
+      // Steady state: one over the cap on nearly every new transition, so a
+      // single scan beats sorting the whole table.
+      let worstKey: string | undefined;
+      let worst: TransitionState | undefined;
+      for (const [key, s] of this.transitions) {
+        if (key === protectKey) continue;
+        if (worst === undefined || weakerFirst(s, worst) < 0) {
+          worstKey = key;
+          worst = s;
+        }
+      }
+      if (worstKey !== undefined) this.transitions.delete(worstKey);
+      return;
+    }
+    // Bulk (an oversized import): rank once instead of rescanning per victim.
+    const ranked = [...this.transitions.entries()]
+      .filter(([key]) => key !== protectKey)
+      .sort((a, b) => weakerFirst(a[1], b[1]));
+    for (let i = 0; i < overflow && i < ranked.length; i++) {
+      this.transitions.delete(ranked[i]![0]);
+    }
+  }
+
+  /**
+   * Same trim for one server's openers, and the same exemption: the opener
+   * just recorded is never its own victim. (This shape predates the decay
+   * work — under count-ranked eviction a newcomer tied with other count-1
+   * entries and won on recency — but scoring made it reachable, so it is
+   * fixed here rather than left as a latent duplicate of the bug above.)
+   */
+  private evictOpeners(server: string, now: number, protectKey?: string): void {
+    const mine = [...this.openers.entries()].filter(([, o]) => o.server === server);
+    const overflow = mine.length - MAX_OPENERS_PER_SERVER;
+    if (overflow <= 0) return;
+    const ranked = mine
+      .filter(([key]) => key !== protectKey)
+      .sort(
+        (a, b) =>
+          decayedScore(a[1].score, a[1].lastUpdated, now) -
+            decayedScore(b[1].score, b[1].lastUpdated, now) ||
+          a[1].lastUpdated - b[1].lastUpdated,
+      );
+    for (let i = 0; i < overflow && i < ranked.length; i++) {
+      this.openers.delete(ranked[i]![0]);
+    }
   }
 
   // -- prediction -----------------------------------------------------------

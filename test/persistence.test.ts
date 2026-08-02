@@ -210,6 +210,22 @@ describe('TransitionLearner export/import', () => {
     expect(l.predict(call('s', 'cold', {}, null, 0))).toEqual([]);
   });
 
+  it('trims an oversized opener list to the live per-server cap', () => {
+    const l = new TransitionLearner({ now: () => 0 });
+    l.importState({
+      transitions: [],
+      openers: Array.from({ length: 40 }, (_, i) => ({
+        server: 's',
+        tool: `t${i}`,
+        argsRepr: '{}',
+        count: i + 2,
+      })),
+    });
+    const kept = l.exportState().openers ?? [];
+    expect(kept).toHaveLength(8); // MAX_OPENERS_PER_SERVER, enforced on load
+    expect(Math.min(...kept.map((o) => o.count))).toBe(34); // the strongest 8
+  });
+
   it('ignores hostile score and lastUpdated values without dropping the entry', () => {
     const l = new TransitionLearner({ now: () => 5_000 });
     l.importState({
