@@ -8,7 +8,6 @@
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { canonicalKey } from './keys.js';
-import type { LatencyOracle } from './latency.js';
 import type {
   DecisionEvent,
   ObservedCall,
@@ -53,13 +52,6 @@ export interface PredictorOptions {
     /** Session-opening reads worth prefetching at proxy start (§13.15). */
     openerPredictions?(server: string): Prediction[];
   };
-  /**
-   * Expected upstream latency per (server, tool), the "time saved" term of
-   * the expected-value ranking (§5.6, Appendix A). Optional: without it — and
-   * before it has measured anything — ranking is by score alone, exactly as
-   * it was before.
-   */
-  latency?: LatencyOracle;
 }
 
 /** A completed real call, as reported by the proxy core. */
@@ -107,7 +99,6 @@ export class Predictor {
   private readonly learner: PredictorOptions['learner'];
   private readonly maxPerTrigger: number;
   private readonly metrics: PredictorMetrics;
-  private readonly latency: LatencyOracle | undefined;
 
   constructor(opts: PredictorOptions) {
     // A Map avoids Object.prototype lookups for hostile server labels.
@@ -116,7 +107,6 @@ export class Predictor {
     this.learner = opts.learner;
     this.maxPerTrigger = opts.maxPerTrigger;
     this.metrics = opts.metrics;
-    this.latency = opts.latency;
   }
 
   /** Late-bind a fingerprinted profile (§13.11). */
@@ -283,8 +273,7 @@ export class Predictor {
   /**
    * Shared batch tail: dedupe on canonical cache key (keeping the
    * higher-scored prediction; the key is stamped so the executor reuses it
-   * instead of recomputing), rank by expected value, cap (§5.6), and record
-   * events.
+   * instead of recomputing), rank by score, cap (§5.6), and record events.
    */
   private selectBatch(
     profile: ServerProfile,
@@ -296,30 +285,13 @@ export class Predictor {
       const key = dedupeKey(profile, cand.prediction, cand.order);
       if (!key.startsWith('\x00unkeyable:')) cand.prediction.key = key;
       const existing = byKey.get(key);
-      // Dedupe compares raw score, not expected value: both sides are the
-      // same (server, tool, args), so the latency factor is identical and
-      // cancels. Comparing the cheaper number keeps this loop oracle-free.
       if (!existing || cand.score > existing.score) byKey.set(key, cand);
     }
 
-    const pool = [...byKey.values()];
-    const value = this.expectedValues(pool);
-    const ranked = pool.sort(
-      (a, b) => value.get(b)! - value.get(a)! || b.score - a.score || a.order - b.order,
+    const ranked = [...byKey.values()].sort(
+      (a, b) => b.score - a.score || a.order - b.order,
     );
     const kept = ranked.slice(0, this.maxPerTrigger);
-    // Expected value decides MEMBERSHIP; probability decides ORDER. The
-    // executor issues this array in order and queues whatever the budget
-    // cannot start, so on a serial (stdio) upstream the array order is the
-    // order the one slot is spent in — and there the rationed resource is
-    // elapsed idle time, not slots. Under a time budget the greedy
-    // value-per-unit-cost ratio is (p·T)/T = p, i.e. exactly the old
-    // confidence ordering, and a joiner is credited the work already done,
-    // so firing the expensive bet first buys nothing and can starve a
-    // likelier cheap one. On a parallel upstream every kept candidate
-    // launches anyway, so re-sorting here is a no-op. Weakly better in one
-    // regime, neutral in the other.
-    kept.sort((a, b) => b.score - a.score || a.order - b.order);
     for (const cut of ranked.slice(kept.length)) {
       this.metrics.record({
         type: 'suppressed',
@@ -343,42 +315,6 @@ export class Predictor {
       });
     }
     return kept.map((c) => c.prediction);
-  }
-
-  /**
-   * Expected value per candidate: `score × expected upstream ms`, i.e.
-   * probability times the wall clock a hit would actually save (§5.6,
-   * Appendix A / PASTE's `p·T`). This is what the per-trigger cap cuts on.
-   * Ranking by probability alone gave the last slot to a 50 ms call at 0.8
-   * over a 2 s call at 0.3, though the second is worth roughly ten times
-   * more waiting — and a slot spent is a slot spent either way.
-   *
-   * A tool with no latency evidence contributes a factor of 1, which is the
-   * OLD ordering exactly — and it is all-or-nothing rather than a mixed
-   * batch, because predictions never cross servers (validatePrediction
-   * forces the trigger's server) and the oracle falls back to the server's
-   * own mean. So either every candidate here is priced or none is; a cold
-   * start ranks precisely as it did before this existed.
-   *
-   * The oracle is advisory: any failure degrades to the old ordering rather
-   * than costing the batch.
-   */
-  private expectedValues(pool: ScoredPrediction[]): Map<ScoredPrediction, number> {
-    const out = new Map<ScoredPrediction, number>();
-    for (const cand of pool) out.set(cand, cand.score);
-    if (!this.latency) return out;
-    try {
-      for (const cand of pool) {
-        const ms = this.latency.expected(cand.prediction.server, cand.prediction.tool);
-        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) continue;
-        out.set(cand, cand.score * ms);
-      }
-    } catch {
-      // A broken oracle must never cost a prediction: fall back wholesale to
-      // score-only ranking rather than leaving the batch half-priced.
-      for (const cand of pool) out.set(cand, cand.score);
-    }
-    return out;
   }
 }
 

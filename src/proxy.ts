@@ -26,7 +26,6 @@ import { BudgetManager } from './budget.js';
 import { Metrics } from './metrics.js';
 import { Predictor } from './predictor.js';
 import { TransitionLearner } from './learner.js';
-import { LatencyModel } from './latency.js';
 import { SpeculationExecutor } from './executor.js';
 import { builtinProfiles, detectProfile, profileCanonicalizer } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
@@ -69,14 +68,6 @@ export class SpeculateProxy {
   private initialized = false;
   private closing = false;
   private readonly learner: TransitionLearner;
-  /**
-   * What each (server, tool) costs upstream (§5.6, Appendix A). Fed by every
-   * upstream call this process makes — speculative ones from the executor,
-   * real ones from the read path below — and read by the predictor and the
-   * executor's drain queue to rank by expected time saved rather than by
-   * probability alone. Session-scoped: never persisted (see latency.ts).
-   */
-  private readonly latency: LatencyModel;
   private readonly noProfile = new Set<string>();
   private readonly store: StateStore | null;
   private readonly usageRecorder: UsageRecorder | null;
@@ -176,7 +167,6 @@ export class SpeculateProxy {
       this.savedStamp = this.dirtyStamp();
     }
 
-    this.latency = new LatencyModel({ now });
     this.predictor = new Predictor({
       profiles: this.profiles,
       maxPerTrigger: config.maxPredictionsPerTrigger,
@@ -185,7 +175,6 @@ export class SpeculateProxy {
       // §5.3 Tier 2 (server-agnostic): learns tool-call transitions from the
       // session itself, so unprofiled servers gain speculation over time.
       learner: this.learner,
-      latency: this.latency,
     });
     this.executor = new SpeculationExecutor({
       upstreams: this.upstreams,
@@ -196,7 +185,6 @@ export class SpeculateProxy {
       profiles: this.profiles,
       config,
       now,
-      latency: this.latency,
     });
 
     for (const [name, sc] of Object.entries(config.servers)) {
@@ -733,13 +721,6 @@ export class SpeculateProxy {
       }
       latencyMs = this.now() - t0;
       this.metrics.record({ type: 'real_call', server, tool, latencyMs });
-      // The other half of the latency evidence (§5.6): a tool nothing has
-      // ever speculated is still measured the first time the agent asks for
-      // it, so the first prediction of it is already priced. Hits and joins
-      // are deliberately NOT recorded here — the executor already measured
-      // the speculative call they came from, and a joiner's residual wait
-      // would understate the tool's real cost.
-      this.latency.record(server, tool, latencyMs);
       if (!result.isError && this.policy.isSuspended(server, tool)) {
         // §4: a successful real call resets the auth breaker.
         this.policy.resetSuspension(server, tool);

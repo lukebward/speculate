@@ -57,14 +57,6 @@ export class SpeculationExecutor {
       profiles: Record<string, ServerProfile>;
       config: SpeculateConfig;
       now?: () => number;
-      /**
-       * Expected-latency model (§5.6, Appendix A). The executor FEEDS it:
-       * every speculative call it issues is a free measurement of what that
-       * tool costs upstream, hit or wasted, and it is the only place that
-       * sees the ones the agent never claims. It deliberately does not rank
-       * on it — see enqueue(). Optional; absent, nothing is measured here.
-       */
-      latency?: { record(server: string, tool: string, latencyMs: number): void };
     },
   ) {}
 
@@ -163,12 +155,6 @@ export class SpeculationExecutor {
     const promise = upstream
       .callTool(p.tool, p.args, { timeoutMs: SPECULATIVE_CALL_TIMEOUT_MS })
       .then((result) => {
-        // The upstream answered, so this is a real measurement of what a
-        // prefetch of this tool costs — worth recording whether or not the
-        // agent ever claims it, and whether or not the answer is an error
-        // result (the wait was real either way). A call that never answered
-        // is NOT measured below: the speculative timeout is not a latency.
-        this.measure(p.server, p.tool, now() - meta.issuedAt);
         if (result.isError) {
           // §4/§6: error results are never cached speculatively.
           const text = resultText(result);
@@ -214,14 +200,7 @@ export class SpeculationExecutor {
       queue = [];
       this.pending.set(p.server, queue);
     }
-    // Highest-confidence predictions fire first when the slot frees —
-    // deliberately NOT the expected-value ranking the per-trigger cap cuts
-    // on (§5.6). This queue exists precisely because the slot is BUSY, i.e.
-    // what is being rationed here is upstream time, not launches, and a real
-    // call that arrives mid-flight is credited the work already done. Under
-    // a time budget the greedy value-per-unit-cost ratio is (p·T)/T = p, so
-    // confidence is the right order and firing the expensive bet first would
-    // starve a likelier cheap one for no gain. See predictor.selectBatch.
+    // Highest-confidence predictions fire first when the slot frees.
     const at = queue.findIndex((q) => q.p.confidence < p.confidence);
     const item = { p, queuedAt: now() };
     if (at === -1) queue.push(item);
@@ -229,15 +208,6 @@ export class SpeculationExecutor {
     while (queue.length > QUEUE_MAX_LENGTH) {
       const dropped = queue.pop()!;
       this.suppress(dropped.p, 'queue-full');
-    }
-  }
-
-  /** Feed one measured upstream duration to the latency model; never throws. */
-  private measure(server: string, tool: string, latencyMs: number): void {
-    try {
-      this.deps.latency?.record(server, tool, latencyMs);
-    } catch {
-      // Telemetry must never fail a speculative call.
     }
   }
 
