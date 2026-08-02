@@ -9,6 +9,7 @@
  * When running the proxy, stdout carries the MCP protocol; all diagnostics
  * go to stderr. `doctor` and `validate` are human-facing and use stdout.
  */
+import { spawn } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import { loadConfig } from './config.js';
 import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
@@ -17,14 +18,8 @@ import { runDoctor } from './doctor.js';
 import { buildWrapConfig, parseWrapArgs } from './wrap.js';
 import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
-import { parseTryArgs, runTry } from './tryRun.js';
+import { nodeSignalNumber, parseTryArgs, runTry } from './tryRun.js';
 import { speculateOff, speculateOn, speculateStatus } from './manage.js';
-import { parseExecArgs, runExec } from './execClient.js';
-import {
-  DaemonAlreadyRunningError,
-  parseDaemonArgs,
-  startExecDaemon,
-} from './execDaemon.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
 import { createUsageRecorder } from './usage.js';
@@ -34,37 +29,26 @@ const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
 install-and-it-works (no config files edited by hand):
   speculate try [-- <claude args...>]      zero-write trial: launch Claude Code with every
-                                           MCP server wrapped + CLI speculation, this session only
-  speculate on [--mode <mode>] [--no-plugin]
-                                           the one command: wrap this project's MCP servers
-                                           (via 'claude mcp') AND install CLI speculation —
-                                           the plugin's workspace server + Bash hook
-                                           (--no-plugin: workspace server only, no hook)
+                                           MCP server wrapped, this session only
+  speculate on [--mode <mode>]             wrap this project's MCP servers via 'claude mcp'
   speculate off                            undo everything 'on' did (exact restore)
   speculate status                         what's wrapped here, and what drifted since 'on'
-  speculate stats [--json]                 cumulative MCP and CLI speculation usage
+  speculate stats [--json]                 cumulative speculation usage
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
                                            server any client launches, even ones added later
 
 manual wrapping:
   speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
-  speculate wrap --workspace <dir>                           zero config: CLI speculation for a repo
   speculate --config <path> [--mode strict|annotated|off]    run the proxy from a config file
   speculate init [path]                                      write a starter config
   speculate doctor --config <path>                           connect upstreams, explain
                                                              per-tool speculation eligibility
   speculate validate --config <path>                         validate the config and exit
 
-CLI speculation (used by the Claude Code plugin's Bash hook):
-  speculate exec [--cwd <dir>] -- <command...>   serve a vetted read-only command from the
-                                                 per-workspace daemon cache (fail-open)
-  speculate exec --stats                         daemon hit-rate for this workspace
-
 wrap flags (before the '--'):
   --mode <mode>       strict|annotated|off (default for wrap: annotated)
   --profile <name>    force a vetted profile (auto-detected for known servers)
   --allow <t1,t2>     extra read-only allowlist entries
-  --workspace <dir>   speculate the bundled read-only shell server for <dir>
   --sniff             engage only if the client speaks MCP; else byte-transparent pipe
 
 options:
@@ -72,6 +56,10 @@ options:
   --mode <mode>     override the config's speculation mode for this run
   --version         print version and exit
   --help            show this help
+
+compatibility:
+  speculate exec [--cwd <dir>] -- <command...>   run <command> verbatim; kept only so a
+                                                stranded ≤0.10 Bash hook still works (removed in 0.12)
 `;
 
 const STARTER_CONFIG = `{
@@ -84,8 +72,6 @@ const STARTER_CONFIG = `{
       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." },
       "profile": "github",
     },
-    // CLI speculation for a repo (git status/diff/log, ls, ripgrep):
-    // "workspace": { "command": "speculate-shell", "args": ["--cwd", "/path/to/repo"], "profile": "shell" },
   },
   // "persistence": { "enabled": false },
 }
@@ -103,9 +89,8 @@ interface Args {
     | 'off'
     | 'status'
     | 'stats'
-    | 'exec'
-    | 'exec-daemon'
-    | 'shims';
+    | 'shims'
+    | 'exec';
   configPath: string;
   modeOverride: 'strict' | 'annotated' | 'off' | null;
   rest: string[];
@@ -119,9 +104,8 @@ const REST_COMMANDS = new Set([
   'off',
   'status',
   'stats',
-  'exec',
-  'exec-daemon',
   'shims',
+  'exec',
 ] as const);
 
 /**
@@ -134,10 +118,10 @@ const REST_COMMANDS = new Set([
  *   which flushes stdout/stderr completely, however slow the consumer —
  *   the same blocking semantics as any ordinary CLI.
  * - Paths where live handles would hold the loop open forever (proxy
- *   transports and upstream children, the exec daemon's server, a piped
- *   stdin): exitWhenFlushed() hands process.exit() to the streams' write
- *   callbacks, which fire only after everything previously buffered has
- *   reached the OS. Exact, no timer.
+ *   transports and upstream children, a piped stdin): exitWhenFlushed()
+ *   hands process.exit() to the streams' write callbacks, which fire only
+ *   after everything previously buffered has reached the OS. Exact, no
+ *   timer.
  */
 class ExitRequest {
   constructor(readonly code: number) {}
@@ -205,8 +189,88 @@ function parseArgs(argv: string[]): Args {
   return { command, configPath, modeOverride, rest: [] };
 }
 
+/**
+ * `speculate exec [--cwd <dir>] -- <command...>` — compatibility only.
+ *
+ * CLI speculation (and the ≤0.10 plugin's Bash hook that rewrote the agent's
+ * `git status`/`rg`/`ls` into `speculate exec -- …`) was retired in 0.11, but
+ * that hook stays installed per-project until `speculate on` cleans it up.
+ * Failing those calls would break the agent's basic workflow in every
+ * not-yet-cleaned project, so exec survives one release as a VERBATIM
+ * pass-through: no shell, no rewriting, the child's own exit code. Remove in
+ * 0.12.
+ */
+interface ExecArgs {
+  cwd: string | null;
+  argv: string[];
+}
+
+export function parseExecArgs(argv: string[]): ExecArgs | { error: string } {
+  let cwd: string | null = null;
+  let i = 0;
+  for (; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === '--') {
+      i++;
+      break;
+    }
+    if (a === '--cwd') {
+      const v = argv[++i];
+      if (!v) return { error: '--cwd requires a directory' };
+      cwd = v;
+    } else {
+      return { error: `unknown exec argument '${a}'` };
+    }
+  }
+  const rest = argv.slice(i);
+  if (rest.length === 0) return { error: "expected '--' followed by a command" };
+  return { cwd, argv: rest };
+}
+
+const EXEC_NOTICE =
+  "[speculate] CLI speculation was retired in 0.11 — this is a compatibility pass-through; run 'speculate on' to remove the legacy hook.";
+
+async function runExecPassThrough(execArgs: ExecArgs): Promise<number> {
+  process.stderr.write(`${EXEC_NOTICE}\n`);
+  const command = execArgs.argv[0]!;
+  return new Promise<number>((resolveExit) => {
+    let child;
+    try {
+      child = spawn(command, execArgs.argv.slice(1), {
+        cwd: execArgs.cwd ?? process.cwd(),
+        stdio: 'inherit',
+      });
+    } catch (err) {
+      // spawn() can throw SYNCHRONOUSLY instead of emitting 'error': EINVAL
+      // for a .cmd/.bat target on Node >= 20 (CVE-2024-27980), or
+      // ERR_INVALID_ARG_VALUE for an empty argv0. A legacy hook's call must
+      // fail the same fail-soft way whichever door it comes through.
+      process.stderr.write(
+        `[speculate] exec: cannot run '${command}': ${(err as Error).message}\n`,
+      );
+      resolveExit(127);
+      return;
+    }
+    child.on('error', (err) => {
+      process.stderr.write(`[speculate] exec: cannot run '${command}': ${err.message}\n`);
+      resolveExit(127);
+    });
+    child.on('exit', (code, signal) =>
+      resolveExit(signal ? 128 + (nodeSignalNumber(signal) ?? 1) : (code ?? 0)),
+    );
+  });
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.command === 'exec') {
+    const execArgs = parseExecArgs(args.rest);
+    if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
+    // stdio is inherited, so nothing of the child's is buffered here.
+    process.exitCode = await runExecPassThrough(execArgs);
+    return;
+  }
 
   if (args.command === 'init') {
     if (existsSync(args.configPath)) {
@@ -233,25 +297,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (args.command === 'exec') {
-    const execArgs = parseExecArgs(args.rest);
-    if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
-    process.exitCode = await runExec(execArgs);
-    return; // natural exit — a slow reader gets every byte
-  }
-
-  if (args.command === 'exec-daemon') {
-    const daemonArgs = parseDaemonArgs(args.rest);
-    if ('error' in daemonArgs) fail(`exec-daemon: ${daemonArgs.error}`);
-    try {
-      await startExecDaemon({ ...daemonArgs, onIdle: () => exitWhenFlushed(0) });
-    } catch (err) {
-      if (err instanceof DaemonAlreadyRunningError) return; // rendezvous won
-      throw err;
-    }
-    return; // stays alive serving the socket
-  }
-
   if (args.command === 'shims') {
     const shimsArgs = parseShimsArgs(args.rest);
     if ('error' in shimsArgs) fail(`shims: ${shimsArgs.error}`);
@@ -268,7 +313,6 @@ async function main(): Promise<void> {
 
   if (args.command === 'on' || args.command === 'off' || args.command === 'status') {
     let mode: 'strict' | 'annotated' | 'off' | null = null;
-    let plugin = true;
     for (let i = 0; i < args.rest.length; i++) {
       if (args.rest[i] === '--mode' && args.command === 'on') {
         const m = args.rest[++i];
@@ -276,13 +320,11 @@ async function main(): Promise<void> {
           fail(`--mode must be strict|annotated|off (got '${m ?? ''}')`);
         }
         mode = m;
-      } else if (args.rest[i] === '--no-plugin' && args.command === 'on') {
-        plugin = false;
       } else {
         fail(`unknown ${args.command} argument '${args.rest[i]}'`);
       }
     }
-    const manageOpts = { self: selfCommand(), mode, plugin };
+    const manageOpts = { self: selfCommand(), mode };
     const code =
       args.command === 'on'
         ? await speculateOn(manageOpts)

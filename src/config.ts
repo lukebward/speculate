@@ -49,6 +49,13 @@ const configSchema = z.object({
     .optional(),
 });
 
+/**
+ * Profiles that existed in ≤0.10 and no longer do. Referencing one is a
+ * warning, not a fatal: the rest of the config still loads. Shared with
+ * `speculate wrap --profile` (wrap.ts), which degrades the same way.
+ */
+export const RETIRED_PROFILES: ReadonlySet<string> = new Set(['shell']);
+
 export function parseConfig(raw: unknown): SpeculateConfig {
   const result = configSchema.safeParse(raw);
   if (!result.success) {
@@ -82,6 +89,17 @@ export function loadConfig(path: string): SpeculateConfig {
   // Catch typo'd profile names here so `validate` catches them, not just run.
   // 'none' is the explicit opt-out from profiles AND fingerprinting (§13.11).
   for (const [name, sc] of Object.entries(cfg.servers)) {
+    if (sc.profile && RETIRED_PROFILES.has(sc.profile)) {
+      // A ≤0.10 config naming a profile 0.11 retired must not take the
+      // user's healthy servers down with it: warn, drop the profile (the
+      // server is then fingerprinted like any unprofiled one), carry on.
+      process.stderr.write(
+        `[speculate] warning: config ${path}: server '${name}' uses profile '${sc.profile}', ` +
+          `retired in 0.11 with CLI speculation — ignoring it (delete that line).\n`,
+      );
+      delete (sc as { profile?: string }).profile;
+      continue;
+    }
     if (sc.profile && sc.profile !== 'none' && !Object.hasOwn(builtinProfiles, sc.profile)) {
       throw new Error(
         `config ${path}: server '${name}' references unknown profile '${sc.profile}' (available: ${Object.keys(builtinProfiles).join(', ')})`,

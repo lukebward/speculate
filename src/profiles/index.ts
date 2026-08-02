@@ -5,12 +5,10 @@
 import type { ArgsCanonicalizer, ResultParser, ServerProfile } from '../types.js';
 import { filesystemProfile } from './filesystem.js';
 import { githubProfile } from './github.js';
-import { shellProfile } from './shell.js';
 import { slackProfile } from './slack.js';
 
 export const builtinProfiles: Record<string, ServerProfile> = {
   github: githubProfile,
-  shell: shellProfile,
   filesystem: filesystemProfile,
   slack: slackProfile,
 };

@@ -114,7 +114,7 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" fon
 <circle cx="20" cy="${HEADER / 2}" r="5.5" fill="#ff5f57"/>
 <circle cx="40" cy="${HEADER / 2}" r="5.5" fill="#febc2e"/>
 <circle cx="60" cy="${HEADER / 2}" r="5.5" fill="#28c840"/>
-<text x="${W / 2}" y="${HEADER / 2 + 4}" text-anchor="middle" font-size="12" fill="#8b949e">npm run demo · live against github.com</text>
+<text x="${W / 2}" y="${HEADER / 2 + 4}" text-anchor="middle" font-size="12" fill="#8b949e">npm run demo · mock GitHub upstream</text>
 ${body}</svg>
 `;
 

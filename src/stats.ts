@@ -59,7 +59,11 @@ export function formatUsageReport(report: UsageReport): string {
     `Wasted calls: ${report.totals.wasted} (${wastePerHit} per hit)`,
     `Sessions: ${report.totals.sessions}`,
     `MCP: ${formatDuration(report.bySource.mcp.estimatedSavedMs)} saved`,
-    `CLI: ${formatDuration(report.bySource.cli.estimatedSavedMs)} saved`,
+    // Fresh 0.11 installs never write `cli` records (the tier was removed);
+    // only show the line when a pre-0.11 install left some behind.
+    ...(report.bySource.cli.sessions > 0
+      ? [`CLI: ${formatDuration(report.bySource.cli.estimatedSavedMs)} saved`]
+      : []),
     ...report.workspaces.map(
       (workspace) =>
         `${escapeControls(workspace.workspace)}: ${formatDuration(workspace.estimatedSavedMs)} saved`,

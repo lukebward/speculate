@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, resolve } from 'node:path';
 import { defaultStateDirectory } from './persistence.js';
 
-export type UsageSource = 'mcp' | 'cli';
+export type UsageSource = 'mcp' | 'cli'; // 'cli' survives only to read <=0.10 stats files
 
 export interface UsageCounters {
   hits: number;

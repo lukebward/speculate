@@ -8,14 +8,16 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { StatsReport } from '../src/types.js';
 import { readUsageReport } from '../src/usage.js';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const TSX = join(ROOT, 'node_modules', '.bin', 'tsx');
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TSX = process.execPath;
+const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const LATENCY_MS = 150;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -45,7 +47,7 @@ async function startProxy(
       servers: {
         github: {
           command: TSX,
-          args: [join(ROOT, 'mock', 'mock-github.ts')],
+          args: [TSX_CLI, join(ROOT, 'mock', 'mock-github.ts')],
           env: {
             SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
@@ -65,7 +67,7 @@ async function startProxy(
   const client = new Client({ name: 'itest', version: '0.0.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: TSX,
-    args: [join(ROOT, 'src', 'cli.ts'), '--config', configPath],
+    args: [TSX_CLI, join(ROOT, 'src', 'cli.ts'), '--config', configPath],
     env: { ...process.env, XDG_STATE_HOME: dir } as Record<string, string>,
     stderr: 'inherit',
   });

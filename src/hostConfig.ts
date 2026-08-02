@@ -54,7 +54,11 @@ export interface ClaudeConfigView {
   warnings: string[];
 }
 
-/** The server name Speculate itself registers for CLI speculation. */
+/**
+ * The server name a <=0.10 install registered for CLI speculation. Nothing
+ * writes it any more (the tier was retired in 0.11); it survives so
+ * manage.ts can recognize and remove the leftover entry on upgrade.
+ */
 export const WORKSPACE_SERVER_NAME = 'speculate-workspace';
 
 function readJsonFile(path: string, warnings: string[]): Record<string, unknown> | null {
@@ -187,9 +191,11 @@ export function selfCommand(): { command: string; args: string[] } {
     return { command: process.execPath, args: [builtJs] };
   }
   const tsSource = fileURLToPath(new URL('./cli.ts', import.meta.url));
-  const tsx = fileURLToPath(new URL('../node_modules/.bin/tsx', import.meta.url));
+  // tsx's entry point under node, not the .bin shim: Windows cannot spawn an
+  // extensionless sh script, and node refuses .cmd shims without a shell.
+  const tsx = fileURLToPath(new URL('../node_modules/tsx/dist/cli.mjs', import.meta.url));
   if (existsSync(tsSource) && existsSync(tsx)) {
-    return { command: tsx, args: [tsSource] };
+    return { command: process.execPath, args: [tsx, tsSource] };
   }
   throw new Error('cannot locate the speculate CLI entrypoint; run npm run build');
 }
@@ -224,16 +230,8 @@ export function unwrapEntry(entry: McpServerEntry): McpServerEntry | null {
   const args = entry.args ?? [];
   const wrapIdx = args.indexOf('wrap');
   const dashIdx = args.indexOf('--', wrapIdx + 1);
-  if (dashIdx === -1 || dashIdx + 1 >= args.length) return null; // e.g. a --workspace wrap
+  if (dashIdx === -1 || dashIdx + 1 >= args.length) return null; // no wrapped command to restore
   const original = args.slice(dashIdx + 1);
   const out: McpServerEntry = { ...entry, command: original[0]!, args: original.slice(1) };
   return out;
-}
-
-/** The bundled-shell workspace entry for a project directory. */
-export function workspaceEntry(
-  self: { command: string; args: string[] },
-  dir: string,
-): McpServerEntry {
-  return { command: self.command, args: [...self.args, 'wrap', '--workspace', dir] };
 }

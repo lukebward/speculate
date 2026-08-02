@@ -449,7 +449,44 @@ Two additions on top of the durable usage stats work (§9, §13.6), both through
 
 Scenario coverage: S9 (priming curve across three restarts), S10/S11 (profile workloads vs the §10 criteria: both ~60% hit rate, ~58% tool-wait cut on the mock bench), S12 (durable receipts accumulate across sessions through `speculate stats --json`; usage snapshots verified aggregate-only — no tool names, arguments, or result text).
 
-Known limits (v0.11 candidates): openers fire only on the MCP proxy path (the exec daemon's `cli` label doesn't record them); the 2-sighting opener threshold deliberately trades one cold session for evidence; opener recording keys on exact argument reprs, so a workspace whose opening reads vary (e.g. issue-of-the-day) never primes — by design, never by accident.
+Known limits (v0.11 candidates): openers fire only on the MCP proxy path; the exec daemon that once carried the `cli` label was removed in v0.11. The 2-sighting opener threshold deliberately trades one cold session for evidence; opener recording keys on exact argument reprs, so a workspace whose opening reads vary (e.g. issue-of-the-day) never primes — by design, never by accident.
+
+## v0.11 (2026-08-01): MCP-only focus
+
+CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.
+Rationale: speculation value scales with upstream latency, and MCP/SaaS reads
+(hundreds of ms) dominate local CLI reads (~30 ms, often net-negative after
+hook spawn overhead); read-only vetting of arbitrary argv has no
+deterministic cross-platform answer short of per-OS sandbox machinery,
+while MCP's readOnlyHint gives it for free; and the tier carried the
+project's POSIX-only surface (unix sockets, uid checks) plus a Windows
+.git/index watcher loop that flushed every prefetch. `on`/`off` now clean
+up artifacts a ≤0.10 install left behind. Full trail:
+docs/superpowers/specs/2026-08-01-focus-mcp-design.md.
+
+`speculate exec` survives as a verbatim pass-through (no shell, no rewriting,
+the child's exit code) so the ≤0.10 Bash hook keeps working. That hook
+rewrites the agent's `git status`/`rg`/`ls` into `speculate exec -- …` in
+every project until `speculate on` removes it. Compatibility only, for one
+release: removed in 0.12.
+
+Windows: npm installs `claude` as a `.cmd` shim, which Node refuses to spawn
+(CVE-2024-27980), so `on`/`off`/`status` reach the front door through cmd.exe.
+Arguments are quoted for the child's CommandLineToArgvW, then escaped twice
+for cmd (the shim's `%*` re-parses one of the rounds), with `%` stepped
+outside the quotes (a caret inside quotes is literal), so a `%APPDATA%` in an
+MCP entry can neither expand nor inject. Two limits are cmd's own: the command
+line cannot exceed ~8191 characters (fails loud with "The command line is too
+long.", exit 1) and a raw `\n`/`\r` inside an argument truncates the line
+(JSON-escaped `\\n`, what `mcp add-json` payloads carry, is unaffected).
+
+Benchmark re-verified after the removal (the harness was always MCP-only, so
+the §11 numbers carry forward unchanged): hit rate 71%, waste 0.00/hit, both
+deterministic across runs; tool-wait cut −64%…−67% over four runs (timing
+jitter; −66% is the central value). Test suite: 431 tests, 424 passing, 7
+skipped on Windows. The §10 caveat still governs: this is a scripted,
+workflow-shaped ceiling, and §10 item 8's adversarial floor script remains
+unwritten, so no measured lower bound exists yet.
 
 ---
 

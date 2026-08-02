@@ -1,20 +1,18 @@
 {
   "name": "speculate-mcp",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Speculative-prefetching MCP proxy: make your agent's next tool call instant",
   "main": "dist/src/cli.js",
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
-    "test:e2e": "SPECULATE_E2E_LIVE=1 vitest run test/e2e-github-live.test.ts",
     "test:scenarios": "vitest run test/scenarios.test.ts",
     "bench": "tsx bench/bench.ts",
     "demo": "tsx demo/demo.ts",
     "mock-github": "tsx mock/mock-github.ts",
     "start": "tsx src/cli.ts",
     "prepare": "node scripts/prepare.cjs",
-    "shell": "tsx shell/speculate-shell.ts",
-    "demo:svg": "npm run demo > /tmp/speculate-demo-capture.txt && node scripts/gen-demo-svg.mjs /tmp/speculate-demo-capture.txt demo/speculate-demo.svg"
+    "demo:svg": "node scripts/demo-svg.mjs"
   },
   "repository": {
     "type": "git",
@@ -39,13 +37,10 @@
   "type": "module",
   "bin": {
     "speculate": "dist/src/cli.js",
-    "speculate-shell": "dist/shell/speculate-shell.js",
     "speculate-mcp": "dist/src/cli.js"
   },
   "files": [
     "dist/src",
-    "dist/shell",
-    "plugin",
     "README.md",
     "DESIGN.md",
     "LICENSE"

@@ -1,10 +1,8 @@
 /**
  * wrap.ts tests (DESIGN.md §13.9): parseWrapArgs flag handling and
- * buildWrapConfig assembly (profile autodetect, allowlist, state keys,
- * workspace mode).
+ * buildWrapConfig assembly (profile autodetect, allowlist, state keys).
  */
-import { isAbsolute, resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildWrapConfig, parseWrapArgs, type WrapArgs } from '../src/wrap.js';
 
 // --- helpers -----------------------------------------------------------------
@@ -24,8 +22,6 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
     mode: over.mode ?? 'annotated',
     profile: over.profile ?? null,
     allow: over.allow ?? [],
-    workspace: over.workspace ?? null,
-    commands: over.commands ?? null,
     sniff: over.sniff ?? false,
     command: over.command ?? [],
   };
@@ -42,19 +38,13 @@ describe('parseWrapArgs', () => {
       mode: 'strict',
       profile: 'github',
       allow: ['a', 'b'],
-      workspace: null,
-      commands: null,
-      noAuto: false,
       sniff: false,
       command: ['github-mcp-server', 'stdio'],
     });
   });
 
-  it('parses --sniff for wrapped commands and rejects it with --workspace', () => {
+  it('parses --sniff for wrapped commands', () => {
     expect(ok(parseWrapArgs(['--sniff', '--', 'srv'])).sniff).toBe(true);
-    expect(err(parseWrapArgs(['--sniff', '--workspace', '.']))).toContain(
-      '--sniff applies only when wrapping a command',
-    );
   });
 
   it('defaults mode to annotated', () => {
@@ -71,29 +61,50 @@ describe('parseWrapArgs', () => {
     const e = err(parseWrapArgs(['--profile', 'gitlab', '--', 'srv']));
     expect(e).toContain("unknown profile 'gitlab'");
     expect(e).toContain('github');
-    expect(e).toContain('shell');
+    expect(e).toContain('filesystem');
+  });
+
+  it("degrades a retired --profile shell instead of failing the wrap", () => {
+    // Same contract as a config file naming it (config.ts RETIRED_PROFILES):
+    // a ≤0.10 invocation still runs, profile-less, with one stderr warning.
+    // Failing here would break a wrapped server that works fine unprofiled.
+    const written: string[] = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown): boolean => {
+      written.push(String(chunk));
+      return true;
+    });
+    const args = ok(parseWrapArgs(['--profile', 'shell', '--', 'srv']));
+    expect(args.profile).toBeNull();
+    expect(written.join('')).toContain("profile 'shell'");
+    expect(written.join('')).toContain('retired in 0.11');
+    vi.restoreAllMocks();
   });
 
   it('parses --allow csv: trims spaces, drops empties', () => {
     expect(ok(parseWrapArgs(['--allow', ' a , ,b,, c ', '--', 'srv'])).allow).toEqual(['a', 'b', 'c']);
   });
 
-  it('resolves a relative --workspace to an absolute path', () => {
-    const ws = ok(parseWrapArgs(['--workspace', 'some/dir'])).workspace;
-    expect(ws).toBe(resolve('some/dir'));
-    expect(isAbsolute(ws!)).toBe(true);
-  });
-
-  it('rejects --workspace combined with a wrapped command', () => {
-    expect(err(parseWrapArgs(['--workspace', '.', '--', 'srv']))).toContain('mutually exclusive');
-  });
-
-  it('rejects neither --workspace nor a command', () => {
+  it('rejects when no command is given', () => {
     expect(err(parseWrapArgs([]))).toContain("wrap needs a server command after '--'");
   });
 
   it('rejects an unknown flag before --', () => {
     expect(err(parseWrapArgs(['--bogus', '--', 'srv']))).toContain("unknown wrap argument '--bogus'");
+  });
+
+  it('rejects the removed --workspace flag', () => {
+    const r = parseWrapArgs(['--workspace', '.']);
+    expect('error' in r && r.error).toMatch(/unknown wrap argument '--workspace'/);
+  });
+
+  it('rejects the removed --commands flag', () => {
+    const r = parseWrapArgs(['--commands', 'x.jsonc', '--', 'server']);
+    expect('error' in r && r.error).toMatch(/unknown wrap argument '--commands'/);
+  });
+
+  it('rejects the removed --no-auto flag', () => {
+    const r = parseWrapArgs(['--no-auto', '--', 'server']);
+    expect('error' in r && r.error).toMatch(/unknown wrap argument '--no-auto'/);
   });
 
   it("leaves flag-looking tokens after -- to the wrapped command", () => {
@@ -114,11 +125,6 @@ describe('buildWrapConfig', () => {
     expect(config.servers['upstream']!.profile).toBe('github');
   });
 
-  it('auto-detects the shell profile from speculate-shell in the command line', () => {
-    const { config } = buildWrapConfig(mkArgs({ command: ['node', '/opt/speculate-shell.js'] }));
-    expect(config.servers['upstream']!.profile).toBe('shell');
-  });
-
   it('sets no profile when nothing matches', () => {
     const { config } = buildWrapConfig(mkArgs({ command: ['my-server', 'stdio'] }));
     expect('profile' in config.servers['upstream']!).toBe(false);
@@ -126,9 +132,9 @@ describe('buildWrapConfig', () => {
 
   it('lets an explicit --profile win over autodetect', () => {
     const { config } = buildWrapConfig(
-      mkArgs({ profile: 'shell', command: ['github-mcp-server', 'stdio'] }),
+      mkArgs({ profile: 'filesystem', command: ['github-mcp-server', 'stdio'] }),
     );
-    expect(config.servers['upstream']!.profile).toBe('shell');
+    expect(config.servers['upstream']!.profile).toBe('filesystem');
   });
 
   it('places the allow list in allowTools (and omits the key when empty)', () => {
@@ -155,29 +161,5 @@ describe('buildWrapConfig', () => {
   it('defaults to annotated mode end to end (parse → build)', () => {
     const { config } = buildWrapConfig(ok(parseWrapArgs(['--', 'srv'])));
     expect(config.mode).toBe('annotated');
-  });
-
-  describe('workspace mode', () => {
-    // resolveShellServerCommand touches the filesystem, so only the
-    // profile / '--cwd' tail / stateKey are asserted, not the command path.
-    const abs = resolve('some-ws');
-
-    it('configures a shell-profile workspace server with a --cwd tail', () => {
-      const { config } = buildWrapConfig(mkArgs({ workspace: abs }));
-      const server = config.servers['workspace']!;
-      expect(server.profile).toBe('shell');
-      expect(server.args!.slice(-2)).toEqual(['--cwd', abs]);
-    });
-
-    it('keys state by the workspace path', () => {
-      const { stateKey } = buildWrapConfig(mkArgs({ workspace: abs }));
-      expect(stateKey).toBe(`wrap-workspace:${abs}`);
-    });
-
-    it('passes mode and allow list through', () => {
-      const { config } = buildWrapConfig(mkArgs({ workspace: abs, mode: 'strict', allow: ['run'] }));
-      expect(config.mode).toBe('strict');
-      expect(config.servers['workspace']!.allowTools).toEqual(['run']);
-    });
   });
 });

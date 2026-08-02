@@ -6,10 +6,19 @@
  * shadow-don't-touch rule for .mcp.json and the state-less unwrap net.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { speculateOff, speculateOn, speculateStatus, type CmdRunner } from '../src/manage.js';
+import {
+  execFileRunner,
+  resolveClaudeBin,
+  speculateOff,
+  speculateOn,
+  speculateStatus,
+  win32ShimInvocation,
+  type CmdRunner,
+} from '../src/manage.js';
+import { isWindows } from './platform.js';
 import { WORKSPACE_SERVER_NAME } from '../src/hostConfig.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
@@ -59,6 +68,13 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
         stdout: JSON.stringify(
           pluginSim.installed ? [{ name: 'speculate', marketplace: 'speculate' }] : [],
         ),
+        stderr: '',
+      };
+    }
+    if (args[1] === 'marketplace' && args[2] === 'list') {
+      return {
+        code: 0,
+        stdout: JSON.stringify(pluginSim.marketplace ? [{ name: 'speculate' }] : []),
         stderr: '',
       };
     }
@@ -127,7 +143,7 @@ const opts = () => ({
 });
 
 describe('speculate on', () => {
-  it('wraps user-scope servers in place and adds the workspace server', async () => {
+  it('wraps user-scope servers in place', async () => {
     writeClaudeJson({
       mcpServers: { github: { command: 'gh-server', args: ['stdio'], env: { T: '1' } } },
     });
@@ -140,15 +156,12 @@ describe('speculate on', () => {
     expect(wrapped.args).toContain('wrap');
     expect(wrapped.args.slice(-2)).toEqual(['gh-server', 'stdio']);
     expect(wrapped.env).toEqual({ T: '1' });
-    // Workspace server registered at local scope for this project.
-    const local = config.projects[cwd].mcpServers;
-    expect(local[WORKSPACE_SERVER_NAME].args).toContain('--workspace');
-    // State file records both.
+    // State file records it.
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     const actions = Object.fromEntries(
       state.projects[cwd].entries.map((e: AnyRecord) => [e.name, e.action]),
     );
-    expect(actions).toEqual({ github: 'rewrote', [WORKSPACE_SERVER_NAME]: 'added' });
+    expect(actions).toEqual({ github: 'rewrote' });
   });
 
   it('shadows approved .mcp.json servers at local scope, never touching the file', async () => {
@@ -211,68 +224,495 @@ describe('speculate on', () => {
   });
 });
 
-describe('speculate on + the Claude Code plugin (one command does MCP and CLI)', () => {
-  it('installs the plugin at local scope and skips the workspace server', async () => {
-    pluginSim = { installed: false, marketplace: false };
-    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+describe('legacy artifact cleanup', () => {
+  it('on removes a leftover speculate-workspace server', async () => {
+    // A ≤0.10 install left the workspace server registered at local scope.
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            [WORKSPACE_SERVER_NAME]: { command: SELF.command, args: [...SELF.args, 'wrap', '--workspace', cwd] },
+          },
+        },
+      },
+    });
     const code = await speculateOn(opts());
     expect(code).toBe(0);
-    // Plugin installed through the host CLI, at local scope.
-    expect(pluginSim.installed).toBe(true);
-    expect(calls).toContainEqual(['claude', 'plugin', 'marketplace', 'add', 'lukebward/speculate']);
-    expect(calls).toContainEqual([
-      'claude', 'plugin', 'install', '-s', 'local', 'speculate@speculate',
-    ]);
-    // The plugin brings the workspace server — no separate local registration.
+    expect(calls).toContainEqual(['claude', 'mcp', 'remove', WORKSPACE_SERVER_NAME, '-s', 'local']);
     expect(readClaudeJson().projects?.[cwd]?.mcpServers?.[WORKSPACE_SERVER_NAME]).toBeUndefined();
-    // Recorded for exact restore.
-    const state = JSON.parse(readFileSync(statePath, 'utf8'));
-    const actions = Object.fromEntries(
-      state.projects[cwd].entries.map((e: AnyRecord) => [e.name, e.action]),
+  });
+
+  it('on uninstalls the legacy plugin when plugin list reports it, trying the qualified id first', async () => {
+    pluginSim = { installed: true, marketplace: true }; // ≤0.10 plugin still installed
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    // ≤0.10's own `on` recorded that it added the marketplace registration
+    // itself — only then is it safe for cleanup to remove it. That flag is
+    // host-global, so 0.10 wrote it at the top level of the state file, not
+    // per-project.
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: { [cwd]: { entries: [], updatedAt: Date.now() } },
+        marketplaceAddedByOn: true,
+      }),
     );
-    expect(actions).toEqual({ github: 'rewrote', 'speculate@speculate': 'plugin' });
-    expect(state.marketplaceAddedByOn).toBe(true);
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+    // 0.10's PLUGIN_ID was the fully-qualified id; try that first.
+    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate']);
+    expect(calls).toContainEqual(['claude', 'plugin', 'marketplace', 'remove', 'speculate']);
+    expect(pluginSim.installed).toBe(false);
+    expect(pluginSim.marketplace).toBe(false);
+    // The ownership flag is consumed: a later run must not claim ownership of
+    // a marketplace registration the user re-added by hand.
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).marketplaceAddedByOn).toBe(false);
   });
 
-  it('does not reinstall when the plugin is already there, and off leaves it alone', async () => {
-    pluginSim = { installed: true, marketplace: true }; // user installed it themselves
+  it('on leaves the marketplace registration alone when no state recorded owning it', async () => {
+    pluginSim = { installed: true, marketplace: true };
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    await speculateOn(opts());
-    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'install')).toEqual([]);
-
-    await speculateOff(opts());
-    // `on` didn't install it, so `off` must not uninstall it.
-    expect(pluginSim.installed).toBe(true);
-    expect(pluginSim.marketplace).toBe(true);
+    // No state file at all (or none recording marketplaceAddedByOn): the
+    // marketplace registration might belong to another project or the user
+    // added it by hand — cleanup must not remove it.
+    const code = await speculateOn(opts());
+    expect(code).toBe(0);
+    expect(pluginSim.installed).toBe(false); // plugin itself is always removed
+    expect(pluginSim.marketplace).toBe(true); // but the marketplace is left alone
+    expect(calls.some((c) => c[1] === 'plugin' && c[2] === 'marketplace')).toBe(false);
   });
 
-  it('off uninstalls the plugin and removes the marketplace it added', async () => {
-    pluginSim = { installed: false, marketplace: false };
+  it('cleanup failures are logged, never fatal', async () => {
+    pluginSim = { installed: true, marketplace: true };
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    await speculateOn(opts());
-    expect(pluginSim.installed).toBe(true);
+    const failingRunner: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'uninstall') {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'boom' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOn({ ...opts(), runner: failingRunner });
+    expect(code).toBe(0); // the unrelated github wrap still succeeded
+    expect(logs.join('\n')).toContain('plugin uninstall failed');
+    expect(readClaudeJson().mcpServers.github.command).toBe(SELF.command);
+  });
 
+  it('off with a ≤0.10 state file containing action:"plugin" still uninstalls', async () => {
+    pluginSim = { installed: true, marketplace: true };
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: 'speculate@speculate', scope: 'local', action: 'plugin' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
     const code = await speculateOff(opts());
     expect(code).toBe(0);
+    // Detection fired in cleanupLegacyArtifacts, so off()'s own entry
+    // handling must not attempt a redundant second uninstall. The qualified
+    // id (0.10's own PLUGIN_ID) is tried first and succeeds here.
+    const uninstallCalls = calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall');
+    expect(uninstallCalls).toEqual([['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate']]);
     expect(pluginSim.installed).toBe(false);
-    expect(pluginSim.marketplace).toBe(false); // last project let go → marketplace removed
-    expect(readClaudeJson().mcpServers.github).toEqual({ command: 'gh-server' });
   });
 
-  it('--no-plugin (plugin: false) keeps the workspace-server behavior', async () => {
-    pluginSim = { installed: false, marketplace: false };
-    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    await speculateOn({ ...opts(), plugin: false });
-    expect(pluginSim.installed).toBe(false);
-    expect(readClaudeJson().projects[cwd].mcpServers[WORKSPACE_SERVER_NAME]).toBeDefined();
+  it('off still attempts uninstall directly when legacy detection is unavailable, and fails loud', async () => {
+    // pluginSim stays null: `claude plugin` doesn't exist on this host at
+    // all, so cleanupLegacyArtifacts's detection can't confirm anything —
+    // it must not cause a state-recorded plugin install to be silently
+    // dropped. off() has to attempt the uninstall itself and, on failure,
+    // log and count it, so the exit code reflects the failure.
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: 'speculate@speculate', scope: 'local', action: 'plugin' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const code = await speculateOff(opts());
+    expect(code).toBe(1);
+    // Both legacy ids are tried, in order, before giving up.
+    const uninstallCalls = calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall');
+    expect(uninstallCalls).toEqual([
+      ['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate'],
+      ['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate'],
+    ]);
+    expect(logs.join('\n')).toContain('uninstall failed');
+    // The remediation string names the id that actually failed last.
+    expect(logs.join('\n')).toContain('plugin uninstall -s local speculate');
   });
 
-  it('falls back to the workspace server when the plugin CLI is unavailable', async () => {
-    pluginSim = null; // old host: `claude plugin` doesn't exist
+  it('detects a plugin identified only by id (speculate@speculate, no bare name field)', async () => {
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    const code = await speculateOn(opts());
+    let installed = true;
+    const idOnlyRunner: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'list') {
+        calls.push([cmd, ...args]);
+        return {
+          code: 0,
+          stdout: JSON.stringify(installed ? [{ id: 'speculate@speculate' }] : []),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'plugin' && args[1] === 'uninstall') {
+        calls.push([cmd, ...args]);
+        installed = false;
+        return { code: 0, stdout: 'Uninstalled', stderr: '' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOn({ ...opts(), runner: idOnlyRunner });
     expect(code).toBe(0);
-    expect(readClaudeJson().projects[cwd].mcpServers[WORKSPACE_SERVER_NAME]).toBeDefined();
+    expect(calls).toContainEqual(['claude', 'plugin', 'uninstall', '-s', 'local', 'speculate@speculate']);
+    expect(installed).toBe(false);
+  });
+
+  it('off with a ≤0.10 state entry for the leftover workspace server exits clean, not spuriously failed', async () => {
+    // A ≤0.10 state file recorded the workspace server as a plain wrapped
+    // ("added") entry, and the host still has it registered. cleanupLegacyArtifacts
+    // removes it from the HOST; off()'s own entry handling must recognize
+    // that and not re-attempt (and fail) the same removal.
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            [WORKSPACE_SERVER_NAME]: { command: SELF.command, args: [...SELF.args, 'wrap', '--workspace', cwd] },
+          },
+        },
+      },
+    });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const code = await speculateOff(opts());
+    expect(code).toBe(0);
+    const removeCalls = calls.filter(
+      (c) => c[1] === 'mcp' && c[2] === 'remove' && c[3] === WORKSPACE_SERVER_NAME,
+    );
+    expect(removeCalls).toEqual([['claude', 'mcp', 'remove', WORKSPACE_SERVER_NAME, '-s', 'local']]);
+    expect(logs.join('\n')).not.toContain('failed');
+  });
+
+  it("off's own direct-removal attempt fires when cleanup's view never saw the workspace server, but the host still has it", async () => {
+    // The legacy state record survives (as in the ≤0.10 upgrade case above),
+    // but this time cleanupLegacyArtifacts's own view of the host — built by
+    // parsing .claude.json — never included speculate-workspace at all (a
+    // stale/partial read, or a host quirk our parsing doesn't recognize), so
+    // its own removal is never attempted (workspaceServerRemovalAttempted
+    // stays false). The host itself, simulated here independently of that
+    // file, still has the server. This is off()'s own per-entry fallback —
+    // "cleanup never saw it in the host view" — which must attempt the
+    // removal directly rather than silently doing nothing.
+    writeClaudeJson({}); // no speculate-workspace entry visible to our parsing
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const hostStillHasIt: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'remove' && args[2] === WORKSPACE_SERVER_NAME) {
+        calls.push([cmd, ...args]);
+        return { code: 0, stdout: `Removed ${WORKSPACE_SERVER_NAME}`, stderr: '' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOff({ ...opts(), runner: hostStillHasIt });
+    expect(code).toBe(0);
+    // Exactly one removal attempt: cleanupLegacyArtifacts's own workspace
+    // check (based on its view) never fired, so off()'s per-entry direct
+    // attempt is the only one — not a redundant double-removal.
+    const removeCalls = calls.filter(
+      (c) => c[1] === 'mcp' && c[2] === 'remove' && c[3] === WORKSPACE_SERVER_NAME,
+    );
+    expect(removeCalls).toEqual([['claude', 'mcp', 'remove', WORKSPACE_SERVER_NAME, '-s', 'local']]);
+    expect(logs.join('\n')).toContain(`${WORKSPACE_SERVER_NAME}: removed`);
+    expect(logs.join('\n')).not.toContain('failed');
+  });
+
+  it('off\'s direct-removal attempt classifies "no such server" as success, not failure', async () => {
+    // Same unreachable-from-cleanup setup as above, but the host reports the
+    // server is already gone by the time off() attempts it directly (a race
+    // with a prior/parallel cleanup, or simply already removed by hand).
+    // That must be classified as success — the load-bearing
+    // /no\s+(mcp\s+)?server/i check.
+    writeClaudeJson({});
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const alreadyGone: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'remove' && args[2] === WORKSPACE_SERVER_NAME) {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'No MCP server found named speculate-workspace' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOff({ ...opts(), runner: alreadyGone });
+    expect(code).toBe(0);
+    expect(logs.join('\n')).not.toContain('failed');
+    expect(logs.join('\n')).not.toContain(`${WORKSPACE_SERVER_NAME}: removed`);
+    expect(logs.join('\n')).toContain('off: done.');
+  });
+
+  it("off's direct-removal attempt still fails loud on an unrelated removal error", async () => {
+    // Same setup again, but this time the direct removal fails for a reason
+    // that has nothing to do with "already gone" — must be counted and
+    // reported honestly, not swallowed by the success-classification regex.
+    writeClaudeJson({});
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const unrelatedFailure: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'remove' && args[2] === WORKSPACE_SERVER_NAME) {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'permission denied' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOff({ ...opts(), runner: unrelatedFailure });
+    expect(code).toBe(1);
+    expect(logs.join('\n')).toContain(`${WORKSPACE_SERVER_NAME}: remove failed: permission denied`);
+    expect(logs.join('\n')).toContain('off: done (1 failure(s))');
+  });
+
+  it('on strips ≤0.10 legacy entries once cleanup has actually removed them', async () => {
+    // A ≤0.10 managed.json carried a leftover workspace-server entry and a
+    // plugin entry. Once cleanupLegacyArtifacts has really removed them from
+    // the HOST, `on` must not write these back: doing so would make a later
+    // `off` chase artifacts already gone, producing spurious "remove
+    // failed"/"uninstall failed" lines and a wrong exit code. (The workspace
+    // server is absent from the host view here — already clean — and the
+    // plugin uninstall below succeeds.)
+    pluginSim = { installed: true, marketplace: false };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [
+              { name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' },
+              { name: 'speculate@speculate', scope: 'local', action: 'plugin' },
+            ],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const onCode = await speculateOn(opts());
+    expect(onCode).toBe(0);
+    const written = JSON.parse(readFileSync(statePath, 'utf8'));
+    const names = written.projects[cwd].entries.map((e: AnyRecord) => e.name);
+    expect(names).not.toContain(WORKSPACE_SERVER_NAME);
+    expect(written.projects[cwd].entries.some((e: AnyRecord) => e.action === 'plugin')).toBe(false);
+    expect(names).toContain('github');
+
+    // off() against the now-pruned state must also exit clean.
+    logs = [];
+    const offCode = await speculateOff(opts());
+    expect(offCode).toBe(0);
+    expect(logs.join('\n')).not.toContain('failed');
+  });
+
+  it('on KEEPS a ≤0.10 plugin record when detection never confirmed an uninstall', async () => {
+    // The plugin IS installed, but this host's `plugin list --json` errors,
+    // so cleanup's detection misses and no uninstall is attempted. Pruning
+    // the record here would destroy off()'s recorded-install safety net and
+    // strand the retired Bash hook forever.
+    pluginSim = { installed: true, marketplace: false };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: 'speculate@speculate', scope: 'local', action: 'plugin' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const listFails: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'list') {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'unknown option --json' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOn({ ...opts(), runner: listFails });
+    expect(code).toBe(0);
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall')).toEqual([]);
+    const written = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(written.projects[cwd].entries.some((e: AnyRecord) => e.action === 'plugin')).toBe(true);
+
+    // …and because the record survived, off()'s direct-attempt fallback is
+    // still reachable: the stranded plugin does get uninstalled.
+    const offCode = await speculateOff({ ...opts(), runner: listFails });
+    expect(offCode).toBe(0);
+    expect(calls.some((c) => c[1] === 'plugin' && c[2] === 'uninstall')).toBe(true);
+    expect(pluginSim.installed).toBe(false);
+  });
+
+  it('on KEEPS a ≤0.10 workspace-server record when the host removal failed', async () => {
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            [WORKSPACE_SERVER_NAME]: { command: SELF.command, args: [...SELF.args, 'wrap', '--workspace', cwd] },
+          },
+        },
+      },
+    });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: WORKSPACE_SERVER_NAME, scope: 'local', action: 'added' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    const removeFails: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'remove' && args[2] === WORKSPACE_SERVER_NAME) {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'permission denied' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    const code = await speculateOn({ ...opts(), runner: removeFails });
+    expect(code).toBe(0); // legacy cleanup failures are logged, never fatal
+    const written = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(written.projects[cwd].entries.map((e: AnyRecord) => e.name)).toContain(
+      WORKSPACE_SERVER_NAME,
+    );
+  });
+
+  it('does not mistake an unrelated plugin for the retired one', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    const otherPlugins: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin') {
+        calls.push([cmd, ...args]);
+        if (args[1] === 'list') {
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              { name: 'speculate-tools', marketplace: 'acme' },
+              { id: 'my-speculate@corp', name: 'my-speculate' },
+            ]),
+            stderr: '',
+          };
+        }
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    expect(await speculateOn({ ...opts(), runner: otherPlugins })).toBe(0);
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall')).toEqual([]);
+    logs = [];
+    expect(await speculateStatus({ ...opts(), runner: otherPlugins })).toBe(0);
+    expect(logs.join('\n')).not.toContain('legacy plugin installed');
+  });
+
+  it('falls back to the bare plugin id only when a ≤0.10 record says we installed it', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    let installed = true;
+    // A host that rejects the qualified id but accepts the bare one — the
+    // only scenario LEGACY_PLUGIN_IDS' fallback exists for.
+    const qualifiedFails: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'list') {
+        calls.push([cmd, ...args]);
+        return {
+          code: 0,
+          stdout: JSON.stringify(installed ? [{ id: 'speculate@speculate' }] : []),
+          stderr: '',
+        };
+      }
+      if (args[0] === 'plugin' && args[1] === 'uninstall') {
+        calls.push([cmd, ...args]);
+        if (args[4] === 'speculate@speculate') return { code: 1, stdout: '', stderr: 'no such plugin' };
+        installed = false;
+        return { code: 0, stdout: 'Uninstalled', stderr: '' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    // No record: the bare id can name someone else's plugin — never guessed.
+    expect(await speculateOn({ ...opts(), runner: qualifiedFails })).toBe(0);
+    expect(
+      calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall').map((c) => c[5]),
+    ).toEqual(['speculate@speculate']);
+    expect(installed).toBe(true);
+
+    // With a ≤0.10 record the fallback is ours to make — and it succeeds.
+    calls = [];
+    logs = [];
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [{ name: 'speculate@speculate', scope: 'local', action: 'plugin' }],
+            updatedAt: Date.now(),
+          },
+        },
+      }),
+    );
+    expect(await speculateOff({ ...opts(), runner: qualifiedFails })).toBe(0);
+    expect(
+      calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall').map((c) => c[5]),
+    ).toEqual(['speculate@speculate', 'speculate']);
+    expect(installed).toBe(false);
+    expect(logs.join('\n')).toContain('uninstalled the speculate plugin');
+    expect(logs.join('\n')).not.toContain('uninstall failed');
   });
 });
 
@@ -311,6 +751,45 @@ describe('speculate off', () => {
       args: ['stdio'],
       env: { T: '1' },
     });
+  });
+
+  it('restores BOTH scopes when the same name is wrapped at user and local scope', async () => {
+    // `on` wraps user-scope `gh`; the user later adds a local-scope override
+    // (which now wins) and re-runs `on`. State is keyed by scope+name, so the
+    // user-scope record is not overwritten — and one `off` restores both.
+    writeClaudeJson({ mcpServers: { gh: { command: 'gh-user', args: ['stdio'] } } });
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    config.projects = { [cwd]: { mcpServers: { gh: { command: 'gh-local', args: [] } } } };
+    writeClaudeJson(config);
+    expect(await speculateOn(opts())).toBe(0);
+
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(
+      state.projects[cwd].entries.map((e: AnyRecord) => `${e.scope}:${e.name}`).sort(),
+    ).toEqual(['local:gh', 'user:gh']);
+
+    logs = [];
+    expect(await speculateOff(opts())).toBe(0);
+    const after = readClaudeJson();
+    expect(after.mcpServers.gh).toEqual({ command: 'gh-user', args: ['stdio'] });
+    expect(after.projects[cwd].mcpServers.gh).toEqual({ command: 'gh-local', args: [] });
+    expect(logs.join('\n')).not.toContain('failed');
+  });
+
+  it("never passes a dash-leading server name to 'claude mcp' in the no-state fallback", async () => {
+    // A hand-written user-scope entry named '--help' that happens to look
+    // wrapped: passing it positionally would let the host parse it as a flag.
+    writeClaudeJson({
+      mcpServers: {
+        '--help': { command: SELF.command, args: [...SELF.args, 'wrap', '--', 'evil-server'] },
+      },
+    });
+    const code = await speculateOff(opts()); // no state file at all
+    expect(code).toBe(0);
+    expect(calls.some((c) => c[1] === 'mcp' && c[2] === 'remove' && c[3] === '--help')).toBe(false);
+    expect(logs.join('\n')).toContain("--help: skipped (name starts with '-')");
+    expect(readClaudeJson().mcpServers['--help']).toBeDefined();
   });
 
   it('with no state file, removes a .mcp.json shadow instead of leaking a local copy', async () => {
@@ -353,5 +832,202 @@ describe('speculate status', () => {
     expect(text).toContain('github (user): wrapped (managed)');
     expect(text).toContain('linear (user): NOT wrapped');
     expect(text).toContain("run it again");
+  });
+
+  it('flags a leftover ≤0.10 speculate-workspace server as legacy, not healthy', async () => {
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: {
+            [WORKSPACE_SERVER_NAME]: { command: SELF.command, args: [...SELF.args, 'wrap', '--workspace', cwd] },
+          },
+        },
+      },
+    });
+    const code = await speculateStatus(opts());
+    expect(code).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain(
+      `${WORKSPACE_SERVER_NAME} (local): legacy CLI-speculation server (retired in 0.11)`,
+    );
+    expect(text).toContain("run 'speculate on' to remove");
+    expect(text).not.toContain('wrapped (managed)');
+  });
+
+  it('flags a leftover ≤0.10 plugin install, whose Bash hook now breaks git commands', async () => {
+    pluginSim = { installed: true, marketplace: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    const code = await speculateStatus(opts());
+    expect(code).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain('legacy plugin installed');
+    expect(text).toContain("breaks 'git ...' commands");
+    expect(text).toContain("run 'speculate on' to remove");
+    // The plugin is still there, so this is not the stranded-marketplace case.
+    expect(text).not.toContain('legacy marketplace');
+  });
+
+  it('reports a stranded ≤0.10 marketplace registration once the plugin is gone', async () => {
+    // 0.11 deleted the marketplace manifest this registration resolves, and
+    // cleanup only removes registrations our own ≤0.10 state claims to own —
+    // so the honest move for everyone else is to name it and the fix.
+    pluginSim = { installed: false, marketplace: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    const code = await speculateStatus(opts());
+    expect(code).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain(
+      "legacy marketplace 'speculate' registered (its source was removed in 0.11)",
+    );
+    expect(text).toContain('remove with: claude plugin marketplace remove speculate');
+  });
+
+  it('says nothing about the marketplace when none is registered', async () => {
+    pluginSim = { installed: false, marketplace: false };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateStatus(opts())).toBe(0);
+    expect(logs.join('\n')).not.toContain('legacy marketplace');
+  });
+});
+
+describe('execFileRunner against a real Windows .cmd shim', () => {
+  /**
+   * Runs `fn` against a real `%*`-forwarding batch shim — the shape npm
+   * installs for Claude Code. Node refuses to spawn a .cmd directly (EINVAL
+   * since CVE-2024-27980), so the runner goes through cmd.exe, and the JSON
+   * `mcp add-json` payload must survive that hop byte-for-byte.
+   */
+  function withShim(
+    fn: (shim: string, dir: string) => Promise<void>,
+  ): () => Promise<void> {
+    return async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'speculate-shim-'));
+      try {
+        writeFileSync(
+          join(dir, 'echo-args.mjs'),
+          'console.log(JSON.stringify(process.argv.slice(2)));\n',
+        );
+        writeFileSync(
+          join(dir, 'claude.cmd'),
+          `@echo off\r\n"${process.execPath}" "%~dp0echo-args.mjs" %*\r\n`,
+        );
+        await fn(join(dir, 'claude.cmd'), dir);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+  }
+
+  it.skipIf(!isWindows)(
+    'runs the shim and round-trips argv verbatim',
+    withShim(async (shim, dir) => {
+      const payload = JSON.stringify({
+        command: 'gh server',
+        args: ['stdio', 'a&b', 'c|d', 'e>f', '(g)'],
+        env: { T: '1' },
+      });
+      const args = ['mcp', 'add-json', 'github', payload, '-s', 'user'];
+      const res = await execFileRunner(shim, args, { cwd: dir });
+      expect(res.code).toBe(0);
+      expect(JSON.parse(res.stdout)).toEqual(args);
+    }),
+  );
+
+  it.skipIf(!isWindows)(
+    'carries %VAR% through literally — no expansion, no injection',
+    withShim(async (shim, dir) => {
+      // Windows MCP entries idiomatically hold %APPDATA%/%USERPROFILE%.
+      // Expanding one here would bake the expansion into the wrapped entry,
+      // so `off`'s exact restore would hand back a mangled original — and a
+      // variable whose VALUE is cmd syntax would execute (verified below).
+      process.env['SPECULATE_TEST_EVIL'] = '& echo PWNED > pwned.txt & rem ';
+      try {
+        const payload = JSON.stringify({
+          command: 'gh',
+          args: ['%APPDATA%\\server.js', 'C:\\x\\%APPDATA%\\y'],
+          env: { HOME: '%USERPROFILE%', E: '%SPECULATE_TEST_EVIL%' },
+        });
+        const args = ['mcp', 'add-json', 'github', payload, '-s', 'user'];
+        const res = await execFileRunner(shim, args, { cwd: dir });
+        expect(res.code).toBe(0);
+        // Byte-identical: nothing expanded, and the JSON is not truncated.
+        expect(JSON.parse(res.stdout)).toEqual(args);
+        // The injected `& echo … > pwned.txt` never ran.
+        expect(existsSync(join(dir, 'pwned.txt'))).toBe(false);
+      } finally {
+        delete process.env['SPECULATE_TEST_EVIL'];
+      }
+    }),
+  );
+
+  it.skipIf(!isWindows)(
+    'carries literal percents (100%, %%, bare) through unchanged',
+    withShim(async (shim, dir) => {
+      const args = ['mcp', 'add-json', 'p', '100%', '%%', '%', 'a\\%b', '50%off'];
+      const res = await execFileRunner(shim, args, { cwd: dir });
+      expect(res.code).toBe(0);
+      expect(JSON.parse(res.stdout)).toEqual(args);
+    }),
+  );
+
+  // Platform-independent: the escaping itself, so a non-Windows CI still
+  // guards it. `%` cannot be protected with a bare `^` where it sits — a
+  // caret INSIDE quotes is a literal caret (cmd only consumes carets outside
+  // quotes), so the percent has to step out of the quotes to be escaped.
+  it('escapes % by stepping outside the quotes, twice (once per cmd parse)', () => {
+    const { args } = win32ShimInvocation('C:\\bin\\claude.cmd', ['%APPDATA%']);
+    expect(args.slice(0, 3)).toEqual(['/d', '/s', '/c']);
+    expect(args[3]).toBe('""C:\\bin\\claude.cmd" ""^^^%"APPDATA"^^^%"""');
+    // A backslash run immediately before an inserted quote is doubled, or the
+    // child's CommandLineToArgvW would read it as an escaped quote and eat it:
+    // C:\x\%APPDATA% must not arrive as C:\x"%APPDATA%.
+    const path = win32ShimInvocation('c.cmd', ['C:\\x\\%A%']);
+    expect(path.args[3]).toBe('""c.cmd" "C:\\x\\\\"^^^%"A"^^^%"""');
+  });
+});
+
+describe('resolveClaudeBin', () => {
+  it('resolves a bare name against PATH × PATHEXT on win32, preferring .exe', () => {
+    const binDir = join(home, 'bin1');
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, 'claude.cmd'), '@echo off\r\n');
+    // npm-installed Claude Code is a .cmd shim: execFile/spawn never find it.
+    expect(resolveClaudeBin('claude', { platform: 'win32', pathEnv: binDir })).toBe(
+      join(binDir, 'claude.cmd'),
+    );
+    writeFileSync(join(binDir, 'claude.exe'), '');
+    expect(resolveClaudeBin('claude', { platform: 'win32', pathEnv: binDir })).toBe(
+      join(binDir, 'claude.exe'),
+    );
+  });
+
+  it('honors PATH order across directories', () => {
+    const first = join(home, 'first');
+    const second = join(home, 'second');
+    mkdirSync(first, { recursive: true });
+    mkdirSync(second, { recursive: true });
+    writeFileSync(join(second, 'claude.exe'), '');
+    expect(resolveClaudeBin('claude', { platform: 'win32', pathEnv: [first, second].join(';') })).toBe(
+      join(second, 'claude.exe'),
+    );
+    writeFileSync(join(first, 'claude.cmd'), '@echo off\r\n');
+    expect(resolveClaudeBin('claude', { platform: 'win32', pathEnv: [first, second].join(';') })).toBe(
+      join(first, 'claude.cmd'),
+    );
+  });
+
+  it('fails soft: unchanged off win32, when nothing matches, or when already a path', () => {
+    const binDir = join(home, 'bin2');
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, 'claude.cmd'), '@echo off\r\n');
+    expect(resolveClaudeBin('claude', { platform: 'darwin', pathEnv: binDir })).toBe('claude');
+    expect(resolveClaudeBin('claude', { platform: 'win32', pathEnv: join(home, 'nope') })).toBe(
+      'claude',
+    );
+    expect(resolveClaudeBin('claude', { platform: 'win32', pathEnv: '' })).toBe('claude');
+    expect(
+      resolveClaudeBin('C:\\tools\\claude.cmd', { platform: 'win32', pathEnv: binDir }),
+    ).toBe('C:\\tools\\claude.cmd');
+    expect(resolveClaudeBin('./claude', { platform: 'win32', pathEnv: binDir })).toBe('./claude');
   });
 });

@@ -5,6 +5,7 @@
  * marker-managed and idempotent.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { hasPosixShell, isWindows } from './platform.js';
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +15,7 @@ import {
   removeRcBlock,
   shimScript,
   shimsDir,
+  shimsStatus,
   uninstallShims,
   upsertRcBlock,
 } from '../src/shims.js';
@@ -67,7 +69,9 @@ describe('shim script behavior', () => {
   let specDir: string;
 
   beforeEach(() => {
-    installShims({ home, noRc: true, log });
+    // platform is pinned so the POSIX behavior under test is exercised on
+    // every OS in the matrix (installShims degrades on win32 — see below).
+    installShims({ home, noRc: true, log, platform: 'linux' });
     shimDir = shimsDir(home);
     realDir = join(home, 'realbin');
     specDir = join(home, 'specbin');
@@ -75,13 +79,13 @@ describe('shim script behavior', () => {
     makeFakeBin(specDir, 'speculate', '#!/bin/sh\necho "speculate-called $@"\n');
   });
 
-  it('resolves and execs the real launcher when speculate is not installed', async () => {
+  it.skipIf(!hasPosixShell)('resolves and execs the real launcher when speculate is not installed', async () => {
     const res = await runShim(join(shimDir, 'npx'), ['-y', 'pkg'], `${shimDir}:${realDir}`);
     expect(res.code).toBe(0);
     expect(res.stdout).toBe('real-npx -y pkg\n');
   });
 
-  it('routes through speculate wrap --sniff when available and non-interactive', async () => {
+  it.skipIf(!hasPosixShell)('routes through speculate wrap --sniff when available and non-interactive', async () => {
     const res = await runShim(
       join(shimDir, 'npx'),
       ['-y', 'some-mcp-server'],
@@ -93,7 +97,7 @@ describe('shim script behavior', () => {
     );
   });
 
-  it('honors the SPECULATE_OFF kill switch', async () => {
+  it.skipIf(!hasPosixShell)('honors the SPECULATE_OFF kill switch', async () => {
     const res = await runShim(
       join(shimDir, 'npx'),
       ['x'],
@@ -103,7 +107,7 @@ describe('shim script behavior', () => {
     expect(res.stdout).toBe('real-npx x\n');
   });
 
-  it('fails with 127 when no real launcher exists anywhere', async () => {
+  it.skipIf(!hasPosixShell)('fails with 127 when no real launcher exists anywhere', async () => {
     const res = await runShim(join(shimDir, 'npx'), [], shimDir);
     expect(res.code).toBe(127);
   });
@@ -135,12 +139,45 @@ describe('rc block management', () => {
   it('install/uninstall edit the rc file via markers', () => {
     const rcPath = join(home, '.zshrc');
     writeFileSync(rcPath, '# existing config\n');
-    installShims({ home, rcPath, log });
+    installShims({ home, rcPath, log, platform: 'linux' });
     const rc = readFileSync(rcPath, 'utf8');
     expect(rc).toContain('# existing config');
     expect(rc).toContain(shimsDir(home));
-    uninstallShims({ home, rcPath, log });
+    uninstallShims({ home, rcPath, log, platform: 'linux' });
     expect(readFileSync(rcPath, 'utf8')).not.toContain('speculate');
     expect(existsSync(shimsDir(home))).toBe(false);
+  });
+});
+
+describe('win32 degradation', () => {
+  it('install writes nothing and says why (sh shims cannot run on Windows)', () => {
+    const rcPath = join(home, '.bashrc');
+    writeFileSync(rcPath, '# existing config\n');
+    const code = installShims({ home, rcPath, log, platform: 'win32' });
+    expect(code).toBe(2); // asked to do something it cannot do
+    expect(logs.join('\n')).toContain('not supported on Windows');
+    expect(existsSync(join(shimsDir(home), 'npx'))).toBe(false);
+    // Git Bash would parse a drive-colon PATH entry into two dead components.
+    expect(readFileSync(rcPath, 'utf8')).toBe('# existing config\n');
+  });
+
+  it('status reports the platform instead of misreading PATH', () => {
+    const code = shimsStatus({ home, log, platform: 'win32' });
+    expect(code).toBe(0); // a status report is not a failure
+    expect(logs.join('\n')).toContain('not supported on Windows');
+    expect(logs.join('\n')).not.toContain('on PATH in this shell');
+  });
+
+  it.skipIf(isWindows)('reports PATH membership honestly on POSIX', () => {
+    installShims({ home, noRc: true, log, platform: process.platform });
+    const previous = process.env.PATH;
+    process.env.PATH = [shimsDir(home), '/usr/bin'].join(':');
+    try {
+      logs = [];
+      shimsStatus({ home, log, platform: process.platform });
+    } finally {
+      process.env.PATH = previous;
+    }
+    expect(logs.join('\n')).toContain('shim dir IS on PATH');
   });
 });
