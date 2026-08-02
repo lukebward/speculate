@@ -1,0 +1,223 @@
+# Prediction Quality Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make the learner predict well on any MCP server with no profile, by scoring its competing argument-source hypotheses, emitting several ranked candidates per trigger, and decaying stale evidence.
+
+**Architecture:** Build the measurement first, then change scoring under it. Each task reports its recall@K delta against the baseline; a change that does not move recall does not land.
+
+**Tech Stack:** TypeScript (strict), Node >= 18, vitest, no new dependencies.
+
+**Spec:** `docs/superpowers/specs/2026-08-02-prediction-quality-design.md` (read it).
+
+## Global Constraints
+
+- **Generic only.** No server-specific field (`updated_at`, authorship, anything GitHub/Slack-shaped) may enter the core scorer. The generic path must work on a server nobody has profiled. Profiles stay as optional accelerants.
+- **Old state files must keep loading.** New fields default rather than invalidate; `loadManagedState`-style tolerance already exists in `deserialize*` and must be preserved.
+- **`count` keeps gating `minObservations`.** Decay adds a separate `score` used for ranking and eviction only. Decaying `count` in place would silently stop stale-but-valid transitions from firing.
+- **Privacy unchanged:** argument templates persist, results never do.
+- Baseline to beat: **497 passing / 7 platform-skipped**, `npx tsc --noEmit` clean.
+- Windows is a first-class target: `fileURLToPath`, no POSIX assumptions, no shell.
+- Commit after every task with the trailer:
+  `Claude-Session: https://claude.ai/code/session_0132gkXEyxVDApKViwTv4X4a`
+
+---
+
+### Task 1: Evaluation harness and baseline
+
+**Files:**
+- Create: `eval/corpus.ts`, `eval/replay.ts`, `eval/eval.ts`
+- Modify: `package.json` (add `"eval": "tsx eval/eval.ts"`)
+- Test: `test/eval.test.ts`
+
+**Interfaces:**
+- Produces:
+```ts
+export interface EvalSession { server: string; calls: Array<{ tool: string; args: Record<string, unknown>; parsed: unknown }> }
+export interface Archetype { name: string; sessions(seed: number): EvalSession[] }
+export interface RecallReport {
+  archetype: string; pairs: number;
+  recallAt1: number; recallAt3: number; recallAt5: number;
+  wastePerHit: number;
+}
+export function runEval(seed: number): RecallReport[]
+```
+
+- [ ] **Step 1: Write the corpus.** `eval/corpus.ts` exports at least four archetypes. They must NOT be shaped to the GitHub profile's five rules, or this repeats the circular-benchmark mistake the project already made once:
+  - `list-detail-varied`: list of 10 entities, then open one at a **randomized** index drawn from a skewed distribution (index 0 most likely but not always), repeated across sessions.
+  - `return-visits`: the same 2 entities reopened repeatedly across sessions, at varying list positions.
+  - `multi-arg`: a follow-up call whose args come from two different sources (one arg-copy, one parsed-path).
+  - `adversarial`: low-predictability, entities chosen uniformly at random with no repetition. This is the floor `DESIGN.md` §10 item 8 promised and never delivered.
+
+  Seed all randomness explicitly (a small deterministic PRNG in the file); `Math.random()` must not appear, so runs are reproducible.
+
+- [ ] **Step 2: Write the replay.** `eval/replay.ts` drives a real `TransitionLearner` (and optionally the full `Predictor`) directly, in-process, with no MCP server or subprocess. For each session: feed calls in order via the learner's observe path; before feeding call N, ask for predictions given call N-1 and record the **rank** of the actual call N among them (or a miss). Warm-up sessions count toward learning but not toward the score, so cold start is not scored as failure. Report recall@1/3/5 and waste per hit.
+
+- [ ] **Step 3: Write `eval/eval.ts`** to run every archetype and print a table: archetype, pairs, recall@1/3/5, waste/hit. Print a single `BASELINE` line with the overall recall@3 so later tasks can diff against it.
+
+- [ ] **Step 4: Add a test** (`test/eval.test.ts`) asserting the harness is deterministic (same seed gives identical report) and that the adversarial archetype scores strictly below the varied one. Do not assert absolute recall numbers; they change in later tasks by design.
+
+- [ ] **Step 5: Run `npm run eval`, record the baseline table in the task report verbatim.** This is the number every later task is measured against.
+
+- [ ] **Step 6: Commit** `eval: offline recall@K harness with an adversarial floor archetype`.
+
+### Task 2: Decay infrastructure, persisted recency, value-based eviction
+
+**Files:**
+- Modify: `src/learner.ts`
+- Test: `test/learner.test.ts`, `test/persistence.test.ts`
+
+**Interfaces:**
+- Consumes: `TransitionState`, `OpenerState`, `SerializedTransition`, `SerializedOpener`.
+- Produces:
+```ts
+/** Exported for tests: score decayed from `from` to `to`. */
+export function decayedScore(score: number, from: number, to: number, tauMs?: number): number
+```
+  plus `score: number` on `TransitionState`/`OpenerState` and `score`/`lastUpdated` on both serialized shapes.
+
+- [ ] **Step 1: Write failing tests.**
+
+```ts
+it('decays a score toward zero as time passes', () => {
+  const fresh = decayedScore(4, 0, 0);
+  const aged = decayedScore(4, 0, 14 * 24 * 3600_000);
+  expect(fresh).toBe(4);
+  expect(aged).toBeLessThan(4);
+  expect(aged).toBeGreaterThan(0);
+});
+
+it('ranks a recently used transition above an equally frequent stale one', () => {
+  // two transitions, same count, different lastUpdated; assert predict() order
+});
+
+it('evicts the lowest-scoring transition, not the oldest inserted', () => {
+  // fill past maxTransitions; insert a hot transition FIRST, then many cold ones
+  // assert the hot transition survives (today's FIFO drops it)
+});
+
+it('persists lastUpdated so decay survives a reload', () => {
+  // export -> import with a clock advanced; assert the score reflects the gap
+  // rather than being restamped to now
+});
+
+it('loads a pre-existing state file with no score/lastUpdated fields', () => {
+  // assert count-derived defaults and no throw
+});
+```
+
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3: Implement.**
+  - Add `TAU_MS` (default 14 days) and `decayedScore(score, from, to, tau)`.
+  - Add `score` to `TransitionState` and `OpenerState`. On observation: `state.score = decayedScore(state.score, state.lastUpdated, now) + 1`, then `state.lastUpdated = now`. `count` continues to increment exactly as today and continues to gate `minObservations`.
+  - **Serialize `lastUpdated` and `score`** on both `SerializedTransition` and `SerializedOpener`. Today `SerializedTransition` carries neither, so `deserialize` restamps `lastUpdated` to `now()` (`src/learner.ts:338`) and decay would reset on every reload. On load: missing `score` defaults to `count`; missing `lastUpdated` defaults to `now()`.
+  - Replace the FIFO eviction at `src/learner.ts:341-344` with lowest-decayed-score, tie-broken by stalest `lastUpdated`, mirroring the opener eviction at `:249`.
+  - Rank predictions by decayed score (highest first) where they are currently ordered by raw `count` (`:431-436`).
+- [ ] **Step 4:** Focused tests pass, `npx tsc --noEmit` clean, full `npx vitest run` green.
+- [ ] **Step 5: Run `npm run eval`** and record the delta against Task 1's baseline in the report.
+- [ ] **Step 6: Commit** `feat: decay stale learner evidence and evict by value`.
+
+### Task 3: Per-source scoring and multi-candidate emission
+
+This is the task that lifts recall@K above recall@1. Expect the largest delta here.
+
+**Files:**
+- Modify: `src/learner.ts`
+- Test: `test/learner.test.ts`
+
+**Interfaces:**
+- Produces: sources stored as `{ s: Source; score: number; lastUpdated: number }`; `SerializedSource` gains optional `score`/`lastUpdated`; `predict()` may return several predictions derived from one transition.
+
+- [ ] **Step 1: Write failing tests.**
+
+```ts
+it('credits every source that could have produced the observed value', () => {
+  // an observation where BOTH an arg-copy and a parsed index yield the value
+  // assert both sources' scores rose, not just the first
+});
+
+it('prefers the source that has actually been right, over priority order', () => {
+  // arg-copy resolves but has always been wrong; parsed index 2 has always
+  // been right. After enough evidence, predict() must emit index 2 FIRST.
+  // Today priority order makes this impossible.
+});
+
+it('emits several ranked candidates from one transition', () => {
+  // a list->detail transition where the chosen index varies
+  // assert predict() returns index0 AND index1 as separate predictions,
+  // ordered by observed frequency
+});
+
+it('evicts the weakest source at the cap instead of refusing new ones', () => {
+  // saturate MAX_SOURCES_PER_ARG with losers, then feed a consistent winner
+  // assert the winner is stored
+});
+
+it('keeps loading sources with no score field', () => { /* back-compat */ });
+```
+
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3: Implement.**
+  - Wrap stored sources in `{ s, score, lastUpdated }`, decayed like transitions.
+  - **On observe:** for each argument, test every stored source against the observed value and increment **all** that match (not just the first). Add newly discovered sources as today.
+  - **At `MAX_SOURCES_PER_ARG`:** evict the lowest-scoring source rather than `break`ing (`src/learner.ts:633`).
+  - **On predict:** for each argument, rank its resolvable sources by decayed score. Build candidates with a **beam of width `maxPredictionsPerTrigger`**: start from the all-best combination, then generate variants substituting the next-best source for one argument at a time, ordering by the product of normalized source scores. Dedupe by materialized-args repr. This yields index 0, index 1, index 2 for the single-varying-argument case, which is the dominant real shape.
+  - Confidence per emitted prediction: today's transition-derived confidence multiplied by the normalized combo score, so a well-evidenced first choice outranks a speculative third. Keep the existing `0.55` ceiling.
+  - `resolveSources`' fixed priority order is now a **fallback only**, used when no source has evidence yet.
+- [ ] **Step 4:** Focused tests pass, `npx tsc --noEmit` clean, full suite green. Existing tests that pin first-source-wins or the old confidence formula may be updated **only** where this spec deliberately changes that behavior; list each one you touched and why in the report.
+- [ ] **Step 5: Run `npm run eval`**, record the delta. Recall@3 on `list-detail-varied` should rise materially; if it does not, stop and report rather than proceeding.
+- [ ] **Step 6: Commit** `feat: learn which argument source is right, and offer several`.
+
+### Task 4: Widen the learnable index window
+
+**Files:**
+- Modify: `src/learner.ts`
+- Test: `test/learner.test.ts`
+
+- [ ] **Step 1: Write a failing test** asserting a transition whose follow-up consistently uses index 5 of the previous result becomes predictable. Today `pushArrayPaths` caps at `Math.min(arr.length, 3)`, so it cannot be.
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3: Implement.** Replace the literal `3` with `MAX_ARRAY_INDEX_PATHS` (default 8). Safe only because Task 3's per-source scoring prunes losers; `MAX_PARSED_PATHS = 256` still bounds total enumeration. Confirm in the report that enumeration cost did not blow up (assert the path count stays bounded for a large array).
+- [ ] **Step 4:** Focused tests pass, full suite green.
+- [ ] **Step 5: Run `npm run eval`**, record the delta.
+- [ ] **Step 6: Commit** `feat: learn follow-up positions past the third entry`.
+
+### Task 5: Entity frecency for return visits
+
+**Files:**
+- Modify: `src/learner.ts`
+- Test: `test/learner.test.ts`
+
+**Interfaces:**
+- Produces: `entities: Map<string, {score, lastUpdated}>` keyed `${server} ${tool} ${argsRepr}`, serialized as an optional `entities?: []` on `SerializedLearner`.
+
+- [ ] **Step 1: Write failing tests.**
+
+```ts
+it('predicts a repeatedly reopened entity regardless of its list position', () => {
+  // open entity X many times, always from a different index
+  // assert predict() offers X even when it is not at a top index
+});
+
+it('does not fire entity predictions for an unseen tool transition', () => {
+  // gate (a): the tool-pair transition must exist
+});
+
+it('caps entity predictions per trigger', () => { /* gate (c) */ });
+```
+
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3: Implement.** Record every observed `(server, tool, canonical argsRepr)` with the same decay. On predict, after the transition-derived candidates, append up to 2 entity candidates, gated on: the tool-pair transition exists, the entity's decayed score clears a threshold (default 3), and the candidate is not already present. Confidence stays below the transition-derived candidates so it never displaces better-evidenced ones.
+- [ ] **Step 4:** Focused tests pass, full suite green.
+- [ ] **Step 5: Run `npm run eval`**, record the delta, expecting movement on `return-visits` specifically.
+- [ ] **Step 6: Commit** `feat: predict entities you keep returning to`.
+
+### Task 6: Honest numbers and docs
+
+**Files:**
+- Modify: `DESIGN.md`, `package.json` + `package-lock.json` (0.13.0), `plugin/.claude-plugin/plugin.json` (0.13.0, a test asserts these match)
+
+- [ ] **Step 1:** `npm version 0.13.0 --no-git-tag-version`, and bump the plugin manifest in the same commit.
+- [ ] **Step 2: DESIGN.md** gets a `## v0.13 (2026-08-02): prediction quality` section recording: the five defects fixed, the decay model with its TAU, the beam emission, and **the measured recall table before and after, including the adversarial floor**. State plainly that the floor exists and what it is. Do not use em dashes.
+- [ ] **Step 3:** Note in the same section that `npm run eval` is now the instrument for prediction quality, and that `npm run bench` measures prefetch mechanics only, which is what made the older headline number circular.
+- [ ] **Step 4: Verify** `npx tsc --noEmit`, full `npx vitest run`, `npm run eval`, `npm run bench`, `npm run demo`.
+- [ ] **Step 5: Commit** `docs: v0.13 prediction quality, with measured recall`.
