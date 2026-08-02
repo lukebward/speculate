@@ -498,6 +498,31 @@ describe('corpus independence', () => {
     }
   });
 
+  it('moves two arguments together in paired-args, which is the shape it exists to measure', () => {
+    // The archetype is worthless if its two ids can be read off different
+    // rows: the whole point is that only the pairings the agent actually made
+    // are correct, so a model ranking each argument on its own marginal
+    // evidence fills the batch with combinations that never occurred.
+    const archetype = ARCHETYPES.find((a) => a.name === 'paired-args')!;
+    const sessions = archetype.sessions(1);
+    let offTop = 0;
+    let mixed = 0;
+    for (const session of sessions) {
+      const listed = session.calls[0]!.parsed as {
+        releases: Array<Record<string, unknown>>;
+      };
+      const opened = session.calls[1]!.args as { releaseId: unknown; buildId: unknown };
+      const row = listed.releases.findIndex((r) => r.releaseId === opened.releaseId);
+      expect(row).toBeGreaterThanOrEqual(0);
+      if (row > 0) offTop++;
+      if (listed.releases[row]!.buildId !== opened.buildId) mixed++;
+    }
+    expect(mixed).toBe(0);
+    // And the co-variation has to be observable: if row 0 were always the one
+    // opened, there would be no second combination to get wrong.
+    expect(offTop).toBeGreaterThan(sessions.length / 4);
+  });
+
   it('exercises the learner with results the parsed-path search can walk', () => {
     // Every workflow session must carry at least one array-of-objects result:
     // that is the shape `enumerateParsedPaths` indexes (0..2), and a corpus of

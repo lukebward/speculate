@@ -665,7 +665,87 @@ const directRecall: Archetype = {
   },
 };
 
-// -- archetype 6: adversarial (the floor) --------------------------------------
+// -- archetype 6: paired-args ---------------------------------------------------
+
+/**
+ * Index weights for the opened row. 85% of the mass sits inside the 0..2
+ * window a parsed path can address, so the leg's ceiling is high and what it
+ * actually measures is whether the model can OFFER those three rows coherently
+ * rather than whether it can reach them at all.
+ */
+const PAIRED_INDEX_WEIGHTS = [45, 25, 15, 6, 4, 3, 1, 1];
+
+/**
+ * TWO arguments that move TOGETHER — the shape the rest of the corpus cannot
+ * express, and the one an argument model scoring each argument on its own
+ * marginal evidence gets wrong in a way no other archetype can see.
+ *
+ * `release_get_manifest` takes the releaseId AND the buildId of the row the
+ * agent opened. Both are read out of the same row, so of the nine pairings the
+ * three rows admit, only three have ever occurred. A beam that ranks each
+ * argument independently rates "row 1's release with row 0's build" as the
+ * CHEAPEST substitution available — one step from the best combination — so it
+ * spends the batch on pairings that never happened while the one real
+ * alternative falls past the per-trigger cap. Measured, that is the difference
+ * between 0.44 and 0.85 on this leg; every other archetype reports 0.000 for
+ * the same change, because none of them has two arguments with more than one
+ * live hypothesis each.
+ *
+ * The second leg (`release_get_manifest → …`) is an ordinary arg-copy branch,
+ * so the archetype still exercises ranking rather than derivation alone, and
+ * the `channel` argument is a true constant per session, which keeps a const
+ * source in the mix beside the two moving ones.
+ */
+const pairedArgs: Archetype = {
+  name: 'paired-args',
+  sessions(seed) {
+    const rng = makeRng(streamSeed(seed, 'paired-args'));
+    const release = minter('rel');
+    const build = minter('bld');
+    const envs = ['staging', 'canary', 'prod'] as const;
+    const out: EvalSession[] = [];
+
+    for (let s = 0; s < SESSIONS_PER_ARCHETYPE; s++) {
+      const env = rng.pick(envs);
+      const releases = Array.from({ length: 8 }, () => ({
+        releaseId: release(),
+        buildId: build(),
+        owner: `team-${rng.int(5)}`,
+      }));
+      const opened = releases[rng.weighted(PAIRED_INDEX_WEIGHTS)]!;
+      const listed = { env, releases, channel: 'stable' };
+
+      const calls: EvalSession['calls'] = [
+        { tool: 'env_list_releases', args: { env }, parsed: listed },
+        {
+          // Both ids come from the SAME row: the pairing is the whole point.
+          tool: 'release_get_manifest',
+          args: { releaseId: opened.releaseId, buildId: opened.buildId },
+          parsed: {
+            releaseId: opened.releaseId,
+            buildId: opened.buildId,
+            owner: opened.owner,
+            artifacts: [{ name: phrase(rng), bytes: rng.int(9_000) }],
+          },
+        },
+      ];
+
+      if (rng.weighted([65, 35]) === 0) {
+        calls.push({
+          tool: 'release_get_diff',
+          args: { buildId: opened.buildId },
+          parsed: { buildId: opened.buildId, files: [phrase(rng)] },
+        });
+      } else {
+        calls.push({ tool: 'env_list_releases', args: { env }, parsed: listed });
+      }
+      out.push({ server: 'deploys', calls });
+    }
+    return out;
+  },
+};
+
+// -- archetype 7: adversarial (the floor) --------------------------------------
 
 /**
  * The low-predictability floor DESIGN.md §10 item 8 asks for: the next tool is
@@ -722,6 +802,7 @@ export const ARCHETYPES: readonly Archetype[] = [
   multiArg,
   regimeShift,
   directRecall,
+  pairedArgs,
   adversarial,
 ];
 

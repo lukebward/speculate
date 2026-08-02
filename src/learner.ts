@@ -77,6 +77,13 @@ const MAX_SOURCES_PER_ARG = 12;
  */
 const MIN_SOURCE_SOLO_WINS = 2;
 /**
+ * Combinations the beam may examine per transition. A fixed bound, NOT a
+ * function of the per-trigger cap: the emitted prefix must be identical
+ * whether the caller asks for 3 candidates or 5, which is what makes an
+ * offline eval measured at k=5 a faithful reading of production at k=3.
+ */
+const MAX_BEAM_POPS = 64;
+/**
  * Per-argument evidence gate (§5.3). A template used to be disabled forever
  * by ONE observation it could not derive — an agent opening the second row
  * of a list instead of the first was enough to kill the transition for the
@@ -162,6 +169,12 @@ export interface SerializedSource {
   lastUpdated?: number;
   /** Observations this source alone explained. Absent pre-v0.13; defaults 0. */
   solo?: number;
+  /**
+   * 32-bit window of WHICH recent observations this source explained. Omitted
+   * when empty, and absent pre-v0.13; defaults to 0, which reads as "no
+   * provenance recorded" and never blocks a candidate on its own.
+   */
+  seen?: number;
 }
 
 export interface SerializedTransition {
@@ -236,6 +249,16 @@ interface ScoredSource {
   lastUpdated: number;
   /** Observations this source alone explained (see MIN_SOURCE_SOLO_WINS). */
   solo: number;
+  /**
+   * WHICH observations this source explained, as a 32-bit window: bit 0 is
+   * this transition's most recent observation, bit i is i observations ago.
+   * Shifted for every source of every template on every observation, so bit
+   * positions mean the same thing ACROSS arguments — which is the whole
+   * point. Scores say how often each argument's hypotheses were right on
+   * their own; only this says whether two of them were ever right TOGETHER
+   * (see coherence in materializeCombos).
+   */
+  seen: number;
 }
 
 interface ArgTemplate {
@@ -751,7 +774,12 @@ export class TransitionLearner {
 function serializeSource(src: ScoredSource): SerializedSource {
   // (score, lastUpdated) travel together and undecayed, exactly as they do
   // for a transition: the next load charges the whole downtime.
-  const evidence = { score: src.score, lastUpdated: src.lastUpdated, solo: src.solo };
+  const evidence = {
+    score: src.score,
+    lastUpdated: src.lastUpdated,
+    solo: src.solo,
+    ...(src.seen !== 0 ? { seen: src.seen } : {}),
+  };
   switch (src.s.kind) {
     case 'arg':
       return { kind: 'arg', key: src.s.key, ...evidence };
@@ -796,6 +824,7 @@ function deserializeSource(raw: unknown, now: number): ScoredSource | null {
     score: importedScore(s.score, 0, MAX_IMPORTED_COUNT),
     lastUpdated: importedStamp(s.lastUpdated, now),
     solo: importedCount(s.solo) ?? 0,
+    seen: importedMask(s.seen),
   };
 }
 
@@ -855,6 +884,16 @@ function importedScore(raw: unknown, count: number, max: number): number {
 function importedCount(raw: unknown): number | undefined {
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return undefined;
   return Math.min(Math.floor(raw), MAX_IMPORTED_COUNT);
+}
+
+/**
+ * A persisted observation-provenance window, or 0 when absent/junk. Forced
+ * into an unsigned 32-bit int so a doctored file cannot smuggle a float or a
+ * negative through the bitwise coherence check.
+ */
+function importedMask(raw: unknown): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return 0;
+  return Math.trunc(raw) >>> 0;
 }
 
 /**
@@ -1002,6 +1041,11 @@ function updateTemplates(
   now: number,
 ): void {
   for (const [name, tpl] of state.templates) {
+    // Age every provenance window by one observation FIRST, so that bit i
+    // means "i observations ago" for every source of every argument. Doing it
+    // per template as each argument is handled would let the windows drift
+    // apart, and comparing two arguments' bits is the only thing they are for.
+    for (const src of tpl.sources) src.seen = (src.seen << 1) >>> 0;
     if (!Object.prototype.hasOwnProperty.call(nextArgs, name)) {
       tpl.missed += 1; // previously seen arg absent now
     }
@@ -1032,6 +1076,7 @@ function updateTemplates(
       if (!sourceProduces(src.s, prev, repr)) continue;
       src.score = decayedScore(src.score, src.lastUpdated, now) + 1;
       src.lastUpdated = now;
+      src.seen = (src.seen | 1) >>> 0; // this observation, for coherence
       matched.push(src);
     }
     // `derived` counts what the template could have PREDICTED, so only
@@ -1054,6 +1099,13 @@ function updateTemplates(
       // the new one instead of going silent forever.
       admitted.push(newSource({ kind: 'const', value, repr }, now));
     }
+    // A solo win credits the observation that REVEALED the source, unlike
+    // `derived` above, and the asymmetry is deliberate: `derived` asks "could
+    // the template have predicted this?", which a source mined from the value
+    // cannot have done, while `solo` asks "is this hypothesis telling us
+    // something no other one does?", which is exactly what a value nothing
+    // else explained shows. The two counters answer different questions and a
+    // source still needs MIN_SOURCE_SOLO_WINS of them to be offered.
     const explanations = matched.length + admitted.length;
     if (explanations === 1) (matched[0] ?? admitted[0]!).solo += 1;
     if (admitted.length > 0) {
@@ -1065,7 +1117,7 @@ function updateTemplates(
 
 /** A newly discovered hypothesis: one observation of evidence, no solo win. */
 function newSource(s: Source, now: number): ScoredSource {
-  return { s, score: 1, lastUpdated: now, solo: 0 };
+  return { s, score: 1, lastUpdated: now, solo: 0, seen: 1 };
 }
 
 /** Identity of a hypothesis, for "does the template already hold this?". */
@@ -1208,6 +1260,14 @@ interface ArgOption {
   /** Decayed evidence for this VALUE: the best admissible source producing it. */
   score: number;
   /**
+   * Share of the argument's evidence behind this value, 0..1, and 1 for the
+   * best one. Set by argWeights() once the whole option list is known, which
+   * is why it is not filled in at construction.
+   */
+  weight: number;
+  /** Union of the provenance windows of the sources producing this value. */
+  seen: number;
+  /**
    * True when the value came from a `const` source — remembered, not read off
    * the call that just happened. That is the freshness distinction (§6.2):
    * a derived argument says "next", a memorized one says "at some point".
@@ -1240,7 +1300,7 @@ function argOptions(tpl: ArgTemplate, call: ObservedCall, now: number): ArgOptio
     .map((src, i) => ({ src, i, score: decayedScore(src.score, src.lastUpdated, now) }))
     .sort((a, b) => b.score - a.score || kindRank(a.src.s) - kindRank(b.src.s) || a.i - b.i);
 
-  const seen = new Set<string>();
+  const byRepr = new Map<string, ArgOption>();
   const out: ArgOption[] = [];
   for (let rank = 0; rank < ranked.length; rank++) {
     const entry = ranked[rank]!;
@@ -1251,17 +1311,47 @@ function argOptions(tpl: ArgTemplate, call: ObservedCall, now: number): ArgOptio
     if (repr === undefined) continue; // an unrepresentable value is no answer
     // Hypotheses that agree on this call are one candidate, carrying the
     // best-evidenced one's score: offering the same value twice would spend
-    // two slots on one answer.
-    if (seen.has(repr)) continue;
-    seen.add(repr);
-    out.push({
+    // two slots on one answer. Their provenance windows union, because the
+    // question a window answers ("was this VALUE right on that observation?")
+    // is about the value, not about which source produced it.
+    const existing = byRepr.get(repr);
+    if (existing) {
+      existing.seen = (existing.seen | entry.src.seen) >>> 0;
+      continue;
+    }
+    const option: ArgOption = {
       value: res.value,
       repr,
       score: entry.score,
+      weight: 1,
+      seen: entry.src.seen,
       memorized: entry.src.s.kind === 'const',
-    });
+    };
+    byRepr.set(repr, option);
+    out.push(option);
   }
   return out.length > 0 ? out : null;
+}
+
+/**
+ * Fill in each option's weight: the SHARE of the argument's evidence standing
+ * behind it, with the best one pinned at 1 so the all-best combination weighs
+ * 1 and a transition's first candidate ranks exactly where it did before.
+ *
+ * Normalizing against the leader instead would rank twelve tied one-off
+ * literals exactly like a genuine 25/9/5 split of a list position, which is
+ * how a transition with an underivable argument spends a whole batch on
+ * memorized junk before the miss-rate gate closes on it. Computed over the
+ * whole admissible list BEFORE the per-trigger cap truncates it, so the
+ * emitted prefix does not depend on how many predictions a trigger is allowed.
+ */
+function argWeights(options: ArgOption[]): void {
+  let total = 0;
+  for (const o of options) total += o.score;
+  for (let i = 0; i < options.length; i++) {
+    const o = options[i]!;
+    o.weight = i === 0 || total <= 0 ? 1 : o.score / total;
+  }
 }
 
 /** Seed priority, the tie-break among equally evidenced sources. */
@@ -1295,6 +1385,8 @@ interface ArgCombo {
    * derived part.
    */
   memorized: boolean;
+  /** False only when two of the chosen values have never been right together. */
+  coherent: boolean;
 }
 
 /**
@@ -1303,10 +1395,14 @@ interface ArgCombo {
  * The first is the all-best combination — every argument answered by its
  * best-evidenced source, weight exactly 1, i.e. what this transition used to
  * emit as its only candidate. The rest substitute the next-best value for one
- * argument at a time, ordered by the product of the per-argument normalized
- * scores. For the dominant real shape — one argument that moves (which row of
- * the list did the agent open?) and the rest fixed — that yields row 0, row 1,
- * row 2 in the order they have actually been opened.
+ * argument at a time, ordered by the product of the per-argument weights. For
+ * the dominant real shape — one argument that moves (which row of the list did
+ * the agent open?) and the rest fixed — that yields row 0, row 1, row 2 in the
+ * order they have actually been opened.
+ *
+ * A substitution is skipped when the chosen values are known NEVER to have
+ * been right together (see the coherence check below), so two arguments that
+ * co-vary do not fill the batch with pairings that never happened.
  *
  * Empty when any argument is underivable or unresolvable: a prediction is
  * still all-or-nothing, and no argument is ever fabricated.
@@ -1319,7 +1415,6 @@ function materializeCombos(
 ): ArgCombo[] {
   const names: string[] = [];
   const options: ArgOption[][] = [];
-  const weights: number[][] = [];
   for (const [name, tpl] of state.templates) {
     const opts = argOptions(tpl, call, now);
     if (opts === null) return []; // fail closed — never partial args
@@ -1328,20 +1423,7 @@ function materializeCombos(
     // per-source scoring) answers with its priority-order first source and
     // offers no alternatives: there is nothing to rank them by.
     const usable = opts[0]!.score > 0 ? opts : [opts[0]!];
-    // A hedge is worth the SHARE of this argument's evidence standing behind
-    // it — computed over every admissible value, before the cap truncates
-    // them, so the weights (and so the emitted prefix) do not depend on how
-    // many predictions this trigger happens to be allowed. Normalizing
-    // against the leader instead would rank twelve tied one-off literals
-    // exactly like a genuine 25/9/5 split of a list position, which is how a
-    // transition with an underivable argument spends a whole batch on
-    // memorized junk before the miss-rate gate closes on it.
-    const total = usable.reduce((sum, o) => sum + o.score, 0);
-    weights.push(
-      // The best value keeps weight 1 so the all-best combination weighs 1
-      // and a transition's first candidate ranks exactly where it did before.
-      usable.map((o, i) => (i === 0 || total <= 0 ? 1 : o.score / total)),
-    );
+    argWeights(usable);
     options.push(usable.slice(0, Math.max(1, limit)));
   }
 
@@ -1350,13 +1432,26 @@ function materializeCombos(
     const args: Record<string, unknown> = {};
     let weight = 1;
     let memorized = false;
+    // Provenance windows intersected across arguments. An argument with no
+    // window recorded (a pre-v0.13 state file, or a source whose sightings
+    // have aged out of the 32-observation window) contributes no evidence
+    // either way and is left out of the count.
+    let support = 0xffffffff;
+    let known = 0;
     for (let a = 0; a < n; a++) {
       const option = options[a]![idx[a]!]!;
       args[names[a]!] = option.value;
-      weight *= weights[a]![idx[a]!]!;
+      weight *= option.weight;
       if (option.memorized) memorized = true;
+      if (option.seen !== 0) {
+        support = (support & option.seen) >>> 0;
+        known++;
+      }
     }
-    return { args, weight, memorized };
+    // Two or more windows that never overlap is positive evidence that this
+    // pairing has never occurred; anything less is simply unknown, and
+    // unknown must not block a candidate.
+    return { args, weight, memorized, coherent: known < 2 || support !== 0 };
   };
 
   // Best-first over the lattice of per-argument choices. Every step
@@ -1364,9 +1459,9 @@ function materializeCombos(
   // heaviest frontier entry yields the combinations in exact weight order.
   const out: ArgCombo[] = [];
   const root = new Array<number>(n).fill(0);
-  const seen = new Set<string>([root.join(',')]);
+  const visited = new Set<string>([root.join(',')]);
   const frontier = [{ idx: root, c: combo(root) }];
-  while (out.length < limit && frontier.length > 0) {
+  for (let pops = 0; out.length < limit && frontier.length > 0 && pops < MAX_BEAM_POPS; pops++) {
     let best = 0;
     for (let i = 1; i < frontier.length; i++) {
       if (frontier[i]!.c.weight > frontier[best]!.c.weight) best = i;
@@ -1375,14 +1470,19 @@ function materializeCombos(
     // Weight 0 marks a substitution with no standing of its own, and nothing
     // behind it in the order can weigh more: stop rather than fill the batch.
     if (cur.c.weight <= 0) break;
-    out.push(cur.c);
+    // An incoherent combination is skipped but still EXPANDED: the coherent
+    // pairing of two co-varying arguments is only reachable through it. The
+    // all-best combination is never skipped — it is what this transition
+    // predicted before there was a beam at all, and dropping it would turn a
+    // ranking heuristic into a fail-closed gate.
+    if (out.length === 0 || cur.c.coherent) out.push(cur.c);
     for (let a = 0; a < n; a++) {
       if (cur.idx[a]! + 1 >= options[a]!.length) continue;
       const next = [...cur.idx];
       next[a]! += 1;
       const key = next.join(',');
-      if (seen.has(key)) continue;
-      seen.add(key);
+      if (visited.has(key)) continue;
+      visited.add(key);
       frontier.push({ idx: next, c: combo(next) });
     }
   }

@@ -752,6 +752,78 @@ describe('per-source scoring', () => {
     expect(preds[0]!.args).toEqual({ x: 'live' });
   });
 
+  it('falls back to a memorized literal only once that literal has recurred', () => {
+    // The paired halves of an invariant that MOVED. Before per-source scoring,
+    // "the derivation did not resolve" meant "predict nothing", full stop.
+    // Now a literal with independent standing can stand in — which is what
+    // makes an entity the user keeps returning to predictable — so the line
+    // sits between one sighting and two, and both sides are pinned here.
+    const learner = new TransitionLearner({ now });
+    const derive = (i: number): void =>
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', parsed: { rows: [{ id: `r${i}` }] } },
+        { tool: 'open', args: { id: `r${i}` } },
+      );
+    const memorize = (i: number): void =>
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', parsed: { rows: [{ id: `r${i}` }] } },
+        { tool: 'open', args: { id: 'STALE' } },
+      );
+    for (let i = 0; i < 6; i++) derive(i);
+
+    memorize(6);
+    // Seen once: a coincidence, not a hypothesis. The parsed path cannot
+    // resolve against an empty list, and nothing stands in for it.
+    expect(learner.predict(mkCall('srv', 'list', {}, { rows: [] }))).toEqual([]);
+
+    memorize(7);
+    // Seen twice, both times explained by nothing else: now it answers.
+    const preds = learner.predict(mkCall('srv', 'list', {}, { rows: [] }));
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ id: 'STALE' });
+    // Still nothing fabricated: the value was observed, twice, as this
+    // argument of this transition.
+  });
+
+  it('a state file with no scores goes quieter, not louder, after the upgrade', () => {
+    const learner = new TransitionLearner({ now });
+    learner.importState({
+      transitions: [
+        {
+          server: 's',
+          prevTool: 'a',
+          nextTool: 'b',
+          count: 5,
+          templates: [
+            {
+              name: 'x',
+              underivable: false,
+              derived: 5,
+              missed: 0,
+              sources: [
+                { kind: 'parsed', path: ['rows', '0', 'id'] },
+                { kind: 'const', repr: '"memo"' },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    // The derivation resolves: unchanged from before the upgrade.
+    expect(
+      learner.predict(mkCall('s', 'a', {}, { rows: [{ id: 'live' }] }))[0]!.args,
+    ).toEqual({ x: 'live' });
+    // It does not: the const behind it carries no imported evidence, so it may
+    // not stand in. The pre-scoring build answered "memo" here. Quieter is the
+    // right direction for a value whose standing is unknown, and one
+    // observation of real traffic is enough to score it.
+    expect(learner.predict(mkCall('s', 'a', {}, { rows: [] }))).toEqual([]);
+  });
+
   it('never spends a slot on a hypothesis that has only ever agreed with a better one', () => {
     const learner = new TransitionLearner({ now });
     // The const mined from the first sighting is right whenever the board is
@@ -785,6 +857,44 @@ describe('per-source scoring', () => {
     const preds = learner.predict(mkCall('srv', 'a'));
     expect(preds).toHaveLength(3);
     expect(preds.map((p) => p.tool)).toEqual(['b', 'c', 'b']);
+  });
+
+  it('does not fill the batch with argument combinations that never occurred', () => {
+    const learner = new TransitionLearner({ now });
+    // Two arguments that CO-VARY: row 0 is opened with token 0, row 1 with
+    // token 1, never a mix. Ranking each argument's alternatives on its own
+    // marginal evidence says all four pairings are plausible, and the two
+    // that never happened are the CHEAPEST substitutions -- so they take the
+    // batch and the one real alternative falls past the cap.
+    for (let i = 0; i < 12; i++) {
+      const row = i % 2;
+      const ids = [`a${i}`, `b${i}`];
+      const toks = [`s${i}`, `u${i}`];
+      observePair(
+        learner,
+        'srv',
+        {
+          tool: 'list',
+          parsed: { rows: ids.map((id) => ({ id })), toks: toks.map((v) => ({ v })) },
+        },
+        { tool: 'open', args: { id: ids[row]!, tok: toks[row]! } },
+      );
+    }
+
+    const preds = learner.predict(
+      mkCall(
+        'srv',
+        'list',
+        {},
+        { rows: [{ id: 'A' }, { id: 'B' }], toks: [{ v: 'S' }, { v: 'U' }] },
+      ),
+    );
+    // Only the two combinations the agent has actually made, and the real
+    // alternative is inside the cap instead of ranked fourth.
+    expect(preds.map((p) => p.args)).toEqual([
+      { id: 'A', tok: 'S' },
+      { id: 'B', tok: 'U' },
+    ]);
   });
 
   it('lets a source that is right now overtake one that was right last quarter', () => {
