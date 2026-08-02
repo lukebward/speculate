@@ -24,6 +24,8 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
     allow: over.allow ?? [],
     sniff: over.sniff ?? false,
     command: over.command ?? [],
+    url: over.url ?? null,
+    headers: over.headers ?? {},
   };
 }
 
@@ -40,6 +42,8 @@ describe('parseWrapArgs', () => {
       allow: ['a', 'b'],
       sniff: false,
       command: ['github-mcp-server', 'stdio'],
+      url: null,
+      headers: {},
     });
   });
 
@@ -161,5 +165,82 @@ describe('buildWrapConfig', () => {
   it('defaults to annotated mode end to end (parse → build)', () => {
     const { config } = buildWrapConfig(ok(parseWrapArgs(['--', 'srv'])));
     expect(config.mode).toBe('annotated');
+  });
+});
+
+// --- remote (http) wrapping ----------------------------------------------------
+
+describe('wrap --url', () => {
+  it('wraps a remote server with no command at all', () => {
+    const args = ok(parseWrapArgs(['--url', 'https://api.example.test/mcp/']));
+    expect(args.url).toBe('https://api.example.test/mcp/');
+    expect(args.command).toEqual([]);
+    const { config, stateKey } = buildWrapConfig(args);
+    expect(config.servers['upstream']!.url).toBe('https://api.example.test/mcp/');
+    expect(config.servers['upstream']!.command).toBeUndefined();
+    expect(stateKey).toContain('https://api.example.test/mcp/');
+  });
+
+  it('parses repeatable --header "K: V" and resolves ${VAR} from the environment', () => {
+    vi.stubEnv('SPECULATE_WRAP_TOKEN', 'tok_live_123');
+    const args = ok(
+      parseWrapArgs([
+        '--url',
+        'https://api.example.test/mcp/',
+        '--header',
+        'Authorization: Bearer ${SPECULATE_WRAP_TOKEN}',
+        '--header',
+        'X-Api-Version:2026-01-01',
+      ]),
+    );
+    expect(args.headers).toEqual({
+      Authorization: 'Bearer tok_live_123',
+      'X-Api-Version': '2026-01-01',
+    });
+    const { config } = buildWrapConfig(args);
+    expect(config.servers['upstream']!.headers).toEqual(args.headers);
+  });
+
+  it('fails loudly, naming the variable, when a header variable is unset', () => {
+    vi.stubEnv('SPECULATE_WRAP_MISSING', undefined);
+    const message = err(
+      parseWrapArgs([
+        '--url',
+        'https://api.example.test/mcp/',
+        '--header',
+        'Authorization: Bearer ${SPECULATE_WRAP_MISSING}',
+      ]),
+    );
+    expect(message).toMatch(/SPECULATE_WRAP_MISSING/);
+    expect(message).toMatch(/not set/);
+  });
+
+  it('rejects --header without --url (stdio credentials go in env)', () => {
+    expect(err(parseWrapArgs(['--header', 'Authorization: x', '--', 'srv']))).toMatch(/--url/);
+  });
+
+  it('rejects --url together with a wrapped command, and a bare --url with neither', () => {
+    expect(err(parseWrapArgs(['--url', 'https://a.test/mcp', '--', 'srv']))).toMatch(/--url/);
+    expect(err(parseWrapArgs([]))).toMatch(/--url/);
+  });
+
+  it('rejects a non-http --url and a malformed one', () => {
+    expect(err(parseWrapArgs(['--url', 'ftp://a.test/mcp']))).toMatch(/http/);
+    expect(err(parseWrapArgs(['--url', 'not a url']))).toMatch(/--url/);
+  });
+
+  it('rejects --sniff with --url (there is no command to degrade into a pipe)', () => {
+    expect(err(parseWrapArgs(['--url', 'https://a.test/mcp', '--sniff']))).toMatch(/--sniff/);
+  });
+
+  it('rejects a --header with no colon', () => {
+    expect(err(parseWrapArgs(['--url', 'https://a.test/mcp', '--header', 'Authorization']))).toMatch(
+      /--header/,
+    );
+  });
+
+  it('omits headers from the built config when none were given', () => {
+    const { config } = buildWrapConfig(ok(parseWrapArgs(['--url', 'https://a.test/mcp'])));
+    expect('headers' in config.servers['upstream']!).toBe(false);
   });
 });

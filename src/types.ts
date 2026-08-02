@@ -281,6 +281,17 @@ export interface ServerConfig {
   env?: Record<string, string>;
   /** streamable-HTTP upstream */
   url?: string;
+  /**
+   * Extra HTTP request headers for a `url` upstream: this is how an
+   * AUTHENTICATED remote MCP server is reached (`Authorization: Bearer …`).
+   * `${VAR}` placeholders in values are resolved from the environment by
+   * config.ts at load, so the token need not live in the config file.
+   *
+   * AFTER LOADING, THE VALUES HERE ARE SECRETS. Nothing may print one:
+   * diagnostics show header NAMES only (doctor.ts), and anything that
+   * echoes upstream error text runs it through Upstream#redact first.
+   */
+  headers?: Record<string, string>;
   /** Built-in profile name (e.g. 'github'). */
   profile?: string;
   /**

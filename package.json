@@ -8,6 +8,7 @@
     "test": "vitest run",
     "test:scenarios": "vitest run test/scenarios.test.ts",
     "bench": "tsx bench/bench.ts",
+    "bench:remote": "tsx bench/remote.ts",
     "eval": "tsx eval/eval.ts",
     "demo": "tsx demo/demo.ts",
     "mock-github": "tsx mock/mock-github.ts",

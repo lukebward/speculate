@@ -594,6 +594,48 @@ The argument survives for **openers**, where the evidence is missing rather than
 
 Unchanged on purpose: the safety policy, the budget, and the invalidation rules. And the sharpest staleness caveat in the design is untouched by any of this — mutations made outside the proxy (a teammate merges the PR, a file changes on disk) remain invisible to invalidation, bounded only by the TTL (§6.2, §11 risk 3). Measuring age does not narrow that window; it makes the width of it observable.
 
+### 13.20 v0.14: authenticated remote upstreams, and the first non-mock measurement (2026-08-02)
+
+§13.2 onward, every latency number in this document came from `mock/mock-github.ts` with an injected delay. That was a reasonable way to develop the mechanism and a poor way to know whether it works, and the gap had a specific cause: **Speculate could not connect to a single authenticated remote MCP server.** `upstream.ts` constructed `new StreamableHTTPClientTransport(new URL(url))` with no options and the config schema had no `headers` field, so the only upstreams reachable were local stdio servers and anonymous HTTP ones, precisely the population with the least latency to hide (§13.7 v0.11 rationale: value scales with upstream latency).
+
+**Config.** A `url` server takes `headers`, whose values may carry `${VAR}` placeholders resolved from the environment at load, so a bearer token never has to be written into a file that is commonly committed. Three decisions are load-bearing and all three are *loud*:
+
+- An **unset or empty** variable is a fatal config error naming the variable. The two lenient alternatives are both worse than a clear message here: substituting nothing puts `Authorization: Bearer ` on the wire, and leaving the text alone puts the literal `${GITHUB_TOKEN}` on the wire. Each produces a confusing 401 from the server instead of an actionable error, and the second one leaks the placeholder to a third party. An empty variable counts as unset because an empty credential is never what anybody meant.
+- **CR/LF in a resolved value is fatal.** Values come from the environment, so this is the header-injection boundary.
+- `headers` on a **stdio** server is a config error, alongside the existing `command` XOR `url` refinement. Stdio credentials go in `env`, and silently ignoring a misplaced key is how a user concludes their token is being sent when it is not.
+
+There is no escape syntax for a literal `${NAME}`, and `${VAR:-default}` is deliberately unmatched (it stays literal rather than resolving to something unintended).
+
+**Secrecy is the property this change lives or dies on**, because the failure is unrecoverable: a token in a log has to be rotated. The guard is layered rather than placed at each log site.
+
+- Nothing prints a value. `doctor` prints header **names**, which answers the only question a user has ("did my Authorization header get through?"), and marks them redacted. `speculate status`, the startup summary, and the §9 decision log never held server config to begin with.
+- `Upstream#redact` scrubs any configured header value out of text, and `connect`/`callTool` run every error they throw through it. The scrub sits at that boundary **on purpose**: upstream error text is arbitrary remote-influenced data that several modules write straight to stderr (proxy connect failures, `executor.ts` suppression reasons, the decision log), and covering the boundary once covers call sites added later for free. It mutates `message` in place rather than re-wrapping, so `instanceof` checks and message regexes downstream are unaffected. Values under 8 characters are skipped: redacting `2` would corrupt unrelated messages far more often than it would protect anything.
+- The test for this is not a mock. A loopback HTTP server records the request headers and echoes the `Authorization` header back in its 401 body; the suite asserts the header arrived *and* that the token appears in neither the thrown error nor `friendlySpawnError`.
+
+`speculate wrap --url <url> [--header "K: V"]` was unblocked by the same work and ships with it, sharing the config path's resolver so the two have one contract rather than two. `--sniff` is rejected with `--url` (sniffing degrades to piping the wrapped command's bytes, and there is no child to pipe to).
+
+**Measured, against GitHub's hosted MCP server** (`https://api.githubcopilot.com/mcp/`, 44 tools, 27 annotated `readOnlyHint: true`). `bench/remote.ts`, gated on `SPECULATE_E2E_LIVE=1` plus a credential, discovers the tool list rather than assuming names (this server exposes the consolidated `issue_read`/`pull_request_read`, not the classic `get_issue`, so `detectProfile` matches **nothing** and the run below is genuinely zero-config), refuses to call anything not affirmatively read-only, and alternates off/on sessions so a slow minute on the network hits both arms. Session: 8 read-only calls across 3 user turns (skim open issues, open the top two and read their comments, switch to PRs, read the changed files).
+
+Three independent invocations, `modelcontextprotocol/servers`, total tool wait per session:
+
+| run | off | speculating | | off | speculating | | off | speculating |
+|---|---|---|---|---|---|---|---|---|
+| 1 (cold) | 10.21 s | 3.71 s | | 4.01 s | 5.10 s | | 4.59 s | 4.11 s |
+| 2 | 3.90 s | 3.08 s | | 4.14 s | 3.62 s | | 4.71 s | 2.16 s |
+| 3 | 3.86 s | **0.57 s** | | 6.45 s | 0.54 s | | 5.65 s | 0.55 s |
+| 4 | | | | 4.46 s | 0.52 s | | 3.68 s | 0.54 s |
+| 5 | | | | | | | 4.32 s | 0.78 s |
+
+Warm sessions: **7 of 8 calls served from the buffer, 88% hit rate, 0 wasted speculative calls, ~0.55 s total tool wait against a ~4.3 s baseline (−85%)**. Per-call, a prefetched read returns in 1–3 ms against 320–780 ms live. The one call that is never prefetched is the **first** one of the session, which is correct: nothing has happened yet to predict from.
+
+**Three honest caveats, none of which the table above should be read without.**
+
+1. **Run 1 is a wash, and can be slower.** Across the three invocations the cold session went 3.71 s / 5.10 s / 4.11 s against baselines of 10.21 s / 4.01 s / 4.59 s: once clearly better, once 27% *worse*, once level. A cold learner has nothing armed, so speculation contributes upstream calls and no hits. This is the fail-closed design working (§5.3: an argument no source has produced is never fabricated), not a defect, but "Speculate makes your first session faster" is not a claim this data supports.
+2. **It takes two to three passes through the same workflow to arm.** `minObservations` is 2 and `MIN_TEMPLATE_EVIDENCE` is 4, so run 2 is partial (3.08 / 3.62 / 2.16 s) and run 3 is the first fully warm one. The benchmark shares one state file across a mode's runs precisely because that is what a real user experiences (persistence is on by default), and reporting only the cold number would understate the tool exactly as much as reporting only the warm one overstates it.
+3. **The baseline itself is noisy.** Off-mode totals ranged 3.68–10.21 s for an identical 8-call script; the 10.21 s outlier is the first run against a cold connection. The benchmark interleaves the arms and reports every run rather than a single pair for this reason. The measured per-call latency of this server, 320–780 ms, is also notably *worse* than the ~233 ms median that motivated the work, which strengthens the premise rather than weakening it.
+
+What this does **not** measure: a second concurrent user, a server with tighter rate limits than GitHub's, or a workflow that varies more between passes than this one does. And the §6.2 staleness caveat is if anything sharper against a live SaaS backend than against a mock: a teammate commenting on the issue between the prefetch and the read is invisible to invalidation, bounded only by the TTL.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.

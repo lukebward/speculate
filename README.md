@@ -58,6 +58,19 @@ No install and no Claude Code required: prefix the server command already in you
 }
 ```
 
+Remote (hosted) MCP servers are where the latency actually is, and they need credentials:
+
+```jsonc
+"github": {
+  "command": "npx",
+  "args": ["-y", "speculate-mcp", "wrap",
+           "--url", "https://api.githubcopilot.com/mcp/",
+           "--header", "Authorization: Bearer ${GITHUB_TOKEN}"]
+}
+```
+
+`${VAR}` in a header value is resolved from the environment when Speculate starts, so the token stays out of the file. An unset variable is a startup error naming the variable, never a literal `${GITHUB_TOKEN}` sent upstream. The same `headers` block works in a config file. Header **values are never logged**; `doctor` shows names only.
+
 The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate, time saved, and `ageAtHit`, how stale the served prefetches were. `speculate stats` reports durable cumulative usage.
 
 ## Safety
@@ -79,8 +92,11 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 ```bash
 npm install     # builds dist/ via the prepare hook
 npm test        # unit and end-to-end suite
-npm run bench   # speculation off vs on
+npm run bench   # speculation off vs on, bundled mock upstream
 npm run eval    # offline prediction recall, headline and floor
+
+# against a REAL hosted MCP server (opt-in, needs a credential, read-only calls only)
+SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
 npm run demo    # the README demo, against the bundled mock
 ```
 
