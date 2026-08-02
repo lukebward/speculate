@@ -331,7 +331,7 @@ describe('const templates and poisoning', () => {
     expect(learner.predict(mkCall('srv', 'c'))).toEqual([]);
   });
 
-  it('an arg name appearing only on a later instance poisons the transition', () => {
+  it('an arg name appearing only on a later instance goes quiet while the evidence is thin', () => {
     const learner = new TransitionLearner({ now });
     observePair(learner, 'srv', { tool: 'a' }, { tool: 'b', args: { x: 1 } });
     observePair(
@@ -340,10 +340,13 @@ describe('const templates and poisoning', () => {
       { tool: 'a' },
       { tool: 'b', args: { x: 1, y: 2 } },
     );
+    // Two observations is not a verdict on `y`, so the learner says nothing —
+    // temporarily. See the arg-set-instability cases below for what it does
+    // once there is enough evidence to have an opinion.
     expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
   });
 
-  it('a previously seen arg going missing poisons the transition', () => {
+  it('a previously seen arg going missing goes quiet while the evidence is thin', () => {
     const learner = new TransitionLearner({ now });
     observePair(
       learner,
@@ -353,6 +356,94 @@ describe('const templates and poisoning', () => {
     );
     observePair(learner, 'srv', { tool: 'a' }, { tool: 'b', args: { x: 1 } });
     expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
+  });
+});
+
+// --- arg-set instability, once there is evidence ------------------------------
+
+/**
+ * An argument the follow-up call only SOMETIMES carries. Absence is counted
+ * as a miss like any other, so the same rate gate decides it — and the
+ * learner has no way to say "sometimes": past the gate it emits the argument
+ * on every prediction, below it emits nothing at all.
+ */
+describe('an optional argument', () => {
+  /** Observes a→b `presence.length` times, with `opt` only where marked. */
+  function observeOptional(learner: TransitionLearner, presence: boolean[]): void {
+    for (const withOpt of presence) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'a' },
+        { tool: 'b', args: withOpt ? { q: 'Q', opt: 'E' } : { q: 'Q' } },
+      );
+    }
+  }
+
+  it('present in 6 of 10 calls is emitted on EVERY prediction', () => {
+    const learner = new TransitionLearner({ now });
+    observeOptional(
+      learner,
+      [true, true, false, true, false, true, false, true, false, true],
+    );
+    const preds = learner.predict(mkCall('srv', 'a'));
+    expect(preds).toHaveLength(1);
+    // A 40% miss rate is under MAX_TEMPLATE_MISS_RATE, so `opt` is emitted
+    // even for the 40% of calls that omit it: those predictions simply miss.
+    expect(preds[0]!.args).toEqual({ q: 'Q', opt: 'E' });
+  });
+
+  it('present in 3 of 12 calls silences the whole transition', () => {
+    const learner = new TransitionLearner({ now });
+    observeOptional(learner, [
+      true, false, false, false,
+      true, false, false, false,
+      true, false, false, false,
+    ]);
+    // A 75% miss rate reaches the gate, and one underivable argument still
+    // drops the prediction whole — `q` is derivable and goes down with it.
+    expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
+  });
+});
+
+describe('MAX_TEMPLATE_MISS_RATE', () => {
+  // The constant that decides how wrong a derivation may keep being before
+  // the learner stops using it. Both halves observe the same shape ten times
+  // and differ only in the rate, so this test owns the threshold outright.
+  const derivable = (learner: TransitionLearner, id: number): void =>
+    observePair(
+      learner,
+      'srv',
+      { tool: 'list', parsed: { items: [{ id }] } },
+      { tool: 'get', args: { id } },
+    );
+  /** Same shape, but the opened id appears nowhere in the trigger call. */
+  const unexplained = (learner: TransitionLearner, id: number): void =>
+    observePair(
+      learner,
+      'srv',
+      { tool: 'list', parsed: { items: [{ id }] } },
+      { tool: 'get', args: { id: -id } },
+    );
+  const trigger = mkCall('srv', 'list', {}, { items: [{ id: 42 }] });
+
+  it('keeps a derivation that misses half the time', () => {
+    const learner = new TransitionLearner({ now });
+    for (let i = 1; i <= 5; i++) {
+      derivable(learner, i);
+      unexplained(learner, 100 + i);
+    }
+    const preds = learner.predict(trigger); // derived 5, missed 5
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ id: 42 });
+  });
+
+  it('drops a derivation that misses four times in five', () => {
+    const learner = new TransitionLearner({ now });
+    derivable(learner, 1);
+    derivable(learner, 2);
+    for (let i = 1; i <= 8; i++) unexplained(learner, 100 + i);
+    expect(learner.predict(trigger)).toEqual([]); // derived 2, missed 8
   });
 });
 

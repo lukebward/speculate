@@ -8,10 +8,12 @@
  * any MCP server with zero configuration; cold-start is simply "no
  * predictions yet".
  *
- * Fail-closed by construction: an argument whose provenance can't be
- * derived consistently poisons its transition, and predict() never emits
- * partially materialized args. Neither observe() nor predict() ever
- * throws — weird result shapes degrade to fewer/no candidates.
+ * Fail-closed by construction: an argument no source has ever produced is
+ * never fabricated, an argument whose derivation keeps being wrong is
+ * gated off by the evidence (see isUnderivable), one such argument drops
+ * its whole transition, and predict() never emits partially materialized
+ * args. Neither observe() nor predict() ever throws — weird result shapes
+ * degrade to fewer/no candidates.
  *
  * Dependency-free besides types.js/keys.js. No metrics, no logging.
  */
@@ -65,10 +67,16 @@ const MAX_SOURCES_PER_ARG = 12;
  */
 const MIN_TEMPLATE_EVIDENCE = 4;
 /**
- * Miss rate at or above which a template is treated as underivable. The
- * reciprocal is the worst waste-per-hit a surviving template can impose
- * (0.75 ⇒ at most three wasted predictions per hit), so this is the knob
- * that trades recall on moving values against wasted prefetches.
+ * Miss rate at or above which a template is treated as underivable — the knob
+ * that trades recall on moving values against wasted prefetches. A surviving
+ * template at miss rate m costs m/(1-m) wasted predictions per hit, so 0.75
+ * admits derivations that are wrong three times for every time they are
+ * right. Note that this is a LIFETIME average: `derived`/`missed` do not
+ * decay (unlike the transition scores this file ranks by), so a derivation
+ * that used to work has to accumulate misses in proportion to its whole
+ * history before the gate closes. In production the §5.6 feedback loop is
+ * the faster backstop — it suppresses a learner ruleId that keeps missing
+ * after a handful of speculations, without waiting on the lifetime rate.
  */
 const MAX_TEMPLATE_MISS_RATE = 0.75;
 /** Session-opener tracking (§13.15): per-server cap and sanity bounds. */
@@ -788,6 +796,12 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
     if (derived === undefined && missed === undefined && tpl.underivable) {
       // Pre-v0.13 file: the sticky boolean is all the evidence there is, and
       // it never travelled with usable sources. Keep it fail-closed.
+      // Both counters must be absent to read a file as pre-v0.13, so a
+      // hand-written hybrid (`underivable: true` with a `derived` but no
+      // `missed`) would load as derivable-with-no-misses. No build writes
+      // that — this one always writes both — and it can only produce a
+      // prediction from sources the same file supplied, so it is left as a
+      // documented quirk rather than a third code path.
       templates.set(tpl.name, { sources: [], derived: 0, missed: 1 });
       continue;
     }

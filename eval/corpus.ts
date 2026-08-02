@@ -385,8 +385,9 @@ const multiArg: Archetype = {
           });
           break;
         default: {
-          // A fresh query: derivable from nothing, and it poisons the
-          // doc_read → space_search transition. That is the honest outcome.
+          // A fresh query: derivable from nothing, so the doc_read →
+          // space_search transition never gets a derivation to gate on and
+          // scores 0.000. That is the honest outcome.
           const next = phrase(rng);
           const more = Array.from({ length: 5 }, (_unused, i) => ({
             docId: doc(),
