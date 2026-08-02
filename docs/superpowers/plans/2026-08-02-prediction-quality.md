@@ -152,6 +152,19 @@ it('still refuses to guess an argument it has never derived', () => {
 - [ ] **Step 5: Run `npm run eval`**, record the delta. Expect the largest single jump in this plan; if overall recall@3 does not move well above 0.44, stop and report rather than proceeding.
 - [ ] **Step 6: Commit** `fix: one underivable value no longer disables a transition forever`.
 
+### Task 2c: Widen the learnable index window (PREREQUISITE, promoted from Task 4)
+
+**Files:**
+- Modify: `src/learner.ts`
+- Test: `test/learner.test.ts`
+
+- [ ] **Step 1: Write a failing test** asserting a transition whose follow-up consistently uses index 5 of the previous result becomes predictable. Today `pushArrayPaths` caps at `Math.min(arr.length, 3)`, so it cannot be.
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3: Implement.** Replace the literal `3` with `MAX_ARRAY_INDEX_PATHS` (default 8). Task 3 per-source scoring will prune losers once it lands; until then rely on MAX_PARSED_PATHS and the existing source cap. Note `MAX_PARSED_PATHS = 256` still bounds total enumeration. Confirm in the report that enumeration cost did not blow up (assert the path count stays bounded for a large array).
+- [ ] **Step 4:** Focused tests pass, full suite green.
+- [ ] **Step 5: Run `npm run eval`**, record the delta.
+- [ ] **Step 6: Commit** `feat: learn follow-up positions past the third entry`.
+
 ### Task 3: Per-source scoring and multi-candidate emission
 
 This is the task that lifts recall@K above recall@1. Expect the largest delta here after Task 2b.
@@ -203,19 +216,6 @@ it('keeps loading sources with no score field', () => { /* back-compat */ });
 - [ ] **Step 5: Run `npm run eval`**, record the delta. Recall@3 on `list-detail-varied` should rise materially; if it does not, stop and report rather than proceeding.
 - [ ] **Step 6: Commit** `feat: learn which argument source is right, and offer several`.
 
-### Task 4: Widen the learnable index window
-
-**Files:**
-- Modify: `src/learner.ts`
-- Test: `test/learner.test.ts`
-
-- [ ] **Step 1: Write a failing test** asserting a transition whose follow-up consistently uses index 5 of the previous result becomes predictable. Today `pushArrayPaths` caps at `Math.min(arr.length, 3)`, so it cannot be.
-- [ ] **Step 2:** Run → FAIL.
-- [ ] **Step 3: Implement.** Replace the literal `3` with `MAX_ARRAY_INDEX_PATHS` (default 8). Safe only because Task 3's per-source scoring prunes losers; `MAX_PARSED_PATHS = 256` still bounds total enumeration. Confirm in the report that enumeration cost did not blow up (assert the path count stays bounded for a large array).
-- [ ] **Step 4:** Focused tests pass, full suite green.
-- [ ] **Step 5: Run `npm run eval`**, record the delta.
-- [ ] **Step 6: Commit** `feat: learn follow-up positions past the third entry`.
-
 ### Task 5: Entity frecency for return visits
 
 **Files:**
@@ -223,7 +223,7 @@ it('keeps loading sources with no score field', () => { /* back-compat */ });
 - Test: `test/learner.test.ts`
 
 **Interfaces:**
-- Produces: `entities: Map<string, {score, lastUpdated}>` keyed `${server} ${tool} ${argsRepr}`, serialized as an optional `entities?: []` on `SerializedLearner`.
+- Produces: `entities: Map<string, {score, lastUpdated}>` keyed `${server}${tool}${argsRepr}`, serialized as an optional `entities?: []` on `SerializedLearner`.
 
 - [ ] **Step 1: Write failing tests.**
 
