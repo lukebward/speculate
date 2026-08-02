@@ -251,6 +251,22 @@ describe('Metrics — age at hit', () => {
     expect(age.count).toBe(1);
     expect(age.maxMs).toBe(7_000);
   });
+
+  it('keeps count and the TTL quarters describing the SAME population', () => {
+    // The invariant that makes every share below `count` readable: a hit
+    // missing either half of the measurement is admitted to neither, so
+    // `lastTtlQuarter` is never a share of a different denominator.
+    const half = { type: 'hit', server: 'gh', tool: 't', ageMs: 5_000 } as DecisionEvent;
+    const age = recorded([
+      hit(1_000, 0.03),
+      half, // an age with no fraction: half a measurement, so not a sample
+      { ...half, ageMs: undefined, ttlFraction: 0.9 } as DecisionEvent,
+      hit(29_000, 0.97),
+    ]).statsSnapshot().ageAtHit;
+    expect(age.count).toBe(2);
+    expect(age.ttlQuarters.reduce((a, b) => a + b, 0)).toBe(age.count);
+    expect(age.lastTtlQuarter).toBe(0.5);
+  });
 });
 
 describe('Metrics — wastePerHit', () => {

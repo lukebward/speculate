@@ -81,7 +81,6 @@ export class Metrics {
   private ageCount = 0;
   private ageMaxMs = 0;
   private readonly ttlQuarters: [number, number, number, number] = [0, 0, 0, 0];
-  private ttlSamples = 0;
 
   private readonly perServer = new Map<string, PerServerCounters>();
   private readonly perRule = new Map<string, PerRuleCounters>();
@@ -297,18 +296,22 @@ export class Metrics {
    * comforting lie this metric exists to prevent.
    */
   private recordAge(event: DecisionEvent): void {
-    const ageMs = event.ageMs;
+    // INVARIANT: count === sum(ttlQuarters). The two numbers describe the
+    // same sample from two angles, so they are admitted together or not at
+    // all — the cache produces both in one branch, and letting a half-formed
+    // event into one and not the other would make `lastTtlQuarter` a share of
+    // a different population than `count`, which is unreadable without
+    // saying so. Pinned by test.
+    const { ageMs, ttlFraction } = event;
     if (typeof ageMs !== 'number' || !Number.isFinite(ageMs) || ageMs < 0) return;
+    if (typeof ttlFraction !== 'number' || !Number.isFinite(ttlFraction)) return;
+
     const bin = Math.min(AGE_BINS, Math.floor(ageMs / AGE_BIN_MS));
     this.ageBins[bin]!++;
     this.ageCount++;
     if (ageMs > this.ageMaxMs) this.ageMaxMs = ageMs;
-
-    const fraction = event.ttlFraction;
-    if (typeof fraction !== 'number' || !Number.isFinite(fraction)) return;
-    const quarter = Math.min(3, Math.max(0, Math.floor(fraction * 4)));
+    const quarter = Math.min(3, Math.max(0, Math.floor(ttlFraction * 4)));
     this.ttlQuarters[quarter]!++;
-    this.ttlSamples++;
   }
 
   private ageAtHit(): AgeAtHitReport {
@@ -327,7 +330,7 @@ export class Metrics {
       p50Ms: this.agePercentile(0.5),
       p95Ms: this.agePercentile(0.95),
       maxMs: this.ageCount === 0 ? null : this.ageMaxMs,
-      lastTtlQuarter: this.ttlSamples === 0 ? null : this.ttlQuarters[3] / this.ttlSamples,
+      lastTtlQuarter: this.ageCount === 0 ? null : this.ttlQuarters[3] / this.ageCount,
       buckets,
       ttlQuarters: [...this.ttlQuarters],
     };

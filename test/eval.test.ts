@@ -368,6 +368,40 @@ describe('age at consumption', () => {
     expect(otherTtl.floor.hitsAt3).toBe(withSim.floor.hitsAt3);
   });
 
+  it('prices the standing-bet TTL multiplier across inter-call spacing', () => {
+    // THE test that decides the shipped default, and the coverage an earlier
+    // version of this work claimed could not exist. Sweep the gap between an
+    // agent's calls; at each one compare the identity against a halved TTL
+    // for standing bets. The multiplier is free only while the gap stays
+    // under half the TTL, and past that it destroys the class outright —
+    // against a benefit the mean-lead column says is zero at every spacing.
+    const sweep = [1_500, 10_000, 16_000, 20_000].map((callSpacingMs) => {
+      const identity = runEvalDetailed(DEFAULT_SEEDS, { callSpacingMs, standingTtlFactor: 1 });
+      const halved = runEvalDetailed(DEFAULT_SEEDS, { callSpacingMs, standingTtlFactor: 0.5 });
+      return { callSpacingMs, identity, halved };
+    });
+
+    for (const { callSpacingMs, identity, halved } of sweep) {
+      // Below half the TTL the entry outlives the gap either way.
+      if (callSpacingMs * 2 < identity.ttlMs) {
+        expect(halved.age.all.hits, `${callSpacingMs} ms: free`).toBe(identity.age.all.hits);
+        expect(halved.age.standing.hits).toBe(identity.age.standing.hits);
+      } else {
+        // Past it, every standing bet expires before the call that wanted it.
+        expect(halved.age.standing.hits, `${callSpacingMs} ms: class gone`).toBe(0);
+        expect(halved.age.all.hits, `${callSpacingMs} ms: hits lost`).toBeLessThan(
+          identity.age.all.hits,
+        );
+      }
+      // And it never buys freshness: the class is claimed by the very next
+      // call at every spacing, so there is no age for a shorter TTL to save.
+      expect(toAgeReport(identity.age.standing).meanLead).toBe(1);
+    }
+
+    // The class has to stay populated or the sweep proves nothing.
+    expect(sweep[0]!.identity.age.standing.hits).toBeGreaterThan(0);
+  });
+
   it('honours single use: one prediction is consumed at most once', () => {
     const run = runEvalDetailed(DEFAULT_SEEDS);
     // Every hit removes an entry, so hits can never exceed what was issued.

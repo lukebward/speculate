@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { SpeculationExecutor } from '../src/executor.js';
-import { SpeculationCache } from '../src/cache.js';
+import { LONG_HORIZON_TTL_FACTOR, SpeculationCache } from '../src/cache.js';
 import { canonicalKey } from '../src/keys.js';
 import { SafetyPolicy } from '../src/policy.js';
 import { BudgetManager } from '../src/budget.js';
@@ -136,27 +136,32 @@ describe('long-horizon TTL', () => {
     return alive;
   }
 
-  it('halves the TTL of a standing bet, and leaves a next-call prediction alone', async () => {
-    // Same server, same tool, same resolved TTL: only the horizon differs.
+  it('ships as the identity: no class gets a shortened TTL by default', async () => {
+    // The default is 1 on evidence, not by omission (see cache.ts): the eval
+    // measures standing bets consumed at a lead of exactly 1.000 calls, so
+    // shortening them buys no measured freshness while measurably costing
+    // hits once an agent's inter-call gap passes half the TTL.
+    expect(LONG_HORIZON_TTL_FACTOR).toBe(1);
     expect(await lifetime('next')).toBe(30_000);
-    expect(await lifetime('standing')).toBe(15_000);
-  });
-
-  it('treats an unclassified prediction as next-call, not as a standing bet', async () => {
-    // Hand-written profile rules emit no horizon at all; shortening their TTL
-    // silently would be a freshness change nobody asked for.
+    expect(await lifetime('standing')).toBe(30_000);
     expect(await lifetime(undefined)).toBe(30_000);
   });
 
-  it('lets an operator turn the shortening off', async () => {
-    const off = { speculation: { longHorizonTtlFactor: 1 } };
-    expect(await lifetime('standing', off)).toBe(30_000);
+  it('shortens a standing bet only when an operator opts in', async () => {
+    const on = { speculation: { longHorizonTtlFactor: 0.5 } };
+    expect(await lifetime('standing', on)).toBe(15_000);
+    // A next-call prediction is untouched by the knob: it is a horizon
+    // policy, not a server-wide TTL cut.
+    expect(await lifetime('next', on)).toBe(30_000);
+    // Hand-written profile rules emit no horizon at all, so they keep the
+    // full TTL even with the knob on.
+    expect(await lifetime(undefined, on)).toBe(30_000);
   });
 
   it('applies the factor to the resolved TTL, whatever resolved it', async () => {
     // The operator per-tool TTL wins the resolution (§6.2); the multiplier
     // then applies to THAT, not to the profile default it beat.
-    const cfg = { speculation: { ttlMsByTool: { a: 10_000 } } };
+    const cfg = { speculation: { ttlMsByTool: { a: 10_000 }, longHorizonTtlFactor: 0.5 } };
     expect(await lifetime('next', cfg)).toBe(10_000);
     expect(await lifetime('standing', cfg)).toBe(5_000);
   });
@@ -164,7 +169,7 @@ describe('long-horizon TTL', () => {
   it('never turns a live TTL into a dead one', async () => {
     // Rounding a tiny TTL down to 0 would make the entry dead on arrival and
     // silently convert every standing bet into pure waste.
-    const cfg = { speculation: { ttlMsByTool: { a: 1 } } };
+    const cfg = { speculation: { ttlMsByTool: { a: 1 }, longHorizonTtlFactor: 0.01 } };
     expect(await lifetime('standing', cfg)).toBeGreaterThan(0);
   });
 

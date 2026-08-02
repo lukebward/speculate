@@ -231,10 +231,9 @@ describe('prediction horizon', () => {
     expect(preds[0]!.horizon).toBe('next');
   });
 
-  it('marks a prediction carrying a memorized literal as a standing bet', () => {
-    // The value is not in the trigger at all — the learner is betting the
-    // agent will ask for it at some point, which is a longer-horizon claim
-    // than "this is the next call" and so gets a shortened TTL (§6.2).
+  it('marks a prediction that reads NOTHING off the trigger as a standing bet', () => {
+    // No argument is in the trigger at all — the learner is betting the agent
+    // will ask for this at some point, not that the trigger implies it.
     const learner = new TransitionLearner({ now });
     for (const q of ['foo', 'bar']) {
       observePair(
@@ -250,39 +249,38 @@ describe('prediction horizon', () => {
     expect(preds[0]!.horizon).toBe('standing');
   });
 
-  it('marks a transition-derived and a memorized prediction for the SAME tool differently', () => {
-    // Both predict `get`, from the same trigger, in the same batch: the
-    // classification has to be per-argument-source, not per tool or per rule.
+  it('a constant beside a derived argument is still a next-call prediction', () => {
+    // THE regression this pins. Horizon is about whether the TARGET was
+    // derived from the trigger, not whether every argument was. Classifying
+    // on "any argument is memorized" caught the modal real prediction —
+    // profiles are full of constant per_page / state / format arguments —
+    // and would have shortened the TTL of nearly every prediction there is.
     const learner = new TransitionLearner({ now });
-    const seen = (id: number, memo: string): void =>
+    const seen = (id: number): void =>
       observePair(
         learner,
         'srv',
         { tool: 'list', parsed: { items: [{ id }] } },
-        { tool: 'get', args: { id, tag: memo } },
+        { tool: 'get', args: { id, per_page: 100 } },
       );
-    seen(1, 'pinned');
-    seen(2, 'pinned');
+    seen(1);
+    seen(2);
 
     const preds = learner.predict(mkCall('srv', 'list', {}, { items: [{ id: 3 }] }));
     expect(preds).toHaveLength(1);
-    // `id` came from the trigger's parsed result, `tag` from memory — one
-    // memorized argument is enough to make the whole call a standing bet.
-    expect(preds[0]!.args).toEqual({ id: 3, tag: 'pinned' });
-    expect(preds[0]!.horizon).toBe('standing');
+    expect(preds[0]!.args).toEqual({ id: 3, per_page: 100 });
+    expect(preds[0]!.horizon).toBe('next');
+  });
 
-    const derived = new TransitionLearner({ now });
-    for (const id of [1, 2]) {
-      observePair(
-        derived,
-        'srv',
-        { tool: 'list', parsed: { items: [{ id }] } },
-        { tool: 'get', args: { id } },
-      );
-    }
-    const clean = derived.predict(mkCall('srv', 'list', {}, { items: [{ id: 3 }] }));
-    expect(clean[0]!.tool).toBe('get');
-    expect(clean[0]!.horizon).toBe('next');
+  it('treats a zero-argument prediction as next-call, not as a standing bet', () => {
+    // There is nothing to derive, so "no argument came from the trigger" is
+    // vacuously true; the transition that fired it IS the derivation.
+    const learner = new TransitionLearner({ now });
+    observePair(learner, 'srv', { tool: 'a' }, { tool: 'b' });
+    observePair(learner, 'srv', { tool: 'a' }, { tool: 'b' });
+    const preds = learner.predict(mkCall('srv', 'a'));
+    expect(preds[0]!.args).toEqual({});
+    expect(preds[0]!.horizon).toBe('next');
   });
 
   it('calls a session opener a standing bet — it has no trigger at all', () => {

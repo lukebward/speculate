@@ -1379,10 +1379,17 @@ interface ArgCombo {
   /** Product of the per-argument normalized scores; the best combo is 1. */
   weight: number;
   /**
-   * At least one argument is a remembered literal, so this call is a standing
-   * bet rather than a derivation from the trigger (§6.2 freshness). One
-   * memorized argument is enough: the CALL is only as derived as its least
-   * derived part.
+   * NOTHING in this call was read off the trigger — every argument is a
+   * remembered literal — so the only thing tying it to now is the transition
+   * itself (§6.2 freshness).
+   *
+   * The test is `every`, not `some`, and the difference is the whole point.
+   * Horizon is about whether the TARGET was derived from the trigger, not
+   * whether every argument was: `get_issue {repo, number: <from the trigger's
+   * result>, per_page: 100}` is a next-call prediction that happens to carry
+   * a constant, and real profiles are full of constant `per_page` /
+   * `state: 'open'` / `format` arguments. `some` classified the modal
+   * next-call prediction as a standing bet.
    */
   memorized: boolean;
   /** False only when two of the chosen values have never been right together. */
@@ -1431,7 +1438,8 @@ function materializeCombos(
   const combo = (idx: number[]): ArgCombo => {
     const args: Record<string, unknown> = {};
     let weight = 1;
-    let memorized = false;
+    /** Arguments read off the trigger. One is enough to make this next-call. */
+    let derived = 0;
     // Provenance windows intersected across arguments. An argument with no
     // window recorded (a pre-v0.13 state file, or a source whose sightings
     // have aged out of the 32-observation window) contributes no evidence
@@ -1442,7 +1450,7 @@ function materializeCombos(
       const option = options[a]![idx[a]!]!;
       args[names[a]!] = option.value;
       weight *= option.weight;
-      if (option.memorized) memorized = true;
+      if (!option.memorized) derived++;
       if (option.seen !== 0) {
         support = (support & option.seen) >>> 0;
         known++;
@@ -1451,7 +1459,14 @@ function materializeCombos(
     // Two or more windows that never overlap is positive evidence that this
     // pairing has never occurred; anything less is simply unknown, and
     // unknown must not block a candidate.
-    return { args, weight, memorized, coherent: known < 2 || support !== 0 };
+    // A zero-argument call is next-call: there is nothing to derive, and the
+    // transition that triggered it is the derivation.
+    return {
+      args,
+      weight,
+      memorized: n > 0 && derived === 0,
+      coherent: known < 2 || support !== 0,
+    };
   };
 
   // Best-first over the lattice of per-argument choices. Every step

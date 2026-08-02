@@ -22,13 +22,26 @@ export const DEFAULT_TTL_MS = 30_000;
 
 /**
  * TTL multiplier for long-horizon predictions (`Prediction.horizon ===
- * 'standing'`). Those bet that the agent will ask for something at SOME
- * point rather than next, so they sit in the buffer longest and are the
- * likeliest to be served near the TTL edge — the guesses whose staleness
- * risk is worst-evidenced expire soonest. Operator-overridable per server
- * via `speculation.longHorizonTtlFactor`.
+ * 'standing'`) — those that read nothing off the call that just happened.
+ *
+ * **The default is the identity, and that is a measured decision, not an
+ * omission.** The premise of shortening it is that a standing bet waits
+ * longer in the buffer than a derived one and so is served closer to expiry.
+ * The eval measures the opposite: standing predictions are consumed at a
+ * lead of exactly 1.000 calls in every archetype that has any — the same
+ * instant as derived ones — so a fraction buys no measured freshness. It
+ * does cost: swept over inter-call spacing, a factor of 0.5 is free up to
+ * 10 s and then destroys the entire class (at 16 s spacing, 1265 hits → 1150;
+ * every standing hit becomes a miss). Unmeasured benefit against measured
+ * loss is not a trade worth a default.
+ *
+ * The lever stays because the argument for it is sound where the evidence is
+ * missing rather than contrary — §13.15 session openers, which the corpus
+ * cannot see. Operators set it per server via
+ * `speculation.longHorizonTtlFactor`; §13.19 records which counters have to
+ * move first (`expired`, and `perRule['opener:*'].wasted`).
  */
-export const LONG_HORIZON_TTL_FACTOR = 0.5;
+export const LONG_HORIZON_TTL_FACTOR = 1;
 
 /**
  * Terminal entry outcomes, reported to the metrics layer so waste is

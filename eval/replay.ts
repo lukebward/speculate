@@ -45,7 +45,7 @@ import { DEFAULT_TTL_MS, LONG_HORIZON_TTL_FACTOR } from '../src/cache.js';
 import { canonicalKey } from '../src/keys.js';
 import { TransitionLearner } from '../src/learner.js';
 import type { TransitionLearnerOptions } from '../src/learner.js';
-import type { ObservedCall } from '../src/types.js';
+import type { ObservedCall, Prediction } from '../src/types.js';
 import { ARCHETYPES, ARCHETYPE_TIMING, FLOOR_ARCHETYPES, warmupFor } from './corpus.js';
 import type { Archetype, EvalSession } from './corpus.js';
 
@@ -76,7 +76,7 @@ export const CALL_SPACING_MS = 1_500;
  * speculative call issued at T is therefore READY at T + this, which is the
  * instant its TTL starts counting from (src/cache.ts settles the same way).
  */
-const CALL_LATENCY_MS = 40;
+export const CALL_LATENCY_MS = 40;
 /**
  * Spacing between sessions. Larger than the learner's default maxGapMs
  * (120 s), so a session boundary breaks the transition chain exactly as an
@@ -183,8 +183,19 @@ export interface EvalRun {
   overall: ReplayTotals;
   /** Age at consumption, pooled over every archetype (§6.2 freshness). */
   age: AgeBreakdown;
+  /**
+   * The floor archetypes' ages alone. Kept separate for the same reason the
+   * recall floor is: the floor is the only part of the corpus where anything
+   * is consumed later than the very next call (lead 1.276 vs 1.000), and
+   * pooling it into a population 40x its size hides that entirely.
+   */
+  floorAge: AgeBreakdown;
   /** The TTL the buffer simulation ran with, so the ages are interpretable. */
   ttlMs: number;
+  /** The standing-bet TTL multiplier it ran with (§6.2). */
+  standingTtlFactor: number;
+  /** Spacing between calls, which on this corpus sets the ages outright. */
+  callSpacingMs: number;
 }
 
 export interface ReplayOptions {
@@ -246,22 +257,18 @@ class SimBuffer {
     private readonly age: AgeBreakdown,
   ) {}
 
-  /** Admit the batch a completed call triggered, at the shipped cap. */
-  issue(
-    predictions: readonly { server: string; tool: string; args: Record<string, unknown>; horizon?: string }[],
-    callIndex: number,
-    completedAt: number,
-  ): void {
+  /**
+   * Admit the batch a completed call triggered, at the shipped cap. Takes
+   * real `Prediction`s rather than a structural shape so a mistyped horizon
+   * is a compile error here, not a silently misclassified entry.
+   */
+  issue(predictions: readonly Prediction[], callIndex: number, completedAt: number): void {
     for (const p of predictions.slice(0, PRODUCTION_K)) {
       const standing = p.horizon === 'standing';
       const ttl = standing ? Math.max(1, Math.round(this.ttlMs * this.standingFactor)) : this.ttlMs;
       const readyAt = completedAt + CALL_LATENCY_MS;
-      let key: string;
-      try {
-        key = canonicalKey(p.server, p.tool, p.args);
-      } catch {
-        continue; // unkeyable args never reach the cache in production either
-      }
+      const key = safeKey(p.server, p.tool, p.args);
+      if (key === null) continue; // unkeyable args never reach the cache either
       const existing = this.entries.get(key);
       // First put wins while the incumbent is alive — and the incumbent is
       // the OLDER entry, so dedupe is itself one of the mechanisms that
@@ -278,7 +285,8 @@ class SimBuffer {
   }
 
   /** A real call: consume a live entry for its key, if there is one. */
-  consume(key: string, callIndex: number, at: number): void {
+  consume(key: string | null, callIndex: number, at: number): void {
+    if (key === null) return;
     const entry = this.entries.get(key);
     if (entry === undefined) return;
     this.entries.delete(key);
@@ -309,6 +317,19 @@ class SimBuffer {
   private drop(entry: SimEntry): void {
     this.age.all.unconsumed++;
     (entry.standing ? this.age.standing : this.age.next).unconsumed++;
+  }
+}
+
+/**
+ * Canonical key, or null when the args cannot be keyed. Issue and consume
+ * must degrade the SAME way: a key one side can compute and the other cannot
+ * would make an entry unreachable and quietly deflate the hit counts.
+ */
+function safeKey(server: string, tool: string, args: Record<string, unknown>): string | null {
+  try {
+    return canonicalKey(server, tool, args);
+  } catch {
+    return null;
   }
 }
 
@@ -374,7 +395,7 @@ export function replayArchetype(
         }
       }
       if (scored) {
-        buffer.consume(canonicalKey(call.server, call.tool, call.args), i, call.timestamp);
+        buffer.consume(safeKey(call.server, call.tool, call.args), i, call.timestamp);
       }
       clock = call.timestamp;
       learner.observe(call);
@@ -465,6 +486,7 @@ export function runEvalDetailed(
   const floor = emptyTotals();
   const overall = emptyTotals();
   const age = emptyAgeBreakdown();
+  const floorAge = emptyAgeBreakdown();
   for (const archetype of ARCHETYPES) {
     const result = replayArchetypeSeeds(archetype, list, opts);
     byArchetype.push(result);
@@ -472,8 +494,10 @@ export function runEvalDetailed(
     addTotals(FLOOR_ARCHETYPES.has(archetype.name) ? floor : workflow, result.totals);
     // Freshness pools over EVERYTHING: staleness is a property of the buffer,
     // not of how predictable an archetype is, and the floor's entries are
-    // just as capable of being served late as any other.
+    // just as capable of being served late as any other. The floor is ALSO
+    // kept on its own, because it is the only place any lead depth exists.
     addAge(age, result.age);
+    if (FLOOR_ARCHETYPES.has(archetype.name)) addAge(floorAge, result.age);
   }
   return {
     seeds: list,
@@ -483,7 +507,10 @@ export function runEvalDetailed(
     floor,
     overall,
     age,
+    floorAge,
     ttlMs: opts.ttlMs ?? DEFAULT_TTL_MS,
+    standingTtlFactor: opts.standingTtlFactor ?? LONG_HORIZON_TTL_FACTOR,
+    callSpacingMs: opts.callSpacingMs ?? CALL_SPACING_MS,
   };
 }
 

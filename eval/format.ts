@@ -6,7 +6,7 @@
  * import cannot have one.
  */
 import { ARCHETYPE_TIMING, FLOOR_ARCHETYPES } from './corpus.js';
-import { toAgeReport } from './replay.js';
+import { CALL_LATENCY_MS, toAgeReport } from './replay.js';
 import type {
   AgeTotals,
   ArchetypeResult,
@@ -171,8 +171,15 @@ function ageRow(label: string, totals: AgeTotals): string {
  */
 export function ageTable(run: EvalRun): string[] {
   const width = AGE_COLUMNS.reduce((a, c) => a + c.width, 0);
+  const factor =
+    run.standingTtlFactor === 1
+      ? 'standing bets on the same TTL'
+      : `standing bets at x${run.standingTtlFactor}`;
+  // The quarter boundary a hit would have to reach to be "near expiry" at all,
+  // expressed in the units this corpus actually varies: calls apart.
+  const leadToEdge = (0.75 * run.ttlMs + CALL_LATENCY_MS) / run.callSpacingMs;
   return [
-    `age at consumption (${run.ttlMs} ms TTL, single-use buffer, halved for standing bets)`,
+    `age at consumption (${run.ttlMs} ms TTL, single-use buffer, ${factor})`,
     AGE_COLUMNS.map((c, i) =>
       i === 0 ? c.head.padEnd(c.width) : c.head.padStart(c.width),
     ).join(''),
@@ -180,6 +187,14 @@ export function ageTable(run: EvalRun): string[] {
     ageRow('all', run.age.all),
     ageRow('next-call', run.age.next),
     ageRow('standing (memorized)', run.age.standing),
+    '',
+    ageRow('adversarial (floor)', run.floorAge.all),
+    '',
+    // Said plainly, because three columns of the same number read as three
+    // independent measurements and are not.
+    `calls are ${run.callSpacingMs} ms apart, so age = lead x ${run.callSpacingMs} - ${CALL_LATENCY_MS} ms exactly:`,
+    'median/p95/max carry nothing beyond mean lead, which is the live statistic here.',
+    `"last TTL 1/4" cannot be non-zero below a lead of ${leadToEdge.toFixed(1)} at this spacing.`,
   ];
 }
 

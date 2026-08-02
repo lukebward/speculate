@@ -219,7 +219,11 @@ export interface RuleStats {
  * never keys, arguments, or results.
  */
 export interface AgeAtHitReport {
-  /** Hits with a measured age. */
+  /**
+   * Hits with a measured age. INVARIANT: equals the sum of `ttlQuarters` —
+   * a hit is admitted to both or to neither, so every share below is a share
+   * of this same population.
+   */
   count: number;
   /**
    * Median and 95th percentile age in ms, to AGE_BIN_MS resolution (bin
@@ -294,7 +298,10 @@ export interface ServerConfig {
     ttlMsByTool?: Record<string, number>;
     /**
      * TTL multiplier for long-horizon ('standing') predictions, in (0,1].
-     * Default LONG_HORIZON_TTL_FACTOR (0.5); 1 disables the shortening.
+     * Defaults to LONG_HORIZON_TTL_FACTOR, which is 1 (no shortening) on
+     * measured grounds — see src/cache.ts and DESIGN.md §13.19 before
+     * lowering it, and watch `expired` / `perRule['opener:*'].wasted` if
+     * you do.
      */
     longHorizonTtlFactor?: number;
     maxPerMinute?: number;
