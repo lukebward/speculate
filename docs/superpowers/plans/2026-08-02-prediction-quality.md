@@ -119,13 +119,34 @@ it('loads a pre-existing state file with no score/lastUpdated fields', () => {
 
 ### Task 2b: Stop one underivable value from poisoning a template forever
 
-Found by the Task 1 harness, not predicted by the spec: **100 of 450 corpus
-pairs score exactly 0.000** because `ArgTemplate.underivable` is sticky. One
-value the learner cannot derive permanently disables the whole transition, and
+Found by the Task 1 harness, not predicted by the spec: two whole list-detail
+legs score exactly 0.000 because `ArgTemplate.underivable` is sticky. One value
+the learner cannot derive permanently disables the transition, and
 `materializeArgs` (`src/learner.ts:670-684`) then bails on every future
-prediction. The Task 1 report estimates that fixing this alone takes overall
-recall@3 from 0.44 to roughly 0.66, which makes it the single largest recall
-win available and larger than anything else in this plan.
+prediction.
+
+**There are two latches, and loosening only the boolean is a no-op.**
+`updateTemplates` (`src/learner.ts:616-617`) intersects candidate sources with
+`tpl.sources = tpl.sources.filter(...)`, so a value with no matching source
+empties the list. After that `resolveSources` returns `{ok:false}` and
+`materializeArgs` returns null regardless of what the `underivable` flag says.
+Both must change together.
+
+**Measured ladder** (workflow recall@3, seeds 1/2/3, 900 pairs; supersedes the
+retired 0.44 pooled figure and the "~0.77 from this task alone" estimate,
+which credited Task 3's work to this one):
+
+| state | workflow recall@3 |
+|---|---|
+| today | 0.603 |
+| this task, boolean only | 0.603 (no-op) |
+| this task, boolean + source retention | ~0.681 |
+| + Task 3 beam emission | ~0.766 |
+| + Task 5 entity memory | ~0.88 |
+
+Recovering the full ~0.766 needs index-0, index-1 **and** index-2 hypotheses
+emitted per trigger, which is Task 3's beam, not this task. Do not reach for it
+here.
 
 **Files:**
 - Modify: `src/learner.ts`
@@ -147,23 +168,13 @@ it('still refuses to guess an argument it has never derived', () => {
 ```
 
 - [ ] **Step 2:** Run → FAIL (today the first observation poisons it permanently).
-- [ ] **Step 3: Implement.** Replace the sticky boolean with evidence: track derivable and underivable observation counts per argument, and treat the argument as underivable only when it has never been derived, or when its failure rate stays above a threshold across a minimum number of observations. **Preserve the fail-closed property**: an argument with no successful derivation is still never fabricated, and a prediction whose arguments cannot all be resolved is still dropped. This is loosening a permanent latch, not removing a safety gate.
+- [ ] **Step 3: Implement, both latches.**
+  - Replace the sticky boolean with evidence: track derivable and underivable observation counts per argument, and treat the argument as underivable only when it has never been derived, or when its failure rate stays above a threshold across a minimum number of observations.
+  - **Stop `updateTemplates` emptying `sources`** (`src/learner.ts:616-617`). Retain candidate sources across an observation that none of them match, rather than intersecting to nothing. Without this the boolean change measures zero, which is the trap this task previously set.
+  - **Preserve the fail-closed property.** An argument with no successful derivation is still never fabricated, and a prediction whose arguments cannot all be resolved is still dropped. This loosens a permanent latch; it does not remove a safety gate. Say in the report which test pins that.
 - [ ] **Step 4:** Focused tests pass, `npx tsc --noEmit` clean, full suite green.
-- [ ] **Step 5: Run `npm run eval`**, record the delta. Expect the largest single jump in this plan; if overall recall@3 does not move well above 0.44, stop and report rather than proceeding.
+- [ ] **Step 5: Run `npm run eval --` with `--compare`** against the Task 1 baseline JSON. The gate is **attribution, not an absolute number**: `list-detail-varied` must move up. Do not gate on the pooled figure, and do not expect ~0.77 here; that number belongs to this task plus Task 3. If `list-detail-varied` does not move, stop and report.
 - [ ] **Step 6: Commit** `fix: one underivable value no longer disables a transition forever`.
-
-### Task 2c: Widen the learnable index window (PREREQUISITE, promoted from Task 4)
-
-**Files:**
-- Modify: `src/learner.ts`
-- Test: `test/learner.test.ts`
-
-- [ ] **Step 1: Write a failing test** asserting a transition whose follow-up consistently uses index 5 of the previous result becomes predictable. Today `pushArrayPaths` caps at `Math.min(arr.length, 3)`, so it cannot be.
-- [ ] **Step 2:** Run → FAIL.
-- [ ] **Step 3: Implement.** Replace the literal `3` with `MAX_ARRAY_INDEX_PATHS` (default 8). Task 3 per-source scoring will prune losers once it lands; until then rely on MAX_PARSED_PATHS and the existing source cap. Note `MAX_PARSED_PATHS = 256` still bounds total enumeration. Confirm in the report that enumeration cost did not blow up (assert the path count stays bounded for a large array).
-- [ ] **Step 4:** Focused tests pass, full suite green.
-- [ ] **Step 5: Run `npm run eval`**, record the delta.
-- [ ] **Step 6: Commit** `feat: learn follow-up positions past the third entry`.
 
 ### Task 3: Per-source scoring and multi-candidate emission
 
@@ -215,6 +226,36 @@ it('keeps loading sources with no score field', () => { /* back-compat */ });
 - [ ] **Step 4:** Focused tests pass, `npx tsc --noEmit` clean, full suite green. Existing tests that pin first-source-wins or the old confidence formula may be updated **only** where this spec deliberately changes that behavior; list each one you touched and why in the report.
 - [ ] **Step 5: Run `npm run eval`**, record the delta. Recall@3 on `list-detail-varied` should rise materially; if it does not, stop and report rather than proceeding.
 - [ ] **Step 6: Commit** `feat: learn which argument source is right, and offer several`.
+
+### Task 4 (optional, lowest value): Widen the learnable index window
+
+
+**Demoted after measurement, reversing an earlier promotion.** Widening
+`pushArrayPaths` from 0..2 to 0..7 is worth **+3 pairs out of 900 (+0.003)**,
+not the ~0.06 first estimated. Under the shipped per-trigger cap of 3,
+top-3-by-frequency is always `{0,1,2}` whenever the index distribution
+decreases monotonically, which both corpus archetypes do. It must also run
+**after** Task 3: `MAX_SOURCES_PER_ARG = 12` truncates candidates in
+enumeration order (`src/learner.ts:633`), so widening to 8 indices before
+per-source scoring exists can evict good sources.
+
+**Known blind spot, which is why this is not deleted.** Neither corpus
+archetype has a mode above index 2, so a real workload where someone
+habitually opens the fifth item is invisible to both the current window and
+this corpus. The eval also has **zero surviving array-index derivations**, so
+it cannot validate work here at all; rely on `test/learner.test.ts`, and do
+not expect `npm run eval` to move.
+
+**Files:**
+- Modify: `src/learner.ts`
+- Test: `test/learner.test.ts`
+
+- [ ] **Step 1: Write a failing test** asserting a transition whose follow-up consistently uses index 5 of the previous result becomes predictable. Today `pushArrayPaths` caps at `Math.min(arr.length, 3)`, so it cannot be.
+- [ ] **Step 2:** Run → FAIL.
+- [ ] **Step 3: Implement.** Replace the literal `3` with `MAX_ARRAY_INDEX_PATHS` (default 8). Task 3 per-source scoring will prune losers once it lands; until then rely on MAX_PARSED_PATHS and the existing source cap. Note `MAX_PARSED_PATHS = 256` still bounds total enumeration. Confirm in the report that enumeration cost did not blow up (assert the path count stays bounded for a large array).
+- [ ] **Step 4:** Focused tests pass, full suite green.
+- [ ] **Step 5: Run `npm run eval`**, record the delta.
+- [ ] **Step 6: Commit** `feat: learn follow-up positions past the third entry`.
 
 ### Task 5: Entity frecency for return visits
 
