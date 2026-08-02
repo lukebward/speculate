@@ -239,6 +239,13 @@ const listDetailVaried: Archetype = {
  * The same two alerts reopened across many sessions, at list positions that
  * move every time.
  *
+ * SATURATED as of v0.13 (recall@3 ≈ 1.0) and no longer measuring what its
+ * name implies. It relists before every reopen, so the target is always in
+ * the previous call's parsed result and the beam reaches it by array index.
+ * That makes this a test of ARGUMENT DERIVATION over a moving index — worth
+ * keeping as a regression guard, but it is not evidence about entity memory.
+ * `direct-recall` is the archetype that asks the memory question.
+ *
  * Hard leg — `svc_list_alerts → alert_get`: the id alternates between two
  * stable values (so no parsed path survives) at shifting positions. Before
  * §13.18 the learner could keep a const source for exactly ONE of the two and
@@ -544,7 +551,121 @@ const regimeShift: Archetype = {
   },
 };
 
-// -- archetype 5: adversarial (the floor) --------------------------------------
+// -- archetype 5: direct-recall ------------------------------------------------
+
+/** The tickets this operator keeps coming back to, by return frequency. */
+const DIRECT_RECALL_WEIGHTS = [40, 30, 20, 10];
+
+/** One session in this many arrives at the pinned ticket from somewhere rare. */
+const DIRECT_RECALL_RARE_IN = 3;
+
+/**
+ * The entity the user returns to, reached WITHOUT a list that contains it.
+ *
+ * `return-visits` was supposed to be the archetype that justified entity
+ * memory, and it no longer is: it relists before every reopen, so the target
+ * is always sitting in the previous call's parsed result and a beam that
+ * enumerates array positions reaches it by index. It is saturated (≈1.0) and
+ * measures argument derivation, not memory.
+ *
+ * This archetype removes the crutch. The session opens on something whose
+ * result NEVER contains a pinned ticket id, and then the user opens one of
+ * four long-running tickets from memory. The previous call offers plenty of
+ * wrong hypotheses (ticket ids at enumerable array positions) and not one
+ * right one, so the value cannot come from an arg-copy or a parsed path. A
+ * test asserts that against the generated corpus rather than trusting this
+ * comment. What is left is history.
+ *
+ * TWO LEGS, deliberately, because measurement showed they behave differently:
+ *
+ *   - `desk_list_recent → desk_ticket_get` (the common trigger). Per-source
+ *     const scoring already memorizes the four ids and ranks them by decayed
+ *     evidence, which IS frecency. This leg scores ~0.88 and is a REGRESSION
+ *     GUARD, not headroom.
+ *   - `<one of eight rare triggers> → desk_ticket_get`. The same four
+ *     entities, equally well known to the user, reached from a place seen
+ *     only a couple of times. Memorized literals are scoped per
+ *     (server, prevTool, nextTool, arg), so none of that evidence transfers
+ *     and each rare transition has to relearn from nothing. This leg is the
+ *     headroom: it is what a memory keyed by ENTITY rather than by TRANSITION
+ *     would fix.
+ */
+const directRecall: Archetype = {
+  name: 'direct-recall',
+  sessions(seed) {
+    const rng = makeRng(streamSeed(seed, 'direct-recall'));
+    const recent = minter('tkt');
+    const folders = ['support', 'escalations', 'billing'] as const;
+    // Fixed for the run (they are the point), but seed-dependent so different
+    // seeds are different corpora.
+    const pinned = Array.from({ length: DIRECT_RECALL_WEIGHTS.length }, () => ({
+      ticketId: `pin-${rng.int(1_000_000).toString(36)}-${recent()}`,
+      subject: phrase(rng),
+    }));
+    // Eight other places the same tickets get reached from. Spread thin on
+    // purpose: no single one is seen often enough to memorize the ids by
+    // itself, which is exactly the case per-transition memory cannot serve.
+    const elsewhere = [
+      'desk_saved_view_get',
+      'desk_notify_list',
+      'desk_sla_summary',
+      'desk_team_roster',
+      'desk_tag_cloud',
+      'desk_macro_list',
+      'desk_queue_stats',
+      'desk_shift_handoff',
+    ] as const;
+    const out: EvalSession[] = [];
+
+    for (let s = 0; s < SESSIONS_PER_ARCHETYPE; s++) {
+      const folder = rng.pick(folders);
+      // Every id here is minted fresh and never returned to: the queue moves
+      // on, the pinned tickets do not appear in it.
+      const items = Array.from({ length: 6 }, () => ({
+        ticketId: recent(),
+        subject: phrase(rng),
+        at: rng.int(90),
+      }));
+      const target = pinned[rng.weighted(DIRECT_RECALL_WEIGHTS)]!;
+      const rare = rng.int(DIRECT_RECALL_RARE_IN) === 0;
+      const trigger: EvalSession['calls'][number] = rare
+        ? {
+            tool: rng.pick(elsewhere),
+            args: { scope: rng.pick(folders) },
+            parsed: {
+              scope: folder,
+              rows: Array.from({ length: 3 }, () => ({
+                label: phrase(rng),
+                n: rng.int(50),
+              })),
+            },
+          }
+        : {
+            tool: 'desk_list_recent',
+            args: { folder },
+            parsed: { folder, items, unread: rng.int(30) },
+          };
+      out.push({
+        server: 'desk',
+        calls: [
+          trigger,
+          {
+            tool: 'desk_ticket_get',
+            args: { ticketId: target.ticketId },
+            parsed: {
+              ticketId: target.ticketId,
+              subject: target.subject,
+              state: rng.pick(['open', 'waiting', 'blocked'] as const),
+            },
+          },
+        ],
+      });
+    }
+    return out;
+  },
+};
+
+// -- archetype 6: adversarial (the floor) --------------------------------------
 
 /**
  * The low-predictability floor DESIGN.md §10 item 8 asks for: the next tool is
@@ -600,6 +721,7 @@ export const ARCHETYPES: readonly Archetype[] = [
   returnVisits,
   multiArg,
   regimeShift,
+  directRecall,
   adversarial,
 ];
 

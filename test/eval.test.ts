@@ -240,6 +240,61 @@ describe('regime-shift', () => {
   });
 });
 
+// --- entity memory ------------------------------------------------------------
+
+describe('direct-recall', () => {
+  const archetype = ARCHETYPES.find((a) => a.name === 'direct-recall')!;
+
+  /** Every scalar reachable anywhere inside a value. */
+  function scalars(value: unknown, out: Set<string>): Set<string> {
+    if (value === null || typeof value !== 'object') {
+      out.add(JSON.stringify(value));
+    } else if (Array.isArray(value)) {
+      for (const v of value) scalars(v, out);
+    } else {
+      for (const v of Object.values(value)) scalars(v, out);
+    }
+    return out;
+  }
+
+  it('is scored in the headline, not treated as a floor', () => {
+    expect(FLOOR_ARCHETYPES.has('direct-recall')).toBe(false);
+    expect(WORKFLOW_ARCHETYPES.map((a) => a.name)).toContain('direct-recall');
+  });
+
+  it('never leaves the target derivable from the previous call', () => {
+    // THE guarantee. If this ever fails, the archetype has quietly become a
+    // test of argument derivation — which the rest of the corpus already
+    // covers — and any conclusion drawn from it about memory is void.
+    for (const seed of [1, 2, 3]) {
+      for (const session of archetype.sessions(seed)) {
+        const trigger = session.calls[0]!;
+        const target = JSON.stringify(session.calls[1]!.args['ticketId']);
+        const reachable = scalars(trigger.parsed, scalars(trigger.args, new Set()));
+        expect(reachable.has(target), `seed ${seed}: ${target} was in the trigger`).toBe(
+          false,
+        );
+      }
+    }
+  });
+
+  it('reaches the same entities from one common and several rare triggers', () => {
+    // The two legs measure different things and must both stay populated:
+    // the common one guards memory that already works, the rare ones are the
+    // headroom for evidence that is scoped per transition instead of per
+    // entity. Pooling them into one number would hide both.
+    const { byTransition } = replayArchetype(archetype, 1);
+    expect(byTransition.every((t) => t.transition.endsWith('->desk_ticket_get'))).toBe(true);
+    const common = byTransition.filter((t) => t.transition.startsWith('desk_list_recent'));
+    const rare = byTransition.filter((t) => !t.transition.startsWith('desk_list_recent'));
+    expect(common).toHaveLength(1);
+    expect(rare.length).toBeGreaterThanOrEqual(4);
+    expect(common[0]!.pairs).toBeGreaterThan(rare.reduce((a, t) => a + t.pairs, 0));
+    // No rare trigger may become common enough to memorize the ids by itself.
+    for (const t of rare) expect(t.pairs).toBeLessThan(common[0]!.pairs / 4);
+  });
+});
+
 // --- the printed artifact -----------------------------------------------------
 
 describe('report rendering', () => {
