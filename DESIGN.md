@@ -793,6 +793,184 @@ next session start, without `speculate on` ever having run there.
 
 Full trail: docs/superpowers/specs/2026-08-02-auto-wrap-design.md.
 
+## v0.13 (2026-08-02): prediction quality
+
+Five defects in the learner, each found by measurement rather than by reading
+the code. §13.16 through §13.19 carry the detail; this section is the ledger
+and the honest reading of the numbers.
+
+**The instrument came first, because the old headline was circular.**
+`npm run bench` replays a scripted 7-call GitHub session against the mock and
+reports hit rate, tool-wait cut and waste. What it measures is **prefetch
+mechanics**: whether a predicted call is issued early enough, completes in
+time, and is served rather than forwarded. It cannot measure prediction
+quality, because the script and the hand-written GitHub rules that predict it
+were authored together, so quoting its 71% as evidence that the learner
+predicts well was reasoning in a circle. The sharper form of the same point:
+the learner contributes **nothing** to that 71%, since a learned transition
+needs two sightings and the benchmark's workflow repeats none of its calls.
+`npm run eval` is the separate
+instrument, and it was built before any change to `src/`. It scores offline
+**recall@K over transition pairs**: one pair is a consecutive (call i-1, call
+i) inside a scored session, a hit requires tool **and** arguments to match
+under `canonicalKey` (the same key the cache uses, so a right tool with a
+wrong id is a miss), and recall@K is hits at rank ≤ K over pairs. It drives a
+real `TransitionLearner` and imports nothing else: no `ServerProfile`, no
+`Predictor`, so no hand-written rule can contribute a prediction by
+construction, and a test asserts no corpus tool name collides with the
+bundled github, filesystem or slack profiles. Seeds 1, 2 and 3 are pooled;
+the clock is injected and neither `Date.now` nor `Math.random` appears under
+`eval/`. Both commands still ship, and they answer different questions.
+
+**Where it ends up** (seeds 1,2,3; recall@3 is the headline band because 3 is
+the shipped per-trigger cap, §5.6; recall@5 is visible only because the
+harness raises the learner's cap to 5):
+
+| archetype | pairs | recall@1 | recall@3 | recall@5 | waste/hit |
+|---|---|---|---|---|---|
+| list-detail-varied | 300 | 0.373 | 0.727 | 0.790 | 3.24 |
+| return-visits | 300 | 0.593 | 0.997 | 0.997 | 1.26 |
+| multi-arg | 300 | 0.803 | 0.883 | 0.883 | 0.84 |
+| regime-shift | 120 | 0.900 | 0.900 | 0.950 | 2.33 |
+| direct-recall | 150 | 0.267 | 0.587 | 0.627 | 2.38 |
+| paired-args | 300 | 0.537 | 0.887 | 0.923 | 2.70 |
+| **WORKFLOW (headline)** | **1470** | **0.571** | **0.846** | **0.875** | **2.00** |
+| adversarial (floor) | 300 | 0.087 | 0.087 | 0.087 | 9.08 |
+
+**The adversarial floor sat at 0.087 through every task in this plan**, with
+its waste per hit pinned at 9.08 and, at several stages, byte-identical
+counters on both sides of a change. That is the control that makes every
+other number here mean anything. A learner that bought recall by firing more
+speculations at noise would have lifted the floor first, since the floor's
+entity ids are minted once and never repeated; every gain below therefore
+came from ranking better, not from predicting more. The floor is reported
+beside the headline, never pooled into it, and the two are only ever quoted
+together.
+
+**The headline is not one number improving in place, and the denominator is
+why.** The first pooled baseline this branch recorded was **0.6033 over 900
+pairs**; it now reads **0.8463 over 1470**. Three archetypes joined the
+corpus in between, each of them added because an existing defect was
+invisible without it, and each addition moved the headline with no code
+changing at all: `regime-shift` took 900 pairs to 1020 (0.6033 to 0.6363),
+`direct-recall` took 1020 to 1170 (0.8725 to 0.8359), and `paired-args` took
+1170 to 1470 (0.8359 to 0.797, both measured without the coherence check). So the
+end state is a harder corpus **and** a better learner, and the pooled
+endpoints cannot separate the two. The attribution lives in the per-task
+deltas, each measured against a corpus held fixed across the change:
+
+| change | pairs | before | after | Δ recall@3 |
+|---|---|---|---|---|
+| Evidence decays, and eviction goes by value (§13.16) | 1020 | 0.532 | 0.636 | **+0.104** |
+| A template holds evidence, not a latch (§13.17) | 1020 | 0.636 | 0.731 | **+0.095** |
+| Sources compete, and a transition offers several (§13.18) | 1020 | 0.731 | 0.873 | **+0.141** |
+| Co-varying arguments are one hypothesis (§13.18) | 1470 | 0.797 | 0.846 | **+0.049** |
+
+The five defects those four rows close: lifetime-frequency ranking that never
+forgot, paired with FIFO eviction that dropped the best-evidenced entry to
+admit a one-off; a single unexplainable value latching a transition off
+permanently; one hypothesis per argument, fixed to whichever row index the
+first sighting happened to use; one argument set per transition, which pinned
+recall@K to recall@1 whatever the budget allowed; and two arguments read off
+the same row scored as independent, so the cheapest substitutions in the beam
+were pairings that had never occurred. A sixth was introduced and caught in
+review rather than shipped: value-based eviction let a brand-new transition
+be its own victim, freezing the model silently and, because the score
+persists, across restarts. Both eviction sites now exempt the key the current
+observation just wrote, with a regression test at the default
+`minObservations`.
+
+Waste is the price and it is visible: the workflow band reads 2.00 wasted
+predictions per hit against 1.27 at the first baseline, moved by the same mix
+of corpus growth and model change as the headline, and it is concentrated in
+the archetypes the recall came from. That column bills every prediction
+issued at the shipped cap, including the batch fired after each session's
+last call that nothing can ever claim, so it is a deliberately pessimistic
+production estimate and not the instrument §10's ≤2 per hit criterion was
+written against (the bench still reads 0.00). Even read that way it now sits
+exactly on that bar, which makes it the number to watch next rather than one
+with headroom left in it.
+
+**Calibration against PASTE, read the unflattering way.** PASTE (arXiv
+2603.18897) reports **27.8% top-1 and 43.9% top-3** predictor recall on Deep
+Research Bench, SWE Bench and ScholarQA, which are real traces. Our 0.571 and
+0.846 are on a corpus we wrote ourselves. These are not comparable numbers,
+and ours reading higher is most likely evidence that our corpus is easier,
+not that this learner is better: we authored the archetypes knowing what the
+learner can derive, and a synthetic workflow is predictable in ways real
+traffic is not. A real-trace figure for this learner would most likely land
+somewhere between our floor of 0.087 and our headline of 0.846, and nothing
+measured here establishes where. Two differences do run in our favour, and
+they are facts about scope rather than about accuracy: PASTE describes no
+staleness or invalidation mechanism, and no decay, since its patterns are
+mined once and applied uniformly. One runs the other way: it has a string
+formatting and normalization transform as a third kind of argument source,
+where we have only argument copy, parsed result path and memorized constant,
+and it launches greedily on utility rather than against a fixed cap. Real
+numbers for this proxy still come from §9 telemetry, not from either corpus.
+
+**What did not ship, recorded because the plan called for it.**
+
+- **Widening the learnable array-index window** (indices 0..2 to 0..7,
+  `pushArrayPaths`) is **deferred**, measured at **+0.003** (3 pairs of 900),
+  not the ~0.06 first estimated. Under a per-trigger cap of 3 and a
+  monotonically decreasing index distribution, the top three indices by
+  frequency are always {0,1,2}. `src/learner.ts` still reads
+  `Math.min(arr.length, 3)`.
+- **Entity frecency** as a separate mechanism is **dropped**: Task 3's
+  per-source scoring already implements it generically. The `direct-recall`
+  archetype was authored as a negative control, isolating the case where the
+  target id appears nowhere in the trigger's arguments or result (verified 0
+  of 180 sessions) while six wrong ids sit at enumerable array positions. It
+  came back positive at 0.835 recall@3 on its common leg, with the transition
+  holding four `const` sources, one per pinned entity, ranked by decayed
+  score. The control on the control, the same shape with entities never
+  reused, scores 0.000 at zero waste. What remains is scope, not memory:
+  constants are keyed per (server, prevTool, nextTool, argName), so the same
+  entities reached from a rarer trigger get nothing (0.733 / 0.667 / 0.389 /
+  0.000 as that trigger thins from every 2 to every 16 sessions), priced at
+  about +0.03 on the headline.
+- **Utility ranking** (PASTE's `p·T`, cutting the per-trigger cap on expected
+  time saved rather than probability) landed and was **reverted** as a
+  measured no-op. Two reasons, both measured: the bundled bench injects one
+  latency for every tool, so `score × ms` is `score` times a constant and the
+  ranking is provably identical, and the per-trigger cap never binds on the
+  bundled profile (zero cap-suppression events across a full session, since
+  it offers at most 2 to 3 candidates against a cap of 3). Only a constructed
+  heterogeneous workload at cap 1 moved it, 4.50 s to 4.05 s. The eval was
+  unchanged to every digit. The plan's own rule is that a change which does
+  not move the measurement does not land; it is worth revisiting once the cap
+  starts binding, which the beam makes likelier.
+- **The long-horizon TTL lever ships inert.** `speculation.longHorizonTtlFactor`
+  exists per server and `LONG_HORIZON_TTL_FACTOR` defaults to **1**, so
+  nothing is shortened unless someone asks for it. Shortening bought zero
+  measured freshness (standing bets are consumed at a lead of exactly 1.000
+  calls, the same instant as derived ones) and cost about 9% of all hits once
+  inter-call spacing passed roughly half the TTL (1265 to 1150 at factor 0.5
+  from 16 s spacing, with the standing class going to zero). The
+  instrumentation it was built alongside did ship: `ageAtHit` reports median,
+  p95 and max age at consumption, the share consumed in the last quarter of
+  their TTL, and mean lead, in both the runtime and the offline replay.
+
+**What the numbers still do not cover.** The corpus is synthetic and
+authored, not sampled traffic. `derived`/`missed` are the only evidence in
+the learner that does not decay, so a derivation that stops working must
+accumulate misses in proportion to its whole history before the rate gate
+closes; the §5.6 feedback loop is the production backstop and the offline
+harness does not model it. No surviving array-index derivation remains in the
+corpus, so if `pushArrayPaths` broke outright the headline would not move.
+Session-start openers (§13.15) do not fit a recall@K-over-pairs frame and are
+unmeasured. `return-visits` has saturated at 0.997 and no longer discriminates
+anything. And the emitted prefix is prefix-stable across cap values today by
+observation rather than by construction, since the option list is sliced to
+the cap.
+
+Two corrections to the record above. The v0.11 note said §10 item 8's
+adversarial floor remained unwritten, so no measured lower bound existed;
+that is no longer true, and the floor is the 0.087 row. The v0.12 note said
+the `speculate exec` compatibility pass-through would be removed in 0.13.
+That did not happen either, and 0.13 still ships it.
+
 ---
 
 ## Appendix A. Market research & prior art
