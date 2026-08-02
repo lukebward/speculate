@@ -57,6 +57,26 @@ const MAX_PARSED_PATHS = 256;
 /** Per-arg candidate-source cap (arg-copies + parsed-paths; const always kept). */
 const MAX_SOURCES_PER_ARG = 12;
 /**
+ * Observations a competing hypothesis must have explained ON ITS OWN before
+ * it may be offered as an ALTERNATIVE candidate (§13.18). The best-scoring
+ * source is always used; this gate decides only whether a second, third, …
+ * argument set is worth a slot in the batch.
+ *
+ * It is one gate doing two jobs, and both are needed:
+ *   - Recurrence, the same bar `minObservations` sets for transitions: a
+ *     literal seen once is not a hypothesis, it is a coincidence. Without
+ *     this, every unexplainable value mints a const that then offers itself
+ *     back as a candidate forever.
+ *   - Non-domination. A source that has only ever matched at the same time as
+ *     a better one has no evidence of its own: whenever the two disagree —
+ *     which is the only time offering it changes anything — the other one has
+ *     been right. Row 0 and row 2 of a list explain disjoint observations and
+ *     both earn slots; a const that merely echoes an arg-copy never does.
+ * Lifetime count, deliberately undecayed, exactly like `count`: it gates
+ * rather than ranks, and the decayed `score` beside it does the ranking.
+ */
+const MIN_SOURCE_SOLO_WINS = 2;
+/**
  * Per-argument evidence gate (§5.3). A template used to be disabled forever
  * by ONE observation it could not derive — an agent opening the second row
  * of a list instead of the first was enough to kill the transition for the
@@ -131,6 +151,17 @@ export interface SerializedSource {
   path?: string[];
   /** For 'const': the stableStringify repr; the value is rebuilt from it. */
   repr?: string;
+  /**
+   * Decayed evidence weight for THIS hypothesis. Absent pre-v0.13; defaults
+   * to 0 — "no evidence recorded", which is not the same as "never right",
+   * and makes the pre-scoring priority order the fallback ranking for a file
+   * that never scored anything.
+   */
+  score?: number;
+  /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
+  lastUpdated?: number;
+  /** Observations this source alone explained. Absent pre-v0.13; defaults 0. */
+  solo?: number;
 }
 
 export interface SerializedTransition {
@@ -179,20 +210,44 @@ export interface SerializedLearner {
 
 /**
  * Where a next-call argument value came from, relative to the previous
- * call. Stored in priority order within a template: arg-copy sources
- * first, then parsed-path sources, then the const fallback.
+ * call. Seeded in priority order within a template — arg-copy sources
+ * first, then parsed-path sources, then the const fallback — which is now
+ * only the tie-break: evidence decides (§13.18).
  */
 type Source =
   | { kind: 'arg'; key: string }
   | { kind: 'parsed'; path: string[] }
   | { kind: 'const'; value: unknown; repr: string };
 
-interface ArgTemplate {
-  /** Surviving candidate sources, in resolution-priority order. */
-  sources: Source[];
+/**
+ * One competing hypothesis about where an argument's value comes from, with
+ * the evidence for it. Several are held per argument at once: the model that
+ * kept a single narrowed-down source could never offer row 0 AND row 1, and
+ * was hostage to whichever row the first sighting happened to use.
+ */
+interface ScoredSource {
+  s: Source;
   /**
-   * Observations one of `sources` reproduced. ZERO IS ABSOLUTE: an argument
-   * no source has ever produced is never emitted, whatever else is true.
+   * Decayed count of observations this source reproduced, as of
+   * `lastUpdated`. Ranking and eviction only — read through decayedScore().
+   */
+  score: number;
+  /** Injected-clock time `score` was taken at. */
+  lastUpdated: number;
+  /** Observations this source alone explained (see MIN_SOURCE_SOLO_WINS). */
+  solo: number;
+}
+
+interface ArgTemplate {
+  /** Competing candidate sources; seeded in priority order, ranked by score. */
+  sources: ScoredSource[];
+  /**
+   * Observations an ALREADY-STORED source reproduced — i.e. ones the template
+   * could have predicted. A source mined from the observation itself never
+   * counts here; crediting those would make every template trivially
+   * derivable and disable the fail-closed gate entirely. ZERO IS ABSOLUTE: an
+   * argument no source has ever produced is never emitted, whatever else is
+   * true.
    */
   derived: number;
   /**
@@ -519,7 +574,7 @@ export class TransitionLearner {
       // weight: recent evidence is worth more than the same volume of old.
       state.score = decayedScore(state.score, state.lastUpdated, now) + 1;
       state.lastUpdated = now;
-      updateTemplates(state, prev, call.args);
+      updateTemplates(state, prev, call.args, now);
     } else {
       // A primed pair arms on first sight (§13.9); templates still come
       // from real traffic, so a prior can never invent arguments.
@@ -531,7 +586,7 @@ export class TransitionLearner {
         count: initial,
         score: initial,
         lastUpdated: now,
-        templates: initialTemplates(prev, call.args),
+        templates: initialTemplates(prev, call.args, now),
       };
     }
     this.transitions.set(key, state);
@@ -618,76 +673,113 @@ export class TransitionLearner {
       state: TransitionState;
       ruleId: string;
       score: number;
+      weight: number;
       args: Record<string, unknown>;
     }> = [];
     for (const state of this.transitions.values()) {
       if (state.server !== call.server || state.prevTool !== call.tool) continue;
       if (state.count < this.minObservations) continue;
-      const args = materializeArgs(state, call);
-      if (args === null) continue; // fail closed — never partial args
-      candidates.push({
-        state,
-        // Server label is part of the id: feedback must never bleed between
-        // servers that happen to share tool names (review finding, §13.7).
-        ruleId: `learned:${state.server}:${state.prevTool}→${state.nextTool}`,
-        score: decayedScore(state.score, state.lastUpdated, now),
-        args,
-      });
+      // Server label is part of the id: feedback must never bleed between
+      // servers that happen to share tool names (review finding, §13.7).
+      const ruleId = `learned:${state.server}:${state.prevTool}→${state.nextTool}`;
+      const score = decayedScore(state.score, state.lastUpdated, now);
+      for (const c of materializeCombos(state, call, now, this.maxPredictionsPerTrigger)) {
+        candidates.push({ state, ruleId, score: score * c.weight, weight: c.weight, args: c.args });
+      }
     }
-    // Rank by decayed score: among equally frequent transitions the one used
-    // recently is the better guess. The gate above is still the raw count.
+    // One ranking over everything on offer, so a transition's second-choice
+    // argument set has to beat another transition's FIRST choice to take its
+    // slot — a speculative variant never crowds out a better-evidenced
+    // candidate. Among equally frequent transitions the one used recently is
+    // the better guess; the gate above is still the raw count.
     candidates.sort(
       (a, b) =>
-        b.score - a.score || (a.ruleId < b.ruleId ? -1 : a.ruleId > b.ruleId ? 1 : 0),
+        b.score - a.score ||
+        (a.ruleId < b.ruleId ? -1 : a.ruleId > b.ruleId ? 1 : 0) ||
+        b.weight - a.weight,
     );
     // No `key` stamped: the predictor owns canonical cache keying.
-    return candidates.slice(0, this.maxPredictionsPerTrigger).map((c) => ({
-      server: call.server,
-      tool: c.state.nextTool,
-      // Fresh, JSON-shaped copy: emitted args must never alias the stored
-      // const templates or the current call's args/parsed subtrees.
-      args: jsonCopyRecord(c.args),
-      confidence: Math.min(0.55, 0.25 + 0.1 * c.state.count),
-      ruleId: c.ruleId,
-    }));
+    const out: Prediction[] = [];
+    const emitted = new Set<string>();
+    for (const c of candidates) {
+      if (out.length >= this.maxPredictionsPerTrigger) break;
+      // Two candidates that materialize the same call are one prediction.
+      const key = `${c.state.nextTool}\x00${safeStringify(c.args) ?? ''}`;
+      if (emitted.has(key)) continue;
+      emitted.add(key);
+      out.push({
+        server: call.server,
+        tool: c.state.nextTool,
+        // Fresh, JSON-shaped copy: emitted args must never alias the stored
+        // const templates or the current call's args/parsed subtrees.
+        args: jsonCopyRecord(c.args),
+        // The transition's own confidence — same ramp, same 0.55 ceiling —
+        // discounted by how well evidenced this particular argument set is,
+        // so a well-evidenced first choice outranks a speculative third
+        // downstream too, where §5.6 ranks by confidence x effectiveness. The
+        // discount applies AFTER the ceiling: applying it before would let a
+        // well-observed transition's third choice clip back up to the cap and
+        // arrive indistinguishable from its first. The best combo weighs
+        // exactly 1, so a single-candidate transition is unchanged.
+        confidence: Math.min(0.55, 0.25 + 0.1 * c.state.count) * c.weight,
+        ruleId: c.ruleId,
+      });
+    }
+    return out;
   }
 }
 
 // -- (de)serialization ----------------------------------------------------------
 
-function serializeSource(s: Source): SerializedSource {
-  switch (s.kind) {
+function serializeSource(src: ScoredSource): SerializedSource {
+  // (score, lastUpdated) travel together and undecayed, exactly as they do
+  // for a transition: the next load charges the whole downtime.
+  const evidence = { score: src.score, lastUpdated: src.lastUpdated, solo: src.solo };
+  switch (src.s.kind) {
     case 'arg':
-      return { kind: 'arg', key: s.key };
+      return { kind: 'arg', key: src.s.key, ...evidence };
     case 'parsed':
-      return { kind: 'parsed', path: [...s.path] };
+      return { kind: 'parsed', path: [...src.s.path], ...evidence };
     case 'const':
-      return { kind: 'const', repr: s.repr };
+      return { kind: 'const', repr: src.s.repr, ...evidence };
   }
 }
 
-function deserializeSource(raw: unknown): Source | null {
+function deserializeSource(raw: unknown, now: number): ScoredSource | null {
   if (raw === null || typeof raw !== 'object') return null;
   const s = raw as SerializedSource;
-  if (s.kind === 'arg' && typeof s.key === 'string') {
-    return { kind: 'arg', key: s.key };
-  }
-  if (
-    s.kind === 'parsed' &&
-    Array.isArray(s.path) &&
-    s.path.every((seg) => typeof seg === 'string')
-  ) {
-    return { kind: 'parsed', path: [...s.path] };
-  }
-  if (s.kind === 'const' && typeof s.repr === 'string') {
-    try {
-      // repr is the value's stableStringify form, so it round-trips via JSON.
-      return { kind: 'const', value: JSON.parse(s.repr) as unknown, repr: s.repr };
-    } catch {
-      return null;
+  const source = ((): Source | null => {
+    if (s.kind === 'arg' && typeof s.key === 'string') {
+      return { kind: 'arg', key: s.key };
     }
-  }
-  return null;
+    if (
+      s.kind === 'parsed' &&
+      Array.isArray(s.path) &&
+      s.path.every((seg) => typeof seg === 'string')
+    ) {
+      return { kind: 'parsed', path: [...s.path] };
+    }
+    if (s.kind === 'const' && typeof s.repr === 'string') {
+      try {
+        // repr is the value's stableStringify form, so it round-trips via JSON.
+        return { kind: 'const', value: JSON.parse(s.repr) as unknown, repr: s.repr };
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  })();
+  if (!source) return null;
+  return {
+    s: source,
+    // Missing/junk evidence loads as NONE, not as `count`-style credit: a
+    // source may not mint its own standing from a state file, and a file with
+    // no scores at all then ranks by the order it stored them in — which is
+    // the pre-scoring priority order.
+    score: importedScore(s.score, 0, MAX_IMPORTED_COUNT),
+    lastUpdated: importedStamp(s.lastUpdated, now),
+    solo: importedCount(s.solo) ?? 0,
+  };
 }
 
 /**
@@ -806,9 +898,9 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
       continue;
     }
     if (!Array.isArray(tpl.sources)) return null;
-    const sources: Source[] = [];
+    const sources: ScoredSource[] = [];
     for (const rawSrc of tpl.sources) {
-      const s = deserializeSource(rawSrc);
+      const s = deserializeSource(rawSrc, now);
       if (s) sources.push(s); // malformed sources are dropped, not fatal
     }
     // A template that lost all its sources can never derive anything again,
@@ -837,11 +929,12 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
 function initialTemplates(
   prev: PrevCall,
   nextArgs: Record<string, unknown>,
+  now: number,
 ): Map<string, ArgTemplate> {
   const templates = new Map<string, ArgTemplate>();
-  const parsedPaths = enumerateParsedPaths(prev.parsed);
+  const index = indexPrevCall(prev);
   for (const [name, value] of Object.entries(nextArgs)) {
-    templates.set(name, seedTemplate(candidateSources(prev, parsedPaths, value), 0));
+    templates.set(name, seedTemplate(index, value, 0, now));
   }
   return templates;
 }
@@ -852,57 +945,154 @@ function initialTemplates(
  * there are no sources at all (an unrepresentable value), which is the one
  * state no later evidence can talk the learner out of.
  */
-function seedTemplate(sources: Source[], priorMisses: number): ArgTemplate {
+function seedTemplate(
+  index: PrevIndex,
+  value: unknown,
+  priorMisses: number,
+  now: number,
+): ArgTemplate {
+  const repr = safeStringify(value);
+  const sources =
+    repr === undefined
+      ? []
+      : candidateSources(index, value, repr, true).map((s) => newSource(s, now));
+  // One sighting explained by exactly one hypothesis is that hypothesis's
+  // first solo win; explained by several, it separates none of them.
+  if (sources.length === 1) sources[0]!.solo = 1;
   const derived = sources.length > 0 ? 1 : 0;
   return { sources, derived, missed: priorMisses + (derived === 0 ? 1 : 0) };
 }
 
 /**
- * Later instance: intersect each template's candidates with the sources that
- * would also have produced this instance's value — but only when at least one
- * of them would have. An instance NO candidate explains is recorded as a miss
- * and leaves the candidate list intact; emptying it (as this did before v0.13)
- * made resolveSources fail forever after, so a single unexplainable value
- * disabled the whole transition permanently. Arg-set instability (a name that
- * appears late, a name that goes missing) is evidence the same way.
+ * Later instance: score each template's competing hypotheses against this
+ * instance's value.
+ *
+ * Every stored source that would have produced the value is credited — not
+ * just the first one tried — and any source this instance REVEALS that the
+ * template does not hold yet is admitted. Before v0.13 this intersected
+ * instead: the candidate list could only ever shrink, so a template was
+ * hostage to whichever row index its first sighting happened to use and could
+ * never learn that the agent also opens rows 1 and 2. An instance no stored
+ * source explains is still a miss (that is the evidence the fail-closed gate
+ * runs on) — it just no longer forecloses the hypothesis space. Arg-set
+ * instability (a name that appears late, a name that goes missing) is
+ * evidence the same way.
  */
 function updateTemplates(
   state: TransitionState,
   prev: PrevCall,
   nextArgs: Record<string, unknown>,
+  now: number,
 ): void {
   for (const [name, tpl] of state.templates) {
     if (!Object.prototype.hasOwnProperty.call(nextArgs, name)) {
       tpl.missed += 1; // previously seen arg absent now
     }
   }
-  let parsedPaths: ParsedPath[] | null = null;
+  // One index per observation, shared by every argument: the reprs of the
+  // previous call's args and result paths do not depend on which argument is
+  // being explained.
+  let index: PrevIndex | null = null;
   for (const [name, value] of Object.entries(nextArgs)) {
     const tpl = state.templates.get(name);
+    index ??= indexPrevCall(prev);
     if (!tpl) {
       // Arg name not seen on earlier instances: seed it from this instance,
       // billed for every earlier instance it was missing from.
-      parsedPaths ??= enumerateParsedPaths(prev.parsed);
       state.templates.set(
         name,
-        seedTemplate(
-          candidateSources(prev, parsedPaths, value),
-          Math.max(0, state.count - 1),
-        ),
+        seedTemplate(index, value, Math.max(0, state.count - 1), now),
       );
       continue;
     }
     const repr = safeStringify(value);
-    const kept =
-      repr === undefined
-        ? []
-        : tpl.sources.filter((s) => sourceProduces(s, prev, repr));
-    if (kept.length > 0) {
-      tpl.sources = kept; // the derivation narrows
-      tpl.derived += 1;
-    } else {
-      tpl.missed += 1; // one value it cannot explain, sources retained
+    if (repr === undefined) {
+      tpl.missed += 1; // a value nothing can represent explains nothing
+      continue;
     }
+    const matched: ScoredSource[] = [];
+    for (const src of tpl.sources) {
+      if (!sourceProduces(src.s, prev, repr)) continue;
+      src.score = decayedScore(src.score, src.lastUpdated, now) + 1;
+      src.lastUpdated = now;
+      matched.push(src);
+    }
+    // `derived` counts what the template could have PREDICTED, so only
+    // already-stored sources count. Sources mined from the value itself
+    // reproduce it by construction; crediting them would make every template
+    // derivable and silently disable the fail-closed gate.
+    if (matched.length > 0) tpl.derived += 1;
+    else tpl.missed += 1;
+
+    const known = new Set(tpl.sources.map((src) => sourceId(src.s)));
+    const admitted: ScoredSource[] = [];
+    for (const s of candidateSources(index, value, repr, false)) {
+      if (known.has(sourceId(s))) continue;
+      admitted.push(newSource(s, now));
+    }
+    if (matched.length === 0 && admitted.length === 0) {
+      // Nothing in the trigger explains this value. Memorizing the literal is
+      // the last hypothesis available — and it has to earn its keep like any
+      // other, which is how a template whose old constant went stale finds
+      // the new one instead of going silent forever.
+      admitted.push(newSource({ kind: 'const', value, repr }, now));
+    }
+    const explanations = matched.length + admitted.length;
+    if (explanations === 1) (matched[0] ?? admitted[0]!).solo += 1;
+    if (admitted.length > 0) {
+      tpl.sources.push(...admitted);
+      evictSources(tpl, now, admitted.length);
+    }
+  }
+}
+
+/** A newly discovered hypothesis: one observation of evidence, no solo win. */
+function newSource(s: Source, now: number): ScoredSource {
+  return { s, score: 1, lastUpdated: now, solo: 0 };
+}
+
+/** Identity of a hypothesis, for "does the template already hold this?". */
+function sourceId(s: Source): string {
+  switch (s.kind) {
+    case 'arg':
+      return `a\x00${s.key}`;
+    case 'parsed':
+      return `p\x00${s.path.join('\x00')}`;
+    case 'const':
+      return `c\x00${s.repr}`;
+  }
+}
+
+/**
+ * Trim a template to MAX_SOURCES_PER_ARG by dropping its weakest hypotheses
+ * (lowest decayed score, then stalest), never the ones this observation just
+ * admitted — the same admission invariant the transition and opener caps
+ * carry (§13.16). Refusing new sources at the cap instead, as this did before
+ * v0.13, means a saturated argument can never learn anything again: the
+ * churn of one-off consts alone is enough to saturate one.
+ */
+function evictSources(tpl: ArgTemplate, now: number, protectNewest: number): void {
+  // The just-admitted sources sit at the tail; everything before them is fair
+  // game, and the window shrinks with each eviction.
+  let evictable = tpl.sources.length - protectNewest;
+  while (tpl.sources.length > MAX_SOURCES_PER_ARG) {
+    if (evictable <= 0) {
+      // One observation admitted more sources than the cap allows: keep the
+      // prefix rather than growing without bound.
+      tpl.sources.length = MAX_SOURCES_PER_ARG;
+      return;
+    }
+    let worst = 0;
+    for (let i = 1; i < evictable; i++) {
+      const a = tpl.sources[i]!;
+      const b = tpl.sources[worst]!;
+      const delta =
+        decayedScore(a.score, a.lastUpdated, now) -
+          decayedScore(b.score, b.lastUpdated, now) || a.lastUpdated - b.lastUpdated;
+      if (delta < 0) worst = i;
+    }
+    tpl.sources.splice(worst, 1);
+    evictable--;
   }
 }
 
@@ -921,29 +1111,56 @@ function isUnderivable(tpl: ArgTemplate): boolean {
   return tpl.missed / observations >= MAX_TEMPLATE_MISS_RATE;
 }
 
-/** All sources in the previous call that produce `value`, plus the const. */
+/**
+ * Everything one previous call could have supplied, as canonical reprs,
+ * computed ONCE per observation. Every argument of the follow-up call is
+ * explained against the same index, so a wide result is walked and stringified
+ * once instead of once per argument.
+ */
+interface PrevIndex {
+  args: Array<{ key: string; repr: string | undefined }>;
+  paths: Array<{ segs: string[]; repr: string | undefined }>;
+}
+
+function indexPrevCall(prev: PrevCall): PrevIndex {
+  return {
+    args: Object.entries(prev.args).map(([key, v]) => ({ key, repr: safeStringify(v) })),
+    paths: enumerateParsedPaths(prev.parsed).map((p) => ({
+      segs: p.segs,
+      repr: safeStringify(p.value),
+    })),
+  };
+}
+
+/**
+ * Sources in the previous call that produce `repr`, in priority order
+ * (arg-copy, then parsed-path) — the seed ranking, before evidence exists.
+ *
+ * `withConst` appends the memorize-this-literal fallback, which a template's
+ * FIRST sighting always keeps (it is what makes a stable-valued argument
+ * derivable at all). Later sightings mint one only when nothing else explains
+ * the value — see updateTemplates — because a const resolves on every future
+ * call whatever it is worth, so minting one per observation would fill the
+ * cap with stale literals that then compete for slots in the batch.
+ */
 function candidateSources(
-  prev: PrevCall,
-  parsedPaths: ParsedPath[],
+  index: PrevIndex,
   value: unknown,
+  repr: string,
+  withConst: boolean,
 ): Source[] {
-  const repr = safeStringify(value);
-  if (repr === undefined) return [];
   const sources: Source[] = [];
-  // Priority order is baked into storage order: arg-copy, parsed-path, const.
-  for (const [k, v] of Object.entries(prev.args)) {
-    if (sources.length >= MAX_SOURCES_PER_ARG) break;
-    if (safeStringify(v) === repr) sources.push({ kind: 'arg', key: k });
+  // Priority order is baked into seed order: arg-copy, parsed-path, const.
+  const room = withConst ? MAX_SOURCES_PER_ARG - 1 : MAX_SOURCES_PER_ARG;
+  for (const a of index.args) {
+    if (sources.length >= room) break;
+    if (a.repr === repr) sources.push({ kind: 'arg', key: a.key });
   }
-  for (const p of parsedPaths) {
-    if (sources.length >= MAX_SOURCES_PER_ARG) break;
-    if (safeStringify(p.value) === repr) {
-      sources.push({ kind: 'parsed', path: p.segs });
-    }
+  for (const p of index.paths) {
+    if (sources.length >= room) break;
+    if (p.repr === repr) sources.push({ kind: 'parsed', path: p.segs });
   }
-  // The const fallback always survives the cap: it is the source of last
-  // resort that keeps a stable-valued arg derivable.
-  sources.push({ kind: 'const', value, repr });
+  if (withConst) sources.push({ kind: 'const', value, repr });
   return sources;
 }
 
@@ -966,47 +1183,173 @@ function sourceProduces(source: Source, prev: PrevCall, repr: string): boolean {
   }
 }
 
-/**
- * Rebuild a transition's next-call args against the current call. Null when
- * any arg is underivable or fails to resolve now (fail closed).
- */
-function materializeArgs(
-  state: TransitionState,
-  call: ObservedCall,
-): Record<string, unknown> | null {
-  const args: Record<string, unknown> = {};
-  for (const [name, tpl] of state.templates) {
-    if (isUnderivable(tpl)) return null;
-    const resolved = resolveSources(tpl.sources, call);
-    if (!resolved.ok) return null;
-    args[name] = resolved.value;
-  }
-  return args;
+/** One distinct value an argument could take on the current call. */
+interface ArgOption {
+  value: unknown;
+  /** Canonical repr, for collapsing sources that agree on this call. */
+  repr: string;
+  /** Decayed evidence for this VALUE: the best admissible source producing it. */
+  score: number;
 }
 
 /**
- * First source that resolves against the current call wins. Sources are
- * stored in priority order (arg-copy > parsed-path > const), so a plain
- * scan implements the priority; const always resolves.
+ * The distinct values one argument could take on the current call, best
+ * evidence first. Null when the argument is off limits or nothing admissible
+ * resolves — both fail-closed, and both drop the whole prediction.
+ *
+ * Ranking is by decayed per-source score; the seed order (arg-copy >
+ * parsed-path > const) survives only as the tie-break, which is what a state
+ * file written before per-source scoring — every score 0 — ranks by.
+ *
+ * ADMISSIBILITY, and why it is not just "whatever resolves": the
+ * best-evidenced source is always usable, but any OTHER source needs
+ * independent standing (MIN_SOURCE_SOLO_WINS) before it may answer for this
+ * argument — whether as a lower-ranked alternative or as a stand-in when the
+ * best one fails to resolve. Without that, the const mined from a template's
+ * first sighting is a permanent fallback that resolves on every call forever:
+ * a list→detail transition whose parsed path finds nothing today would answer
+ * with the id it saw once, months ago, and "the derivation did not resolve,
+ * so predict nothing" would quietly stop being true.
  */
-function resolveSources(sources: Source[], call: ObservedCall): Resolution {
-  for (const s of sources) {
-    switch (s.kind) {
-      case 'arg':
-        if (Object.prototype.hasOwnProperty.call(call.args, s.key)) {
-          return { ok: true, value: call.args[s.key] };
-        }
-        break;
-      case 'parsed': {
-        const res = resolvePath(call.parsed, s.path);
-        if (res.ok) return res;
-        break;
-      }
-      case 'const':
-        return { ok: true, value: s.value };
+function argOptions(tpl: ArgTemplate, call: ObservedCall, now: number): ArgOption[] | null {
+  if (isUnderivable(tpl)) return null;
+  const ranked = tpl.sources
+    .map((src, i) => ({ src, i, score: decayedScore(src.score, src.lastUpdated, now) }))
+    .sort((a, b) => b.score - a.score || kindRank(a.src.s) - kindRank(b.src.s) || a.i - b.i);
+
+  const seen = new Set<string>();
+  const out: ArgOption[] = [];
+  for (let rank = 0; rank < ranked.length; rank++) {
+    const entry = ranked[rank]!;
+    if (rank > 0 && entry.src.solo < MIN_SOURCE_SOLO_WINS) continue;
+    const res = resolveSource(entry.src.s, call);
+    if (!res.ok) continue;
+    const repr = safeStringify(res.value);
+    if (repr === undefined) continue; // an unrepresentable value is no answer
+    // Hypotheses that agree on this call are one candidate, carrying the
+    // best-evidenced one's score: offering the same value twice would spend
+    // two slots on one answer.
+    if (seen.has(repr)) continue;
+    seen.add(repr);
+    out.push({ value: res.value, repr, score: entry.score });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/** Seed priority, the tie-break among equally evidenced sources. */
+function kindRank(s: Source): number {
+  return s.kind === 'arg' ? 0 : s.kind === 'parsed' ? 1 : 2;
+}
+
+/** This source's value on the current call. `const` always resolves. */
+function resolveSource(s: Source, call: ObservedCall): Resolution {
+  switch (s.kind) {
+    case 'arg':
+      return Object.prototype.hasOwnProperty.call(call.args, s.key)
+        ? { ok: true, value: call.args[s.key] }
+        : { ok: false };
+    case 'parsed':
+      return resolvePath(call.parsed, s.path);
+    case 'const':
+      return { ok: true, value: s.value };
+  }
+}
+
+/** One materialized argument set, with its share of the transition's weight. */
+interface ArgCombo {
+  args: Record<string, unknown>;
+  /** Product of the per-argument normalized scores; the best combo is 1. */
+  weight: number;
+}
+
+/**
+ * Up to `limit` argument sets for one transition, best first (§13.18).
+ *
+ * The first is the all-best combination — every argument answered by its
+ * best-evidenced source, weight exactly 1, i.e. what this transition used to
+ * emit as its only candidate. The rest substitute the next-best value for one
+ * argument at a time, ordered by the product of the per-argument normalized
+ * scores. For the dominant real shape — one argument that moves (which row of
+ * the list did the agent open?) and the rest fixed — that yields row 0, row 1,
+ * row 2 in the order they have actually been opened.
+ *
+ * Empty when any argument is underivable or unresolvable: a prediction is
+ * still all-or-nothing, and no argument is ever fabricated.
+ */
+function materializeCombos(
+  state: TransitionState,
+  call: ObservedCall,
+  now: number,
+  limit: number,
+): ArgCombo[] {
+  const names: string[] = [];
+  const options: ArgOption[][] = [];
+  const weights: number[][] = [];
+  for (const [name, tpl] of state.templates) {
+    const opts = argOptions(tpl, call, now);
+    if (opts === null) return []; // fail closed — never partial args
+    names.push(name);
+    // An argument with no evidence at all (a state file that predates
+    // per-source scoring) answers with its priority-order first source and
+    // offers no alternatives: there is nothing to rank them by.
+    const usable = opts[0]!.score > 0 ? opts : [opts[0]!];
+    // A hedge is worth the SHARE of this argument's evidence standing behind
+    // it — computed over every admissible value, before the cap truncates
+    // them, so the weights (and so the emitted prefix) do not depend on how
+    // many predictions this trigger happens to be allowed. Normalizing
+    // against the leader instead would rank twelve tied one-off literals
+    // exactly like a genuine 25/9/5 split of a list position, which is how a
+    // transition with an underivable argument spends a whole batch on
+    // memorized junk before the miss-rate gate closes on it.
+    const total = usable.reduce((sum, o) => sum + o.score, 0);
+    weights.push(
+      // The best value keeps weight 1 so the all-best combination weighs 1
+      // and a transition's first candidate ranks exactly where it did before.
+      usable.map((o, i) => (i === 0 || total <= 0 ? 1 : o.score / total)),
+    );
+    options.push(usable.slice(0, Math.max(1, limit)));
+  }
+
+  const n = names.length;
+  const combo = (idx: number[]): ArgCombo => {
+    const args: Record<string, unknown> = {};
+    let weight = 1;
+    for (let a = 0; a < n; a++) {
+      const option = options[a]![idx[a]!]!;
+      args[names[a]!] = option.value;
+      weight *= weights[a]![idx[a]!]!;
+    }
+    return { args, weight };
+  };
+
+  // Best-first over the lattice of per-argument choices. Every step
+  // multiplies by a factor <= 1 (options are sorted by score), so popping the
+  // heaviest frontier entry yields the combinations in exact weight order.
+  const out: ArgCombo[] = [];
+  const root = new Array<number>(n).fill(0);
+  const seen = new Set<string>([root.join(',')]);
+  const frontier = [{ idx: root, c: combo(root) }];
+  while (out.length < limit && frontier.length > 0) {
+    let best = 0;
+    for (let i = 1; i < frontier.length; i++) {
+      if (frontier[i]!.c.weight > frontier[best]!.c.weight) best = i;
+    }
+    const cur = frontier.splice(best, 1)[0]!;
+    // Weight 0 marks a substitution with no standing of its own, and nothing
+    // behind it in the order can weigh more: stop rather than fill the batch.
+    if (cur.c.weight <= 0) break;
+    out.push(cur.c);
+    for (let a = 0; a < n; a++) {
+      if (cur.idx[a]! + 1 >= options[a]!.length) continue;
+      const next = [...cur.idx];
+      next[a]! += 1;
+      const key = next.join(',');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      frontier.push({ idx: next, c: combo(next) });
     }
   }
-  return { ok: false };
+  return out;
 }
 
 // -- parsed-result path search ------------------------------------------------

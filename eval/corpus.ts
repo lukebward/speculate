@@ -18,16 +18,17 @@
  * derive and a leg it cannot, so the score sits in a sensitive middle band
  * instead of saturating at 0 or 100.
  *
- * PARTIAL BLIND SPOT — array-index parsed paths. Until v0.13 (§13.17) no
- * archetype had a SURVIVING `hits.0.docId`-style derivation, because both
- * list→detail legs were latched off by one unexplainable value; multi-arg
- * resolves through the nested-object path `suggested.docId` so that it does
- * not smuggle in the "the agent opens the top of the list" assumption. Now
- * that a miss no longer disables a template, `list-detail-varied` does carry
- * one — but it is a single index, drawn from whatever position the first
- * sighting used, so the eval still exercises only a sliver of the 0..2
- * window. Do not treat a green eval as validation of array-path work;
- * test/learner.test.ts is where that lives.
+ * ARRAY-INDEX parsed paths. Until v0.13 (§13.17) no archetype had a SURVIVING
+ * `hits.0.docId`-style derivation, because both list→detail legs were latched
+ * off by one unexplainable value; multi-arg resolves through the
+ * nested-object path `suggested.docId` so that it does not smuggle in the
+ * "the agent opens the top of the list" assumption. Since §13.18 scores
+ * competing sources, `list-detail-varied` exercises the whole 0..2 window at
+ * once (its cardId template ends a seed-1 replay holding cards.0/1/2 with
+ * disjoint evidence). It still says nothing about indices past the window, or
+ * about what happens when two paths carry the same value; do not treat a
+ * green eval as validation of array-path work. test/learner.test.ts is where
+ * that lives.
  *
  * Determinism: every draw comes from the seeded PRNG below. No ambient
  * randomness and no ambient clock is reachable from this package —
@@ -141,9 +142,11 @@ function phrase(rng: Rng): string {
  *
  * Hard leg — `board_list_cards → card_get`: the card id lives only in the
  * parsed list, at a position that moves. Since v0.13 (§13.17) an opened index
- * that differs from the learned one is a miss rather than a death sentence, so
- * this leg scores the share of sessions that reopen the learned position; a
- * model that offered several positions at once would score the rest.
+ * that differs from the learned one is a miss rather than a death sentence,
+ * and since §13.18 the learner offers indices 0/1/2 as competing candidates —
+ * so this leg now scores roughly the mass of the index distribution inside
+ * the 0..2 window, and its ceiling is the long tail past it (30% of sessions),
+ * which no parsed path can address at all.
  * Easy leg — `card_get → …`: FOUR competing follow-ups whose arguments are
  * copies of the previous call's args (plus one genuine constant), so ranking
  * rather than derivation decides recall@1 vs @3 vs @5 — the rarest branch
@@ -237,10 +240,13 @@ const listDetailVaried: Archetype = {
  * move every time.
  *
  * Hard leg — `svc_list_alerts → alert_get`: the id alternates between two
- * stable values (so no parsed path survives) at shifting positions. What is
- * left is a const source for ONE of the two, which is right half the time; a
- * model that remembered recently-visited entities would take the other half,
- * which is exactly what this archetype is for.
+ * stable values (so no parsed path survives) at shifting positions. Before
+ * §13.18 the learner could keep a const source for exactly ONE of the two and
+ * was right half the time; scoring competing sources lets it hold both
+ * literals and offer them as two candidates, which is why this leg now
+ * saturates. It stops measuring entity memory at that point — a third
+ * favourite, or more of them than the per-trigger cap, would be the next
+ * question.
  * Easy leg — `alert_get → …`: arg-copy follow-ups, two-way branch.
  */
 const returnVisits: Archetype = {

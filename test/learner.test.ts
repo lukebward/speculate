@@ -6,6 +6,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import { TransitionLearner, decayedScore } from '../src/learner.js';
+import type { SerializedSource } from '../src/learner.js';
 import type { ObservedCall } from '../src/types.js';
 
 const DAY_MS = 24 * 3600_000;
@@ -232,38 +233,27 @@ describe('const templates and poisoning', () => {
     expect(preds[0]!.args).toEqual({ state: 'open' });
   });
 
-  it('an arg that varies with no derivable source poisons the transition — and the evidence keeps it poisoned', () => {
+  it('an arg that varies with no derivable source silences the transition until a value actually recurs', () => {
     const learner = new TransitionLearner({ now });
-    observePair(
-      learner,
-      'srv',
-      { tool: 'a' },
-      { tool: 'b', args: { token: 'x1' } },
-    );
-    observePair(
-      learner,
-      'srv',
-      { tool: 'a' },
-      { tool: 'b', args: { token: 'x2' } },
-    );
+    const token = (t: string): void =>
+      observePair(learner, 'srv', { tool: 'a' }, { tool: 'b', args: { token: t } });
+
+    token('x1');
+    token('x2');
+    // The const mined from the first sighting never produces x2, and nothing
+    // in the trigger call does either: one derivation, one miss, no verdict.
     expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
 
-    // A consistent VALUE is not a derivation: the only candidate source is
-    // the const mined from the first sighting, and it never produces x2. Each
-    // further sighting is another miss, so the template stays silent.
-    observePair(
-      learner,
-      'srv',
-      { tool: 'a' },
-      { tool: 'b', args: { token: 'x2' } },
-    );
-    observePair(
-      learner,
-      'srv',
-      { tool: 'a' },
-      { tool: 'b', args: { token: 'x2' } },
-    );
-    expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
+    // x2 is now a hypothesis of its own — minted when nothing else explained
+    // it, and only worth anything if it recurs. It does, so the learner
+    // eventually says so. (Before per-source scoring the candidate list could
+    // only shrink, so a template whose constant went stale stayed silent for
+    // the life of the process however consistent the traffic became.)
+    token('x2');
+    token('x2');
+    const preds = learner.predict(mkCall('srv', 'a'));
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ token: 'x2' });
   });
 
   it('recovers after a single underivable observation', () => {
@@ -468,6 +458,294 @@ describe('source priority', () => {
     const preds = learner.predict(mkCall('srv', 'get_issue', { n: 9 }));
     expect(preds).toHaveLength(1);
     expect(preds[0]!.args).toEqual({ n: 9 });
+  });
+});
+
+// --- per-source scoring and multi-candidate emission --------------------------
+
+/**
+ * Each argument keeps SEVERAL competing hypotheses about where its value came
+ * from, scores them against real traffic, and offers the strongest few as
+ * separate predictions. What is pinned here: every source that could have
+ * produced a value is credited (not just the first one tried), evidence beats
+ * the fixed arg>parsed>const priority order, the per-argument cap evicts its
+ * weakest hypothesis instead of refusing new ones, and one transition can
+ * emit row 0, row 1 and row 2 as ranked candidates.
+ */
+describe('per-source scoring', () => {
+  /** The stored sources for one argument of one transition, in stored order. */
+  function sourcesOf(
+    learner: TransitionLearner,
+    nextTool: string,
+    arg: string,
+  ): SerializedSource[] {
+    const t = learner.exportState().transitions.find((x) => x.nextTool === nextTool);
+    if (!t) throw new Error(`no transition to ${nextTool}`);
+    const tpl = t.templates.find((x) => x.name === arg);
+    if (!tpl) throw new Error(`no template for ${arg}`);
+    return tpl.sources;
+  }
+
+  /** `kind:key|path|repr` → stored score, so assertions read like the model. */
+  function scores(
+    learner: TransitionLearner,
+    nextTool: string,
+    arg: string,
+  ): Map<string, number | undefined> {
+    return new Map(
+      sourcesOf(learner, nextTool, arg).map((s) => [
+        `${s.kind}:${s.key ?? s.path?.join('.') ?? s.repr}`,
+        s.score,
+      ]),
+    );
+  }
+
+  /** One `list → open` sighting where the agent opened row `row` of three. */
+  function openRow(learner: TransitionLearner, i: number, row: number): void {
+    const ids = [`a${i}`, `b${i}`, `c${i}`];
+    observePair(
+      learner,
+      'srv',
+      { tool: 'list', parsed: { rows: ids.map((id) => ({ id })) } },
+      { tool: 'open', args: { id: ids[row] } },
+    );
+  }
+
+  const threeRows = mkCall('srv', 'list', {}, { rows: [{ id: 'p' }, { id: 'q' }, { id: 'r' }] });
+
+  it('credits every source that could have produced the observed value', () => {
+    const learner = new TransitionLearner({ now });
+    // The opened id is BOTH a copy of the trigger's `id` argument and the
+    // second row of its parsed result: two hypotheses explain every sighting,
+    // and both must be credited, not merely the first one tried.
+    for (const id of ['v1', 'v2', 'v3']) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', args: { id }, parsed: { rows: [{ id: 'other' }, { id }] } },
+        { tool: 'open', args: { id } },
+      );
+    }
+
+    const byKind = scores(learner, 'open', 'id');
+    expect(byKind.get('arg:id')).toBe(3);
+    expect(byKind.get('parsed:rows.1.id')).toBe(3);
+    // The const mined from the first sighting explained that one and no other.
+    expect(byKind.get('const:"v1"')).toBe(1);
+  });
+
+  it('prefers the source that has actually been right, over priority order', () => {
+    const learner = new TransitionLearner({ now });
+    // First sighting: the trigger's `cursor` argument happens to equal the
+    // opened id, so an arg-copy is stored beside the parsed path — and
+    // arg-copies come FIRST in the fixed priority order.
+    observePair(
+      learner,
+      'srv',
+      {
+        tool: 'list',
+        args: { cursor: 'k0' },
+        parsed: { rows: [{ id: 'x' }, { id: 'y' }, { id: 'k0' }] },
+      },
+      { tool: 'open', args: { id: 'k0' } },
+    );
+    // From then on the agent opens row 2, which is never the cursor.
+    for (let i = 1; i <= 5; i++) {
+      observePair(
+        learner,
+        'srv',
+        {
+          tool: 'list',
+          args: { cursor: `k${i}` },
+          parsed: { rows: [{ id: `a${i}` }, { id: `b${i}` }, { id: `z${i}` }] },
+        },
+        { tool: 'open', args: { id: `z${i}` } },
+      );
+    }
+
+    // The loser is outranked, not deleted: holding both is what makes the
+    // question "which one has been right?" answerable at all.
+    const byKind = scores(learner, 'open', 'id');
+    expect(byKind.get('arg:cursor')).toBe(1);
+    expect(byKind.get('parsed:rows.2.id')).toBe(6);
+
+    const preds = learner.predict(
+      mkCall(
+        'srv',
+        'list',
+        { cursor: 'live' },
+        { rows: [{ id: 'p' }, { id: 'q' }, { id: 'r' }] },
+      ),
+    );
+    expect(preds[0]!.args).toEqual({ id: 'r' }); // evidence, not priority order
+  });
+
+  it('emits several ranked candidates from one transition', () => {
+    const learner = new TransitionLearner({ now });
+    // Row 0 is opened most often, row 1 next, row 2 occasionally.
+    [0, 0, 0, 1, 0, 2, 0, 1, 0, 2, 1, 0].forEach((row, i) => openRow(learner, i, row));
+
+    const preds = learner.predict(threeRows);
+    expect(preds.map((p) => p.tool)).toEqual(['open', 'open', 'open']);
+    // One transition, three argument sets, ordered by how often each row has
+    // actually been the one opened.
+    expect(preds.map((p) => p.args)).toEqual([{ id: 'p' }, { id: 'q' }, { id: 'r' }]);
+    expect(preds[0]!.confidence).toBeGreaterThan(preds[1]!.confidence);
+    expect(preds[1]!.confidence).toBeGreaterThan(preds[2]!.confidence);
+    // Same ruleId: they are the same learned transition, so §5.6 feedback
+    // scores the transition as a whole.
+    expect(new Set(preds.map((p) => p.ruleId)).size).toBe(1);
+  });
+
+  it('never exceeds maxPredictionsPerTrigger when a transition offers variants', () => {
+    const learner = new TransitionLearner({ now, maxPredictionsPerTrigger: 2 });
+    [0, 0, 0, 1, 0, 2, 0, 1, 0, 2, 1, 0].forEach((row, i) => openRow(learner, i, row));
+    expect(learner.predict(threeRows)).toHaveLength(2);
+  });
+
+  it('evicts the weakest source at the cap instead of refusing new ones', () => {
+    const learner = new TransitionLearner({ now });
+    // Twelve one-off literals: every sighting mints a const nothing else
+    // explains, saturating the per-argument cap with hypotheses that never
+    // recur. (MAX_SOURCES_PER_ARG is 12.)
+    for (let i = 0; i < 12; i++) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'a', args: { q: `q${i}` } },
+        { tool: 'b', args: { v: `junk${i}` } },
+      );
+    }
+    // Then the follow-up starts copying the trigger's `q` argument, always.
+    for (let i = 0; i < 8; i++) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'a', args: { q: `w${i}` } },
+        { tool: 'b', args: { v: `w${i}` } },
+      );
+    }
+
+    const stored = sourcesOf(learner, 'b', 'v');
+    expect(stored.length).toBeLessThanOrEqual(12);
+    expect(stored.some((s) => s.kind === 'arg' && s.key === 'q')).toBe(true);
+    // And the winner is used: a saturated candidate list is not a life sentence.
+    const preds = learner.predict(mkCall('srv', 'a', { q: 'live' }));
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ v: 'live' });
+  });
+
+  it('keeps loading sources with no score field', () => {
+    const learner = new TransitionLearner({ now });
+    // A state file written before per-source scoring: sources in the old
+    // fixed priority order and no evidence to tell them apart.
+    learner.importState({
+      transitions: [
+        {
+          server: 's',
+          prevTool: 'a',
+          nextTool: 'b',
+          count: 3,
+          templates: [
+            {
+              name: 'x',
+              underivable: false,
+              derived: 3,
+              missed: 0,
+              sources: [
+                { kind: 'arg', key: 'q' },
+                { kind: 'const', repr: '"fallback"' },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const preds = learner.predict(mkCall('s', 'a', { q: 'live' }));
+    // Unscored sources rank by the legacy priority order, and an alternative
+    // with no evidence behind it is never offered as a second candidate.
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ x: 'live' });
+  });
+
+  it('never spends a slot on a hypothesis that has only ever agreed with a better one', () => {
+    const learner = new TransitionLearner({ now });
+    // The const mined from the first sighting is right whenever the board is
+    // `bugs` — but only ever at the same time as the arg-copy, so it has no
+    // evidence of its own and offering `bugs` here would waste a slot.
+    for (const board of ['bugs', 'bugs', 'platform', 'bugs', 'platform']) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', args: { board } },
+        { tool: 'get', args: { board } },
+      );
+    }
+    const preds = learner.predict(mkCall('srv', 'list', { board: 'mobile' }));
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.args).toEqual({ board: 'mobile' });
+  });
+
+  it('does not let a crowd of tied hedges crowd out another transition best answer', () => {
+    const learner = new TransitionLearner({ now });
+    // `q` cycles through three literals, so the argument ends up with three
+    // equally evidenced hypotheses and no idea which comes next. Ranking a
+    // hedge against the LEADER would score all three as though each were the
+    // answer; ranking it by its share of the argument's evidence says what is
+    // true — each is worth a third — so the rarer transition keeps its slot.
+    for (let i = 0; i < 9; i++) {
+      observePair(learner, 'srv', { tool: 'a' }, { tool: 'b', args: { q: `v${i % 3}` } });
+    }
+    for (let i = 0; i < 4; i++) observePair(learner, 'srv', { tool: 'a' }, { tool: 'c' });
+
+    const preds = learner.predict(mkCall('srv', 'a'));
+    expect(preds).toHaveLength(3);
+    expect(preds.map((p) => p.tool)).toEqual(['b', 'c', 'b']);
+  });
+
+  it('lets a source that is right now overtake one that was right last quarter', () => {
+    const learner = new TransitionLearner({ now });
+    t = 0;
+    for (let i = 0; i < 6; i++) openRow(learner, i, 2);
+    t = 120 * DAY_MS;
+    for (let i = 6; i < 9; i++) openRow(learner, i, 0);
+
+    // Six sightings of row 2 outweigh three of row 0 by raw count; four
+    // months of silence is what makes the recent evidence worth more.
+    expect(learner.predict(threeRows)[0]!.args).toEqual({ id: 'p' });
+  });
+
+  it('drops the whole prediction when one argument cannot be resolved, however many the others offer', () => {
+    const learner = new TransitionLearner({ now });
+    [0, 1, 0, 1, 0, 2, 1, 2].forEach((row, i) => {
+      const ids = [`a${i}`, `b${i}`, `c${i}`];
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', parsed: { token: `t${i}`, rows: ids.map((id) => ({ id })) } },
+        { tool: 'open', args: { id: ids[row], token: `t${i}` } },
+      );
+    });
+
+    // Three ranked ids are available; the token is nowhere in this trigger,
+    // so nothing is emitted — a beam never fabricates the argument it lacks.
+    expect(learner.predict(threeRows)).toEqual([]);
+
+    const preds = learner.predict(
+      mkCall(
+        'srv',
+        'list',
+        {},
+        { token: 'T', rows: [{ id: 'p' }, { id: 'q' }, { id: 'r' }] },
+      ),
+    );
+    expect(preds).toHaveLength(3);
+    expect(preds.map((p) => p.args)).toEqual([
+      { id: 'p', token: 'T' },
+      { id: 'q', token: 'T' },
+      { id: 'r', token: 'T' },
+    ]);
   });
 });
 
