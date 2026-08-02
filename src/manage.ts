@@ -265,21 +265,48 @@ function saveManagedState(path: string, state: ManagedState): void {
 }
 
 /**
+ * Recursively sort OBJECT keys so `JSON.stringify` of the result is
+ * insensitive to source field order — but never reorder ARRAY elements,
+ * whose order is semantically meaningful (an entry's `args` is a command
+ * line). Entries reach effectiveServerHash straight from `JSON.parse` of
+ * the host config, which preserves whatever field order the file happens
+ * to have; `claude mcp add-json` rewriting `~/.claude.json` can change that
+ * order for a server whose meaning didn't change at all, and the hash must
+ * not misfire (and trigger a pointless sync) over that.
+ */
+function canonicalizeForHash(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeForHash);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalizeForHash((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
  * Stable hash of the effective server set (names + command lines) for a
  * project: `speculate sync`'s fast path spawns no subprocess, so this is
  * the whole "did anything change since last sync?" check. Sorted by name
  * so key order in the source config can never change the hash — the state
  * (which scope won, and its exact entry) is what must be stable, not the
- * order the host happened to enumerate servers in.
+ * order the host happened to enumerate servers in. Each entry is
+ * canonicalized before stringifying so an entry's own field order (and any
+ * nested object's, e.g. `env`) can't change the hash either — only array
+ * order (e.g. `args`) is preserved, since that's semantically meaningful.
+ * The parts are hashed as a JSON array, not delimiter-joined, so two
+ * different server sets can never concatenate to the same string.
  */
 export function effectiveServerHash(view: ClaudeConfigView): string {
   const parts: string[] = [];
   for (const [name, scoped] of [...effectiveServers(view.servers)].sort((a, b) =>
     a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
   )) {
-    parts.push(`${scoped.scope} ${name} ${JSON.stringify(scoped.entry)}`);
+    parts.push(`${scoped.scope} ${name} ${JSON.stringify(canonicalizeForHash(scoped.entry))}`);
   }
-  return createHash('sha256').update(parts.join('')).digest('hex');
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
 
 // -- the claude mcp front door ---------------------------------------------------

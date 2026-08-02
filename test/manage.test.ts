@@ -20,7 +20,7 @@ import {
   type CmdRunner,
 } from '../src/manage.js';
 import { isWindows } from './platform.js';
-import { WORKSPACE_SERVER_NAME, type ClaudeConfigView } from '../src/hostConfig.js';
+import { WORKSPACE_SERVER_NAME, type ClaudeConfigView, type ClaudeScope } from '../src/hostConfig.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
 
@@ -1034,10 +1034,24 @@ describe('resolveClaudeBin', () => {
 });
 
 describe('effectiveServerHash', () => {
-  /** Minimal real ClaudeConfigView: every server at user scope, unapproved/unwarned. */
-  function fakeView(servers: Record<string, { command: string; args: string[] }>): ClaudeConfigView {
+  /**
+   * Minimal real ClaudeConfigView. Each server's own field order is
+   * whatever the caller wrote in its object literal (JS preserves own-key
+   * insertion order), which is exactly what the field-order tests below
+   * exploit — no need to bypass this helper to get an oddly-ordered entry.
+   */
+  function fakeView(
+    servers: Record<
+      string,
+      { command: string; args: string[]; env?: Record<string, string>; scope?: ClaudeScope }
+    >,
+  ): ClaudeConfigView {
     return {
-      servers: Object.entries(servers).map(([name, entry]) => ({ name, scope: 'user', entry })),
+      servers: Object.entries(servers).map(([name, { scope, ...entry }]) => ({
+        name,
+        scope: scope ?? 'user',
+        entry,
+      })),
       approvedProjectServers: new Set(),
       projectApprovalKnown: false,
       warnings: [],
@@ -1068,5 +1082,35 @@ describe('effectiveServerHash', () => {
     const a = fakeView({ a: { command: 'x', args: [] }, b: { command: 'y', args: [] } });
     const b = fakeView({ b: { command: 'y', args: [] }, a: { command: 'x', args: [] } });
     expect(effectiveServerHash(a)).toBe(effectiveServerHash(b));
+  });
+
+  // Entries reach effectiveServerHash straight from JSON.parse of the host
+  // config, and `claude mcp add-json` rewriting ~/.claude.json can reorder
+  // an entry's own fields without changing what it means — the hash must
+  // not misfire (and trigger a pointless sync) over that.
+  it('hashes equal when an entry\'s own field order differs but content is identical', () => {
+    const a = fakeView({ github: { command: 'gh', args: ['stdio'] } });
+    const b = fakeView({ github: { args: ['stdio'], command: 'gh' } });
+    expect(effectiveServerHash(a)).toBe(effectiveServerHash(b));
+  });
+
+  it('ignores field order inside a nested object (env)', () => {
+    const a = fakeView({ github: { command: 'gh', args: [], env: { A: '1', B: '2' } } });
+    const b = fakeView({ github: { command: 'gh', args: [], env: { B: '2', A: '1' } } });
+    expect(effectiveServerHash(a)).toBe(effectiveServerHash(b));
+  });
+
+  // Unlike object keys, array element order IS semantically meaningful for
+  // `args` (it's a command line) — canonicalization must never sort it.
+  it('treats a reordered args array as a different command line', () => {
+    const a = fakeView({ github: { command: 'gh', args: ['stdio', '--v2'] } });
+    const b = fakeView({ github: { command: 'gh', args: ['--v2', 'stdio'] } });
+    expect(effectiveServerHash(a)).not.toBe(effectiveServerHash(b));
+  });
+
+  it('hashes the same server name differently when its winning scope differs', () => {
+    const a = fakeView({ github: { command: 'gh', args: ['stdio'], scope: 'user' } });
+    const b = fakeView({ github: { command: 'gh', args: ['stdio'], scope: 'local' } });
+    expect(effectiveServerHash(a)).not.toBe(effectiveServerHash(b));
   });
 });
