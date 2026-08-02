@@ -38,6 +38,7 @@ import {
   type ClaudeScope,
   type McpServerEntry,
 } from './hostConfig.js';
+import type { SpeculationMode } from './types.js';
 
 export interface CmdResult {
   code: number;
@@ -535,47 +536,23 @@ export async function cleanupLegacyArtifacts(
   };
 }
 
-// -- on ---------------------------------------------------------------------------
+// -- shared wrap path ---------------------------------------------------------
 
-export async function speculateOn(opts: ManageOptions): Promise<number> {
-  const ctx = makeCtx(opts);
-  if (!(await frontDoorAvailable(ctx))) {
-    ctx.log(
-      `[speculate] cannot run '${ctx.claudeBin} mcp' — is Claude Code installed and on PATH?`,
-    );
-    return 1;
-  }
-  const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
-  for (const w of view.warnings) ctx.log(`[speculate] warning: ${w}`);
-  const state = loadManagedState(ctx.statePath);
-  const record = state.projects[ctx.cwd] ?? { entries: [], updatedAt: Date.now() };
-  let legacy: LegacyCleanupResult = NO_LEGACY_CLEANUP;
-  try {
-    legacy = await cleanupLegacyArtifacts(ctx, view, {
-      marketplaceAddedByOn: readMarketplaceAddedByOn(state),
-      pluginRecorded: record.entries.some((e) => e.action === 'plugin'),
-    });
-  } catch (err) {
-    ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
-  }
-  // A ≤0.10 record is dropped only once the artifact it describes is really
-  // gone from the HOST — otherwise `off`'s recorded-artifact safety net (the
-  // only path left when detection misses) would be destroyed by an `on` that
-  // never removed anything. Conversely, keeping a record for an artifact
-  // cleanup DID remove would make the next `off` chase a clean host and
-  // report a spurious failure. So: prune on confirmed removal, or on the
-  // host view already showing the artifact gone.
-  const workspaceGone =
-    legacy.workspaceServerRemoved || !effectiveServers(view.servers).has(WORKSPACE_SERVER_NAME);
-  const managed = new Map(
-    record.entries
-      .filter((e) => {
-        if (e.name === WORKSPACE_SERVER_NAME) return !workspaceGone;
-        if (e.action === 'plugin') return !legacy.pluginUninstalled;
-        return true;
-      })
-      .map((e) => [managedKey(e.scope, e.name), e]),
-  );
+export interface WrapOutcome {
+  changed: number;
+  failed: number;
+}
+
+/**
+ * Wraps every eligible server in `view` into `managed`, applying all consent
+ * gates. Mutates `managed` in place. Used by both `on` and `sync`.
+ */
+export async function wrapEffectiveServers(
+  ctx: Ctx,
+  view: ClaudeConfigView,
+  managed: Map<string, ManagedEntry>,
+  opts: { mode?: SpeculationMode },
+): Promise<WrapOutcome> {
   let changed = 0;
   let failed = 0;
 
@@ -650,6 +627,54 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
     ctx.log(`[speculate] ${name}: wrapped (${scoped.scope} scope)`);
     changed++;
   }
+
+  return { changed, failed };
+}
+
+// -- on ---------------------------------------------------------------------------
+
+export async function speculateOn(opts: ManageOptions): Promise<number> {
+  const ctx = makeCtx(opts);
+  if (!(await frontDoorAvailable(ctx))) {
+    ctx.log(
+      `[speculate] cannot run '${ctx.claudeBin} mcp' — is Claude Code installed and on PATH?`,
+    );
+    return 1;
+  }
+  const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
+  for (const w of view.warnings) ctx.log(`[speculate] warning: ${w}`);
+  const state = loadManagedState(ctx.statePath);
+  const record = state.projects[ctx.cwd] ?? { entries: [], updatedAt: Date.now() };
+  let legacy: LegacyCleanupResult = NO_LEGACY_CLEANUP;
+  try {
+    legacy = await cleanupLegacyArtifacts(ctx, view, {
+      marketplaceAddedByOn: readMarketplaceAddedByOn(state),
+      pluginRecorded: record.entries.some((e) => e.action === 'plugin'),
+    });
+  } catch (err) {
+    ctx.log(`[speculate] legacy cleanup failed: ${(err as Error).message}`);
+  }
+  // A ≤0.10 record is dropped only once the artifact it describes is really
+  // gone from the HOST — otherwise `off`'s recorded-artifact safety net (the
+  // only path left when detection misses) would be destroyed by an `on` that
+  // never removed anything. Conversely, keeping a record for an artifact
+  // cleanup DID remove would make the next `off` chase a clean host and
+  // report a spurious failure. So: prune on confirmed removal, or on the
+  // host view already showing the artifact gone.
+  const workspaceGone =
+    legacy.workspaceServerRemoved || !effectiveServers(view.servers).has(WORKSPACE_SERVER_NAME);
+  const managed = new Map(
+    record.entries
+      .filter((e) => {
+        if (e.name === WORKSPACE_SERVER_NAME) return !workspaceGone;
+        if (e.action === 'plugin') return !legacy.pluginUninstalled;
+        return true;
+      })
+      .map((e) => [managedKey(e.scope, e.name), e]),
+  );
+  const { changed, failed } = await wrapEffectiveServers(ctx, view, managed, {
+    mode: opts.mode ?? undefined,
+  });
 
   state.projects[ctx.cwd] = { entries: [...managed.values()], updatedAt: Date.now() };
   // The ownership flag authorized exactly one host-global removal; consume it
