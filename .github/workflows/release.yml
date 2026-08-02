@@ -42,9 +42,25 @@ jobs:
             exit 1
           fi
 
+      # A version already on the registry is not an error. It happens when a
+      # release is bootstrapped by hand (0.12.0 was), when a tag is pushed
+      # twice, or when a run is retried after a later step failed. Publishing
+      # is the only non-idempotent step here, so it is the only one guarded.
+      - name: Skip if this version is already published
+        id: published
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if npm view "speculate-mcp@$v" version >/dev/null 2>&1; then
+            echo "speculate-mcp@$v is already on the registry; nothing to publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - run: npx tsc
 
       - run: npm test
 
       # prepublishOnly would re-run build+test; already done above.
-      - run: npm publish --provenance --ignore-scripts
+      - if: steps.published.outputs.skip != 'true'
+        run: npm publish --provenance --ignore-scripts
