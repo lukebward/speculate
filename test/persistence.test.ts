@@ -92,6 +92,54 @@ describe('TransitionLearner export/import', () => {
     expect(out[0]!.ruleId).toBe('learned:srv:list→get');
   });
 
+  it('carries per-template evidence across a restart', () => {
+    const a = new TransitionLearner({ now: () => 0 });
+    const pair = (listed: number, opened: number, t: number): void => {
+      a.observe(call('srv', 'list', {}, { items: [{ id: listed }] }, t));
+      a.observe(call('srv', 'get', { id: opened }, null, t + 100));
+    };
+    pair(1, 1, 0);
+    pair(2, 2, 1_000);
+    pair(3, 999, 2_000); // the one instance no source explains
+    pair(4, 4, 3_000);
+    pair(5, 5, 4_000);
+
+    const exported = JSON.parse(JSON.stringify(a.exportState())) as {
+      transitions: Array<{
+        nextTool: string;
+        templates: Array<{ name: string; underivable: boolean; derived?: number; missed?: number }>;
+      }>;
+    };
+    const tpl = exported.transitions
+      .find((x) => x.nextTool === 'get')!
+      .templates.find((x) => x.name === 'id')!;
+    expect({ derived: tpl.derived, missed: tpl.missed }).toEqual({ derived: 4, missed: 1 });
+    expect(tpl.underivable).toBe(false);
+
+    // The miss must not re-poison the template on the way back in.
+    const b = new TransitionLearner({ now: () => 0 });
+    b.importState(exported);
+    const out = b.predict(call('srv', 'list', {}, { items: [{ id: 42 }] }, 5_000));
+    expect(out.some((p) => p.tool === 'get' && p.args['id'] === 42)).toBe(true);
+  });
+
+  it('keeps a pre-v0.13 underivable template silent, evidence fields or not', () => {
+    const l = new TransitionLearner({ now: () => 0 });
+    l.importState({
+      transitions: [
+        {
+          server: 's',
+          prevTool: 'a',
+          nextTool: 'b',
+          count: 9,
+          // Old files carry the sticky boolean alone, and never with sources.
+          templates: [{ name: 'x', underivable: true, sources: [] }],
+        },
+      ],
+    });
+    expect(l.predict(call('s', 'a', {}, null, 0))).toEqual([]);
+  });
+
   it('revision changes when transitions change (dirty tracking)', () => {
     const l = new TransitionLearner({ now: () => 0 });
     const r0 = l.revision;

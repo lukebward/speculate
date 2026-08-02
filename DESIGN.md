@@ -150,7 +150,7 @@ Tier-1-shaped rules authored by the operator in `speculate.config.json` rather t
 
 ### 5.3 Tier 2 — Learned transition model (v0.2: session-scoped version implemented)
 
-A per-server bigram model over observed transitions: `P(next_tool | prev_tool)`, learned live from the session. Argument prediction via templates mined per transition — for each argument of the follow-up call, candidate sources (same-named trigger arg, path into the trigger's parsed result, constant) are intersected across observations; a transition predicts only when every argument remains derivable, with arguments resolved against the *current* call. Two consistent observations arm a transition; confidence ramps with count (capped at 0.55, below hand-written rules); ranking and eviction go by a time-decayed score rather than raw count (§13.16); the §5.6 feedback loop suppresses transitions that stop hitting. v0.2 scope: in-memory, per-session, capacity-bounded. Cross-session persistence (per-user/per-project priors) remains post-MVP.
+A per-server bigram model over observed transitions: `P(next_tool | prev_tool)`, learned live from the session. Argument prediction via templates mined per transition — for each argument of the follow-up call, candidate sources (same-named trigger arg, path into the trigger's parsed result, constant) are intersected across observations — but an observation that *no* candidate explains is recorded as a miss and leaves the candidate list intact, so one unexplainable value cannot disable the transition for good (§13.17). A transition predicts only when every argument remains derivable, with arguments resolved against the *current* call. Two consistent observations arm a transition; confidence ramps with count (capped at 0.55, below hand-written rules); ranking and eviction go by a time-decayed score rather than raw count (§13.16); the §5.6 feedback loop suppresses transitions that stop hitting. v0.2 scope: in-memory, per-session, capacity-bounded. Cross-session persistence (per-user/per-project priors) remains post-MVP.
 
 ### 5.4 Tier 3 — Small-LLM predictor (post-MVP, optional)
 
@@ -479,6 +479,29 @@ Scope note: this corpus never reaches `maxTransitions`, so the eval exercises **
 Composition note: the headline **+0.104 is a property of the corpus mix, not a transferable property of the learner**. `regime-shift` supplies 120 of the 1020 workflow pairs (11.8%) and moves +0.900, which is +0.106 of the total by arithmetic alone; the other three archetypes net −0.002. Give the fixture more phase-2 sessions and the same code change reports a bigger number. The per-archetype rows, not the pooled figure, are what attributes the change. `regime-shift` also has near-zero cross-seed variance by construction (the seed varies names and branches, never the transition structure), so running more seeds confirms determinism rather than robustness: the uncertainty in +0.104 lives in the fixture design, not in sampling.
 
 Reach note: the shipped `Predictor.selectBatch` ranks by `confidence × effectiveness`, and learner confidence is derived from the **undecayed** `count`. So decay decides which ≤3 transitions the learner *proposes*, and downstream it survives as the emission-order tie-break between candidates of equal `confidence × effectiveness`. That tie is not an edge case: `effectiveness` returns exactly 0.5 for every rule that has never fired, and learner confidence is two-valued (0.45 at count 2, capped 0.55 at count ≥ 3), so among equal-count learner candidates at cold start the product ties outright and decay orders the **whole** batch. The eval calls `learner.predict` directly, so the table above remains an upper bound on decay's reach in production, but the reach is wider than a tie-break note suggests.
+
+### 13.17 v0.13 — one underivable value no longer disables a transition (2026-08-02)
+
+An argument template was killed by a **single** observation it could not explain, forever. Two latches enforced it and only releasing both changes anything: `ArgTemplate.underivable` was sticky, and `updateTemplates` intersected the candidate sources with the ones that reproduced the new value, so an unexplainable value emptied the list — after which `resolveSources` failed and `materializeArgs` returned null whatever the boolean said. Releasing the boolean alone is a measured no-op. On the eval corpus this scored two whole list→detail legs at exactly **0.000**: an agent opening the second row of a list instead of the first, once, disabled the transition for the rest of the process's life.
+
+The boolean is now **evidence**: `derived` and `missed` counts per argument. An observation no candidate explains records a miss and **retains** the candidate list; an observation some candidate explains still intersects (the derivation narrows as before). An argument is underivable when it has never been derived (`derived === 0`, including the empty source set), when evidence is thin (< 4 observations) and there is any miss at all, or when the miss rate reaches 75% thereafter. The first clause is the fail-closed one and is absolute — **an argument no source has ever produced is never fabricated**, and a prediction whose arguments cannot all be resolved is still dropped. The thin-evidence clause keeps a template quiet while its rate is unmeasurable, so the change costs nothing at cold start; the rate clause caps the waste a surviving template can impose at roughly three wasted predictions per hit.
+
+`derived`/`missed` persist beside the sources. `underivable` is still written, carrying the current verdict for older builds, but a build that understands the counters recomputes the verdict from them — otherwise a rate-poisoned template would come back from disk permanently dead. A pre-v0.13 file (boolean, no counters) loads exactly as before: `underivable: true` stays sourceless and silent, `false` loads as one derivation and no misses.
+
+Measured (offline recall@K harness, seeds 1,2,3, 1020 workflow pairs):
+
+| archetype | before | after | Δ recall@3 |
+|---|---|---|---|
+| **list-detail-varied** | 0.423 | **0.527** | **+0.103** |
+| **return-visits** | 0.497 | **0.717** | **+0.220** |
+| multi-arg | 0.883 | 0.883 | 0.000 |
+| regime-shift | 0.900 | 0.900 | 0.000 |
+| WORKFLOW (headline) | 0.636 | **0.731** | **+0.095** |
+| adversarial (floor) | 0.087 | 0.087 | 0.000 |
+
+The attribution is the point: the movement is entirely in the two archetypes built around a moving list position (`board_list_cards→card_get` 0.000 → 0.207, `svc_list_alerts→alert_get` 0.000 → 0.440), the two that never had a latched template do not move at all, and the noise floor does not move — a change that merely made the learner fire harder would have lifted the floor first. Workflow waste per hit goes 1.45 → 1.54, which is the price: transitions that emitted nothing now emit something, and on these corpora they are right more often than the rate gate's worst case.
+
+Still capped at one hypothesis per transition. `board_list_cards→card_get` lands at 0.207 because the template keeps whichever row the first sighting used; emitting row 0/1/2 as competing hypotheses is a separate change.
 
 ## v0.11 (2026-08-01): MCP-only focus
 

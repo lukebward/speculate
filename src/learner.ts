@@ -54,6 +54,23 @@ const MAX_PARSED_KEYS_PER_LEVEL = 32;
 const MAX_PARSED_PATHS = 256;
 /** Per-arg candidate-source cap (arg-copies + parsed-paths; const always kept). */
 const MAX_SOURCES_PER_ARG = 12;
+/**
+ * Per-argument evidence gate (§5.3). A template used to be disabled forever
+ * by ONE observation it could not derive — an agent opening the second row
+ * of a list instead of the first was enough to kill the transition for the
+ * rest of the process's life. Instead a template stays quiet until it has
+ * this many observations, and from then on speaks for as long as its miss
+ * rate stays under MAX_TEMPLATE_MISS_RATE. Below the evidence threshold a
+ * single miss silences it — quietly and temporarily, not permanently.
+ */
+const MIN_TEMPLATE_EVIDENCE = 4;
+/**
+ * Miss rate at or above which a template is treated as underivable. The
+ * reciprocal is the worst waste-per-hit a surviving template can impose
+ * (0.75 ⇒ at most three wasted predictions per hit), so this is the knob
+ * that trades recall on moving values against wasted prefetches.
+ */
+const MAX_TEMPLATE_MISS_RATE = 0.75;
 /** Session-opener tracking (§13.15): per-server cap and sanity bounds. */
 const MAX_OPENERS_PER_SERVER = 8;
 const MAX_OPENER_REPR_LENGTH = 4_096;
@@ -117,7 +134,21 @@ export interface SerializedTransition {
   score?: number;
   /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
   lastUpdated?: number;
-  templates: Array<{ name: string; underivable: boolean; sources: SerializedSource[] }>;
+  templates: Array<{
+    name: string;
+    /**
+     * The verdict as of the write. Pre-v0.13 this WAS the state (sticky, and
+     * the only thing stored); it is still written so an older build reading a
+     * newer file keeps its fail-closed reading, but a build that understands
+     * `derived`/`missed` recomputes the verdict from those instead.
+     */
+    underivable: boolean;
+    /** Observations a source reproduced. Absent pre-v0.13; defaults to 1. */
+    derived?: number;
+    /** Observations none could. Absent pre-v0.13; defaults to 0. */
+    missed?: number;
+    sources: SerializedSource[];
+  }>;
 }
 
 export interface SerializedOpener {
@@ -149,10 +180,19 @@ type Source =
   | { kind: 'const'; value: unknown; repr: string };
 
 interface ArgTemplate {
-  /** Poisoned: no consistent derivation exists. Sticky once set. */
-  underivable: boolean;
   /** Surviving candidate sources, in resolution-priority order. */
   sources: Source[];
+  /**
+   * Observations one of `sources` reproduced. ZERO IS ABSOLUTE: an argument
+   * no source has ever produced is never emitted, whatever else is true.
+   */
+  derived: number;
+  /**
+   * Observations no source could reproduce, including ones where the
+   * argument was absent entirely. Evidence against the template, not a
+   * death sentence — see isUnderivable().
+   */
+  missed: number;
 }
 
 interface TransitionState {
@@ -386,7 +426,9 @@ export class TransitionLearner {
         lastUpdated: state.lastUpdated,
         templates: [...state.templates.entries()].map(([name, tpl]) => ({
           name,
-          underivable: tpl.underivable,
+          underivable: isUnderivable(tpl),
+          derived: tpl.derived,
+          missed: tpl.missed,
           sources: tpl.sources.map(serializeSource),
         })),
       });
@@ -689,6 +731,16 @@ function importedScore(raw: unknown, count: number, max: number): number {
 }
 
 /**
+ * A persisted template counter, or undefined when the field is absent or
+ * unusable — which is how a pre-v0.13 file is told apart from a current one.
+ * Clamped like every other imported count: a state file cannot mint evidence.
+ */
+function importedCount(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return undefined;
+  return Math.min(Math.floor(raw), MAX_IMPORTED_COUNT);
+}
+
+/**
  * A persisted recency stamp, or now() when absent/junk. Never in the future:
  * a state file written by a clock ahead of ours must not buy an entry
  * permanent freshness.
@@ -721,12 +773,22 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
   const templates = new Map<string, ArgTemplate>();
   for (const rawTpl of t.templates) {
     if (rawTpl === null || typeof rawTpl !== 'object') return null;
-    const tpl = rawTpl as { name?: unknown; underivable?: unknown; sources?: unknown };
+    const tpl = rawTpl as {
+      name?: unknown;
+      underivable?: unknown;
+      derived?: unknown;
+      missed?: unknown;
+      sources?: unknown;
+    };
     if (typeof tpl.name !== 'string' || typeof tpl.underivable !== 'boolean') {
       return null;
     }
-    if (tpl.underivable) {
-      templates.set(tpl.name, { underivable: true, sources: [] });
+    const derived = importedCount(tpl.derived);
+    const missed = importedCount(tpl.missed);
+    if (derived === undefined && missed === undefined && tpl.underivable) {
+      // Pre-v0.13 file: the sticky boolean is all the evidence there is, and
+      // it never travelled with usable sources. Keep it fail-closed.
+      templates.set(tpl.name, { sources: [], derived: 0, missed: 1 });
       continue;
     }
     if (!Array.isArray(tpl.sources)) return null;
@@ -735,9 +797,13 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
       const s = deserializeSource(rawSrc);
       if (s) sources.push(s); // malformed sources are dropped, not fatal
     }
-    // A derivable template that lost all its sources is poisoned, matching
-    // the live invariant (empty sources ⇒ underivable).
-    templates.set(tpl.name, { underivable: sources.length === 0, sources });
+    // A template that lost all its sources can never derive anything again,
+    // matching the live invariant (no sources ⇒ never guess).
+    templates.set(tpl.name, {
+      sources,
+      derived: sources.length === 0 ? 0 : (derived ?? 1),
+      missed: missed ?? 0,
+    });
   }
   const count = Math.min(Math.floor(t.count), MAX_IMPORTED_COUNT);
   return {
@@ -761,16 +827,30 @@ function initialTemplates(
   const templates = new Map<string, ArgTemplate>();
   const parsedPaths = enumerateParsedPaths(prev.parsed);
   for (const [name, value] of Object.entries(nextArgs)) {
-    const sources = candidateSources(prev, parsedPaths, value);
-    templates.set(name, { underivable: sources.length === 0, sources });
+    templates.set(name, seedTemplate(candidateSources(prev, parsedPaths, value), 0));
   }
   return templates;
 }
 
 /**
- * Later instance: intersect each template's candidates with the sources
- * that would also have produced this instance's value. Arg-set instability
- * (new names, missing names) poisons the affected templates.
+ * A template from its first sighting. Sources built from a value derive that
+ * value by construction, so that sighting counts as a derivation — unless
+ * there are no sources at all (an unrepresentable value), which is the one
+ * state no later evidence can talk the learner out of.
+ */
+function seedTemplate(sources: Source[], priorMisses: number): ArgTemplate {
+  const derived = sources.length > 0 ? 1 : 0;
+  return { sources, derived, missed: priorMisses + (derived === 0 ? 1 : 0) };
+}
+
+/**
+ * Later instance: intersect each template's candidates with the sources that
+ * would also have produced this instance's value — but only when at least one
+ * of them would have. An instance NO candidate explains is recorded as a miss
+ * and leaves the candidate list intact; emptying it (as this did before v0.13)
+ * made resolveSources fail forever after, so a single unexplainable value
+ * disabled the whole transition permanently. Arg-set instability (a name that
+ * appears late, a name that goes missing) is evidence the same way.
  */
 function updateTemplates(
   state: TransitionState,
@@ -779,25 +859,52 @@ function updateTemplates(
 ): void {
   for (const [name, tpl] of state.templates) {
     if (!Object.prototype.hasOwnProperty.call(nextArgs, name)) {
-      tpl.underivable = true; // previously seen arg absent now
-      tpl.sources = [];
+      tpl.missed += 1; // previously seen arg absent now
     }
   }
+  let parsedPaths: ParsedPath[] | null = null;
   for (const [name, value] of Object.entries(nextArgs)) {
     const tpl = state.templates.get(name);
     if (!tpl) {
-      // Arg name not seen on earlier instances: inconsistent shape.
-      state.templates.set(name, { underivable: true, sources: [] });
+      // Arg name not seen on earlier instances: seed it from this instance,
+      // billed for every earlier instance it was missing from.
+      parsedPaths ??= enumerateParsedPaths(prev.parsed);
+      state.templates.set(
+        name,
+        seedTemplate(
+          candidateSources(prev, parsedPaths, value),
+          Math.max(0, state.count - 1),
+        ),
+      );
       continue;
     }
-    if (tpl.underivable) continue; // poisoned stays poisoned
     const repr = safeStringify(value);
-    tpl.sources =
+    const kept =
       repr === undefined
         ? []
         : tpl.sources.filter((s) => sourceProduces(s, prev, repr));
-    if (tpl.sources.length === 0) tpl.underivable = true;
+    if (kept.length > 0) {
+      tpl.sources = kept; // the derivation narrows
+      tpl.derived += 1;
+    } else {
+      tpl.missed += 1; // one value it cannot explain, sources retained
+    }
   }
+}
+
+/**
+ * Is this argument off limits? Fail closed on the two cases that matter: a
+ * source set that has never produced anything (including an empty one, which
+ * could not resolve anyway), and a derivation that keeps being wrong once
+ * there is enough evidence to say so. In between — thin evidence with at
+ * least one miss — the learner stays quiet rather than guessing, and can
+ * change its mind later, which the old sticky boolean could not.
+ */
+function isUnderivable(tpl: ArgTemplate): boolean {
+  if (tpl.derived === 0 || tpl.sources.length === 0) return true;
+  const observations = tpl.derived + tpl.missed;
+  if (observations < MIN_TEMPLATE_EVIDENCE) return tpl.missed > 0;
+  return tpl.missed / observations >= MAX_TEMPLATE_MISS_RATE;
 }
 
 /** All sources in the previous call that produce `value`, plus the const. */
@@ -855,7 +962,7 @@ function materializeArgs(
 ): Record<string, unknown> | null {
   const args: Record<string, unknown> = {};
   for (const [name, tpl] of state.templates) {
-    if (tpl.underivable) return null;
+    if (isUnderivable(tpl)) return null;
     const resolved = resolveSources(tpl.sources, call);
     if (!resolved.ok) return null;
     args[name] = resolved.value;

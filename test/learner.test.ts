@@ -232,7 +232,7 @@ describe('const templates and poisoning', () => {
     expect(preds[0]!.args).toEqual({ state: 'open' });
   });
 
-  it('an arg that varies with no derivable source poisons the transition — permanently', () => {
+  it('an arg that varies with no derivable source poisons the transition — and the evidence keeps it poisoned', () => {
     const learner = new TransitionLearner({ now });
     observePair(
       learner,
@@ -248,7 +248,9 @@ describe('const templates and poisoning', () => {
     );
     expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
 
-    // Even if the arg becomes consistent again, the poison sticks.
+    // A consistent VALUE is not a derivation: the only candidate source is
+    // the const mined from the first sighting, and it never produces x2. Each
+    // further sighting is another miss, so the template stays silent.
     observePair(
       learner,
       'srv',
@@ -262,6 +264,71 @@ describe('const templates and poisoning', () => {
       { tool: 'b', args: { token: 'x2' } },
     );
     expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
+  });
+
+  it('recovers after a single underivable observation', () => {
+    const learner = new TransitionLearner({ now });
+    const derivable = (id: number): void =>
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', parsed: { items: [{ id }] } },
+        { tool: 'get', args: { id } },
+      );
+
+    derivable(1);
+    derivable(2); // items.0.id is the surviving source
+    // The odd one out: the agent opened something that is nowhere in the
+    // trigger call. One such observation must not disable the transition.
+    observePair(
+      learner,
+      'srv',
+      { tool: 'list', parsed: { items: [{ id: 3 }] } },
+      { tool: 'get', args: { id: 999 } },
+    );
+    // Thin evidence stays quiet: 2 derivations against 1 miss is not yet a
+    // verdict, so the learner waits rather than guessing.
+    expect(learner.predict(mkCall('srv', 'list', {}, { items: [{ id: 42 }] }))).toEqual(
+      [],
+    );
+
+    derivable(4);
+    derivable(5);
+
+    const preds = learner.predict(
+      mkCall('srv', 'list', {}, { items: [{ id: 42 }] }),
+    );
+    expect(preds).toHaveLength(1);
+    expect(preds[0]!.tool).toBe('get');
+    expect(preds[0]!.args).toEqual({ id: 42 }); // still the learned derivation
+  });
+
+  it('still refuses to guess an argument it has never derived', () => {
+    const learner = new TransitionLearner({ now });
+    // `token` is a fresh value every time and appears nowhere in the trigger
+    // call, so the const from the first sighting is the only candidate and it
+    // never reproduces a later value. No amount of repetition may fabricate it.
+    for (let i = 0; i < 8; i++) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'a' },
+        { tool: 'b', args: { token: `t${i}` } },
+      );
+    }
+    expect(learner.predict(mkCall('srv', 'a'))).toEqual([]);
+
+    // An arg with no representation at all never even gets a candidate
+    // source, so it is never derived and never emitted — however consistent.
+    for (let i = 0; i < 8; i++) {
+      observePair(
+        learner,
+        'srv',
+        { tool: 'c' },
+        { tool: 'd', args: { token: undefined } },
+      );
+    }
+    expect(learner.predict(mkCall('srv', 'c'))).toEqual([]);
   });
 
   it('an arg name appearing only on a later instance poisons the transition', () => {
