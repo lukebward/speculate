@@ -25,6 +25,11 @@
  * injected into the MODEL's context. `systemMessage` is the documented channel
  * for a line the USER should see. It is emitted only when `sync` actually
  * wrapped something, which is rare; the fast path prints nothing at all.
+ *
+ * And ONLY then. The child's stderr also carries Node warnings, tsx notices
+ * and, on a broken install, stack traces — none of which a user should meet at
+ * every session start. So the line is taken by prefix rather than by position,
+ * and only from a run that exited 0.
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -52,12 +57,16 @@ child.stderr?.on('data', (chunk) => {
   if (note.length < 4096) note += String(chunk);
 });
 child.on('error', () => process.exit(0));
-child.on('close', () => {
-  // `sync` is silent unless it wrapped something; its summary is one line.
+child.on('close', (code) => {
+  // A run that failed has nothing to tell the user: it is a bug report, not a
+  // status line, and `speculate status` is where diagnosis lives.
+  if (code !== 0) return;
+  // `sync` is silent unless it wrapped something; its summary is one line, and
+  // every line it writes is prefixed.
   const line = note
     .split('\n')
     .map((l) => l.trim())
-    .filter((l) => l.length > 0)
+    .filter((l) => l.startsWith('[speculate]'))
     .pop();
   if (line) process.stdout.write(`${JSON.stringify({ systemMessage: line })}\n`);
   // No process.exit(): returning lets the write flush, and the exit code is

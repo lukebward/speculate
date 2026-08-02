@@ -7,7 +7,15 @@
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +33,14 @@ import { isWindows } from './platform.js';
 import { WORKSPACE_SERVER_NAME, type ClaudeConfigView, type ClaudeScope } from '../src/hostConfig.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
+
+/** The version the shipped plugin manifest declares (see the version test). */
+const PLUGIN_MANIFEST: Record<string, string> = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL('../plugin/.claude-plugin/plugin.json', import.meta.url)),
+    'utf8',
+  ),
+);
 
 let home: string;
 let cwd: string;
@@ -46,6 +62,12 @@ let pluginSim: { installed: boolean; marketplace: boolean; autowrap?: boolean } 
 let pluginListShape: 'array' | 'id-keyed';
 /** Source path of the auto-wrap marketplace, once `on` has registered it. */
 let autowrapMarketplace: string;
+/**
+ * What `claude plugin list --json` reports for an installed auto-wrap plugin.
+ * A version or an installed hook command that no longer matches what this
+ * Speculate would generate is what `on`'s repair path keys off.
+ */
+let autowrapInstall: { version: string; installPath?: string };
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'speculate-mhome-'));
@@ -56,6 +78,7 @@ beforeEach(() => {
   pluginSim = null;
   pluginListShape = 'array';
   autowrapMarketplace = '';
+  autowrapInstall = { version: PLUGIN_MANIFEST.version! };
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -87,12 +110,25 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
         // the plugin is named, which is the shape that regresses if a
         // matcher only ever looks at record objects.
         if (pluginSim.installed) keyed['speculate@speculate'] = { version: '0.10.0' };
-        if (pluginSim.autowrap) keyed['speculate-autowrap'] = { version: '0.11.0' };
+        if (pluginSim.autowrap) {
+          keyed['speculate-autowrap@speculate-mcp'] = { version: autowrapInstall.version };
+        }
         return { code: 0, stdout: JSON.stringify(keyed), stderr: '' };
       }
+      // The measured shape of a real `claude plugin list --json`: an array of
+      // records whose only identifier is `id`, and it is `<plugin>@<market>`.
       const list: AnyRecord[] = [];
-      if (pluginSim.installed) list.push({ name: 'speculate', marketplace: 'speculate' });
-      if (pluginSim.autowrap) list.push({ name: 'speculate-autowrap', marketplace: 'speculate' });
+      if (pluginSim.installed) {
+        list.push({ id: 'speculate@speculate', version: '0.10.0', scope: 'local' });
+      }
+      if (pluginSim.autowrap) {
+        list.push({
+          id: 'speculate-autowrap@speculate-mcp',
+          version: autowrapInstall.version,
+          scope: 'user',
+          ...(autowrapInstall.installPath ? { installPath: autowrapInstall.installPath } : {}),
+        });
+      }
       return { code: 0, stdout: JSON.stringify(list), stderr: '' };
     }
     if (args[1] === 'marketplace' && args[2] === 'list') {
@@ -125,6 +161,9 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
       if (id.startsWith('speculate-autowrap')) {
         if (!autowrapMarketplace) return { code: 1, stdout: '', stderr: 'no such marketplace' };
         pluginSim.autowrap = true;
+        // A real install copies the CURRENT staged plugin, so whatever made
+        // the installed copy look stale is resolved by it.
+        autowrapInstall = { version: PLUGIN_MANIFEST.version! };
         return { code: 0, stdout: 'Installed speculate-autowrap@speculate-mcp', stderr: '' };
       }
       if (!pluginSim.marketplace) return { code: 1, stdout: '', stderr: 'no such marketplace' };
@@ -132,6 +171,10 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
       return { code: 0, stdout: 'Installed speculate@speculate', stderr: '' };
     }
     if (args[1] === 'uninstall') {
+      if ((args[args.length - 1] ?? '').startsWith('speculate-autowrap')) {
+        pluginSim.autowrap = false;
+        return { code: 0, stdout: 'Uninstalled', stderr: '' };
+      }
       pluginSim.installed = false;
       return { code: 0, stdout: 'Uninstalled', stderr: '' };
     }
@@ -1089,7 +1132,11 @@ describe('the auto-wrap plugin', () => {
         return {
           code: 0,
           stdout: JSON.stringify([
-            { id: 'speculate-autowrap@speculate-mcp', version: '0.12.0', scope: 'user' },
+            {
+              id: 'speculate-autowrap@speculate-mcp',
+              version: PLUGIN_MANIFEST.version,
+              scope: 'user',
+            },
           ]),
           stderr: '',
         };
@@ -1138,7 +1185,11 @@ describe('the auto-wrap plugin', () => {
     await speculateOn(opts());
     const entry = hookEntry(stagedHooks());
     expect(entry.type).toBe('command');
-    expect(entry.command).toContain(SELF.command); // absolute node
+    // `node` by NAME, resolved on PATH: node/node.exe is a real executable
+    // (never a .cmd shim), and a baked interpreter path would break for good
+    // the first time an nvm/fnm/volta user switched Node versions.
+    expect(entry.command.startsWith('node ')).toBe(true);
+    expect(entry.command).not.toContain(SELF.command);
     expect(entry.command).toContain(SELF.args[0]); // absolute cli entry
     // Never the npm shim: Claude Code cannot exec a .cmd hook on Windows.
     expect(entry.command).not.toMatch(/^speculate\b/);
@@ -1205,6 +1256,175 @@ describe('the auto-wrap plugin', () => {
     const res = await runWrapper([angryCli]);
     expect(res.code).toBe(0);
     expect(res.stdout).toBe('');
+  });
+
+  it('the hook wrapper says nothing when the CLI writes to stderr and then fails', async () => {
+    // A corrupt install, a missing dependency, a stack trace: forwarding that
+    // last stderr line would put a failure in front of the user at EVERY
+    // session start, which is exactly what a broken install must never do.
+    const brokenCli = join(home, 'broken-cli.mjs');
+    writeFileSync(
+      brokenCli,
+      "process.stderr.write('Error: Cannot find module\\n    at ModuleJob.run\\n');\nprocess.exit(1);\n",
+    );
+    const res = await runWrapper([brokenCli]);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toBe('');
+    expect(res.stderr).toBe('');
+  });
+
+  it("the hook wrapper ignores stderr that isn't Speculate's own summary", async () => {
+    // Node warnings and tsx notices land on the child's stderr too, and often
+    // AFTER the summary — so the line is chosen by prefix, not by position.
+    const noisyCli = join(home, 'noisy-cli.mjs');
+    writeFileSync(
+      noisyCli,
+      "process.stderr.write('(node:1) ExperimentalWarning: something\\n');\n" +
+        "process.stderr.write('[speculate] wrapped 1 new server (github); speculation active next session\\n');\n" +
+        "process.stderr.write('(node:1) [DEP0040] DeprecationWarning: punycode\\n');\n",
+    );
+    const res = await runWrapper([noisyCli]);
+    expect(res.code).toBe(0);
+    expect(JSON.parse(res.stdout)).toEqual({
+      systemMessage: '[speculate] wrapped 1 new server (github); speculation active next session',
+    });
+
+    const warningsOnly = join(home, 'warnings-cli.mjs');
+    writeFileSync(warningsOnly, "process.stderr.write('(node:1) ExperimentalWarning: x\\n');\n");
+    const quiet = await runWrapper([warningsOnly]);
+    expect(quiet.code).toBe(0);
+    expect(quiet.stdout).toBe('');
+  });
+
+  it('on reinstalls when the installed plugin version is behind the shipped one', async () => {
+    // `claude plugin install` caches per version, so without this no plugin
+    // change ever reaches someone who already has it installed.
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    autowrapInstall = { version: '0.0.1-old' };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(calls).toContainEqual([
+      'claude',
+      'plugin',
+      'install',
+      '-s',
+      'user',
+      'speculate-autowrap',
+    ]);
+    expect(autowrapInstall.version).toBe(PLUGIN_MANIFEST.version);
+    expect(logs.join('\n')).toContain('auto-wrap: refreshed');
+  });
+
+  it('on repairs an installed hook command that no longer matches this install', async () => {
+    // The nvm/fnm case: the interpreter or the CLI path baked into the
+    // installed copy no longer describes this Speculate.
+    const installPath = join(home, 'installed-plugin');
+    mkdirSync(join(installPath, 'hooks'), { recursive: true });
+    writeFileSync(
+      join(installPath, 'hooks', 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              matcher: 'startup',
+              hooks: [
+                {
+                  type: 'command',
+                  command: '"/old/node" "${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs" "/gone/cli.js"',
+                  timeout: 90,
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    autowrapInstall = { version: PLUGIN_MANIFEST.version!, installPath };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn(opts())).toBe(0);
+    // Measured against the real host: with the plugin already installed,
+    // `plugin install` no-ops and does NOT re-copy — only an uninstall first
+    // replaces the stale copy, so the repair is uninstall THEN install.
+    const pluginCalls = calls
+      .filter((c) => c[1] === 'plugin' && (c[2] === 'install' || c[2] === 'uninstall'))
+      .map((c) => [c[2], c[5]]);
+    expect(pluginCalls).toEqual([
+      ['uninstall', 'speculate-autowrap'],
+      ['install', 'speculate-autowrap'],
+    ]);
+    expect(pluginSim!.autowrap).toBe(true); // and it ends up installed again
+    expect(logs.join('\n')).toContain('auto-wrap: refreshed');
+  });
+
+  it('a failed refresh uninstall never leaves on claiming success', async () => {
+    const installPath = join(home, 'installed-plugin');
+    mkdirSync(join(installPath, 'hooks'), { recursive: true });
+    writeFileSync(
+      join(installPath, 'hooks', 'hooks.json'),
+      JSON.stringify({
+        hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'node /gone.mjs' }] }] },
+      }),
+    );
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    autowrapInstall = { version: PLUGIN_MANIFEST.version!, installPath };
+    const uninstallFails: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'uninstall') {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'permission denied' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn({ ...opts(), runner: uninstallFails })).toBe(0);
+    // No install is attempted on top of a failed uninstall, and the user is
+    // told exactly what to run.
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'install')).toEqual([]);
+    expect(logs.join('\n')).toContain('could not refresh');
+    expect(logs.join('\n')).toContain('plugin uninstall -s user speculate-autowrap');
+  });
+
+  it('on leaves a matching install alone (no reinstall churn)', async () => {
+    const installPath = join(home, 'installed-plugin');
+    mkdirSync(join(installPath, 'hooks'), { recursive: true });
+    pluginSim = { installed: false, marketplace: false };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts()); // first run installs and stages
+    // Pretend the host's copy is exactly what `on` just staged.
+    copyFileSync(
+      join(stagedRoot(), 'plugin', 'hooks', 'hooks.json'),
+      join(installPath, 'hooks', 'hooks.json'),
+    );
+    autowrapInstall = { version: PLUGIN_MANIFEST.version!, installPath };
+    calls = [];
+    logs = [];
+    expect(await speculateOn(opts())).toBe(0);
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'install')).toEqual([]);
+    expect(logs.join('\n')).toContain('auto-wrap: already installed');
+  });
+
+  it('cleans up the legacy plugin while the auto-wrap plugin is installed', async () => {
+    // The exact combination the self-uninstall guard exists for: both plugins
+    // present in one `plugin list` payload, one of them ours to remove.
+    pluginSim = { installed: true, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall').map((c) => c[5])).toEqual([
+      'speculate@speculate',
+    ]);
+    expect(pluginSim.installed).toBe(false); // the retired plugin is gone
+    expect(pluginSim.autowrap).toBe(true); // ours survived
+    expect(logs.join('\n')).toContain('uninstalled the speculate plugin');
+    expect(logs.join('\n')).toContain('auto-wrap: already installed');
+  });
+
+  it("the plugin manifest's version tracks the package version", () => {
+    // `claude plugin install` caches per version: a plugin change shipped
+    // without a version bump never reaches anyone who already installed it.
+    const pkg = JSON.parse(
+      readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+    );
+    expect(PLUGIN_MANIFEST.version).toBe(pkg.version);
   });
 
   it('the shipped hooks.json is inert until on bakes a CLI path into it', async () => {

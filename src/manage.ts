@@ -820,22 +820,56 @@ const AUTOWRAP_PLUGIN_MATCH: ReadonlySet<string> = new Set([
   `${AUTOWRAP_PLUGIN_ID}@${AUTOWRAP_MARKETPLACE_ID}`,
 ]);
 
+/** Does one `plugin list --json` record name the auto-wrap plugin (exactly)? */
+function isAutowrapRecord(item: unknown): boolean {
+  if (typeof item === 'string') return AUTOWRAP_PLUGIN_MATCH.has(item);
+  if (!item || typeof item !== 'object') return false;
+  const rec = item as Record<string, unknown>;
+  for (const field of ['id', 'name'] as const) {
+    const value = rec[field];
+    if (typeof value === 'string' && AUTOWRAP_PLUGIN_MATCH.has(value)) return true;
+  }
+  return false;
+}
+
+/** What the host reports about an installed copy; both fields are optional. */
+interface AutowrapInstall {
+  version?: string;
+  installPath?: string;
+}
+
+/**
+ * The host's record for our plugin, or null when it isn't installed. Same
+ * two payload shapes `pluginListHas` handles, but the RECORD is kept: `on`
+ * needs the reported `version` and `installPath` to tell a current install
+ * from one it has to refresh.
+ */
+function autowrapRecord(parsed: unknown): AutowrapInstall | null {
+  const fields = (item: unknown): AutowrapInstall => {
+    const rec = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+    return {
+      ...(typeof rec['version'] === 'string' ? { version: rec['version'] } : {}),
+      ...(typeof rec['installPath'] === 'string' ? { installPath: rec['installPath'] } : {}),
+    };
+  };
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) if (isAutowrapRecord(item)) return fields(item);
+    return null;
+  }
+  if (parsed && typeof parsed === 'object') {
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (isAutowrapRecord(key) || isAutowrapRecord(value)) return fields(value);
+    }
+  }
+  return null;
+}
+
 /**
  * Fail-soft check (same shared plugin list as detectLegacyPlugin, matching a
  * different, disjoint id): is the auto-wrap plugin installed?
  */
 async function detectAutowrapPlugin(ctx: Ctx): Promise<boolean> {
-  const named = (item: unknown): boolean => {
-    if (typeof item === 'string') return AUTOWRAP_PLUGIN_MATCH.has(item);
-    if (!item || typeof item !== 'object') return false;
-    const rec = item as Record<string, unknown>;
-    for (const field of ['id', 'name'] as const) {
-      const value = rec[field];
-      if (typeof value === 'string' && AUTOWRAP_PLUGIN_MATCH.has(value)) return true;
-    }
-    return false;
-  };
-  return pluginListHas(await fetchPluginList(ctx), named);
+  return autowrapRecord(await fetchPluginList(ctx)) !== null;
 }
 
 /**
@@ -856,20 +890,27 @@ function packageRoot(): string | null {
 }
 
 /**
- * The hook's command line, baked absolute at install time.
+ * The hook's command line, with both file paths baked at install time.
  *
  * Never a bare `speculate`: Claude Code cannot exec a `.cmd` shim as a hook on
- * Windows, and npm installs `speculate` as one. `${CLAUDE_PLUGIN_ROOT}` is the
- * host's own expansion for the INSTALLED plugin directory and has to be used
- * for the wrapper, because `claude plugin install` COPIES the plugin: a path
- * into the npm package is precisely the path that disappears on `npm
- * uninstall`, which is the case the wrapper exists to survive. The CLI path
- * after it may well disappear — the wrapper checks it and exits 0 silently.
+ * Windows, and npm installs `speculate` as one. `node` by NAME is a different
+ * case and is deliberate: node/node.exe is a real executable, so PATH
+ * resolution works where a shim would not — and it self-heals the one thing a
+ * baked `process.execPath` cannot survive, an nvm/fnm/volta version switch
+ * that deletes the interpreter the hook was pinned to. `ctx.self.command` is
+ * therefore intentionally unused here; only its ARGS are baked.
+ *
+ * `${CLAUDE_PLUGIN_ROOT}` is the host's own expansion for the INSTALLED plugin
+ * directory and has to be used for the wrapper, because `claude plugin
+ * install` COPIES the plugin: a path into the npm package is precisely the
+ * path that disappears on `npm uninstall`, which is the case the wrapper
+ * exists to survive. The CLI path after it may well disappear too — the
+ * wrapper checks it and exits 0 silently.
  */
 function autowrapHookCommand(self: { command: string; args: string[] }): string {
   const quoted = (s: string): string => `"${s}"`;
   return [
-    quoted(self.command),
+    'node',
     quoted('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs'),
     ...self.args.map(quoted),
   ].join(' ');
@@ -908,13 +949,8 @@ function autowrapHooksJson(self: { command: string; args: string[] }): string {
  * writing a generated hook command into it would fail exactly where auto-wrap
  * matters most. Staging also keeps `speculate on` from dirtying an npm package
  * (or, in a checkout, the working tree).
- *
- * Returns null when the package's plugin files can't be found at all, which
- * every caller treats as "skip, quietly".
  */
-function stageAutowrapPlugin(ctx: Ctx): string | null {
-  const root = packageRoot();
-  if (!root) return null;
+function stageAutowrapPlugin(ctx: Ctx, root: string): string {
   const dest = join(dirname(ctx.statePath), 'autowrap');
   mkdirSync(join(dest, '.claude-plugin'), { recursive: true });
   mkdirSync(join(dest, 'plugin', '.claude-plugin'), { recursive: true });
@@ -935,10 +971,55 @@ function stageAutowrapPlugin(ctx: Ctx): string | null {
   return dest;
 }
 
+/** The version the shipped plugin manifest declares, or null if unreadable. */
+function shippedPluginVersion(root: string): string | null {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(join(root, 'plugin', '.claude-plugin', 'plugin.json'), 'utf8'),
+    ) as { version?: unknown };
+    return typeof manifest.version === 'string' ? manifest.version : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Install the auto-wrap plugin at user scope. Every step is fail-soft: a
- * failure logs ONE line and never aborts `on`, whose real work — wrapping this
- * project's servers — has nothing to do with it.
+ * Is the copy the host already has still the one THIS Speculate would install?
+ *
+ * Two ways it stops being: `claude plugin install` caches per version, so a
+ * newer plugin never reaches anyone who already has an older one; and the hook
+ * command bakes this install's absolute CLI path, which an npm move (or a
+ * checkout that became a global install) invalidates. Either way the hook
+ * would keep running the OLD copy forever, so `on` reinstalls.
+ *
+ * Only positive evidence of staleness counts. A host that reports neither a
+ * version nor an install path, or an install path we cannot read, leaves a
+ * working install alone: reinstalling on every `on` would be worse than the
+ * problem.
+ */
+function autowrapInstallIsCurrent(ctx: Ctx, root: string, installed: AutowrapInstall): boolean {
+  const shipped = shippedPluginVersion(root);
+  if (shipped !== null && installed.version !== undefined && installed.version !== shipped) {
+    return false;
+  }
+  if (installed.installPath !== undefined) {
+    try {
+      const hooks = JSON.parse(
+        readFileSync(join(installed.installPath, 'hooks', 'hooks.json'), 'utf8'),
+      ) as { hooks?: { SessionStart?: { hooks?: { command?: unknown }[] }[] } };
+      const command = hooks.hooks?.SessionStart?.[0]?.hooks?.[0]?.command;
+      if (typeof command === 'string' && command !== autowrapHookCommand(ctx.self)) return false;
+    } catch {
+      // Unreadable: no evidence either way, so nothing to act on.
+    }
+  }
+  return true;
+}
+
+/**
+ * Install (or refresh) the auto-wrap plugin at user scope. Every step is
+ * fail-soft: a failure logs ONE line and never aborts `on`, whose real work —
+ * wrapping this project's servers — has nothing to do with it.
  *
  * User scope, not local, because the point is to catch servers added in
  * projects where nobody thought to run `speculate on`. `off` opts a single
@@ -946,23 +1027,48 @@ function stageAutowrapPlugin(ctx: Ctx): string | null {
  */
 async function installAutowrapPlugin(ctx: Ctx): Promise<void> {
   try {
-    if (await detectAutowrapPlugin(ctx)) {
+    const installed = autowrapRecord(await fetchPluginList(ctx));
+    const root = packageRoot();
+    if (installed && (root === null || autowrapInstallIsCurrent(ctx, root, installed))) {
       ctx.log(
         '[speculate] auto-wrap: already installed (new servers wrap at the next session start)',
       );
       return;
     }
-    const source = stageAutowrapPlugin(ctx);
-    if (!source) {
+    if (root === null) {
       ctx.log(
         "[speculate] auto-wrap: plugin files not found — skipped ('speculate on' still wraps this project)",
       );
       return;
     }
-    // An "already exists" here is a success for us (the host replaces a
-    // same-named registration), so the result is deliberately not checked —
-    // a genuine failure surfaces through the install below.
-    await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'add', source], { cwd: ctx.cwd });
+    const source = stageAutowrapPlugin(ctx, root);
+    if (installed) {
+      // Measured: with the plugin already installed, `plugin install` is a
+      // no-op ("is already installed") and `plugin update` reports "already at
+      // the latest version" — NEITHER re-copies the plugin. Only an uninstall
+      // first actually replaces the stale copy. This is the one place
+      // Speculate uninstalls its own plugin, and it is gated on positive
+      // evidence of staleness and immediately followed by the install below.
+      const un = await ctx.runner(
+        ctx.claudeBin,
+        ['plugin', 'uninstall', '-s', 'user', AUTOWRAP_PLUGIN_ID],
+        { cwd: ctx.cwd },
+      );
+      ctx.pluginList = undefined;
+      if (un.code !== 0) {
+        ctx.log(
+          `[speculate] auto-wrap: could not refresh the installed hook (${(un.stderr || un.stdout).trim() || `exit ${un.code}`}) — reinstall with: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}`,
+        );
+        return;
+      }
+    }
+    // Measured: adding an already-registered marketplace exits 0 ("already on
+    // disk"), so this is expected to succeed on every run after the first. The
+    // detail is kept anyway and reported only if the install that depends on
+    // it fails.
+    const add = await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'add', source], {
+      cwd: ctx.cwd,
+    });
     const ins = await ctx.runner(
       ctx.claudeBin,
       ['plugin', 'install', '-s', 'user', AUTOWRAP_PLUGIN_ID],
@@ -971,10 +1077,18 @@ async function installAutowrapPlugin(ctx: Ctx): Promise<void> {
     // The installed set just changed: drop the memoized list (see
     // fetchPluginList) so a later detector doesn't read the pre-install answer.
     ctx.pluginList = undefined;
+    if (ins.code === 0) {
+      ctx.log(
+        installed
+          ? '[speculate] auto-wrap: refreshed — the installed hook now matches this install'
+          : '[speculate] auto-wrap: installed — servers added later wrap at the next session start',
+      );
+      return;
+    }
+    const detail = (ins.stderr || ins.stdout).trim() || `exit ${ins.code}`;
+    const addDetail = add.code === 0 ? '' : `; marketplace: ${(add.stderr || add.stdout).trim()}`;
     ctx.log(
-      ins.code === 0
-        ? '[speculate] auto-wrap: installed — servers added later wrap at the next session start'
-        : `[speculate] auto-wrap: not installed (${(ins.stderr || ins.stdout).trim() || `exit ${ins.code}`}) — 'speculate on' still wraps this project`,
+      `[speculate] auto-wrap: not installed (${detail}${addDetail}) — 'speculate on' still wraps this project`,
     );
   } catch (err) {
     ctx.log(`[speculate] auto-wrap: install skipped (${(err as Error).message})`);
@@ -1225,6 +1339,12 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     );
     ctx.log(
       `[speculate]   remove it everywhere with: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}`,
+    );
+    // Uninstalling the plugin leaves the registration that supplied it behind,
+    // pointing at a staged directory nothing else uses. Naming it here is the
+    // difference between "removed" and "removed, mostly".
+    ctx.log(
+      `[speculate]   and its marketplace: ${ctx.claudeBin} plugin marketplace remove ${AUTOWRAP_MARKETPLACE_ID}`,
     );
   }
   saveManagedState(ctx.statePath, state);
