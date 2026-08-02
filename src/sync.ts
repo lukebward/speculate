@@ -35,14 +35,22 @@ import {
 
 export interface SyncOptions extends ManageOptions {
   /**
-   * Cap on the wrap phase (the only part that spawns subprocesses). Expiry
-   * is treated as success — a slow day must never cost a session — and the
-   * stored hash is left alone so the next session retries. The CLI also
-   * applies a hard process-level cap on top of this.
+   * Budget for the wrap phase (the only part that spawns subprocesses),
+   * default DEFAULT_BUDGET_MS. It is COOPERATIVE: `wrapEffectiveServers`
+   * checks it between servers, so a wrap is never cut in half. Running out
+   * is treated as success — a slow day must never cost a session — but not
+   * as completion: the stored hash is left alone so the next session picks
+   * up whatever was left.
    */
   timeoutMs?: number;
   lockPath?: string;
 }
+
+/**
+ * What a session start can afford to wait for. Hooks are synchronous, so
+ * this is time the user spends staring at a prompt that hasn't appeared.
+ */
+const DEFAULT_BUDGET_MS = 5_000;
 
 /**
  * A lock older than this belonged to a session that died mid-sync (the CLI's
@@ -91,19 +99,6 @@ function acquireLock(path: string): (() => void) | null {
   }
 }
 
-/** Resolves to the promise's value, or null if `ms` elapses (or it rejects). */
-function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T | null> {
-  return new Promise((resolveRace) => {
-    const timer = setTimeout(() => resolveRace(null), ms);
-    timer.unref?.();
-    const settle = (value: T | null): void => {
-      clearTimeout(timer);
-      resolveRace(value);
-    };
-    promise.then(settle, () => settle(null));
-  });
-}
-
 /** Always resolves 0. Silent unless it wrapped something. */
 export async function speculateSync(opts: SyncOptions): Promise<number> {
   // `makeCtx` defaults `log` to a stderr write, and `wrapEffectiveServers`
@@ -113,24 +108,31 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
   const report = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   try {
     const ctx = makeCtx({ ...opts, log: () => {} });
-    const state = loadManagedState(ctx.statePath);
+    const peek = loadManagedState(ctx.statePath);
     // `off` opted this project out; the global hook must not undo that.
-    if (state.syncOptOut?.[ctx.cwd]) return 0;
-    const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
-    const hash = effectiveServerHash(view);
-    if (state.syncHashes?.[ctx.cwd] === hash) return 0; // fast path: no subprocess
+    if (peek.syncOptOut?.[ctx.cwd]) return 0;
+    const seen = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
+    // Fast path: no subprocess, no lock, no write.
+    if (peek.syncHashes?.[ctx.cwd] === effectiveServerHash(seen)) return 0;
     const release = acquireLock(opts.lockPath ?? defaultLockPath(ctx));
     if (!release) return 0; // another session is syncing; next session picks it up
     try {
+      // Re-read everything under the lock. `on` and `off` don't take it (they
+      // are interactive and rare), so a concurrent one may have changed both
+      // the state and the config since the fast-path peek — and this run ends
+      // by WRITING the state back, which would otherwise clobber, say, the
+      // opt-out `off` just recorded.
+      const state = loadManagedState(ctx.statePath);
+      if (state.syncOptOut?.[ctx.cwd]) return 0;
+      const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
       const record = state.projects[ctx.cwd] ?? { entries: [], updatedAt: Date.now() };
       const managed = new Map(record.entries.map((e) => [managedKey(e.scope, e.name), e]));
       const wrapped: string[] = [];
-      const wrapping = wrapEffectiveServers(ctx, view, managed, {
+      const outcome = await wrapEffectiveServers(ctx, view, managed, {
         mode: opts.mode ?? undefined,
         onWrapped: (name) => wrapped.push(name),
+        deadline: performance.now() + (opts.timeoutMs ?? DEFAULT_BUDGET_MS),
       });
-      const outcome =
-        opts.timeoutMs === undefined ? await wrapping : await withDeadline(wrapping, opts.timeoutMs);
       // Record originals for whatever DID get wrapped, even on a run that
       // ran out of time — that record is what makes `off`'s exact restore
       // possible. Nothing wrapped means nothing to record: writing an empty
@@ -147,7 +149,7 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
       // failure would silently become permanent. Leaving the previous hash
       // in place costs one retry per session until it succeeds. A run that
       // ran out of time is the same case: unfinished, so no claim.
-      if (outcome && outcome.failed === 0) {
+      if (outcome.failed === 0 && !outcome.timedOut) {
         // Recomputed from the config AS IT NOW STANDS: storing the pre-wrap
         // hash would make the very next session sync all over again.
         state.syncHashes = {
@@ -156,7 +158,10 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
         };
       }
       saveManagedState(ctx.statePath, state);
-      if (outcome && wrapped.length > 0 && outcome.failed === 0) {
+      // Report what really happened, including on a run that ran out of
+      // time: those servers ARE wrapped, and they do take effect next
+      // session. The rest are simply the next run's work.
+      if (wrapped.length > 0 && outcome.failed === 0) {
         report(
           `[speculate] wrapped ${wrapped.length} new server${wrapped.length > 1 ? 's' : ''} ` +
             `(${wrapped.join(', ')}); speculation active next session`,

@@ -36,6 +36,12 @@ let logs: string[];
  * `installed`/`marketplace` already track.
  */
 let pluginSim: { installed: boolean; marketplace: boolean; autowrap?: boolean } | null;
+/**
+ * Which of the two shapes `claude plugin list --json` is known to emit this
+ * host uses: a list of records, or an object KEYED by plugin id whose values
+ * don't repeat the id (so only the key names the plugin).
+ */
+let pluginListShape: 'array' | 'id-keyed';
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'speculate-mhome-'));
@@ -44,6 +50,7 @@ beforeEach(() => {
   calls = [];
   logs = [];
   pluginSim = null;
+  pluginListShape = 'array';
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -69,6 +76,15 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
   if (args[0] === 'plugin') {
     if (!pluginSim) return { code: 2, stdout: '', stderr: 'unknown command plugin' };
     if (args[1] === 'list') {
+      if (pluginListShape === 'id-keyed') {
+        const keyed: AnyRecord = {};
+        // Note the values do NOT repeat the id: the KEY is the only place
+        // the plugin is named, which is the shape that regresses if a
+        // matcher only ever looks at record objects.
+        if (pluginSim.installed) keyed['speculate@speculate'] = { version: '0.10.0' };
+        if (pluginSim.autowrap) keyed['speculate-autowrap'] = { version: '0.11.0' };
+        return { code: 0, stdout: JSON.stringify(keyed), stderr: '' };
+      }
       const list: AnyRecord[] = [];
       if (pluginSim.installed) list.push({ name: 'speculate', marketplace: 'speculate' });
       if (pluginSim.autowrap) list.push({ name: 'speculate-autowrap', marketplace: 'speculate' });
@@ -851,15 +867,38 @@ describe('speculate off', () => {
     expect(state.syncOptOut['/some/other/project']).toBe(true);
   });
 
+  it('detects both plugins from an id-keyed list whose values omit the id', async () => {
+    // The other shape hosts emit: only the KEY names the plugin. Both
+    // detectors read the same shared list, so both must handle it.
+    pluginListShape = 'id-keyed';
+    pluginSim = { installed: true, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+
+    await speculateOff(opts());
+    expect(calls.some((c) => c[1] === 'plugin' && c[2] === 'uninstall')).toBe(true);
+    expect(logs.join('\n')).toContain('uninstalled the speculate plugin');
+    expect(logs.join('\n')).toContain('auto-wrap is still installed globally');
+  });
+
   it('asks the host for the plugin list exactly once per run', async () => {
     // Legacy detection and auto-wrap detection both read `plugin list
-    // --json`; off used to spawn it twice. They share one memoized fetch —
-    // safe because the ids they match are disjoint, so an uninstall in
-    // between can never make the reused answer wrong.
-    pluginSim = { installed: true, marketplace: false, autowrap: true };
+    // --json`; off used to spawn it twice for the same answer. Nothing is
+    // uninstalled here, so the memoized fetch serves both.
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     await speculateOff(opts());
     expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'list')).toHaveLength(1);
+    expect(logs.join('\n')).toContain('auto-wrap is still installed globally');
+  });
+
+  it('re-reads the plugin list after an uninstall makes it stale', async () => {
+    // The memo is dropped by whatever CHANGES the installed set, so no
+    // detector can ever read a pre-uninstall answer — the correctness of
+    // sharing one fetch doesn't rest on which ids each detector matches.
+    pluginSim = { installed: true, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOff(opts());
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'list')).toHaveLength(2);
     expect(logs.join('\n')).toContain('auto-wrap is still installed globally');
   });
 
@@ -1163,6 +1202,28 @@ describe('effectiveServerHash', () => {
     const a = fakeView({ github: { command: 'gh', args: ['stdio', '--v2'] } });
     const b = fakeView({ github: { command: 'gh', args: ['--v2', 'stdio'] } });
     expect(effectiveServerHash(a)).not.toBe(effectiveServerHash(b));
+  });
+
+  // Approving a .mcp.json server in Claude Code writes the host's approval
+  // record, NOT the server entry — so a hash over entries alone is identical
+  // before and after, sync's fast path short-circuits, and the newly
+  // approved server is silently never wrapped.
+  it('changes when a project-scope server becomes approved', () => {
+    const pending = fakeView({ team: { command: 't', args: [], scope: 'project' } });
+    const approved: ClaudeConfigView = {
+      ...pending,
+      approvedProjectServers: new Set(['team']),
+      projectApprovalKnown: true,
+    };
+    expect(effectiveServerHash(pending)).not.toBe(effectiveServerHash(approved));
+  });
+
+  it('ignores approval state for servers that are not project-scope', () => {
+    // Only .mcp.json servers have an approval gate; a stray name in the set
+    // must not perturb a user-scope server's hash.
+    const plain = fakeView({ github: { command: 'gh', args: [] } });
+    const noisy: ClaudeConfigView = { ...plain, approvedProjectServers: new Set(['github']) };
+    expect(effectiveServerHash(plain)).toBe(effectiveServerHash(noisy));
   });
 
   it('hashes the same server name differently when its winning scope differs', () => {

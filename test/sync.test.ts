@@ -9,7 +9,7 @@
  * resulting config: the unchanged case must spawn nothing at all, and no
  * failure path may print or throw.
  */
-import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import {
   existsSync,
   mkdtempSync,
@@ -352,21 +352,79 @@ describe('speculate sync', () => {
     expect(existsSync(lockPath)).toBe(false);
   });
 
-  it('gives up within the cap and exits 0 when the host CLI hangs', async () => {
-    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
-    const slow: CmdRunner = (cmd, args) => {
-      calls.push([cmd, ...args]);
-      return new Promise((r) => setTimeout(() => r({ code: 127, stdout: '', stderr: '' }), 60));
+  it('stops BETWEEN servers when the session-start budget is spent', async () => {
+    writeClaudeJson({
+      mcpServers: {
+        alpha: { command: 'alpha-server' },
+        beta: { command: 'beta-server' },
+      },
+    });
+    const slow: CmdRunner = async (cmd, args, o) => {
+      await new Promise((r) => setTimeout(r, 120));
+      return fakeRunner(cmd, args, o);
     };
 
-    const started = Date.now();
-    const code = await speculateSync({ ...opts(), runner: slow, timeoutMs: 5 });
-    expect(code).toBe(0);
-    expect(Date.now() - started).toBeLessThan(60);
-    expect(logs).toEqual([]);
-    // An expired run never claims "nothing changed" — the next one retries.
+    expect(await speculateSync({ ...opts(), runner: slow, timeoutMs: 60 })).toBe(0);
+    // alpha's remove AND its add-json both ran: the budget is checked
+    // between servers, never between a server's remove and its re-add —
+    // that window is where a hard process exit would leave the host with
+    // the server deleted, no restore, and no state record.
+    expect(calls.map((c) => `${c[2]} ${c[3]}`)).toEqual(['remove alpha', 'add-json alpha']);
+    expect(readClaudeJson().mcpServers.alpha.command).toBe(SELF.command);
+    expect(readClaudeJson().mcpServers.beta.command).toBe('beta-server');
+    // What did get wrapped is recorded, so `off` can still restore it …
+    expect(readState().projects[cwd].entries.map((e: AnyRecord) => e.name)).toEqual(['alpha']);
+    // … and an unfinished pass never claims "nothing changed".
     expect(readState().syncHashes?.[cwd]).toBeUndefined();
     expect(existsSync(lockPath)).toBe(false);
-    await new Promise((r) => setTimeout(r, 80)); // let the abandoned call settle
+  });
+
+  it('wraps a .mcp.json server once it is approved, though its entry never changed', async () => {
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { team: { command: 'team-server', args: [] } } }),
+    );
+    writeClaudeJson({ projects: { [cwd]: { enabledMcpjsonServers: ['other'] } } });
+
+    // First session: not approved, so it is skipped — and the hash stored.
+    expect(await speculateSync(opts())).toBe(0);
+    expect(addJsonNames()).toEqual([]);
+    expect(readState().syncHashes[cwd]).toBeDefined();
+
+    // The user approves it in Claude Code. That writes the host's APPROVAL
+    // record; the .mcp.json entry itself is untouched. A hash over entries
+    // alone would be unchanged, the fast path would fire, and this server
+    // would never be wrapped.
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+    calls = [];
+    logs = [];
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(addJsonNames()).toEqual(['team']);
+    expect(logs).toHaveLength(1);
+  });
+
+  it('never writes its summary to stdout (a hook\'s stdout is session context)', async () => {
+    writeClaudeJson({ mcpServers: { slack: { command: 'slack-server' } } });
+    const { log: _log, ...noLogSink } = opts(); // exercise the DEFAULT report sink
+    const stdout = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    let code: number;
+    let onStdout: string[] = [];
+    let onStderr: string[] = [];
+    try {
+      code = await speculateSync(noLogSink);
+    } finally {
+      // Read the history BEFORE restoring: mockRestore() clears it.
+      onStdout = stdout.mock.calls.map((c) => String(c[0]));
+      onStderr = stderr.mock.calls.map((c) => String(c[0]));
+      stdout.mockRestore();
+      stderr.mockRestore();
+    }
+    expect(code).toBe(0);
+    expect(onStdout).toEqual([]);
+    expect(onStderr).toEqual([
+      '[speculate] wrapped 1 new server (slack); speculation active next session\n',
+    ]);
   });
 });

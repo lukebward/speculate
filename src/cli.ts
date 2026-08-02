@@ -316,11 +316,15 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'sync') {
-    // Hard cap on the whole run: the auto-wrap hook is synchronous, so a
-    // hang here would hold up a session start. Expiry is treated as success
-    // (exit 0) — a slow day never costs a session, and the work is picked up
-    // next start. Unref'd so it never keeps an otherwise-idle process alive.
-    const timer = setTimeout(() => process.exit(0), 5_000).unref();
+    // The real budget is COOPERATIVE and lives in speculateSync, which stops
+    // BETWEEN servers so a wrap is never cut in half. This timer is only the
+    // last resort for a hang no layer below can end (every `claude mcp` call
+    // already carries its own 30s execFile timeout): far enough out that it
+    // can no longer fire in the window between a server's `mcp remove` and
+    // the `mcp add-json` that puts it back — killing the process THERE would
+    // leave the server deleted with no restore and no state record. Unref'd
+    // so it never keeps an otherwise-idle process alive.
+    const timer = setTimeout(() => process.exit(0), 60_000).unref();
     try {
       process.exitCode = await speculateSync({ self: selfCommand(), mode: null });
     } catch {

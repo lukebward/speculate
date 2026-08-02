@@ -297,9 +297,17 @@ function canonicalizeForHash(value: unknown): unknown {
 }
 
 /**
- * Stable hash of the effective server set (names + command lines) for a
- * project: `speculate sync`'s fast path spawns no subprocess, so this is
- * the whole "did anything change since last sync?" check. Sorted by name
+ * Stable hash of the effective server set (names + command lines + the
+ * approval state of .mcp.json servers) for a project: `speculate sync`'s
+ * fast path spawns no subprocess, so this is the whole "did anything change
+ * since last sync?" check.
+ *
+ * Approval belongs in the hash because approving a .mcp.json server in
+ * Claude Code writes the host's approval record, NOT the server entry: a
+ * hash over entries alone is identical before and after, so the fast path
+ * would fire and a server the user JUST approved would never be wrapped.
+ * Only project-scope entries carry the flag, since they're the only ones
+ * with an approval gate. Sorted by name
  * so key order in the source config can never change the hash — the state
  * (which scope won, and its exact entry) is what must be stable, not the
  * order the host happened to enumerate servers in. Each entry is
@@ -314,7 +322,11 @@ export function effectiveServerHash(view: ClaudeConfigView): string {
   for (const [name, scoped] of [...effectiveServers(view.servers)].sort((a, b) =>
     a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
   )) {
-    parts.push(`${scoped.scope} ${name} ${JSON.stringify(canonicalizeForHash(scoped.entry))}`);
+    const approval =
+      scoped.scope === 'project' ? (view.approvedProjectServers.has(name) ? '+' : '-') : '';
+    parts.push(
+      `${scoped.scope}${approval} ${name} ${JSON.stringify(canonicalizeForHash(scoped.entry))}`,
+    );
   }
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
@@ -362,15 +374,21 @@ export interface ManageOptions {
 }
 
 export function makeCtx(opts: ManageOptions): Ctx {
+  // An explicitly passed bin is used verbatim (callers — and tests — that
+  // name one mean it); only the default/env name gets PATHEXT resolution,
+  // and only on first USE. That resolution is a synchronous PATH × PATHEXT
+  // existsSync walk, which `sync`'s fast path — the common case, run at
+  // every session start — must not pay for a subprocess it never spawns.
+  let bin = opts.claudeBin;
   return {
     home: opts.home ?? homedir(),
     cwd: resolve(opts.cwd ?? process.cwd()),
     self: opts.self,
     runner: opts.runner ?? execFileRunner,
-    // An explicitly passed bin is used verbatim (callers — and tests — that
-    // name one mean it); only the default/env name gets PATHEXT resolution.
-    claudeBin:
-      opts.claudeBin ?? resolveClaudeBin(process.env.SPECULATE_CLAUDE_BIN ?? 'claude'),
+    get claudeBin(): string {
+      bin ??= resolveClaudeBin(process.env.SPECULATE_CLAUDE_BIN ?? 'claude');
+      return bin;
+    },
     statePath: opts.statePath ?? managedStatePath(),
     log: opts.log ?? ((line) => process.stderr.write(`${line}\n`)),
   };
@@ -437,6 +455,9 @@ async function runLegacyPluginUninstall(
     last = { res, id };
     if (res.code === 0) break;
   }
+  // The installed set just changed: drop the memoized list so a later
+  // detector re-reads the host instead of trusting a pre-uninstall answer.
+  ctx.pluginList = undefined;
   return last;
 }
 
@@ -457,11 +478,9 @@ function isLegacyPluginRecord(item: unknown): boolean {
  * The one `claude plugin list --json` every detector reads (`off` used to
  * spawn it twice: once for the legacy plugin, once for the auto-wrap one).
  * Memoized on the ctx, which lives exactly as long as a single command run.
- *
- * Reusing the list across an uninstall in the same run is safe because the
- * detectors match DISJOINT ids: cleanup only ever uninstalls the legacy ids
- * (LEGACY_PLUGIN_MATCH), so a later `speculate-autowrap` lookup can't be
- * reading a stale answer about its own plugin.
+ * Anything that CHANGES the installed set clears the memo (see
+ * runLegacyPluginUninstall), so staleness is prevented by construction
+ * rather than by an argument about which ids each detector matches.
  *
  * Fail-soft in every direction: a missing plugin CLI, a nonzero exit, or
  * unparseable output all yield null, which every caller reads as "not
@@ -490,7 +509,7 @@ function fetchPluginList(ctx: Ctx): Promise<unknown | null> {
  * are matched exactly (never by substring — a user's unrelated
  * `speculate-tools` is someone else's plugin).
  */
-function pluginListNames(parsed: unknown, matches: (item: unknown) => boolean): boolean {
+function pluginListHas(parsed: unknown, matches: (item: unknown) => boolean): boolean {
   if (Array.isArray(parsed)) return parsed.some(matches);
   if (parsed && typeof parsed === 'object') {
     const rec = parsed as Record<string, unknown>;
@@ -504,7 +523,7 @@ function pluginListNames(parsed: unknown, matches: (item: unknown) => boolean): 
  * answer for every unknown — callers with their own ≤0.10 record still act.
  */
 async function detectLegacyPlugin(ctx: Ctx): Promise<boolean> {
-  return pluginListNames(await fetchPluginList(ctx), isLegacyPluginRecord);
+  return pluginListHas(await fetchPluginList(ctx), isLegacyPluginRecord);
 }
 
 /**
@@ -630,6 +649,12 @@ export async function cleanupLegacyArtifacts(
 export interface WrapOutcome {
   changed: number;
   failed: number;
+  /**
+   * True when the pass stopped early because `opts.deadline` had passed, so
+   * servers were left unvisited. The pass is INCOMPLETE: callers must not
+   * record anything that claims the whole set was handled (`sync`'s hash).
+   */
+  timedOut: boolean;
 }
 
 /**
@@ -639,17 +664,29 @@ export interface WrapOutcome {
  * `onWrapped` fires once per server actually wrapped here, so `sync` can name
  * them in its one-line summary without re-deriving the set from the config it
  * just rewrote. `on` passes nothing (it logs each server as it goes).
+ *
+ * `deadline` (a `performance.now()` timestamp) makes the pass COOPERATIVELY
+ * interruptible for `sync`, whose session-start budget is finite. It is
+ * checked only at the top of an iteration, never between a server's `mcp
+ * remove` and the `mcp add-json` that puts it back — killing the process in
+ * that window would leave the host with the server deleted, no restore, and
+ * no state record. Stopping between servers costs at most one unvisited
+ * server, which the next run picks up.
  */
 export async function wrapEffectiveServers(
   ctx: Ctx,
   view: ClaudeConfigView,
   managed: Map<string, ManagedEntry>,
-  opts: { mode?: SpeculationMode; onWrapped?: (name: string) => void },
+  opts: { mode?: SpeculationMode; onWrapped?: (name: string) => void; deadline?: number },
 ): Promise<WrapOutcome> {
   let changed = 0;
   let failed = 0;
 
   for (const [name, scoped] of effectiveServers(view.servers)) {
+    if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
+      ctx.log(`[speculate] out of time before ${name} — the next run picks it up`);
+      return { changed, failed, timedOut: true };
+    }
     if (name === WORKSPACE_SERVER_NAME) continue;
     if (name.startsWith('-')) {
       // `claude mcp remove/add-json` take the name positionally; a leading
@@ -723,7 +760,7 @@ export async function wrapEffectiveServers(
     changed++;
   }
 
-  return { changed, failed };
+  return { changed, failed, timedOut: false };
 }
 
 // -- on ---------------------------------------------------------------------------
@@ -808,7 +845,7 @@ async function detectAutowrapPlugin(ctx: Ctx): Promise<boolean> {
     const rec = item as Record<string, unknown>;
     return rec['id'] === AUTOWRAP_PLUGIN_ID || rec['name'] === AUTOWRAP_PLUGIN_ID;
   };
-  return pluginListNames(await fetchPluginList(ctx), named);
+  return pluginListHas(await fetchPluginList(ctx), named);
 }
 
 export async function speculateOff(opts: ManageOptions): Promise<number> {
