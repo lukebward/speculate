@@ -5,7 +5,7 @@
  * later task diffs against: it needs a test, and a module that prints on
  * import cannot have one.
  */
-import { FLOOR_ARCHETYPES } from './corpus.js';
+import { ARCHETYPE_TIMING, FLOOR_ARCHETYPES } from './corpus.js';
 import type { ArchetypeResult, EvalRun, RecallReport, ReplayTotals } from './replay.js';
 
 interface Column {
@@ -125,6 +125,28 @@ export function table(run: EvalRun, opts: TableOptions = {}): string[] {
     lines.push(row(r, delta(result.report)));
   }
   return lines;
+}
+
+/**
+ * Footnotes for archetypes that do not replay on the standard schedule, so
+ * the header's "N sessions/archetype, first M warm-up" is never quietly false.
+ */
+export function notes(run: EvalRun): string[] {
+  const out: string[] = [];
+  for (const result of run.byArchetype) {
+    const timing = ARCHETYPE_TIMING.get(result.report.archetype);
+    if (!timing) continue;
+    const bits = [
+      `${result.sessions} sessions/seed`,
+      `first ${result.warmupSessions} warm-up`,
+    ];
+    if (timing.idleGap) {
+      const days = Math.round(timing.idleGap.ms / 86_400_000);
+      bits.push(`${days}-day idle gap before session ${timing.idleGap.beforeSession}`);
+    }
+    out.push(`${result.report.archetype}: ${bits.join(', ')}`);
+  }
+  return out;
 }
 
 /** Per-transition breakdown: which (prevTool → nextTool) pairs move. */

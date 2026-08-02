@@ -26,7 +26,7 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { SESSIONS_PER_ARCHETYPE, WARMUP_SESSIONS } from './corpus.js';
-import { baselineLine, detail, table } from './format.js';
+import { baselineLine, detail, notes, table } from './format.js';
 import { DEFAULT_SEEDS, MAX_K, PRODUCTION_K, runEvalDetailed } from './replay.js';
 import type { EvalRun } from './replay.js';
 
@@ -107,6 +107,8 @@ function main(): void {
   console.log();
   for (const line of table(run, { compare: comparison() })) console.log(indent(line));
   console.log();
+  for (const line of notes(run)) console.log(indent(line));
+  if (notes(run).length > 0) console.log();
   if (process.argv.includes('--detail')) {
     for (const line of detail(run)) console.log(indent(line));
   }

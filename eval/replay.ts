@@ -28,7 +28,7 @@ import { canonicalKey } from '../src/keys.js';
 import { TransitionLearner } from '../src/learner.js';
 import type { TransitionLearnerOptions } from '../src/learner.js';
 import type { ObservedCall } from '../src/types.js';
-import { ARCHETYPES, FLOOR_ARCHETYPES, WARMUP_SESSIONS } from './corpus.js';
+import { ARCHETYPES, ARCHETYPE_TIMING, FLOOR_ARCHETYPES, warmupFor } from './corpus.js';
 import type { Archetype, EvalSession } from './corpus.js';
 
 export interface RecallReport {
@@ -91,6 +91,10 @@ export interface ArchetypeResult {
   totals: ReplayTotals;
   /** Scored pairs grouped by transition, most frequent first. */
   byTransition: TransitionStat[];
+  /** Sessions replayed per seed (archetypes are not all the same length). */
+  sessions: number;
+  /** Sessions observed but not scored, per seed. */
+  warmupSessions: number;
 }
 
 export interface EvalRun {
@@ -119,6 +123,13 @@ export interface ReplayOptions {
    * `maxPredictionsPerTrigger` below MAX_K makes recall@5 unreadable.
    */
   learner?: Omit<TransitionLearnerOptions, 'now'>;
+  /**
+   * Overrides the idle gap an archetype declares in ARCHETYPE_TIMING. Only
+   * `regime-shift` declares one; setting this to 0 collapses its 45-day
+   * silence, which is how the suite proves that archetype measures elapsed
+   * time (i.e. decay) rather than anything else about the corpus.
+   */
+  idleGapMs?: number;
 }
 
 /** Replay one archetype end to end against a fresh learner. */
@@ -127,7 +138,9 @@ export function replayArchetype(
   seed: number,
   opts: ReplayOptions = {},
 ): ArchetypeResult {
-  const warmup = opts.warmupSessions ?? WARMUP_SESSIONS;
+  const warmup = opts.warmupSessions ?? warmupFor(archetype.name);
+  const idleGap = ARCHETYPE_TIMING.get(archetype.name)?.idleGap;
+  const idleGapMs = opts.idleGapMs ?? idleGap?.ms ?? 0;
   const sessions = archetype.sessions(seed);
 
   // The injected clock drives LRU recency only; feeding it the call
@@ -145,7 +158,10 @@ export function replayArchetype(
   for (let s = 0; s < sessions.length; s++) {
     const session = sessions[s]!;
     const scored = s >= warmup;
-    const base = s * SESSION_SPACING_MS;
+    // The declared idle gap lands once, before its session, and every later
+    // session carries it forward — the clock does not rewind.
+    const base =
+      s * SESSION_SPACING_MS + (idleGap && s >= idleGap.beforeSession ? idleGapMs : 0);
     let prev: ObservedCall | null = null;
 
     for (let i = 0; i < session.calls.length; i++) {
@@ -184,6 +200,8 @@ export function replayArchetype(
     byTransition: [...byTransition.values()].sort(
       (a, b) => b.pairs - a.pairs || (a.transition < b.transition ? -1 : 1),
     ),
+    sessions: sessions.length,
+    warmupSessions: warmup,
   };
 }
 
@@ -195,8 +213,10 @@ export function replayArchetypeSeeds(
 ): ArchetypeResult {
   const totals = emptyTotals();
   const merged = new Map<string, TransitionStat>();
+  let shape = { sessions: 0, warmupSessions: 0 };
   for (const seed of seeds) {
     const result = replayArchetype(archetype, seed, opts);
+    shape = { sessions: result.sessions, warmupSessions: result.warmupSessions };
     addTotals(totals, result.totals);
     for (const stat of result.byTransition) {
       const into = merged.get(stat.transition) ?? blankStat(stat.transition);
@@ -213,6 +233,7 @@ export function replayArchetypeSeeds(
     byTransition: [...merged.values()].sort(
       (a, b) => b.pairs - a.pairs || (a.transition < b.transition ? -1 : 1),
     ),
+    ...shape,
   };
 }
 

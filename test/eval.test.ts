@@ -15,13 +15,14 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { githubProfile } from '../src/profiles/github.js';
+import { builtinProfiles } from '../src/profiles/index.js';
 import {
   ARCHETYPES,
   FLOOR_ARCHETYPES,
   SESSIONS_PER_ARCHETYPE,
   WARMUP_SESSIONS,
   WORKFLOW_ARCHETYPES,
+  warmupFor,
 } from '../eval/corpus.js';
 import { baselineLine, table } from '../eval/format.js';
 import { DEFAULT_SEEDS, replayArchetype, runEval, runEvalDetailed } from '../eval/replay.js';
@@ -194,6 +195,51 @@ describe('sensitivity', () => {
   });
 });
 
+// --- staleness ----------------------------------------------------------------
+
+describe('regime-shift', () => {
+  const archetype = ARCHETYPES.find((a) => a.name === 'regime-shift')!;
+
+  it('is scored in the headline, not treated as a floor', () => {
+    expect(FLOOR_ARCHETYPES.has('regime-shift')).toBe(false);
+    expect(WORKFLOW_ARCHETYPES.map((a) => a.name)).toContain('regime-shift');
+  });
+
+  it('scores only the post-shift phase', () => {
+    // Phase 1 is warm-up in full: scoring it would measure the workflow the
+    // user abandoned, which is the opposite of the question being asked.
+    const { warmupSessions, sessions, byTransition } = replayArchetype(archetype, 1);
+    expect(warmupSessions).toBeGreaterThan(0);
+    expect(sessions).toBeGreaterThan(warmupSessions);
+    // Every scored pair is the same trigger, and it is the NEW follow-up.
+    expect(byTransition.map((t) => t.transition)).toEqual([
+      'pipeline_status->pipeline_get_deploy',
+    ]);
+  });
+
+  it('depends on elapsed time — collapse the idle gap and it collapses', () => {
+    // The archetype's whole claim is that it measures staleness. If the same
+    // sessions replayed back-to-back scored the same, it would be measuring
+    // something else and would be worthless as a decay guard.
+    const stale = replayArchetype(archetype, 1);
+    const fresh = replayArchetype(archetype, 1, { idleGapMs: 0 });
+    expect(fresh.totals.pairs).toBe(stale.totals.pairs);
+    expect(fresh.report.recallAt3).toBeLessThan(stale.report.recallAt3);
+    // The right candidate exists in both worlds; only its rank differs. If
+    // this stopped holding, the archetype would have started measuring
+    // capability rather than ordering.
+    expect(fresh.report.recallAt5).toBe(stale.report.recallAt5);
+  });
+
+  it('is crowded out by the shipped per-trigger cap, not absent', () => {
+    // Without decay the fresh transition ranks behind three stale ones, so it
+    // falls outside the cap of 3 while still being inside the top 5. That gap
+    // is the mechanism the archetype exists to expose.
+    const fresh = replayArchetype(archetype, 1, { idleGapMs: 0 });
+    expect(fresh.report.recallAt3).toBeLessThan(fresh.report.recallAt5);
+  });
+});
+
 // --- the printed artifact -----------------------------------------------------
 
 describe('report rendering', () => {
@@ -253,10 +299,11 @@ describe('waste accounting', () => {
     // production waste by roughly one prediction per session.
     for (const archetype of ARCHETYPES) {
       const { totals } = replayArchetype(archetype, 1);
-      const scoredSessions = SESSIONS_PER_ARCHETYPE - WARMUP_SESSIONS;
-      const callsPerSession = archetype.sessions(1)[0]!.calls.length;
-      // One scored pair per scored call after the first.
-      expect(totals.pairs).toBe(scoredSessions * (callsPerSession - 1));
+      // One scored pair per scored call after the first. Computed from the
+      // actual sessions: archetypes are not all the same length or warm-up.
+      const scored = archetype.sessions(1).slice(warmupFor(archetype.name));
+      const expected = scored.reduce((a, s) => a + s.calls.length - 1, 0);
+      expect(totals.pairs, archetype.name).toBe(expected);
       // Triggers outnumber pairs, because the last call of each session is a
       // trigger with no pair — that is the batch being billed.
       expect(totals.issued).toBeGreaterThan(0);
@@ -268,15 +315,20 @@ describe('waste accounting', () => {
 // --- the corpus must not be shaped to the hand-written rules ------------------
 
 describe('corpus independence', () => {
-  it('shares no tool name or server label with the GitHub profile', () => {
-    const forbidden = new Set([
-      ...githubProfile.readOnlyAllowlist,
-      ...githubProfile.rules.map((r) => r.trigger),
-      ...(githubProfile.primes ?? []).flat(),
-    ]);
+  it('shares no tool name or server label with any built-in profile', () => {
+    const forbidden = new Set<string>();
+    for (const profile of Object.values(builtinProfiles)) {
+      for (const tool of profile.readOnlyAllowlist) forbidden.add(tool);
+      for (const rule of profile.rules) forbidden.add(rule.trigger);
+      for (const prime of profile.primes ?? []) for (const tool of prime) forbidden.add(tool);
+    }
+    expect(forbidden.size).toBeGreaterThan(0);
+    const labels = new Set(Object.keys(builtinProfiles));
     for (const archetype of ARCHETYPES) {
       for (const session of archetype.sessions(1)) {
-        expect(session.server).not.toBe('github');
+        expect(labels.has(session.server), `${archetype.name}: ${session.server}`).toBe(
+          false,
+        );
         for (const call of session.calls) {
           expect(forbidden.has(call.tool), `${archetype.name}: ${call.tool}`).toBe(false);
         }

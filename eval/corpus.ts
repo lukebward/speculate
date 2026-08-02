@@ -410,7 +410,130 @@ const multiArg: Archetype = {
   },
 };
 
-// -- archetype 4: adversarial (the floor) --------------------------------------
+// -- archetype 4: regime-shift -------------------------------------------------
+
+/** Phase-1 sessions. Also this archetype's warm-up: none of them are scored. */
+const REGIME_PHASE1_SESSIONS = 40;
+/** Phase-2 sessions — the only ones scored. */
+const REGIME_PHASE2_SESSIONS = 40;
+/**
+ * Idle time between the two phases. Must be several multiples of the
+ * learner's evidence half-life (TAU, 14 days at time of writing) for phase-1
+ * evidence to be genuinely stale rather than merely old.
+ */
+export const REGIME_IDLE_GAP_MS = 45 * 24 * 3600_000;
+
+/**
+ * The user changed how they work.
+ *
+ * Phase 1 establishes a workflow: `pipeline_status` is followed by three
+ * different reads, twice each per session, for 40 sessions — so each of those
+ * transitions ends up with a raw count of 80. Then 45 days pass. Phase 2 uses
+ * the SAME trigger but a follow-up that did not exist before, and it never
+ * reaches a count above 40 — half the abandoned workflow's.
+ *
+ * Only phase 2 is scored, and every scored pair is the same question: after
+ * the trigger, does the model offer what the user does NOW, or what they used
+ * to do?
+ *
+ * A frequency-only learner answers "what they used to do" forever: the three
+ * stale transitions outrank the fresh one on raw count, and with a
+ * per-trigger cap of 3 they crowd it out of the batch entirely — recall@3
+ * near 0 while recall@5 stays high, because the right candidate is there and
+ * merely ranked fourth. Time-decayed evidence answers "what they do now".
+ *
+ * This archetype exists because the rest of the corpus cannot ask that
+ * question: its sessions are 600 s apart against a 14-day half-life, so
+ * nothing in it is ever stale and decay can only perturb tie-breaks. Judging
+ * a staleness change against an instrument blind to staleness is the circular
+ * benchmark mistake wearing a different hat.
+ *
+ * Note what it does NOT measure: it is a discriminator, not a difficulty
+ * test. It sits near 1.0 with decay and near 0.0 without, so it guards the
+ * behaviour rather than leaving headroom.
+ */
+const regimeShift: Archetype = {
+  name: 'regime-shift',
+  sessions(seed) {
+    const rng = makeRng(streamSeed(seed, 'regime-shift'));
+    const run = minter('run');
+    const projects = ['orders-api', 'web-edge', 'ledger-sync', 'search-idx'] as const;
+    // The workflow that gets abandoned. Each appears twice per phase-1
+    // session, so all three accumulate identical raw counts and the fresh
+    // transition has to beat all of them, not just the weakest.
+    const established = [
+      'pipeline_get_logs',
+      'pipeline_list_artifacts',
+      'pipeline_get_tests',
+    ] as const;
+    const out: EvalSession[] = [];
+
+    const status = (project: string, runId: string): EvalSession['calls'][number] => ({
+      tool: 'pipeline_status',
+      args: { project },
+      parsed: {
+        project,
+        runId,
+        branch: rng.pick(['main', 'release', 'next'] as const),
+        jobs: Array.from({ length: 4 }, () => ({
+          name: phrase(rng),
+          state: rng.pick(['passed', 'failed', 'running'] as const),
+        })),
+      },
+    });
+
+    // -- phase 1: the workflow that will be abandoned --
+    for (let s = 0; s < REGIME_PHASE1_SESSIONS; s++) {
+      const project = rng.pick(projects);
+      const runId = run();
+      const calls: EvalSession['calls'] = [];
+      for (let round = 0; round < 2; round++) {
+        // Shuffled order, identical multiset: the counts stay tied while the
+        // sequence is not a fixed drumbeat.
+        const order = [...established];
+        for (let i = order.length - 1; i > 0; i--) {
+          const j = rng.int(i + 1);
+          [order[i], order[j]] = [order[j]!, order[i]!];
+        }
+        for (const tool of order) {
+          calls.push(status(project, runId));
+          calls.push({
+            tool,
+            args: { project, runId },
+            parsed: { runId, project, entries: [{ at: rng.int(90), note: phrase(rng) }] },
+          });
+        }
+      }
+      out.push({ server: 'pipeline', calls });
+    }
+
+    // -- 45 days pass (applied by the replay via ARCHETYPE_TIMING) --
+
+    // -- phase 2: same trigger, new follow-up --
+    for (let s = 0; s < REGIME_PHASE2_SESSIONS; s++) {
+      const project = rng.pick(projects);
+      const runId = run();
+      out.push({
+        server: 'pipeline',
+        calls: [
+          status(project, runId),
+          {
+            tool: 'pipeline_get_deploy',
+            args: { project, runId },
+            parsed: {
+              runId,
+              project,
+              rollout: rng.pick(['queued', 'live', 'rolled-back'] as const),
+            },
+          },
+        ],
+      });
+    }
+    return out;
+  },
+};
+
+// -- archetype 5: adversarial (the floor) --------------------------------------
 
 /**
  * The low-predictability floor DESIGN.md §10 item 8 asks for: the next tool is
@@ -465,8 +588,37 @@ export const ARCHETYPES: readonly Archetype[] = [
   listDetailVaried,
   returnVisits,
   multiArg,
+  regimeShift,
   adversarial,
 ];
+
+/**
+ * Per-archetype replay timing. Kept beside the corpus rather than inside
+ * `Archetype`, whose shape is fixed by the task brief.
+ */
+export interface ArchetypeTiming {
+  /** Overrides WARMUP_SESSIONS: sessions observed but not scored. */
+  warmupSessions?: number;
+  /** Idle time inserted before `beforeSession`, on top of the usual spacing. */
+  idleGap?: { beforeSession: number; ms: number };
+}
+
+export const ARCHETYPE_TIMING: ReadonlyMap<string, ArchetypeTiming> = new Map([
+  [
+    'regime-shift',
+    {
+      // Phase 1 is entirely warm-up: it exists to build the stale evidence,
+      // and scoring it would measure the old workflow instead of the shift.
+      warmupSessions: REGIME_PHASE1_SESSIONS,
+      idleGap: { beforeSession: REGIME_PHASE1_SESSIONS, ms: REGIME_IDLE_GAP_MS },
+    },
+  ],
+]);
+
+/** The warm-up this archetype actually replays with. */
+export function warmupFor(archetype: string): number {
+  return ARCHETYPE_TIMING.get(archetype)?.warmupSessions ?? WARMUP_SESSIONS;
+}
 
 /**
  * Archetypes that are floors, not targets. They are reported next to the
