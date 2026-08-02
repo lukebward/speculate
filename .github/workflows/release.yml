@@ -1,0 +1,50 @@
+name: release
+
+# Publishes to npm when a v* tag is pushed.
+#
+# Authentication is npm trusted publishing (OIDC), so there is no NPM_TOKEN
+# secret to leak or rotate. It requires a one-time setup on npmjs.com:
+# Package settings -> Trusted publishers -> GitHub Actions, naming this
+# repository, this workflow file (release.yml), and the `npm` environment
+# below. OIDC cannot perform a package's FIRST publish, so 0.12.0 was
+# published by hand; every release from then on goes through here.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # required for OIDC auth and provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1; Node 22 ships an older npm.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - name: Fail if the tag does not match package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match package.json version $pkg" >&2
+            exit 1
+          fi
+
+      - run: npx tsc
+
+      - run: npm test
+
+      # prepublishOnly would re-run build+test; already done above.
+      - run: npm publish --provenance --ignore-scripts

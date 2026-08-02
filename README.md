@@ -4,51 +4,41 @@ Speculative prefetching for coding agents. Speculate sits between your MCP clien
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
 
-A run against the bundled mock GitHub server with injected latency, captured as-is: the first pass teaches Speculate the workflow, and on the second the PR is already fetched by the time the agent asks. Re-run it with `npm run demo`; `npm run bench` reproduces the measured off/on comparison: 71% hit rate, −66% tool wait, zero wasted calls on a scripted 7-call session against the mock at 400 ms. That is the optimistic ceiling, not a wild-traffic estimate.
+The same GitHub PR workflow, run twice against a mock server with 400 ms of injected latency. The first pass teaches Speculate the workflow; on the second, the PR is already fetched by the time the agent asks. Reproduce with `npm run demo`.
 
-## Try it in Claude Code: nothing installed, nothing written
-
-```bash
-npx -y github:lukebward/speculate try
-```
-
-Launches a normal `claude` session with every MCP server wrapped, via a throwaway config. Exit the session and no trace remains.
-
-## Turn it on (Claude Code)
+## Install
 
 ```bash
-npm install -g github:lukebward/speculate   # install the CLI once
-speculate on                                # enable it for the current project
+npm install -g speculate-mcp
+speculate on
 ```
 
-`try` and `on` are Claude Code integrations. Using any other MCP client? Skip to [the wrap prefix](#any-other-mcp-client); nothing in this section is required.
+That is the whole setup. `speculate on` re-registers this project's MCP servers wrapped, using Claude Code's own `claude mcp` CLI rather than editing any file by hand, and installs a small hook so servers you add later get wrapped too, starting from your next session.
 
-One command, one project, every MCP server the agent uses: your MCP servers are re-registered wrapped through `claude mcp`, the host's own CLI, never a hand-edited file. Servers pending approval stay pending: Speculate never widens consent.
+Nothing else to configure. Speculate recognizes servers by their live tool lists, ships predictions for GitHub, filesystem, and Slack, and learns the rest from your own traffic.
 
-`on` also installs auto-wrap: a small, hook-only plugin at Claude Code's user scope, installed once and shared by every project. Its single `SessionStart` hook runs `speculate sync`, which wraps any already-approved MCP servers added since the last run. Claude Code snapshots MCP config before `SessionStart` hooks fire, so a server added right now is wrapped at your *next* session start, not this one: a one-session lag, not instant pickup. The hook is also scoped to `startup` sessions, so if you live in `claude --resume` / `--continue`, it never fires and auto-wrap never runs for you — `speculate on` still wraps on the spot. Because the plugin lives at user scope, opening a brand-new project also gets its approved servers wrapped automatically, with no `speculate on` needed there; consent is unchanged either way, so a server still pending approval in `.mcp.json` stays skipped regardless of project. Consent is also honoured in reverse: revoke an approval you had given, or drop the server from `.mcp.json` entirely, and the wrapped copy is removed at the next session start — as long as Speculate's own state file still records that it created that copy. Lose or corrupt that file and the copy is left alone rather than guessed at — the same conservative stance `off` takes when it cannot prove a local entry was Speculate's doing.
+Using a different MCP client? See [Any other MCP client](#any-other-mcp-client).
 
-Upgrading from ≤0.10? `speculate on` also removes the retired CLI-speculation plugin and workspace server. Until you run it, `speculate exec` stays as a compatibility pass-through so that plugin's still-installed Bash hook keeps working. Compatibility only: it is slated for removal in 0.13.
+## Commands
 
-`speculate status` shows what's active and what drifted, including whether auto-wrap is installed and whether this project is opted out of it. `speculate off` restores this project exactly, even without its state file, since wrapped entries carry their original command line after the `--`; it also opts this project out of auto-wrap, so the global hook never silently re-wraps it here, and prints the two commands to remove auto-wrap everywhere, not just for this project: `claude plugin uninstall -s user speculate-autowrap` for the plugin, and `claude plugin marketplace remove speculate-mcp` for the registration it came from. That distinction is not cosmetic, and `off` now says so: user-scope servers are shared by every project, while the opt-out covers one project, so any *other* project's next session start re-wraps them at user scope and this project sees them wrapped again — uninstalling the plugin is the only thing that stops it everywhere. Neither touches the staged plugin copy `on` wrote under Speculate's own state directory; that copy is inert once the plugin is uninstalled and safe to delete by hand.
-
-`speculate stats` shows cumulative estimated time saved, hit rate, waste, and per-workspace usage. Use `speculate stats --json` for structured output. Collection began in v0.10; `speculate try` remains zero-write and is excluded.
-
-No further configuration. Servers are recognized by their live tool lists (a dockerized or renamed server still gets its vetted profile; GitHub, filesystem, and Slack ship built in), and predictions ship pre-loaded then adapt: the learner watches which call follows which in *your* traffic, and persists per config. A restarted proxy prefetches your workflows from the first trigger, and once it has seen how your sessions open (twice), it prefetches those opening reads at launch, before your first request.
+| Command | What it does |
+|---|---|
+| `speculate on` | Wrap this project's MCP servers, and keep new ones wrapped |
+| `speculate off` | Restore this project exactly, and stop auto-wrapping it |
+| `speculate status` | What is wrapped here, and what changed since `on` |
+| `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
+| `speculate try` | Launch a throwaway session to try it, writing nothing |
 
 <details>
-<summary><code>npm install -g</code> from git fails with <code>ENOTDIR … node_modules/speculate-mcp</code>?</summary>
+<summary>How auto-wrapping behaves</summary>
 
-Some npm versions leave a broken symlink behind when installing from git. Clear it and install a prebuilt tarball:
+`on` installs a hook-only plugin at Claude Code's user scope, shared by every project. At each session start it wraps any newly added, already-approved servers.
 
-```bash
-npm uninstall -g speculate-mcp 2>/dev/null
-rm -rf "$(npm root -g)/speculate-mcp" "$(npm root -g)/".speculate-mcp-*   # sudo if needed
+- **One session behind.** Claude Code reads MCP config before session-start hooks run, so a server you add now is wrapped from your *next* session, not this one. It works normally in the meantime, just without prefetching.
+- **Approval is never widened.** A server still pending approval in `.mcp.json` stays pending. Revoke an approval, or delete the server, and the wrapped copy is removed at the next session start.
+- **`--resume` and `--continue` do not trigger it.** The hook runs on fresh sessions only; `speculate on` always wraps on the spot.
+- **Removing it everywhere:** `off` covers one project. To stop it globally, `claude plugin uninstall -s user speculate-autowrap`, then `claude plugin marketplace remove speculate-mcp`.
 
-git clone https://github.com/lukebward/speculate && cd speculate
-npm install && npm pack && npm install -g ./speculate-mcp-*.tgz
-```
-
-`npx … try` is unaffected. A published npm release is the planned durable fix.
 </details>
 
 ## Any other MCP client
@@ -62,7 +52,7 @@ No install and no Claude Code required: prefix the server command already in you
 // after
 "github": {
   "command": "npx",
-  "args": ["-y", "github:lukebward/speculate", "wrap", "--", "github-mcp-server", "stdio"]
+  "args": ["-y", "speculate-mcp", "wrap", "--", "github-mcp-server", "stdio"]
 }
 ```
 
@@ -76,7 +66,9 @@ The client sees standard MCP: same tools, same results, some just arrive ~200× 
 
 ## More control
 
-A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json). `speculate init` writes a starter; `speculate doctor` explains per-tool eligibility ("why isn't it speculating?"). `speculate shims install` (opt-in) adds sniffing `npx`/`uvx` shims so MCP servers you add next year in any client wrap automatically.
+A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json). `speculate init` writes a starter; `speculate doctor` explains per-tool eligibility ("why isn't it speculating?").
+
+`speculate shims install` is the equivalent of auto-wrapping for clients other than Claude Code: opt-in `npx`/`uvx` shims that wrap any MCP server any client launches. It edits one marked block in your shell rc file, and it is POSIX-only.
 
 Architecture, measured results, threat model, and design history: [DESIGN.md](DESIGN.md).
 

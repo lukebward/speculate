@@ -12,14 +12,27 @@
     "mock-github": "tsx mock/mock-github.ts",
     "start": "tsx src/cli.ts",
     "prepare": "node scripts/prepare.cjs",
+    "prepublishOnly": "npm run build && npm test",
     "demo:svg": "node scripts/demo-svg.mjs"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lukebward/speculate.git"
   },
-  "keywords": [],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "prefetch",
+    "speculative-execution",
+    "latency",
+    "claude-code",
+    "proxy",
+    "ai-agents"
+  ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "bugs": {
     "url": "https://github.com/lukebward/speculate/issues"
   },
