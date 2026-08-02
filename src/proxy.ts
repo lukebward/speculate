@@ -156,7 +156,13 @@ export class SpeculateProxy {
     // §13.6 persistence: learned transitions + rule feedback survive
     // restarts. Tool results never touch disk (§6.4). Every load failure is
     // a cold start, never an error.
-    this.learner = new TransitionLearner({ now });
+    // The cap belongs to the learner as much as to the predictor: it is what
+    // sizes the beam (§13.18), so a proxy configured for a wider batch has to
+    // say so here too or the knob widens nothing.
+    this.learner = new TransitionLearner({
+      now,
+      maxPredictionsPerTrigger: config.maxPredictionsPerTrigger,
+    });
     this.store = opts.statePath ? new StateStore(opts.statePath, now) : null;
     if (this.store) {
       const state = this.store.load();

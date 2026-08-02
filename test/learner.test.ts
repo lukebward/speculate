@@ -940,6 +940,151 @@ describe('per-source scoring', () => {
   });
 });
 
+// --- the beam's structural guarantees -----------------------------------------
+
+describe('prefix stability across the per-trigger cap', () => {
+  /**
+   * The load-bearing assumption of the offline eval: it measures at k=5 while
+   * production runs at k=3, which is only a faithful reading if `predict` at 3
+   * is exactly the first three of `predict` at 5.
+   *
+   * The fixture is the case where that used to fail. Argument `a` has five
+   * live values and `b` has two, and the two co-vary: A1 and A2 are only ever
+   * asked for beside B1, everything else beside B0. The coherence check skips
+   * the pairings that never happened, so the beam reaches PAST the top three
+   * values of `a` to find a coherent substitution, and while each argument's
+   * option list was sliced to the caller's cap, A3 and A4 simply did not exist
+   * at k=3, which put a different candidate at rank 2 there than at k=5.
+   */
+  const PLAN = [
+    ...Array<number>(10).fill(0),
+    ...Array<number>(5).fill(1),
+    ...Array<number>(4).fill(2),
+    ...Array<number>(3).fill(3),
+    ...Array<number>(3).fill(4),
+  ];
+  /** A1 and A2 come with B1; A0, A3 and A4 come with B0. Never a mix. */
+  const partner = (a: number): number => (a === 1 || a === 2 ? 1 : 0);
+  const KEYS = ['a0', 'a1', 'a2', 'a3', 'a4', 'b0', 'b1'];
+
+  function taught(maxPredictionsPerTrigger: number): TransitionLearner {
+    const learner = new TransitionLearner({ now, maxPredictionsPerTrigger });
+    PLAN.forEach((a, i) => {
+      const parsed = Object.fromEntries(KEYS.map((k) => [k, `${k}-${i}`]));
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', parsed },
+        { tool: 'open', args: { a: `a${a}-${i}`, b: `b${partner(a)}-${i}` } },
+      );
+    });
+    return learner;
+  }
+
+  const live = mkCall(
+    'srv',
+    'list',
+    {},
+    Object.fromEntries(KEYS.map((k) => [k, k.toUpperCase()])),
+  );
+
+  it('emits at k=3 exactly the first three of what it emits at k=5', () => {
+    const atThree = taught(3).predict(live).map((p) => p.args);
+    const atFive = taught(5).predict(live).map((p) => p.args);
+    expect(atThree).toHaveLength(3);
+    expect(atFive).toHaveLength(5);
+    expect(atThree).toEqual(atFive.slice(0, 3));
+    // And the fixture has teeth: rank 2 at k=3 is a value that the third-best
+    // option of `a` cannot produce, so a lattice sized by the cap could not
+    // have reached it. Without a fixed option bound this assertion fails while
+    // the eval keeps reporting the k=5 answer.
+    expect(atThree[1]).toEqual({ a: 'A3', b: 'B0' });
+  });
+});
+
+describe('the coherence check never blocks the primary prediction', () => {
+  it('emits the all-best combination even when it is itself incoherent', () => {
+    // Both arguments are read off the trigger, and the best-evidenced source
+    // for each has never explained an observation the other one did: `x` comes
+    // from `p` on five calls, and on those same five `y` came from `s`, not
+    // from its own leader `r`. The all-best pairing therefore looks like one
+    // that has never occurred, and it is still what this transition predicted
+    // before there was a beam at all, so it must be emitted. Skipping it would
+    // turn a ranking heuristic into a fail-closed gate and silently drop the
+    // PRIMARY prediction.
+    const learner = new TransitionLearner({ now });
+    const seen = (i: number, x: string, y: string): void => {
+      const parsed = Object.fromEntries(['p', 'q', 't', 'r', 's'].map((k) => [k, `${k}-${i}`]));
+      observePair(
+        learner,
+        'srv',
+        { tool: 'list', parsed },
+        { tool: 'open', args: { x: `${x}-${i}`, y: `${y}-${i}` } },
+      );
+    };
+    let i = 0;
+    for (let n = 0; n < 5; n++) seen(i++, 'p', 's'); // p: 5, s: 5
+    for (let n = 0; n < 4; n++) seen(i++, 'q', 'r'); // q: 4, r: 4
+    for (let n = 0; n < 2; n++) seen(i++, 't', 'r'); // t: 2, r: 6
+
+    const preds = learner.predict(
+      mkCall('srv', 'list', {}, { p: 'P', q: 'Q', t: 'T', r: 'R', s: 'S' }),
+    );
+    // `p` leads `x` (5 > 4 > 2) and `r` leads `y` (6 > 5), and their windows
+    // are disjoint by construction.
+    expect(preds[0]!.args).toEqual({ x: 'P', y: 'R' });
+  });
+
+  it('treats a missing provenance window as unknown, never as "never together"', () => {
+    // A pre-v0.13 state file, or sources whose sightings have aged out of the
+    // 32-observation window: every window is empty. Empty is not evidence, and
+    // reading it as "these values have never been right together" would drop
+    // every substitution for the rest of the file's life.
+    const learner = new TransitionLearner({ now });
+    const scored = (path: string[], score: number): SerializedSource => ({
+      kind: 'parsed',
+      path,
+      score,
+      solo: score,
+    });
+    learner.importState({
+      transitions: [
+        {
+          server: 's',
+          prevTool: 'a',
+          nextTool: 'b',
+          count: 10,
+          templates: [
+            {
+              name: 'x',
+              underivable: false,
+              derived: 10,
+              missed: 0,
+              sources: [scored(['rows', '0', 'id'], 6), scored(['rows', '1', 'id'], 4)],
+            },
+            {
+              name: 'y',
+              underivable: false,
+              derived: 10,
+              missed: 0,
+              sources: [scored(['toks', '0', 'v'], 6), scored(['toks', '1', 'v'], 4)],
+            },
+          ],
+        },
+      ],
+    });
+
+    const preds = learner.predict(
+      mkCall('s', 'a', {}, { rows: [{ id: 'A' }, { id: 'B' }], toks: [{ v: 'S' }, { v: 'U' }] }),
+    );
+    expect(preds.map((p) => p.args)).toEqual([
+      { x: 'A', y: 'S' },
+      { x: 'B', y: 'S' },
+      { x: 'A', y: 'U' },
+    ]);
+  });
+});
+
 // --- gap handling ---------------------------------------------------------------
 
 describe('maxGapMs', () => {

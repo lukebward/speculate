@@ -340,6 +340,13 @@ export class Metrics {
    * Nearest-rank percentile over the histogram, reported as the bin midpoint
    * (so ±AGE_BIN_MS/2); the overflow bin reports its lower edge, and `maxMs`
    * carries the exact tail.
+   *
+   * The midpoint is clamped to the exact maximum, because a rounded-up
+   * percentile beside an exact maximum can otherwise report a median LARGER
+   * than the largest sample: two hits at 0 ms and 30 ms against a 100 ms bin
+   * read p50 = 50 ms, max = 30 ms. That is reachable against a fast local
+   * server, where every age lands in the first bin, and it makes the report
+   * look broken at exactly the moment it has the best news.
    */
   private agePercentile(p: number): number | null {
     if (this.ageCount === 0) return null;
@@ -348,9 +355,9 @@ export class Metrics {
     for (let bin = 0; bin <= AGE_BINS; bin++) {
       seen += this.ageBins[bin]!;
       if (seen >= rank) {
-        return bin === AGE_BINS
-          ? AGE_BINS * AGE_BIN_MS
-          : bin * AGE_BIN_MS + AGE_BIN_MS / 2;
+        const estimate =
+          bin === AGE_BINS ? AGE_BINS * AGE_BIN_MS : bin * AGE_BIN_MS + AGE_BIN_MS / 2;
+        return Math.min(estimate, this.ageMaxMs);
       }
     }
     return this.ageMaxMs;

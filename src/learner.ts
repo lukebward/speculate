@@ -84,6 +84,20 @@ const MIN_SOURCE_SOLO_WINS = 2;
  */
 const MAX_BEAM_POPS = 64;
 /**
+ * Distinct values one argument may offer the beam. A fixed bound for the same
+ * reason MAX_BEAM_POPS is one, and the stronger half of that guarantee:
+ * slicing each argument's option list to the CALLER'S cap made the k=5 lattice
+ * a strict superset of the k=3 one, so with the coherence skip below a
+ * cap-exclusive value could be emitted at rank <= 3 by a k=5 run that a k=3 run
+ * could not reach. The prefix would then be stable only by observation. Sliced
+ * at a constant, the lattice is identical at every cap and `predict` at k is a
+ * prefix of `predict` at any larger k by construction, which is what makes an
+ * offline eval measured at k=5 a faithful reading of production at k=3. Must
+ * therefore be >= the largest k anything measures at (the eval's 5); anything
+ * above that only widens the lattice for every caller.
+ */
+const MAX_OPTIONS_PER_ARG = 5;
+/**
  * Per-argument evidence gate (§5.3). A template used to be disabled forever
  * by ONE observation it could not derive — an agent opening the second row
  * of a list instead of the first was enough to kill the transition for the
@@ -1142,15 +1156,15 @@ function sourceId(s: Source): string {
  */
 function evictSources(tpl: ArgTemplate, now: number, protectNewest: number): void {
   // The just-admitted sources sit at the tail; everything before them is fair
-  // game, and the window shrinks with each eviction.
+  // game, and the window shrinks with each eviction. It cannot run out while
+  // the cap is still exceeded: candidateSources() admits at most
+  // MAX_SOURCES_PER_ARG sources in one observation, so a length above the cap
+  // always leaves at least one unprotected source ahead of them. The guard is
+  // therefore unreachable, and it is in the loop condition rather than a
+  // branch so that a future violation stalls instead of evicting the
+  // observation that is being recorded right now.
   let evictable = tpl.sources.length - protectNewest;
-  while (tpl.sources.length > MAX_SOURCES_PER_ARG) {
-    if (evictable <= 0) {
-      // One observation admitted more sources than the cap allows: keep the
-      // prefix rather than growing without bound.
-      tpl.sources.length = MAX_SOURCES_PER_ARG;
-      return;
-    }
+  while (tpl.sources.length > MAX_SOURCES_PER_ARG && evictable > 0) {
     let worst = 0;
     for (let i = 1; i < evictable; i++) {
       const a = tpl.sources[i]!;
@@ -1390,6 +1404,14 @@ interface ArgCombo {
    * a constant, and real profiles are full of constant `per_page` /
    * `state: 'open'` / `format` arguments. `some` classified the modal
    * next-call prediction as a standing bet.
+   *
+   * KNOWN INCONSISTENCY, recorded in §13.19 rather than repaired here: by the
+   * same principle an ALL-constant argument set is a next-call prediction too
+   * (a zero-argument one already is, three lines below), and the corpus agrees
+   * with that reading, since the standing class is consumed at a lead of
+   * exactly 1.000 calls. Inert while LONG_HORIZON_TTL_FACTOR is 1. Changing it
+   * empties the class rather than moving anything between classes, so it is a
+   * decision about what the class is for, not a one-line fix.
    */
   memorized: boolean;
   /** False only when two of the chosen values have never been right together. */
@@ -1431,7 +1453,8 @@ function materializeCombos(
     // offers no alternatives: there is nothing to rank them by.
     const usable = opts[0]!.score > 0 ? opts : [opts[0]!];
     argWeights(usable);
-    options.push(usable.slice(0, Math.max(1, limit)));
+    // Sliced to a fixed constant, NOT to `limit`: see MAX_OPTIONS_PER_ARG.
+    options.push(usable.slice(0, MAX_OPTIONS_PER_ARG));
   }
 
   const n = names.length;

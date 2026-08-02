@@ -192,6 +192,18 @@ describe('Metrics — age at hit', () => {
     expect(age.maxMs).toBe(25_000); // exact, so the tail is never rounded away
   });
 
+  it('never reports a percentile above its own maximum', () => {
+    // The percentiles are bin midpoints and `maxMs` is exact, so against a
+    // fast local server, where every hit lands in the first 100 ms bin, an
+    // unclamped midpoint reads p50 = 50 ms beside max = 30 ms: a median larger
+    // than the largest sample, which makes the report look broken at exactly
+    // the moment it has the best news.
+    const age = recorded([hit(0, 0), hit(30, 0.001)]).statsSnapshot().ageAtHit;
+    expect(age.maxMs).toBe(30);
+    expect(age.p50Ms!).toBeLessThanOrEqual(age.maxMs!);
+    expect(age.p95Ms!).toBeLessThanOrEqual(age.maxMs!);
+  });
+
   it('moves when consumption is delayed — the property the metric rests on', () => {
     const fresh = recorded([hit(200, 0.01), hit(300, 0.01)]).statsSnapshot().ageAtHit;
     const stale = recorded([hit(20_000, 0.7), hit(21_000, 0.7)]).statsSnapshot().ageAtHit;
