@@ -139,10 +139,17 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
       if (wrapped.length > 0) {
         state.projects[ctx.cwd] = { entries: [...managed.values()], updatedAt: Date.now() };
       }
-      if (outcome) {
+      // Only a pass that COMPLETED and wrapped everything it could may claim
+      // "nothing has changed since this hash". A failure usually leaves the
+      // config exactly as it found it (the wrap path restores the original),
+      // so storing the hash anyway would make every later session take the
+      // fast path and never retry that server — a transient `claude mcp`
+      // failure would silently become permanent. Leaving the previous hash
+      // in place costs one retry per session until it succeeds. A run that
+      // ran out of time is the same case: unfinished, so no claim.
+      if (outcome && outcome.failed === 0) {
         // Recomputed from the config AS IT NOW STANDS: storing the pre-wrap
-        // hash would make the very next session sync all over again. Only a
-        // COMPLETED pass may claim "nothing has changed since this hash".
+        // hash would make the very next session sync all over again.
         state.syncHashes = {
           ...(state.syncHashes ?? {}),
           [ctx.cwd]: effectiveServerHash(readClaudeServers({ home: ctx.home, cwd: ctx.cwd })),

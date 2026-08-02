@@ -34,6 +34,7 @@ install-and-it-works (no config files edited by hand):
   speculate on [--mode <mode>]             wrap this project's MCP servers via 'claude mcp'
   speculate off                            undo everything 'on' did (exact restore)
   speculate status                         what's wrapped here, and what drifted since 'on'
+  speculate sync                           wrap MCP servers added since the last run (run by the auto-wrap hook)
   speculate stats [--json]                 cumulative speculation usage
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
                                            server any client launches, even ones added later
@@ -59,7 +60,6 @@ options:
   --help            show this help
 
 compatibility:
-  speculate sync                           wrap servers added since the last run (used by the auto-wrap hook)
   speculate exec [--cwd <dir>] -- <command...>   run <command> verbatim; kept only so a
                                                 stranded ≤0.10 Bash hook still works (removed in 0.12)
 `;

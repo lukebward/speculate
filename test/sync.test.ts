@@ -225,6 +225,36 @@ describe('speculate sync', () => {
     expect(code).toBe(0);
     expect(logs).toEqual([]);
     expect(readClaudeJson().mcpServers.github.command).toBe('gh-server');
+    // Nothing was wrapped, so nothing may claim "nothing changed".
+    expect(readState().syncHashes?.[cwd]).toBeUndefined();
+  });
+
+  it('leaves the stored hash alone when a wrap fails, so the next session retries', async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    writeState({ syncHashes: { [cwd]: 'hash-of-an-older-server-set' } });
+    // The remove succeeds and the original is restored, so the config ends up
+    // byte-identical — exactly the shape a transient host failure takes, and
+    // the shape that would make a stored hash skip this server forever.
+    const failsToWrap: CmdRunner = async (cmd, args, o) => {
+      if (args[1] === 'add-json' && args[3]!.includes('"wrap"')) {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'host is having a bad day' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+
+    expect(await speculateSync({ ...opts(), runner: failsToWrap })).toBe(0);
+    expect(logs).toEqual([]);
+    expect(readState().syncHashes[cwd]).toBe('hash-of-an-older-server-set');
+    expect(readClaudeJson().mcpServers.github.command).toBe('gh-server');
+
+    // Next session, host healthy again: it retries rather than fast-pathing.
+    calls = [];
+    logs = [];
+    expect(await speculateSync(opts())).toBe(0);
+    expect(addJsonNames()).toEqual(['github']);
+    expect(logs).toHaveLength(1);
+    expect(readState().syncHashes[cwd]).toBe(currentHash());
   });
 
   it('exits 0 and silent when the runner throws outright', async () => {
