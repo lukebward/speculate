@@ -320,10 +320,11 @@ async function main(): Promise<void> {
     // BETWEEN servers so a wrap is never cut in half. This timer is only the
     // last resort for a hang no layer below can end (every `claude mcp` call
     // already carries its own 30s execFile timeout): far enough out that it
-    // can no longer fire in the window between a server's `mcp remove` and
-    // the `mcp add-json` that puts it back — killing the process THERE would
-    // leave the server deleted with no restore and no state record. Unref'd
-    // so it never keeps an otherwise-idle process alive.
+    // effectively never fires in the window between a server's `mcp remove`
+    // and the `mcp add-json` that puts it back — killing the process THERE
+    // would leave the server deleted with no restore and no state record. It
+    // is narrowed, not closed: the budget plus two 30s execFile timeouts can
+    // still reach 60s. Unref'd so it never keeps an idle process alive.
     const timer = setTimeout(() => process.exit(0), 60_000).unref();
     try {
       process.exitCode = await speculateSync({ self: selfCommand(), mode: null });

@@ -24,9 +24,17 @@
  */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   WORKSPACE_SERVER_NAME,
   effectiveServers,
@@ -629,6 +637,11 @@ export async function cleanupLegacyArtifacts(
       cwd: ctx.cwd,
     });
     marketplaceRemoved = rm.code === 0;
+    // What a marketplace offers changes what `plugin list` can report, so the
+    // memo is dropped here too — the docstring on fetchPluginList claims
+    // staleness is prevented by construction, and this is one of the sites
+    // that has to be true for.
+    ctx.pluginList = undefined;
     ctx.log(
       rm.code === 0
         ? '[speculate] legacy: removed the speculate marketplace registration'
@@ -763,6 +776,211 @@ export async function wrapEffectiveServers(
   return { changed, failed, timedOut: false };
 }
 
+// -- the auto-wrap plugin -------------------------------------------------------
+
+/**
+ * The auto-wrap plugin's id. Its whole content is ONE SessionStart hook that
+ * runs `speculate sync`, so MCP servers added after `speculate on` are wrapped
+ * without anyone remembering to re-run it. Installed at USER scope by `on`.
+ *
+ * Deliberately disjoint from LEGACY_PLUGIN_IDS/LEGACY_PLUGIN_MATCH, which name
+ * only the retired ≤0.10 plugin: were the two sets ever to overlap, cleanup
+ * would uninstall the plugin `on` had just installed.
+ */
+export const AUTOWRAP_PLUGIN_ID = 'speculate-autowrap';
+
+/**
+ * The marketplace `.claude-plugin/marketplace.json` declares. NOT `speculate`
+ * — that name belongs to the retired ≤0.10 registration, which cleanup removes
+ * when this project's state claims it and `status` tells everyone else to
+ * remove by hand. Sharing the name would make `on` re-add what cleanup had
+ * just removed, and turn that status hint into advice that breaks auto-wrap.
+ */
+const AUTOWRAP_MARKETPLACE_ID = 'speculate-mcp';
+
+/**
+ * How long the host lets the hook run, in SECONDS. It must exceed `sync`'s own
+ * last-resort exit (60s): a shorter host-side timeout kills a wrap in flight,
+ * reopening the very window — a server deleted between `mcp remove` and `mcp
+ * add-json` — that the cooperative deadline exists to close. It is a ceiling
+ * that should never be approached: the fast path costs two file reads.
+ */
+const AUTOWRAP_HOOK_TIMEOUT_S = 90;
+
+/**
+ * The ids a host may report our plugin under. `claude plugin list --json`
+ * emits records identified ONLY by `id`, and that id is
+ * `<plugin>@<marketplace>` (measured) — so the qualified form has to be
+ * matched or the plugin `on` just installed reads back as absent. Matched
+ * exactly, never by substring: a stranger's `speculate-autowrap-fork` is
+ * someone else's plugin.
+ */
+const AUTOWRAP_PLUGIN_MATCH: ReadonlySet<string> = new Set([
+  AUTOWRAP_PLUGIN_ID,
+  `${AUTOWRAP_PLUGIN_ID}@${AUTOWRAP_MARKETPLACE_ID}`,
+]);
+
+/**
+ * Fail-soft check (same shared plugin list as detectLegacyPlugin, matching a
+ * different, disjoint id): is the auto-wrap plugin installed?
+ */
+async function detectAutowrapPlugin(ctx: Ctx): Promise<boolean> {
+  const named = (item: unknown): boolean => {
+    if (typeof item === 'string') return AUTOWRAP_PLUGIN_MATCH.has(item);
+    if (!item || typeof item !== 'object') return false;
+    const rec = item as Record<string, unknown>;
+    for (const field of ['id', 'name'] as const) {
+      const value = rec[field];
+      if (typeof value === 'string' && AUTOWRAP_PLUGIN_MATCH.has(value)) return true;
+    }
+    return false;
+  };
+  return pluginListHas(await fetchPluginList(ctx), named);
+}
+
+/**
+ * The installed package root — the directory that ships `plugin/`. Resolved by
+ * walking up from THIS module so it works from `src/manage.ts` (a checkout)
+ * and `dist/src/manage.js` (an npm install) alike. Not derived from
+ * `ctx.self`, which in a source checkout points at tsx's entrypoint, not ours.
+ */
+function packageRoot(): string | null {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    if (existsSync(join(dir, 'plugin', 'hooks', 'autowrap.mjs'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * The hook's command line, baked absolute at install time.
+ *
+ * Never a bare `speculate`: Claude Code cannot exec a `.cmd` shim as a hook on
+ * Windows, and npm installs `speculate` as one. `${CLAUDE_PLUGIN_ROOT}` is the
+ * host's own expansion for the INSTALLED plugin directory and has to be used
+ * for the wrapper, because `claude plugin install` COPIES the plugin: a path
+ * into the npm package is precisely the path that disappears on `npm
+ * uninstall`, which is the case the wrapper exists to survive. The CLI path
+ * after it may well disappear — the wrapper checks it and exits 0 silently.
+ */
+function autowrapHookCommand(self: { command: string; args: string[] }): string {
+  const quoted = (s: string): string => `"${s}"`;
+  return [
+    quoted(self.command),
+    quoted('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs'),
+    ...self.args.map(quoted),
+  ].join(' ');
+}
+
+function autowrapHooksJson(self: { command: string; args: string[] }): string {
+  return `${JSON.stringify(
+    {
+      hooks: {
+        SessionStart: [
+          {
+            matcher: 'startup',
+            hooks: [
+              {
+                type: 'command',
+                command: autowrapHookCommand(self),
+                timeout: AUTOWRAP_HOOK_TIMEOUT_S,
+              },
+            ],
+          },
+        ],
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+/**
+ * Stage a complete, self-contained copy of the plugin (plus its one-plugin
+ * marketplace) next to the managed state, with the hook command generated for
+ * THIS install, and return the directory to hand `plugin marketplace add`.
+ *
+ * The shipped copy inside the package is the template, never the target: a
+ * global npm install is frequently root-owned or otherwise read-only, and
+ * writing a generated hook command into it would fail exactly where auto-wrap
+ * matters most. Staging also keeps `speculate on` from dirtying an npm package
+ * (or, in a checkout, the working tree).
+ *
+ * Returns null when the package's plugin files can't be found at all, which
+ * every caller treats as "skip, quietly".
+ */
+function stageAutowrapPlugin(ctx: Ctx): string | null {
+  const root = packageRoot();
+  if (!root) return null;
+  const dest = join(dirname(ctx.statePath), 'autowrap');
+  mkdirSync(join(dest, '.claude-plugin'), { recursive: true });
+  mkdirSync(join(dest, 'plugin', '.claude-plugin'), { recursive: true });
+  mkdirSync(join(dest, 'plugin', 'hooks'), { recursive: true });
+  copyFileSync(
+    join(root, '.claude-plugin', 'marketplace.json'),
+    join(dest, '.claude-plugin', 'marketplace.json'),
+  );
+  copyFileSync(
+    join(root, 'plugin', '.claude-plugin', 'plugin.json'),
+    join(dest, 'plugin', '.claude-plugin', 'plugin.json'),
+  );
+  copyFileSync(
+    join(root, 'plugin', 'hooks', 'autowrap.mjs'),
+    join(dest, 'plugin', 'hooks', 'autowrap.mjs'),
+  );
+  writeFileSync(join(dest, 'plugin', 'hooks', 'hooks.json'), autowrapHooksJson(ctx.self));
+  return dest;
+}
+
+/**
+ * Install the auto-wrap plugin at user scope. Every step is fail-soft: a
+ * failure logs ONE line and never aborts `on`, whose real work — wrapping this
+ * project's servers — has nothing to do with it.
+ *
+ * User scope, not local, because the point is to catch servers added in
+ * projects where nobody thought to run `speculate on`. `off` opts a single
+ * project out through the state file rather than uninstalling this.
+ */
+async function installAutowrapPlugin(ctx: Ctx): Promise<void> {
+  try {
+    if (await detectAutowrapPlugin(ctx)) {
+      ctx.log(
+        '[speculate] auto-wrap: already installed (new servers wrap at the next session start)',
+      );
+      return;
+    }
+    const source = stageAutowrapPlugin(ctx);
+    if (!source) {
+      ctx.log(
+        "[speculate] auto-wrap: plugin files not found — skipped ('speculate on' still wraps this project)",
+      );
+      return;
+    }
+    // An "already exists" here is a success for us (the host replaces a
+    // same-named registration), so the result is deliberately not checked —
+    // a genuine failure surfaces through the install below.
+    await ctx.runner(ctx.claudeBin, ['plugin', 'marketplace', 'add', source], { cwd: ctx.cwd });
+    const ins = await ctx.runner(
+      ctx.claudeBin,
+      ['plugin', 'install', '-s', 'user', AUTOWRAP_PLUGIN_ID],
+      { cwd: ctx.cwd },
+    );
+    // The installed set just changed: drop the memoized list (see
+    // fetchPluginList) so a later detector doesn't read the pre-install answer.
+    ctx.pluginList = undefined;
+    ctx.log(
+      ins.code === 0
+        ? '[speculate] auto-wrap: installed — servers added later wrap at the next session start'
+        : `[speculate] auto-wrap: not installed (${(ins.stderr || ins.stdout).trim() || `exit ${ins.code}`}) — 'speculate on' still wraps this project`,
+    );
+  } catch (err) {
+    ctx.log(`[speculate] auto-wrap: install skipped (${(err as Error).message})`);
+  }
+}
+
 // -- on ---------------------------------------------------------------------------
 
 export async function speculateOn(opts: ManageOptions): Promise<number> {
@@ -807,6 +1025,10 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
   const { changed, failed } = await wrapEffectiveServers(ctx, view, managed, {
     mode: opts.mode ?? undefined,
   });
+  // Servers added AFTER this run are the auto-wrap plugin's job. Installed
+  // after the wrap so its one line lands with the summary rather than in the
+  // middle of the per-server output — and it can never fail `on`.
+  await installAutowrapPlugin(ctx);
 
   state.projects[ctx.cwd] = { entries: [...managed.values()], updatedAt: Date.now() };
   // The ownership flag authorized exactly one host-global removal; consume it
@@ -823,30 +1045,6 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
 }
 
 // -- off --------------------------------------------------------------------------
-
-/**
- * The user-scope auto-wrap plugin's id. `off` only needs to know whether
- * it's installed, to tell the user their opt-out is per-project while the
- * plugin itself is not. Matched on its own, never through
- * LEGACY_PLUGIN_IDS/LEGACY_PLUGIN_MATCH (which name only the retired ≤0.10
- * plugin): the two sets must stay disjoint, or cleanup would uninstall the
- * auto-wrap plugin `on` just installed.
- */
-const AUTOWRAP_PLUGIN_ID = 'speculate-autowrap';
-
-/**
- * Fail-soft check (same shared plugin list as detectLegacyPlugin, matching a
- * different, disjoint id): is `speculate-autowrap` installed?
- */
-async function detectAutowrapPlugin(ctx: Ctx): Promise<boolean> {
-  const named = (item: unknown): boolean => {
-    if (typeof item === 'string') return item === AUTOWRAP_PLUGIN_ID;
-    if (!item || typeof item !== 'object') return false;
-    const rec = item as Record<string, unknown>;
-    return rec['id'] === AUTOWRAP_PLUGIN_ID || rec['name'] === AUTOWRAP_PLUGIN_ID;
-  };
-  return pluginListHas(await fetchPluginList(ctx), named);
-}
 
 export async function speculateOff(opts: ManageOptions): Promise<number> {
   const ctx = makeCtx(opts);
@@ -1072,6 +1270,12 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
     );
   } else if (!record && unwrapped > 0) {
     ctx.log(`[speculate] run 'speculate on' to wrap them (or 'speculate try' for a zero-write trial)`);
+  }
+  if (await detectAutowrapPlugin(ctx)) {
+    // Says the quiet part out loud: the wrap a session-start hook performs
+    // lands in the NEXT session, because the host snapshots MCP config before
+    // running the hook. Measured, inherent, and not worth hiding.
+    ctx.log('[speculate]   auto-wrap: installed (new servers wrap at the next session start)');
   }
   if (await detectLegacyPlugin(ctx)) {
     ctx.log(

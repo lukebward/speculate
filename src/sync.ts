@@ -54,10 +54,13 @@ const DEFAULT_BUDGET_MS = 5_000;
 
 /**
  * A lock older than this belonged to a session that died mid-sync (the CLI's
- * hard cap can kill one at 5s). Generous enough that a live-but-slow run is
- * never trampled, short enough that a crash costs at most one more session.
+ * last-resort cap kills one at 60s). It MUST exceed that cap: a holder that
+ * legitimately runs to the cap would otherwise look stale to a second session,
+ * which would seize the lock and write concurrently — the exact race the lock
+ * exists to prevent. Short enough that a crash still costs at most one more
+ * session.
  */
-const LOCK_STALE_MS = 30_000;
+const LOCK_STALE_MS = 90_000;
 
 /**
  * Concurrent sessions all read-modify-write the same global `~/.claude.json`

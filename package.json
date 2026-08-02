@@ -41,6 +41,8 @@
   },
   "files": [
     "dist/src",
+    "plugin",
+    ".claude-plugin",
     "README.md",
     "DESIGN.md",
     "LICENSE"

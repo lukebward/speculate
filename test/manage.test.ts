@@ -6,9 +6,11 @@
  * shadow-don't-touch rule for .mcp.json and the state-less unwrap net.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   effectiveServerHash,
   execFileRunner,
@@ -42,6 +44,8 @@ let pluginSim: { installed: boolean; marketplace: boolean; autowrap?: boolean } 
  * don't repeat the id (so only the key names the plugin).
  */
 let pluginListShape: 'array' | 'id-keyed';
+/** Source path of the auto-wrap marketplace, once `on` has registered it. */
+let autowrapMarketplace: string;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'speculate-mhome-'));
@@ -51,6 +55,7 @@ beforeEach(() => {
   logs = [];
   pluginSim = null;
   pluginListShape = 'array';
+  autowrapMarketplace = '';
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -98,6 +103,13 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
       };
     }
     if (args[1] === 'marketplace' && args[2] === 'add') {
+      // The auto-wrap marketplace is added by PATH (a staged directory); the
+      // ≤0.10 one was only ever added by the name `speculate`. They are
+      // deliberately distinct registrations, so the sim tracks them apart.
+      if (args[3] !== 'speculate') {
+        autowrapMarketplace = args[3] ?? '';
+        return { code: 0, stdout: 'Added marketplace speculate-mcp', stderr: '' };
+      }
       const already = pluginSim.marketplace;
       pluginSim.marketplace = true;
       return already
@@ -109,6 +121,12 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
       return { code: 0, stdout: 'Removed', stderr: '' };
     }
     if (args[1] === 'install') {
+      const id = args[args.length - 1] ?? '';
+      if (id.startsWith('speculate-autowrap')) {
+        if (!autowrapMarketplace) return { code: 1, stdout: '', stderr: 'no such marketplace' };
+        pluginSim.autowrap = true;
+        return { code: 0, stdout: 'Installed speculate-autowrap@speculate-mcp', stderr: '' };
+      }
       if (!pluginSim.marketplace) return { code: 1, stdout: '', stderr: 'no such marketplace' };
       pluginSim.installed = true;
       return { code: 0, stdout: 'Installed speculate@speculate', stderr: '' };
@@ -298,7 +316,11 @@ describe('legacy artifact cleanup', () => {
     expect(code).toBe(0);
     expect(pluginSim.installed).toBe(false); // plugin itself is always removed
     expect(pluginSim.marketplace).toBe(true); // but the marketplace is left alone
-    expect(calls.some((c) => c[1] === 'plugin' && c[2] === 'marketplace')).toBe(false);
+    // (`on` does add its OWN marketplace — what must never happen is a
+    // REMOVAL of a ≤0.10 registration this project's state doesn't claim.)
+    expect(
+      calls.some((c) => c[1] === 'plugin' && c[2] === 'marketplace' && c[3] === 'remove'),
+    ).toBe(false);
   });
 
   it('cleanup failures are logged, never fatal', async () => {
@@ -984,6 +1006,217 @@ describe('speculate status', () => {
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     expect(await speculateStatus(opts())).toBe(0);
     expect(logs.join('\n')).not.toContain('legacy marketplace');
+  });
+});
+
+describe('the auto-wrap plugin', () => {
+  /** Where `on` stages the plugin it hands `claude plugin marketplace add`. */
+  const stagedRoot = (): string => join(home, 'autowrap');
+  const stagedHooks = (): AnyRecord =>
+    JSON.parse(readFileSync(join(stagedRoot(), 'plugin', 'hooks', 'hooks.json'), 'utf8'));
+  const hookEntry = (hooks: AnyRecord): AnyRecord => hooks.hooks.SessionStart[0].hooks[0];
+
+  /** Run the shipped hook wrapper directly, exactly as the host would. */
+  function runWrapper(
+    args: string[],
+    env: Record<string, string> = {},
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const wrapper = fileURLToPath(new URL('../plugin/hooks/autowrap.mjs', import.meta.url));
+    return new Promise((res) => {
+      execFile(
+        process.execPath,
+        [wrapper, ...args],
+        { env: { ...process.env, ...env } },
+        (err, stdout, stderr) => {
+          const anyErr = err as (Error & { code?: number | string }) | null;
+          res({ code: typeof anyErr?.code === 'number' ? anyErr.code : 0, stdout, stderr });
+        },
+      );
+    });
+  }
+
+  it('on installs the auto-wrap plugin at user scope', async () => {
+    pluginSim = { installed: false, marketplace: false };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(calls).toContainEqual([
+      'claude',
+      'plugin',
+      'install',
+      '-s',
+      'user',
+      'speculate-autowrap',
+    ]);
+    expect(pluginSim.autowrap).toBe(true);
+    expect(logs.join('\n')).toContain('auto-wrap: installed');
+  });
+
+  it('running on twice leaves the auto-wrap plugin installed (self-uninstall guard)', async () => {
+    pluginSim = { installed: false, marketplace: false };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    expect(pluginSim.autowrap).toBe(true);
+    calls = [];
+    logs = [];
+    expect(await speculateOn(opts())).toBe(0);
+    expect(pluginSim.autowrap).toBe(true);
+    // Nothing may uninstall it — least of all the run that just installed it.
+    expect(calls.filter((c) => c[2] === 'uninstall')).toEqual([]);
+    // Already installed: no marketplace/install churn on the second run.
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'install')).toEqual([]);
+  });
+
+  it('legacy cleanup never matches the auto-wrap plugin', async () => {
+    // The host reports ONLY `speculate-autowrap`. A cleanup matcher that
+    // matched on a substring of 'speculate' would uninstall it here.
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall')).toEqual([]);
+    expect(pluginSim.autowrap).toBe(true);
+    logs = [];
+    expect(await speculateStatus(opts())).toBe(0);
+    expect(logs.join('\n')).not.toContain('legacy plugin installed');
+  });
+
+  it('detects the plugin from the qualified id the host really reports', async () => {
+    // Measured shape of `claude plugin list --json`: an array of records whose
+    // only identifier is `id`, and it is `<plugin>@<marketplace>` — a bare
+    // `name` field is never emitted.
+    const qualified: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'list') {
+        calls.push([cmd, ...args]);
+        return {
+          code: 0,
+          stdout: JSON.stringify([
+            { id: 'speculate-autowrap@speculate-mcp', version: '0.12.0', scope: 'user' },
+          ]),
+          stderr: '',
+        };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn({ ...opts(), runner: qualified })).toBe(0);
+    // Already installed: nothing installed again, and never an uninstall.
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'install')).toEqual([]);
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'uninstall')).toEqual([]);
+    logs = [];
+    await speculateStatus({ ...opts(), runner: qualified });
+    expect(logs.join('\n')).toContain('auto-wrap: installed');
+  });
+
+  it('status reports auto-wrap when installed', async () => {
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateStatus(opts())).toBe(0);
+    expect(logs.join('\n')).toContain(
+      'auto-wrap: installed (new servers wrap at the next session start)',
+    );
+  });
+
+  it('an install failure is logged once and never fails on', async () => {
+    pluginSim = { installed: false, marketplace: false };
+    const installFails: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'plugin' && args[1] === 'install') {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'marketplace unreachable' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn({ ...opts(), runner: installFails })).toBe(0);
+    expect(logs.filter((l) => l.includes('auto-wrap'))).toHaveLength(1);
+    expect(logs.join('\n')).toContain('marketplace unreachable');
+    // The wrap itself still happened.
+    expect(readClaudeJson().mcpServers.github.command).toBe(SELF.command);
+  });
+
+  it('the generated hook command is absolute and never a bare speculate', async () => {
+    pluginSim = { installed: false, marketplace: false };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    const entry = hookEntry(stagedHooks());
+    expect(entry.type).toBe('command');
+    expect(entry.command).toContain(SELF.command); // absolute node
+    expect(entry.command).toContain(SELF.args[0]); // absolute cli entry
+    // Never the npm shim: Claude Code cannot exec a .cmd hook on Windows.
+    expect(entry.command).not.toMatch(/^speculate\b/);
+    expect(entry.command).not.toMatch(/(^|["\s])speculate(\.cmd|\.bat)?(["\s]|$)/);
+    // The wrapper is addressed through the host's own expansion for the
+    // INSTALLED copy — a path into the npm package is the one that vanishes.
+    expect(entry.command).toContain('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs');
+    // Must outlast sync's own last-resort 60s exit, or the host kills a wrap
+    // mid-flight and reopens the window the cooperative deadline closed.
+    expect(entry.timeout).toBeGreaterThanOrEqual(60);
+    expect(stagedHooks().hooks.SessionStart[0].matcher).toBe('startup');
+    // The staged tree is what the host was pointed at, and it carries the
+    // wrapper (the package dir may be root-owned or read-only).
+    expect(calls).toContainEqual(['claude', 'plugin', 'marketplace', 'add', stagedRoot()]);
+    expect(existsSync(join(stagedRoot(), 'plugin', 'hooks', 'autowrap.mjs'))).toBe(true);
+    expect(existsSync(join(stagedRoot(), '.claude-plugin', 'marketplace.json'))).toBe(true);
+    expect(existsSync(join(stagedRoot(), 'plugin', '.claude-plugin', 'plugin.json'))).toBe(true);
+  });
+
+  it('the hook wrapper exits 0 when the CLI path no longer exists', async () => {
+    // `claude plugin install` COPIES the plugin, so it survives an `npm
+    // uninstall` of Speculate. Erroring here would break every session start
+    // from then on, forever.
+    const res = await runWrapper([], { SPECULATE_CLI: join(home, 'gone', 'cli.js') });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toBe('');
+    expect(res.stderr).toBe('');
+  });
+
+  it('the hook wrapper exits 0 with no baked CLI path at all', async () => {
+    const res = await runWrapper([], { SPECULATE_CLI: '' });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toBe('');
+    expect(res.stderr).toBe('');
+  });
+
+  it("the hook wrapper surfaces sync's summary as a systemMessage, and nothing else", async () => {
+    // On exit 0 a hook's stderr is invisible to the user, and for SessionStart
+    // plain stdout is injected into the MODEL's context. `systemMessage` is
+    // the documented channel for a line the user should actually see.
+    const fakeCli = join(home, 'fake-cli.mjs');
+    writeFileSync(
+      fakeCli,
+      "process.stderr.write('[speculate] wrapped 1 new server (github); speculation active next session\\n');\n",
+    );
+    const withSummary = await runWrapper([fakeCli]);
+    expect(withSummary.code).toBe(0);
+    expect(withSummary.stderr).toBe('');
+    expect(JSON.parse(withSummary.stdout)).toEqual({
+      systemMessage: '[speculate] wrapped 1 new server (github); speculation active next session',
+    });
+
+    // The common case — sync says nothing — must print nothing at all.
+    writeFileSync(join(home, 'quiet-cli.mjs'), '\n');
+    const quiet = await runWrapper([join(home, 'quiet-cli.mjs')]);
+    expect(quiet.code).toBe(0);
+    expect(quiet.stdout).toBe('');
+    expect(quiet.stderr).toBe('');
+  });
+
+  it('the hook wrapper exits 0 when the CLI itself fails', async () => {
+    const angryCli = join(home, 'angry-cli.mjs');
+    writeFileSync(angryCli, 'process.exit(3);\n');
+    const res = await runWrapper([angryCli]);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toBe('');
+  });
+
+  it('the shipped hooks.json is inert until on bakes a CLI path into it', async () => {
+    // Someone can install the plugin straight from the marketplace. Whatever
+    // ships must not fail a session start on its own.
+    const shipped = JSON.parse(
+      readFileSync(fileURLToPath(new URL('../plugin/hooks/hooks.json', import.meta.url)), 'utf8'),
+    );
+    const entry = hookEntry(shipped);
+    expect(entry.command).not.toMatch(/(^|["\s])speculate(\.cmd|\.bat)?(["\s]|$)/);
+    expect(entry.command).toContain('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs');
+    expect(entry.timeout).toBeGreaterThanOrEqual(60);
   });
 });
 
