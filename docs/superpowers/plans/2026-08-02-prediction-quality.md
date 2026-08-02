@@ -257,35 +257,39 @@ not expect `npm run eval` to move.
 - [ ] **Step 5: Run `npm run eval`**, record the delta.
 - [ ] **Step 6: Commit** `feat: learn follow-up positions past the third entry`.
 
-### Task 5: Entity frecency for return visits
+### Task 5: DROPPED — entity frecency already shipped in Task 3
 
-**Files:**
-- Modify: `src/learner.ts`
-- Test: `test/learner.test.ts`
+**Killed by measurement, not by judgement.** This task was to add
+`(server, tool, canonicalArgs) -> decayed score` memory so the learner could
+predict an entity the user keeps returning to. It is redundant: Task 3's
+per-source scoring already does it.
 
-**Interfaces:**
-- Produces: `entities: Map<string, {score, lastUpdated}>` keyed `${server}${tool}${argsRepr}`, serialized as an optional `entities?: []` on `SerializedLearner`.
+Evidence. The `direct-recall` archetype was built specifically to isolate the
+one case entity memory should uniquely solve, where the entity is **not
+derivable from the previous call at all** (verified: across 180 sessions the
+target id appears zero times in the trigger's args or, recursively, its parsed
+result, while six wrong ids sit at enumerable array positions). It was expected
+to fail at HEAD. It scored **0.835** on its common-trigger leg. Reading
+`exportState()` shows why: the transition holds **four `const` sources, one per
+pinned entity, ranked by decayed score**, giving recall@1 0.369 (the 40% entity)
+and recall@3 0.835 (the top three, 40+30+20). That is entity frecency, arrived
+at generically. The negative control confirms it: the same shape with entities
+never reused scores 0.000 with zero waste, so the score is the returns and
+nothing else.
 
-- [ ] **Step 1: Write failing tests.**
+**What actually remains is scope, not memory.** Constants are keyed per
+`(server, prevTool, nextTool, arg)`, so the same entities reached from a rarer
+trigger get nothing. Measured as the second trigger thins from every-2 to
+every-16 sessions: 0.733 / 0.667 / 0.389 / 0.000, while the common leg stays
+flat near 0.87. The `direct-recall` archetype ships both legs, the common one
+as a guard and 47 rare-trigger pairs as live headroom.
 
-```ts
-it('predicts a repeatedly reopened entity regardless of its list position', () => {
-  // open entity X many times, always from a different index
-  // assert predict() offers X even when it is not at a top index
-});
-
-it('does not fire entity predictions for an unseen tool transition', () => {
-  // gate (a): the tool-pair transition must exist
-});
-
-it('caps entity predictions per trigger', () => { /* gate (c) */ });
-```
-
-- [ ] **Step 2:** Run → FAIL.
-- [ ] **Step 3: Implement.** Record every observed `(server, tool, canonical argsRepr)` with the same decay. On predict, after the transition-derived candidates, append up to 2 entity candidates, gated on: the tool-pair transition exists, the entity's decayed score clears a threshold (default 3), and the candidate is not already present. Confidence stays below the transition-derived candidates so it never displaces better-evidenced ones.
-- [ ] **Step 4:** Focused tests pass, full suite green.
-- [ ] **Step 5: Run `npm run eval`**, record the delta, expecting movement on `return-visits` specifically.
-- [ ] **Step 6: Commit** `feat: predict entities you keep returning to`.
+**Optional successor, if time allows:** share value-evidence across transitions
+with the same `(server, nextTool, arg)`, so a value learned under a common
+trigger is available under a rare one. Judge it against **+0.03 headline**, not
+the +0.25 the original framing implied, and drop it too if it does not clear
+that. Note it touches the persistence key shape, so it carries migration risk
+disproportionate to its size.
 
 ### Task 5c: Rank by expected value, not probability alone
 
