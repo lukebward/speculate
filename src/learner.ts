@@ -19,7 +19,7 @@ import { stableStringify } from './keys.js';
 import type { ObservedCall, Prediction } from './types.js';
 
 export interface TransitionLearnerOptions {
-  /** Injectable clock (LRU recency only — gap math uses call timestamps). */
+  /** Injectable clock (decay and recency only — gap math uses call timestamps). */
   now?: () => number;
   /** Max prev→next spacing (ms, by call timestamps) to count as a transition. */
   maxGapMs?: number;
@@ -27,7 +27,7 @@ export interface TransitionLearnerOptions {
   minObservations?: number;
   /** Cap on predictions returned per trigger call. */
   maxPredictionsPerTrigger?: number;
-  /** LRU cap on tracked transitions. */
+  /** Cap on tracked transitions; the weakest is evicted past it. */
   maxTransitions?: number;
 }
 
@@ -35,6 +35,14 @@ const DEFAULT_MAX_GAP_MS = 120_000;
 const DEFAULT_MIN_OBSERVATIONS = 2;
 const DEFAULT_MAX_PREDICTIONS_PER_TRIGGER = 3;
 const DEFAULT_MAX_TRANSITIONS = 500;
+/**
+ * Evidence half-life constant (§5.3): a score loses 1/e of its weight per
+ * TAU of silence. 14 days is long enough that a workflow paused over a
+ * holiday still ranks, short enough that a project finished last quarter
+ * stops outranking this week's. Ranking and eviction only — `count` never
+ * decays, so the minObservations gate keeps its meaning.
+ */
+const TAU_MS = 14 * 24 * 3600_000;
 /** Persisted observation counts are clamped here on import (sanity bound). */
 const MAX_IMPORTED_COUNT = 10_000;
 /** Wide-result guards: a huge JSON map must not explode template state. */
@@ -47,12 +55,38 @@ const MAX_OPENERS_PER_SERVER = 8;
 const MAX_OPENER_REPR_LENGTH = 4_096;
 const MAX_IMPORTED_OPENER_COUNT = 1_000;
 
+/**
+ * Exponential time decay of an evidence score: `score * e^(-elapsed/tau)`.
+ *
+ * Exported for tests. Total by construction — a non-finite or negative
+ * elapsed time (clock skew, a state file from a machine set to the future)
+ * decays nothing rather than amplifying anything, and a non-positive tau
+ * simply disables decay.
+ */
+export function decayedScore(
+  score: number,
+  from: number,
+  to: number,
+  tauMs: number = TAU_MS,
+): number {
+  if (!Number.isFinite(score) || score <= 0) return 0;
+  if (!Number.isFinite(tauMs) || tauMs <= 0) return score;
+  const elapsed = to - from;
+  if (!Number.isFinite(elapsed) || elapsed <= 0) return score;
+  return score * Math.exp(-elapsed / tauMs);
+}
+
 // -- persistence shapes (DESIGN.md §13.6) --------------------------------------
 //
 // What persists: transition structure — tool names and argument TEMPLATES
-// (including constant argument values via their canonical repr). What never
-// persists: tool results, the per-server chain heads (session-local), and
-// LRU clocks (recency resets on load).
+// (including constant argument values via their canonical repr), plus the
+// decayed evidence score and the clock reading it was taken at. What never
+// persists: tool results and the per-server chain heads (session-local).
+//
+// Recency MUST travel with the snapshot: restamping lastUpdated on load
+// would reset decay on every restart and make the whole mechanism cosmetic.
+// Both new fields are optional so a pre-existing state file still loads —
+// missing score defaults to count, missing lastUpdated to now().
 
 export interface SerializedSource {
   kind: 'arg' | 'parsed' | 'const';
@@ -67,6 +101,10 @@ export interface SerializedTransition {
   prevTool: string;
   nextTool: string;
   count: number;
+  /** Decayed evidence weight. Absent pre-v0.13; defaults to `count`. */
+  score?: number;
+  /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
+  lastUpdated?: number;
   templates: Array<{ name: string; underivable: boolean; sources: SerializedSource[] }>;
 }
 
@@ -76,6 +114,10 @@ export interface SerializedOpener {
   /** stableStringify of the opening call's args (constants only, by nature). */
   argsRepr: string;
   count: number;
+  /** Decayed evidence weight. Absent pre-v0.13; defaults to `count`. */
+  score?: number;
+  /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
+  lastUpdated?: number;
 }
 
 export interface SerializedLearner {
@@ -105,8 +147,18 @@ interface TransitionState {
   server: string;
   prevTool: string;
   nextTool: string;
+  /**
+   * Lifetime observation count. Never decays: it is the evidence gate
+   * (minObservations) and the confidence input. A transition that was real
+   * a year ago is still real, it is just no longer topical.
+   */
   count: number;
-  /** Injected-clock time of the last observation (LRU recency). */
+  /**
+   * Decayed evidence weight as of `lastUpdated`, for ranking and eviction
+   * only. Read through decayedScore(), never raw.
+   */
+  score: number;
+  /** Injected-clock time `score` was taken at (also recency for eviction). */
   lastUpdated: number;
   /** Per-argument templates for the next call's args, keyed by arg name. */
   templates: Map<string, ArgTemplate>;
@@ -124,7 +176,10 @@ interface OpenerState {
   server: string;
   tool: string;
   argsRepr: string;
+  /** Lifetime sighting count — the minObservations gate. Never decays. */
   count: number;
+  /** Decayed evidence weight as of `lastUpdated` (eviction only). */
+  score: number;
   /** Injected-clock time of the last sighting (eviction tie-break). */
   lastUpdated: number;
 }
@@ -159,8 +214,9 @@ export class TransitionLearner {
   private mutations = 0;
   /**
    * Tracked transitions keyed by `<server> <prevTool> <nextTool>` (labels
-   * and tool names never contain spaces). Map insertion order is LRU
-   * order: every update deletes and re-sets the entry.
+   * and tool names never contain spaces). Map insertion order is
+   * observation order — every update deletes and re-sets the entry — which
+   * is the last eviction tie-break and the export order, not the policy.
    */
   private readonly transitions = new Map<string, TransitionState>();
   /**
@@ -230,23 +286,29 @@ export class TransitionLearner {
       const repr = safeStringify(args);
       if (repr === undefined || repr.length > MAX_OPENER_REPR_LENGTH) return;
       const key = `${server}\x00${tool}\x00${repr}`;
+      const now = this.now();
       const existing = this.openers.get(key);
       if (existing) {
         existing.count = Math.min(existing.count + 1, MAX_IMPORTED_OPENER_COUNT);
-        existing.lastUpdated = this.now();
+        existing.score = decayedScore(existing.score, existing.lastUpdated, now) + 1;
+        existing.lastUpdated = now;
       } else {
         this.openers.set(key, {
           server,
           tool,
           argsRepr: repr,
           count: 1,
-          lastUpdated: this.now(),
+          score: 1,
+          lastUpdated: now,
         });
         const mine = [...this.openers.entries()].filter(([, o]) => o.server === server);
         if (mine.length > MAX_OPENERS_PER_SERVER) {
-          // Evict the weakest opener (lowest count, then stalest).
+          // Evict the weakest opener (lowest decayed score, then stalest).
           mine.sort(
-            (a, b) => a[1].count - b[1].count || a[1].lastUpdated - b[1].lastUpdated,
+            (a, b) =>
+              decayedScore(a[1].score, a[1].lastUpdated, now) -
+                decayedScore(b[1].score, b[1].lastUpdated, now) ||
+              a[1].lastUpdated - b[1].lastUpdated,
           );
           this.openers.delete(mine[0]![0]);
         }
@@ -264,10 +326,18 @@ export class TransitionLearner {
    */
   openerPredictions(server: string): Prediction[] {
     try {
+      const now = this.now();
+      // The gate is the undecayed count: an opener that qualified once still
+      // qualifies. Decay only decides which of the qualifiers goes first.
       const mine = [...this.openers.values()].filter(
         (o) => o.server === server && o.count >= this.minObservations,
       );
-      mine.sort((a, b) => b.count - a.count || (a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0));
+      mine.sort(
+        (a, b) =>
+          decayedScore(b.score, b.lastUpdated, now) -
+            decayedScore(a.score, a.lastUpdated, now) ||
+          (a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0),
+      );
       const out: Prediction[] = [];
       for (const o of mine.slice(0, this.maxPredictionsPerTrigger)) {
         let args: unknown;
@@ -292,9 +362,10 @@ export class TransitionLearner {
   }
 
   /**
-   * Snapshot of learned transitions for persistence (LRU order, oldest
-   * first, so importing re-establishes the same eviction order). Chain
-   * heads and recency clocks are session-local and excluded.
+   * Snapshot of learned transitions for persistence, in observation order
+   * (oldest first). Each entry carries its evidence score and the clock
+   * reading that score was taken at, so decay continues across a restart
+   * instead of resetting. Chain heads are session-local and excluded.
    */
   exportState(): SerializedLearner {
     const transitions: SerializedTransition[] = [];
@@ -304,6 +375,11 @@ export class TransitionLearner {
         prevTool: state.prevTool,
         nextTool: state.nextTool,
         count: state.count,
+        // The (score, lastUpdated) pair travels together and undecayed: the
+        // next load applies the decay for the whole gap, however long the
+        // process was down.
+        score: state.score,
+        lastUpdated: state.lastUpdated,
         templates: [...state.templates.entries()].map(([name, tpl]) => ({
           name,
           underivable: tpl.underivable,
@@ -316,6 +392,8 @@ export class TransitionLearner {
       tool: o.tool,
       argsRepr: o.argsRepr,
       count: o.count,
+      score: o.score,
+      lastUpdated: o.lastUpdated,
     }));
     return openers.length > 0 ? { transitions, openers } : { transitions };
   }
@@ -330,28 +408,20 @@ export class TransitionLearner {
     try {
       const root = data as { transitions?: unknown; openers?: unknown };
       if (!root || !Array.isArray(root.transitions)) return;
+      const now = this.now();
       for (const raw of root.transitions) {
-        const t = deserializeTransition(raw);
+        const t = deserializeTransition(raw, now);
         if (!t) continue;
-        const key = `${t.server} ${t.prevTool} ${t.nextTool}`;
-        this.transitions.set(key, {
-          ...t,
-          lastUpdated: this.now(),
-        });
-        while (this.transitions.size > this.maxTransitions) {
-          const oldest = this.transitions.keys().next();
-          if (oldest.done) break;
-          this.transitions.delete(oldest.value);
-        }
+        this.transitions.set(`${t.server} ${t.prevTool} ${t.nextTool}`, t);
       }
+      // Trim once, after the whole file is in: an oversized snapshot then
+      // keeps its most valuable entries rather than its last-listed ones.
+      this.evictTransitions(now);
       if (Array.isArray(root.openers)) {
         for (const raw of root.openers) {
-          const o = deserializeOpener(raw);
+          const o = deserializeOpener(raw, now);
           if (!o) continue; // malformed openers are skipped, never fatal
-          this.openers.set(`${o.server}\x00${o.tool}\x00${o.argsRepr}`, {
-            ...o,
-            lastUpdated: this.now(),
-          });
+          this.openers.set(`${o.server}\x00${o.tool}\x00${o.argsRepr}`, o);
         }
       }
       this.mutations++;
@@ -379,40 +449,65 @@ export class TransitionLearner {
     if (gap < 0 || gap > this.maxGapMs) return;
 
     const key = `${call.server} ${prev.tool} ${call.tool}`;
+    const now = this.now();
     this.mutations++;
     let state = this.transitions.get(key);
     if (state) {
-      this.transitions.delete(key); // refresh LRU position on re-set below
+      this.transitions.delete(key); // keep insertion order = observation order
       state.count += 1;
-      state.lastUpdated = this.now();
+      // Age the standing evidence to now, THEN add this observation's full
+      // weight: recent evidence is worth more than the same volume of old.
+      state.score = decayedScore(state.score, state.lastUpdated, now) + 1;
+      state.lastUpdated = now;
       updateTemplates(state, prev, call.args);
     } else {
+      // A primed pair arms on first sight (§13.9); templates still come
+      // from real traffic, so a prior can never invent arguments.
+      const initial = this.primed.has(key) ? this.minObservations : 1;
       state = {
         server: call.server,
         prevTool: prev.tool,
         nextTool: call.tool,
-        // A primed pair arms on first sight (§13.9); templates still come
-        // from real traffic, so a prior can never invent arguments.
-        count: this.primed.has(key) ? this.minObservations : 1,
-        lastUpdated: this.now(),
+        count: initial,
+        score: initial,
+        lastUpdated: now,
         templates: initialTemplates(prev, call.args),
       };
     }
     this.transitions.set(key, state);
+    this.evictTransitions(now);
+  }
 
-    while (this.transitions.size > this.maxTransitions) {
-      const oldest = this.transitions.keys().next();
-      if (oldest.done) break;
-      this.transitions.delete(oldest.value);
-    }
+  /**
+   * Trim to maxTransitions by VALUE, not arrival order: drop the lowest
+   * decayed scores, ties broken by the stalest observation and then (via a
+   * stable sort) by insertion order, so eviction is deterministic. Evicting
+   * FIFO threw away the transition seen a hundred times at session start to
+   * make room for a one-off seen a second ago.
+   *
+   * Ranking once rather than rescanning per victim keeps a bulk import
+   * (which can overflow the cap by thousands at a stroke) linearithmic.
+   */
+  private evictTransitions(now: number): void {
+    const overflow = this.transitions.size - this.maxTransitions;
+    if (overflow <= 0) return;
+    const ranked = [...this.transitions.entries()].sort(
+      (a, b) =>
+        decayedScore(a[1].score, a[1].lastUpdated, now) -
+          decayedScore(b[1].score, b[1].lastUpdated, now) ||
+        a[1].lastUpdated - b[1].lastUpdated,
+    );
+    for (let i = 0; i < overflow; i++) this.transitions.delete(ranked[i]![0]);
   }
 
   // -- prediction -----------------------------------------------------------
 
   private predictInner(call: ObservedCall): Prediction[] {
+    const now = this.now();
     const candidates: Array<{
       state: TransitionState;
       ruleId: string;
+      score: number;
       args: Record<string, unknown>;
     }> = [];
     for (const state of this.transitions.values()) {
@@ -425,13 +520,15 @@ export class TransitionLearner {
         // Server label is part of the id: feedback must never bleed between
         // servers that happen to share tool names (review finding, §13.7).
         ruleId: `learned:${state.server}:${state.prevTool}→${state.nextTool}`,
+        score: decayedScore(state.score, state.lastUpdated, now),
         args,
       });
     }
+    // Rank by decayed score: among equally frequent transitions the one used
+    // recently is the better guess. The gate above is still the raw count.
     candidates.sort(
       (a, b) =>
-        b.state.count - a.state.count ||
-        (a.ruleId < b.ruleId ? -1 : a.ruleId > b.ruleId ? 1 : 0),
+        b.score - a.score || (a.ruleId < b.ruleId ? -1 : a.ruleId > b.ruleId ? 1 : 0),
     );
     // No `key` stamped: the predictor owns canonical cache keying.
     return candidates.slice(0, this.maxPredictionsPerTrigger).map((c) => ({
@@ -487,7 +584,7 @@ function deserializeSource(raw: unknown): Source | null {
  * Validate one persisted opener (untrusted input): sane strings, args that
  * round-trip to a plain object, count clamped. Null skips the entry.
  */
-function deserializeOpener(raw: unknown): Omit<OpenerState, 'lastUpdated'> | null {
+function deserializeOpener(raw: unknown, now: number): OpenerState | null {
   if (raw === null || typeof raw !== 'object') return null;
   const o = raw as SerializedOpener;
   if (
@@ -510,17 +607,38 @@ function deserializeOpener(raw: unknown): Omit<OpenerState, 'lastUpdated'> | nul
   } catch {
     return null;
   }
+  const count = Math.min(Math.floor(o.count), MAX_IMPORTED_OPENER_COUNT);
   return {
     server: o.server,
     tool: o.tool,
     argsRepr: o.argsRepr,
-    count: Math.min(Math.floor(o.count), MAX_IMPORTED_OPENER_COUNT),
+    count,
+    score: importedScore(o.score, count, MAX_IMPORTED_OPENER_COUNT),
+    lastUpdated: importedStamp(o.lastUpdated, now),
   };
 }
 
-function deserializeTransition(
-  raw: unknown,
-): Omit<TransitionState, 'lastUpdated'> | null {
+/**
+ * A persisted score, or `count` when the file predates the field (or carries
+ * junk there). Clamped to the same bound as count so a doctored file cannot
+ * pin an entry at the top of the ranking forever.
+ */
+function importedScore(raw: unknown, count: number, max: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return count;
+  return Math.min(raw, max);
+}
+
+/**
+ * A persisted recency stamp, or now() when absent/junk. Never in the future:
+ * a state file written by a clock ahead of ours must not buy an entry
+ * permanent freshness.
+ */
+function importedStamp(raw: unknown, now: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return now;
+  return Math.min(raw, now);
+}
+
+function deserializeTransition(raw: unknown, now: number): TransitionState | null {
   if (raw === null || typeof raw !== 'object') return null;
   const t = raw as SerializedTransition;
   if (
@@ -561,11 +679,14 @@ function deserializeTransition(
     // the live invariant (empty sources ⇒ underivable).
     templates.set(tpl.name, { underivable: sources.length === 0, sources });
   }
+  const count = Math.min(Math.floor(t.count), MAX_IMPORTED_COUNT);
   return {
     server: t.server,
     prevTool: t.prevTool,
     nextTool: t.nextTool,
-    count: Math.min(Math.floor(t.count), MAX_IMPORTED_COUNT),
+    count,
+    score: importedScore(t.score, count, MAX_IMPORTED_COUNT),
+    lastUpdated: importedStamp(t.lastUpdated, now),
     templates,
   };
 }

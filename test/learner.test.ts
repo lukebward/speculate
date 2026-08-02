@@ -5,8 +5,10 @@
  * against weird parsed shapes.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
-import { TransitionLearner } from '../src/learner.js';
+import { TransitionLearner, decayedScore } from '../src/learner.js';
 import type { ObservedCall } from '../src/types.js';
+
+const DAY_MS = 24 * 3600_000;
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -419,7 +421,60 @@ describe('ranking and cap', () => {
   });
 });
 
-describe('LRU eviction', () => {
+describe('time decay', () => {
+  it('decays a score toward zero as time passes', () => {
+    const fresh = decayedScore(4, 0, 0);
+    const aged = decayedScore(4, 0, 14 * DAY_MS);
+    expect(fresh).toBe(4);
+    expect(aged).toBeLessThan(4);
+    expect(aged).toBeGreaterThan(0);
+    // Monotonic: more elapsed time is never worth more evidence.
+    expect(decayedScore(4, 0, 28 * DAY_MS)).toBeLessThan(aged);
+  });
+
+  it('ranks a recently used transition above an equally frequent stale one', () => {
+    const learner = new TransitionLearner({ now });
+    t = 0;
+    for (let i = 0; i < 2; i++) observePair(learner, 'srv', { tool: 'a' }, { tool: 'b' });
+    t = 60 * DAY_MS;
+    for (let i = 0; i < 2; i++) observePair(learner, 'srv', { tool: 'a' }, { tool: 'z' });
+
+    // Equal counts (2 each). Ordering by raw count leaves a ruleId tie-break,
+    // which would put the stale 'b' first; decayed score must invert that.
+    const preds = learner.predict(mkCall('srv', 'a'));
+    expect(preds.map((p) => p.tool)).toEqual(['z', 'b']);
+  });
+
+  it('keeps count gating minObservations even when the score has decayed away', () => {
+    const learner = new TransitionLearner({ now });
+    t = 0;
+    for (let i = 0; i < 2; i++) observePair(learner, 'srv', { tool: 'a' }, { tool: 'b' });
+    t = 3650 * DAY_MS; // a decade later: score is ~0, count is still 2
+    expect(learner.predict(mkCall('srv', 'a'))).toHaveLength(1);
+  });
+});
+
+describe('value-based eviction', () => {
+  it('evicts the lowest-scoring transition, not the oldest inserted', () => {
+    const learner = new TransitionLearner({
+      now,
+      minObservations: 1,
+      maxTransitions: 3,
+    });
+    t = 1;
+    // The hot transition is inserted FIRST and never touched again.
+    for (let i = 0; i < 5; i++) observePair(learner, 'srv', { tool: 'hot' }, { tool: 'x' });
+    // Then enough one-shot transitions to push well past the cap.
+    for (const cold of ['c1', 'c2', 'c3', 'c4']) {
+      observePair(learner, 'srv', { tool: cold }, { tool: 'y' });
+    }
+
+    // FIFO drops the oldest insertion, which is the most valuable entry here.
+    expect(learner.predict(mkCall('srv', 'hot'))).toHaveLength(1);
+    expect(learner.predict(mkCall('srv', 'c1'))).toEqual([]); // weakest and stalest
+    expect(learner.predict(mkCall('srv', 'c4'))).toHaveLength(1);
+  });
+
   it('evicts the least-recently-updated transition at maxTransitions', () => {
     const learner = new TransitionLearner({
       now,
