@@ -291,24 +291,33 @@ the +0.25 the original framing implied, and drop it too if it does not clear
 that. Note it touches the persistence key shape, so it carries migration risk
 disproportionate to its size.
 
-### Task 5c: Rank by expected value, not probability alone
+### Task 5c: REVERTED — a measured no-op on every shipped configuration
 
-From PASTE (arXiv 2603.18897), which the project already cites as the closest
-published analogue. It does not fix K. It ranks candidates by a utility score
-`U = (p · T) / (c · d)` (probability times time saved, over cost) and
-"launched greedily as long as sufficient slack resources remain."
+Implemented from PASTE (arXiv 2603.18897), which ranks candidates by
+`U = (p·T)/(c·d)` and launches greedily while slack remains, rather than fixing
+K. Speculate ranked by `confidence × effectiveness` alone, so a 50 ms call at
+0.8 outranked a 2 s call at 0.3 despite being worth roughly a tenth as much.
+The reasoning still looks right; it just does not pay here yet.
 
-Speculate currently ranks by `confidence × ruleEffectiveness`
-(`src/predictor.ts:291-293`) and caps at 3, so a 50 ms call at 0.8 confidence
-outranks a 2 s call at 0.3 even though the second is worth roughly ten times
-more wall-clock. The data to fix this already exists: `upstreamLatencyMs` is
-recorded per cache entry (`src/cache.ts`) and flows through metrics.
+**Why it was reverted.** It could not be demonstrated on anything we ship:
 
-- [ ] **Step 1:** Track a decayed mean upstream latency per `(server, tool)`, reusing the Task 2 decay helper so a tool that got slower recently is weighted as such.
-- [ ] **Step 2:** Rank by `score × expectedLatencyMs`, falling back to the current ordering when a tool has no latency history yet (cold start must not regress).
-- [ ] **Step 3:** Keep the hard cap as a backstop, but let the effective K shrink when candidates are cheap and grow when they are expensive, bounded by the existing idle-only budget in `src/budget.ts`. Do not remove the budget; it is the safety gate.
-- [ ] **Step 4:** `npm run eval -- --compare`. **Expect no movement**: the eval scores rank-of-actual-call and is latency-blind, so this cannot show up there. Justify it on the bench instead (`npm run bench` measures wall-clock) and say plainly that the eval is the wrong instrument for this change.
-- [ ] **Step 5:** Commit `feat: rank speculations by expected time saved, not probability alone`.
+- The bundled bench gives every mock tool the same latency, so `score × ms` is
+  `score` times a constant. Nothing to prioritize.
+- On the bundled profile the per-trigger cap **never binds** (measured: zero
+  per-trigger-cap suppression events), so there is no cut for a better ranking
+  to change.
+- The only win was on a constructed `--hetero --cap 1` workload: 4.50 s → 4.05 s.
+
+Cost was 805 insertions across 10 files including a new `src/latency.ts`. The
+plan's own rule is that a change which does not move the measurement does not
+land, and this moved nothing on any default.
+
+**When to revisit.** PASTE's utility ranking matters when a trigger offers more
+candidates than the budget pays for. Task 3's beam now emits several candidates
+per trigger, so if the cap starts binding in practice, or if beams widen, the
+premise becomes true and this is worth rebuilding. The reverted commit is
+`41128ee` and the honest per-workload numbers are in
+`.superpowers/sdd/task-5c-report.md`.
 
 ### Task 5b: Staleness, because better prediction makes it worse
 
