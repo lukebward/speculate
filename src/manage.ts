@@ -204,11 +204,11 @@ export interface ManagedEntry {
  * name alone made the second `on` overwrite the first record and let `off`
  * leave a still-wrapped entry behind while reporting success.
  */
-function managedKey(scope: ClaudeScope, name: string): string {
+export function managedKey(scope: ClaudeScope, name: string): string {
   return `${scope}\u0000${name}`;
 }
 
-interface ManagedState {
+export interface ManagedState {
   version: 1;
   projects: Record<string, { entries: ManagedEntry[]; updatedAt: number }>;
   /**
@@ -255,7 +255,7 @@ export function managedStatePath(): string {
   return join(stateHome, 'speculate', 'managed.json');
 }
 
-function loadManagedState(path: string): ManagedState {
+export function loadManagedState(path: string): ManagedState {
   try {
     const data = JSON.parse(readFileSync(path, 'utf8')) as ManagedState;
     if (data && typeof data === 'object' && data.version === 1 && data.projects) {
@@ -267,7 +267,7 @@ function loadManagedState(path: string): ManagedState {
   return { version: 1, projects: {} };
 }
 
-function saveManagedState(path: string, state: ManagedState): void {
+export function saveManagedState(path: string, state: ManagedState): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
@@ -321,7 +321,7 @@ export function effectiveServerHash(view: ClaudeConfigView): string {
 
 // -- the claude mcp front door ---------------------------------------------------
 
-interface Ctx {
+export interface Ctx {
   home: string;
   cwd: string;
   self: { command: string; args: string[] };
@@ -329,6 +329,8 @@ interface Ctx {
   claudeBin: string;
   statePath: string;
   log: (line: string) => void;
+  /** Memoized `claude plugin list --json`; see fetchPluginList. */
+  pluginList?: Promise<unknown | null>;
 }
 
 async function mcpAddJson(
@@ -359,7 +361,7 @@ export interface ManageOptions {
   mode?: 'strict' | 'annotated' | 'off' | null;
 }
 
-function makeCtx(opts: ManageOptions): Ctx {
+export function makeCtx(opts: ManageOptions): Ctx {
   return {
     home: opts.home ?? homedir(),
     cwd: resolve(opts.cwd ?? process.cwd()),
@@ -452,34 +454,57 @@ function isLegacyPluginRecord(item: unknown): boolean {
 }
 
 /**
- * Detect a still-installed legacy plugin via `claude plugin list --json`.
- * Parses the JSON (hosts emit either an array of records or an id-keyed
- * object) and matches ids/names exactly. Fail-soft in every direction: a
- * missing plugin CLI, a nonzero exit, or unparseable output means "not
- * detected", never a guess — callers with their own ≤0.10 record still act.
+ * The one `claude plugin list --json` every detector reads (`off` used to
+ * spawn it twice: once for the legacy plugin, once for the auto-wrap one).
+ * Memoized on the ctx, which lives exactly as long as a single command run.
+ *
+ * Reusing the list across an uninstall in the same run is safe because the
+ * detectors match DISJOINT ids: cleanup only ever uninstalls the legacy ids
+ * (LEGACY_PLUGIN_MATCH), so a later `speculate-autowrap` lookup can't be
+ * reading a stale answer about its own plugin.
+ *
+ * Fail-soft in every direction: a missing plugin CLI, a nonzero exit, or
+ * unparseable output all yield null, which every caller reads as "not
+ * detected", never a guess.
+ */
+function fetchPluginList(ctx: Ctx): Promise<unknown | null> {
+  ctx.pluginList ??= (async () => {
+    try {
+      const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
+      if (list.code !== 0) return null;
+      try {
+        return JSON.parse(list.stdout) as unknown;
+      } catch {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  })();
+  return ctx.pluginList;
+}
+
+/**
+ * Does a parsed `plugin list --json` payload name a plugin `matches` accepts?
+ * Hosts emit either an array of records or an id-keyed object; both shapes
+ * are matched exactly (never by substring — a user's unrelated
+ * `speculate-tools` is someone else's plugin).
+ */
+function pluginListNames(parsed: unknown, matches: (item: unknown) => boolean): boolean {
+  if (Array.isArray(parsed)) return parsed.some(matches);
+  if (parsed && typeof parsed === 'object') {
+    const rec = parsed as Record<string, unknown>;
+    return Object.keys(rec).some((k) => matches(k)) || Object.values(rec).some(matches);
+  }
+  return false;
+}
+
+/**
+ * Detect a still-installed legacy plugin. Fail-soft: "not detected" is the
+ * answer for every unknown — callers with their own ≤0.10 record still act.
  */
 async function detectLegacyPlugin(ctx: Ctx): Promise<boolean> {
-  try {
-    const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
-    if (list.code !== 0) return false;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(list.stdout);
-    } catch {
-      return false;
-    }
-    if (Array.isArray(parsed)) return parsed.some(isLegacyPluginRecord);
-    if (parsed && typeof parsed === 'object') {
-      const rec = parsed as Record<string, unknown>;
-      return (
-        Object.keys(rec).some((k) => LEGACY_PLUGIN_MATCH.has(k)) ||
-        Object.values(rec).some(isLegacyPluginRecord)
-      );
-    }
-    return false;
-  } catch {
-    return false;
-  }
+  return pluginListNames(await fetchPluginList(ctx), isLegacyPluginRecord);
 }
 
 /**
@@ -610,12 +635,16 @@ export interface WrapOutcome {
 /**
  * Wraps every eligible server in `view` into `managed`, applying all consent
  * gates. Mutates `managed` in place. Used by both `on` and `sync`.
+ *
+ * `onWrapped` fires once per server actually wrapped here, so `sync` can name
+ * them in its one-line summary without re-deriving the set from the config it
+ * just rewrote. `on` passes nothing (it logs each server as it goes).
  */
 export async function wrapEffectiveServers(
   ctx: Ctx,
   view: ClaudeConfigView,
   managed: Map<string, ManagedEntry>,
-  opts: { mode?: SpeculationMode },
+  opts: { mode?: SpeculationMode; onWrapped?: (name: string) => void },
 ): Promise<WrapOutcome> {
   let changed = 0;
   let failed = 0;
@@ -658,6 +687,7 @@ export async function wrapEffectiveServers(
       }
       managed.set(managedKey('local', name), { name, scope: 'local', action: 'shadowed' });
       ctx.log(`[speculate] ${name}: wrapped via local shadow (.mcp.json untouched; local wins)`);
+      opts.onWrapped?.(name);
       changed++;
       continue;
     }
@@ -689,6 +719,7 @@ export async function wrapEffectiveServers(
       original: scoped.entry,
     });
     ctx.log(`[speculate] ${name}: wrapped (${scoped.scope} scope)`);
+    opts.onWrapped?.(name);
     changed++;
   }
 
@@ -757,49 +788,27 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
 // -- off --------------------------------------------------------------------------
 
 /**
- * The (task-4) user-scope auto-wrap plugin's id. `off` only needs to know
- * whether it's installed, to tell the user their opt-out is per-project
- * while the plugin itself is not. This is deliberately a narrow, local
- * check — not routed through LEGACY_PLUGIN_IDS/LEGACY_PLUGIN_MATCH, which
- * name only the retired ≤0.10 plugin — so a later task adding real
- * plugin-list plumbing (shared with `sync`) can replace it outright rather
- * than untangle it from legacy-plugin detection.
+ * The user-scope auto-wrap plugin's id. `off` only needs to know whether
+ * it's installed, to tell the user their opt-out is per-project while the
+ * plugin itself is not. Matched on its own, never through
+ * LEGACY_PLUGIN_IDS/LEGACY_PLUGIN_MATCH (which name only the retired ≤0.10
+ * plugin): the two sets must stay disjoint, or cleanup would uninstall the
+ * auto-wrap plugin `on` just installed.
  */
 const AUTOWRAP_PLUGIN_ID = 'speculate-autowrap';
 
 /**
- * Fail-soft check (same shape as detectLegacyPlugin, matching a different
- * id): is `speculate-autowrap` in `claude plugin list --json`? A missing
- * plugin CLI, nonzero exit, or unparseable output all mean "not detected",
- * never a guess.
+ * Fail-soft check (same shared plugin list as detectLegacyPlugin, matching a
+ * different, disjoint id): is `speculate-autowrap` installed?
  */
 async function detectAutowrapPlugin(ctx: Ctx): Promise<boolean> {
-  try {
-    const list = await ctx.runner(ctx.claudeBin, ['plugin', 'list', '--json'], { cwd: ctx.cwd });
-    if (list.code !== 0) return false;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(list.stdout);
-    } catch {
-      return false;
-    }
-    const named = (item: unknown): boolean => {
-      if (typeof item === 'string') return item === AUTOWRAP_PLUGIN_ID;
-      if (!item || typeof item !== 'object') return false;
-      const rec = item as Record<string, unknown>;
-      return rec['id'] === AUTOWRAP_PLUGIN_ID || rec['name'] === AUTOWRAP_PLUGIN_ID;
-    };
-    if (Array.isArray(parsed)) return parsed.some(named);
-    if (parsed && typeof parsed === 'object') {
-      const rec = parsed as Record<string, unknown>;
-      return (
-        Object.keys(rec).includes(AUTOWRAP_PLUGIN_ID) || Object.values(rec).some(named)
-      );
-    }
-    return false;
-  } catch {
-    return false;
-  }
+  const named = (item: unknown): boolean => {
+    if (typeof item === 'string') return item === AUTOWRAP_PLUGIN_ID;
+    if (!item || typeof item !== 'object') return false;
+    const rec = item as Record<string, unknown>;
+    return rec['id'] === AUTOWRAP_PLUGIN_ID || rec['name'] === AUTOWRAP_PLUGIN_ID;
+  };
+  return pluginListNames(await fetchPluginList(ctx), named);
 }
 
 export async function speculateOff(opts: ManageOptions): Promise<number> {
@@ -980,7 +989,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       '[speculate] auto-wrap is still installed globally (this project is now opted out).',
     );
     ctx.log(
-      '[speculate]   remove it everywhere with: claude plugin uninstall -s user speculate-autowrap',
+      `[speculate]   remove it everywhere with: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}`,
     );
   }
   saveManagedState(ctx.statePath, state);

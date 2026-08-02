@@ -20,6 +20,7 @@ import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
 import { nodeSignalNumber, parseTryArgs, runTry } from './tryRun.js';
 import { speculateOff, speculateOn, speculateStatus } from './manage.js';
+import { speculateSync } from './sync.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
 import { createUsageRecorder } from './usage.js';
@@ -58,6 +59,7 @@ options:
   --help            show this help
 
 compatibility:
+  speculate sync                           wrap servers added since the last run (used by the auto-wrap hook)
   speculate exec [--cwd <dir>] -- <command...>   run <command> verbatim; kept only so a
                                                 stranded ≤0.10 Bash hook still works (removed in 0.12)
 `;
@@ -88,6 +90,7 @@ interface Args {
     | 'on'
     | 'off'
     | 'status'
+    | 'sync'
     | 'stats'
     | 'shims'
     | 'exec';
@@ -103,6 +106,7 @@ const REST_COMMANDS = new Set([
   'on',
   'off',
   'status',
+  'sync',
   'stats',
   'shims',
   'exec',
@@ -308,6 +312,24 @@ async function main(): Promise<void> {
           ? uninstallShims(opts)
           : shimsStatus(opts);
     process.exitCode = code;
+    return;
+  }
+
+  if (args.command === 'sync') {
+    // Hard cap on the whole run: the auto-wrap hook is synchronous, so a
+    // hang here would hold up a session start. Expiry is treated as success
+    // (exit 0) — a slow day never costs a session, and the work is picked up
+    // next start. Unref'd so it never keeps an otherwise-idle process alive.
+    const timer = setTimeout(() => process.exit(0), 5_000).unref();
+    try {
+      process.exitCode = await speculateSync({ self: selfCommand(), mode: null });
+    } catch {
+      // selfCommand() throws when the entrypoint can't be located (a
+      // half-removed install with the plugin still there). The hook must
+      // still exit 0 silently rather than error on every launch forever.
+      process.exitCode = 0;
+    }
+    clearTimeout(timer);
     return;
   }
 

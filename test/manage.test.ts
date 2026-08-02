@@ -851,6 +851,18 @@ describe('speculate off', () => {
     expect(state.syncOptOut['/some/other/project']).toBe(true);
   });
 
+  it('asks the host for the plugin list exactly once per run', async () => {
+    // Legacy detection and auto-wrap detection both read `plugin list
+    // --json`; off used to spawn it twice. They share one memoized fetch —
+    // safe because the ids they match are disjoint, so an uninstall in
+    // between can never make the reused answer wrong.
+    pluginSim = { installed: true, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOff(opts());
+    expect(calls.filter((c) => c[1] === 'plugin' && c[2] === 'list')).toHaveLength(1);
+    expect(logs.join('\n')).toContain('auto-wrap is still installed globally');
+  });
+
   it('off says auto-wrap is still active globally when the plugin is installed', async () => {
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     await speculateOn(opts());
