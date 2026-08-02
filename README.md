@@ -4,7 +4,7 @@ Speculative prefetching for coding agents. Speculate sits between your MCP clien
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
 
-The same GitHub PR workflow, run twice against a mock server with 400 ms of injected latency. The first pass teaches Speculate the workflow; on the second, the PR is already fetched by the time the agent asks. Reproduce with `npm run demo`.
+The same workflow twice, against a mock server with injected latency. Reproduce with `npm run demo`.
 
 ## Install
 
@@ -56,7 +56,7 @@ No install and no Claude Code required: prefix the server command already in you
 }
 ```
 
-The client sees standard MCP: same tools, same results, some just arrive ~200× faster. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate and time saved; `speculate stats` reports durable cumulative usage.
+The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate and time saved; `speculate stats` reports durable cumulative usage.
 
 ## Safety
 
@@ -76,9 +76,9 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 
 ```bash
 npm install     # builds dist/ via the prepare hook
-npm test        # 504 tests (497 passing, 7 skipped on this platform)
+npm test        # unit and end-to-end suite
 npm run bench   # speculation off vs on
-npm run demo    # the README demo, against the bundled mock (injected latency)
+npm run demo    # the README demo, against the bundled mock
 ```
 
 Running the test suite needs Node >= 20.19 (vitest's native rolldown binding; npm silently skips it on older Node). The runtime floor for *using* speculate is unchanged at Node >= 18.

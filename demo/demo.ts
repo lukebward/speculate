@@ -26,7 +26,6 @@ const THINK_MS = 1500;
 const LATENCY_MS = 400;
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
-const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
 
@@ -90,31 +89,24 @@ async function main(): Promise<void> {
     return out[0]!;
   };
 
+  // Deliberately sparse: the two columns of timings are the whole argument,
+  // and narration around them only competes with it. The titlebar the SVG
+  // renderer draws still names the mock upstream, so nothing here has to.
   console.log();
-  console.log(bold('  Speculate demo: list PRs, then read the top one'));
-  console.log(
-    dim(
-      `  mock GitHub upstream · repo ${repo.owner}/${repo.repo} · ${LATENCY_MS} ms injected latency\n`,
-    ),
-  );
-
-  console.log(dim('  pass 1: Speculate watches the workflow'));
+  console.log(dim('  pass 1'));
   const list1 = await timed('list_pull_requests', repo);
   console.log(callLine('list_pull_requests', list1.ms));
   await sleep(THINK_MS);
   const pr1 = topPr(list1.result);
   const view1 = await timed('get_pull_request', { ...repo, pull_number: pr1.number });
-  const title = pr1.title.length > 36 ? `${pr1.title.slice(0, 35)}…` : pr1.title;
-  console.log(callLine(`get_pull_request #${pr1.number}`, view1.ms, dim(`"${title}"`)));
+  console.log(callLine(`get_pull_request #${pr1.number}`, view1.ms));
   console.log();
 
   await sleep(1200);
-  console.log(dim('  pass 2: the same workflow'));
+  console.log(dim('  pass 2'));
   const list2 = await timed('list_pull_requests', repo);
   const pr2 = topPr(list2.result);
-  console.log(
-    callLine('list_pull_requests', list2.ms, dim(`→ prefetches get_pull_request #${pr2.number}`)),
-  );
+  console.log(callLine('list_pull_requests', list2.ms, dim(`→ prefetches #${pr2.number}`)));
   await sleep(THINK_MS);
   const view2 = await timed('get_pull_request', { ...repo, pull_number: pr2.number });
   const speedup = view1.ms / Math.max(view2.ms, 1);
