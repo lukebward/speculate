@@ -506,7 +506,15 @@ however early, can make a wrap take effect in the session that triggered it.
 A server added now runs unwrapped, exactly as if speculation were off, for
 one more session, then wraps starting the session after. Both the plugin's
 own summary line and `speculate status` state this plainly rather than
-implying instant pickup.
+implying instant pickup. One further limit of the same shape, stated here
+because nothing else in the product can state it: the hook is registered
+with `matcher: "startup"`, so it fires only for a fresh session. Someone
+who works entirely in `claude --resume` or `claude --continue` never fires
+it and therefore never gets auto-wrap at all; for them `speculate on`
+remains the only thing that wraps anything. Widening the matcher to
+`resume`/`compact` would run the hash check on far more session events for
+a wrap that is one session late regardless, so the narrow matcher stands —
+but as a choice, not as an oversight.
 
 **Sync is cheap on the common path and fails open on every other one.**
 Before spawning anything, it hashes the project's effective server set
@@ -519,11 +527,25 @@ directory rather than per project, because every session ultimately
 read-modifies-writes the same global `~/.claude.json`; a session that
 cannot get the lock exits immediately and leaves the work for whichever
 session next finds the config unlocked, which costs nothing given the lag
-already puts everything one session behind. The wrap pass itself runs under
+already puts everything one session behind. `on` and `off` deliberately do
+not take that lock — they are interactive, and blocking a person behind a
+background hook would be the worse trade — so sync's final write is a
+read-merge-write, not a write-back: it re-reads the state file immediately
+before saving and touches only this project's own two keys. Writing its
+whole in-memory copy back silently reverted an `off` that completed in
+another project mid-sync, erasing the opt-out that `off` had just recorded
+and resurrecting the project record it had just deleted, so the project the
+user had turned off was re-wrapped at its next session start. The wrap pass itself runs under
 a cooperative deadline, 5 s by default: checked only between servers, never
 between one server's `remove` and its paired `add-json`, so a session that
 runs out of budget mid-list leaves a clean host, nothing deleted without a
-replacement, rather than a fully wrapped one. Every failure path returns
+replacement, rather than a fully wrapped one. Above that sits a last-resort
+process exit for a hang no layer below can end, set at 100 s — the 5 s
+budget plus three consecutive 30 s `execFile` timeouts — so that even a
+`remove` and its paired `add-json` both hanging to their own timeouts
+finish before it fires; the plugin's own hook timeout (120 s) is kept above
+that, since a host-side kill lands wherever it lands, including in exactly
+the window the cooperative deadline exists to protect. Every failure path returns
 success and sync prints at most one summary line: a session start must
 never be blocked or sprayed with diagnostics on auto-wrap's account, so
 `speculate status` remains the place to look when something needs
@@ -539,7 +561,19 @@ for anyone who wants auto-wrap gone entirely, plus the command to remove
 the marketplace registration that supplied it (`claude plugin marketplace
 remove speculate-mcp`), since a host-global registration is exactly the
 kind of artifact `off`'s per-project framing could otherwise leave
-unmentioned. What `off` still does not touch or mention is the staged
+unmentioned. It also names the limit that framing hides. The servers `off`
+unwraps at USER scope are shared by every project on the machine, while the
+opt-out it records covers one project, so any OTHER project's next session
+start re-wraps them at user scope — and this project sees them wrapped
+again, within a single session, without auto-wrap having disobeyed its
+opt-out at all. Whenever `off` unwrapped anything at user scope it now says
+so, and names the plugin uninstall as the only thing that actually stops
+it. `speculate status` closes the same loop from the other side: with the
+plugin installed it used to report "installed (new servers wrap at the next
+session start)" purely on detection, which is exactly wrong in a project
+that has just run `off`; it now reports the opt-out and names `speculate
+on` as the way back in, and that is the only place the opt-out is visible
+at all. What `off` still does not touch or mention is the staged
 plugin copy under `<state>/autowrap` (the same directory that holds
 `managed.json`) that `on` wrote in order to install the plugin in the
 first place; that copy is inert once the plugin is uninstalled, since
@@ -574,13 +608,28 @@ but a ≤0.10 Bash hook can still be sitting in a project nobody has run
 `speculate on` in yet, so the shim keeps earning its place. Removal moves
 to 0.13.
 
-Consent is unchanged throughout: sync wraps only servers
+**Consent, in both directions.** Sync wraps only servers
 `wrapEffectiveServers` would already wrap through `on`, including the
 `.mcp.json` approval gate, so nothing sync does can turn a pending server
-into a running one. The one honest new consent-adjacent fact: because the
-plugin installs at user scope, opening a brand-new project also gets its
-already-approved servers wrapped automatically at that project's next
-session start, without `speculate on` ever having run there.
+into a running one — and, as of this release, revoking an approval takes
+the wrapped server away again. The second half was missing, and 0.12 is
+what made it matter. Once an approved project server is shadowed by the
+wrapped copy registered at local scope, the local entry wins the scope
+contest, so the project entry's approval flag stopped reaching the
+per-project hash: revoking the approval changed nothing sync could see,
+sync made zero calls, and the shadow stayed registered and running at a
+scope that has no approval gate at all. That was already true of `on` in
+0.11; 0.12 escalated it, because shadows are now created unattended in
+projects where nobody ever ran `speculate on`. Both halves are fixed: the
+hash covers a shadowed project entry as well as the effective one, so a
+revoke moves it, and `sync`/`on` then REMOVE a shadow whose `.mcp.json`
+counterpart is no longer approved, leaving the pending entry in effect and
+unwrapped. Only shadows Speculate created are removed — the managed state
+records those with action `shadowed` — so a local entry the user wrapped
+themselves is never touched. The other honest consent-adjacent fact:
+because the plugin installs at user scope, opening a brand-new project also
+gets its already-approved servers wrapped automatically at that project's
+next session start, without `speculate on` ever having run there.
 
 Full trail: docs/superpowers/specs/2026-08-02-auto-wrap-design.md.
 

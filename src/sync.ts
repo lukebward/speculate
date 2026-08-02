@@ -54,13 +54,13 @@ const DEFAULT_BUDGET_MS = 5_000;
 
 /**
  * A lock older than this belonged to a session that died mid-sync (the CLI's
- * last-resort cap kills one at 60s). It MUST exceed that cap: a holder that
- * legitimately runs to the cap would otherwise look stale to a second session,
- * which would seize the lock and write concurrently — the exact race the lock
- * exists to prevent. Short enough that a crash still costs at most one more
- * session.
+ * last-resort cap kills one at 100s, and the host's own hook timeout at 120s).
+ * It MUST exceed both: a holder that legitimately runs to either would
+ * otherwise look stale to a second session, which would seize the lock and
+ * write concurrently — the exact race the lock exists to prevent. Short enough
+ * that a crash still costs at most one more session.
  */
-const LOCK_STALE_MS = 90_000;
+const LOCK_STALE_MS = 150_000;
 
 /**
  * Concurrent sessions all read-modify-write the same global `~/.claude.json`
@@ -136,14 +136,6 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
         onWrapped: (name) => wrapped.push(name),
         deadline: performance.now() + (opts.timeoutMs ?? DEFAULT_BUDGET_MS),
       });
-      // Record originals for whatever DID get wrapped, even on a run that
-      // ran out of time — that record is what makes `off`'s exact restore
-      // possible. Nothing wrapped means nothing to record: writing an empty
-      // entry list here would make `status` report drift "since 'speculate
-      // on'" in a project where `on` has never run.
-      if (wrapped.length > 0) {
-        state.projects[ctx.cwd] = { entries: [...managed.values()], updatedAt: Date.now() };
-      }
       // Only a pass that COMPLETED and wrapped everything it could may claim
       // "nothing has changed since this hash". A failure usually leaves the
       // config exactly as it found it (the wrap path restores the original),
@@ -152,15 +144,35 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
       // failure would silently become permanent. Leaving the previous hash
       // in place costs one retry per session until it succeeds. A run that
       // ran out of time is the same case: unfinished, so no claim.
-      if (outcome.failed === 0 && !outcome.timedOut) {
-        // Recomputed from the config AS IT NOW STANDS: storing the pre-wrap
-        // hash would make the very next session sync all over again.
-        state.syncHashes = {
-          ...(state.syncHashes ?? {}),
-          [ctx.cwd]: effectiveServerHash(readClaudeServers({ home: ctx.home, cwd: ctx.cwd })),
-        };
+      const nextHash =
+        outcome.failed === 0 && !outcome.timedOut
+          ? // Recomputed from the config AS IT NOW STANDS: storing the pre-wrap
+            // hash would make the very next session sync all over again.
+            effectiveServerHash(readClaudeServers({ home: ctx.home, cwd: ctx.cwd }))
+          : null;
+      // Read-merge-write, not write-back. `on` and `off` never take this lock
+      // (they are interactive; blocking a person on a background hook would
+      // be worse than the race), so the state on disk may have moved since
+      // the load above — a concurrent `off` in ANOTHER project records its
+      // opt-out and deletes its project record. Writing this run's whole
+      // in-memory copy back reverted both, so the project the user had just
+      // turned off was re-wrapped at its next session start. Re-read now and
+      // touch only the two keys that belong to THIS project.
+      const merged = loadManagedState(ctx.statePath);
+      // Record originals for whatever DID get wrapped, even on a run that
+      // ran out of time — that record is what makes `off`'s exact restore
+      // possible. Nothing wrapped and nothing removed means nothing to
+      // record: writing an empty entry list would make `status` report drift
+      // "since 'speculate on'" in a project where `on` has never run.
+      if (wrapped.length > 0 || outcome.revoked > 0) {
+        const entries = [...managed.values()];
+        if (entries.length > 0) merged.projects[ctx.cwd] = { entries, updatedAt: Date.now() };
+        else delete merged.projects[ctx.cwd];
       }
-      saveManagedState(ctx.statePath, state);
+      if (nextHash !== null) {
+        merged.syncHashes = { ...(merged.syncHashes ?? {}), [ctx.cwd]: nextHash };
+      }
+      saveManagedState(ctx.statePath, merged);
       // Report what really happened, including on a run that ran out of
       // time: those servers ARE wrapped, and they do take effect next
       // session. The rest are simply the next run's work.
@@ -168,6 +180,15 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
         report(
           `[speculate] wrapped ${wrapped.length} new server${wrapped.length > 1 ? 's' : ''} ` +
             `(${wrapped.join(', ')}); speculation active next session`,
+        );
+      }
+      // Consent moving the other way is the one other thing worth a line: a
+      // revoked .mcp.json approval takes a running server away, and silence
+      // there would look like Speculate ignored the revoke.
+      if (outcome.revoked > 0) {
+        report(
+          `[speculate] removed ${outcome.revoked} wrapped .mcp.json shadow` +
+            `${outcome.revoked > 1 ? 's' : ''} whose approval was revoked`,
         );
       }
     } finally {

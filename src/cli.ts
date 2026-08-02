@@ -61,7 +61,7 @@ options:
 
 compatibility:
   speculate exec [--cwd <dir>] -- <command...>   run <command> verbatim; kept only so a
-                                                stranded ≤0.10 Bash hook still works (removed in 0.12)
+                                                stranded ≤0.10 Bash hook still works (removed in 0.13)
 `;
 
 const STARTER_CONFIG = `{
@@ -317,16 +317,20 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'sync') {
+    if (args.rest.length > 0) fail(`unknown sync argument '${args.rest[0]}'`);
     // The real budget is COOPERATIVE and lives in speculateSync, which stops
     // BETWEEN servers so a wrap is never cut in half. This timer is only the
     // last resort for a hang no layer below can end (every `claude mcp` call
     // already carries its own 30s execFile timeout): far enough out that it
-    // effectively never fires in the window between a server's `mcp remove`
-    // and the `mcp add-json` that puts it back — killing the process THERE
-    // would leave the server deleted with no restore and no state record. It
-    // is narrowed, not closed: the budget plus two 30s execFile timeouts can
-    // still reach 60s. Unref'd so it never keeps an idle process alive.
-    const timer = setTimeout(() => process.exit(0), 60_000).unref();
+    // CANNOT fire in the window between a server's `mcp remove` and the `mcp
+    // add-json` that puts it back — killing the process THERE would leave the
+    // server deleted with no restore and no state record. 100s is the 5s
+    // budget plus three consecutive 30s execFile timeouts, so even a `remove`
+    // and an `add-json` that both hang to their own timeout finish inside it
+    // (60s was not: the budget plus two hangs already reached it, landing the
+    // hard exit exactly in that window). Unref'd so it never keeps an idle
+    // process alive.
+    const timer = setTimeout(() => process.exit(0), 100_000).unref();
     try {
       process.exitCode = await speculateSync({ self: selfCommand(), mode: null });
     } catch {

@@ -10,6 +10,7 @@
  * failure path may print or throw.
  */
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { execFile } from 'node:child_process';
 import {
   existsSync,
   mkdtempSync,
@@ -20,7 +21,8 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { effectiveServerHash, speculateOn, type CmdRunner } from '../src/manage.js';
+import { fileURLToPath } from 'node:url';
+import { effectiveServerHash, speculateOff, speculateOn, type CmdRunner } from '../src/manage.js';
 import { speculateSync } from '../src/sync.js';
 import { readClaudeServers } from '../src/hostConfig.js';
 
@@ -427,4 +429,185 @@ describe('speculate sync', () => {
       '[speculate] wrapped 1 new server (slack); speculation active next session\n',
     ]);
   });
+
+  it("does not revert an 'off' that lands in another project mid-sync", async () => {
+    // `on`/`off` are interactive and never take sync's lock (blocking a
+    // person on a background hook would be worse), so an `off` CAN complete
+    // between sync's read of the state and its write. Writing the whole
+    // in-memory object back erased the opt-out `off` had just recorded AND
+    // resurrected the project record it had just deleted — so the very next
+    // session start re-wrapped the project the user had just turned off.
+    const other = mkdtempSync(join(tmpdir(), 'speculate-sother-'));
+    try {
+      writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+      expect(await speculateOn({ ...opts(), cwd: other })).toBe(0); // project A
+      // Project B has work to do: a server that appeared after A's `on`.
+      const config = readClaudeJson();
+      config.mcpServers.linear = { command: 'linear-server' };
+      writeClaudeJson(config);
+      calls = [];
+      logs = [];
+
+      // The interleave: B's sync has already read the state (it is past the
+      // fast path and holds the lock) when A's `off` runs to completion.
+      let offRan = false;
+      const interleaved: CmdRunner = async (cmd, args, o) => {
+        if (!offRan) {
+          offRan = true;
+          expect(await speculateOff({ ...opts(), cwd: other, log: () => {} })).toBe(0);
+        }
+        return fakeRunner(cmd, args, o);
+      };
+      expect(await speculateSync({ ...opts(), runner: interleaved })).toBe(0);
+
+      const state = readState();
+      expect(offRan).toBe(true);
+      // A's opt-out survives …
+      expect(state.syncOptOut?.[other]).toBe(true);
+      // … and the record `off` deleted stays deleted (a resurrected record
+      // is what would make the next session re-wrap A).
+      expect(state.projects[other]).toBeUndefined();
+      // B's own work is still recorded.
+      expect(state.projects[cwd].entries.map((e: AnyRecord) => e.name)).toEqual(['linear']);
+      expect(state.syncHashes[cwd]).toBe(currentHash());
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it("another project's servers never invalidate this project's hash", async () => {
+    // Local-scope servers for every project live in the SAME ~/.claude.json,
+    // so another project's sync rewrites a file this one also reads. The
+    // hash is per project and must cover only what this project can see.
+    const other = mkdtempSync(join(tmpdir(), 'speculate-sother-'));
+    try {
+      writeClaudeJson({
+        projects: {
+          [cwd]: {
+            mcpServers: {
+              alpha: { command: SELF.command, args: [...SELF.args, 'wrap', '--', 'alpha-server'] },
+            },
+          },
+          [other]: { mcpServers: { beta: { command: 'beta-server' } } },
+        },
+      });
+      writeState({ syncHashes: { [cwd]: currentHash() } });
+
+      const config = readClaudeJson();
+      config.projects[other].mcpServers.gamma = { command: 'gamma-server' };
+      writeClaudeJson(config);
+
+      expect(await speculateSync(opts())).toBe(0);
+      expect(calls).toEqual([]); // still the fast path
+      expect(logs).toEqual([]);
+
+      // … while a change to THIS project's own set does invalidate it.
+      const mine = readClaudeJson();
+      mine.projects[cwd].mcpServers.delta = { command: 'delta-server' };
+      writeClaudeJson(mine);
+      expect(await speculateSync(opts())).toBe(0);
+      expect(addJsonNames()).toEqual(['delta']);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it('removes its own shadow when the .mcp.json approval is revoked', async () => {
+    const mcpJson = { mcpServers: { team: { command: 'team-server', args: [] } } };
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify(mcpJson));
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(readClaudeJson().projects[cwd].mcpServers.team.command).toBe(SELF.command);
+
+    // The user revokes approval in Claude Code. The wrapped LOCAL shadow
+    // still wins the scope contest, so the effective set looks unchanged —
+    // but consent hangs on the .mcp.json entry, and local scope has no
+    // approval gate at all. The hash must move, and the shadow must go.
+    const config = readClaudeJson();
+    config.projects[cwd].disabledMcpjsonServers = ['team'];
+    writeClaudeJson(config);
+    calls = [];
+    logs = [];
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(calls.map((c) => `${c[2]} ${c[3]}`)).toEqual(['remove team']);
+    expect(readClaudeJson().projects[cwd].mcpServers?.team).toBeUndefined();
+    // .mcp.json untouched, and the pending entry is back in effect (pending).
+    expect(JSON.parse(readFileSync(join(cwd, '.mcp.json'), 'utf8'))).toEqual(mcpJson);
+    // No stale record of a shadow that no longer exists.
+    expect(readState().projects[cwd]).toBeUndefined();
+    expect(readState().syncHashes[cwd]).toBe(currentHash());
+    expect(logs.join('\n')).toContain('approval');
+
+    // And the next session is a no-op: the removal completed the pass.
+    calls = [];
+    logs = [];
+    expect(await speculateSync(opts())).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it('leaves a local shadow it did not create alone', async () => {
+    // Same revoke, but the wrapped local entry is the USER's own (no managed
+    // record of a shadow Speculate created). Never remove what we didn't add.
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { team: { command: 'team-server', args: [] } } }),
+    );
+    const theirs = { command: SELF.command, args: [...SELF.args, 'wrap', '--', 'their-server'] };
+    writeClaudeJson({
+      projects: {
+        [cwd]: { disabledMcpjsonServers: ['team'], mcpServers: { team: theirs } },
+      },
+    });
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(calls).toEqual([]);
+    expect(readClaudeJson().projects[cwd].mcpServers.team).toEqual(theirs);
+  });
+
+  it("seeds the hash on 'on' so the very next session takes the fast path", async () => {
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readState().syncHashes[cwd]).toBe(currentHash());
+
+    calls = [];
+    logs = [];
+    expect(await speculateSync(opts())).toBe(0);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('speculate sync (CLI grammar)', () => {
+  const ROOT = fileURLToPath(new URL('..', import.meta.url));
+  const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+
+  it('rejects an unknown argument instead of exiting 0 quietly', async () => {
+    // `sync` owns its whole argv (REST_COMMANDS) but read none of it, so a
+    // typo'd flag was silently ignored — unlike every sibling command. The
+    // failure happens during argument parsing, so nothing is ever synced.
+    const stateHome = mkdtempSync(join(tmpdir(), 'speculate-scli-'));
+    try {
+      const res = await new Promise<{ code: number; stderr: string }>((done) => {
+        execFile(
+          process.execPath,
+          [TSX_CLI, join(ROOT, 'src', 'cli.ts'), 'sync', '--nope'],
+          { env: { ...process.env, XDG_STATE_HOME: stateHome }, encoding: 'utf8' },
+          (error, _stdout, stderr) => {
+            const code =
+              error && typeof (error as { code?: unknown }).code === 'number'
+                ? (error as { code: number }).code
+                : error
+                  ? 1
+                  : 0;
+            done({ code, stderr });
+          },
+        );
+      });
+      expect(res.code).toBe(2);
+      expect(res.stderr).toContain("unknown sync argument '--nope'");
+    } finally {
+      rmSync(stateHome, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

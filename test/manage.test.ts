@@ -980,6 +980,33 @@ describe('speculate off', () => {
     expect(logs.join('\n')).toContain('auto-wrap is still installed globally');
   });
 
+  it('off says a user-scope unwrap does not survive another project’s session', async () => {
+    // `off` unwraps USER-scope servers, which every project shares, but opts
+    // only THIS project out. Any other project's next session start re-wraps
+    // them at user scope, where this project sees them wrapped again — so
+    // the only thing that really stops it is uninstalling the plugin.
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    logs = [];
+    expect(await speculateOff(opts())).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toMatch(/user scope|user-scope/i);
+    expect(text).toMatch(/another project|any other project/i);
+    expect(text).toContain('claude plugin uninstall -s user speculate-autowrap');
+  });
+
+  it('off says nothing about user scope when it only removed a local shadow', async () => {
+    // Nothing global was touched here, so the global caveat would be noise.
+    const mcpJson = { mcpServers: { team: { command: 'team-server', args: [] } } };
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify(mcpJson));
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+    await speculateOn(opts());
+    logs = [];
+    expect(await speculateOff(opts())).toBe(0);
+    expect(logs.join('\n')).toContain('shadow removed');
+    expect(logs.join('\n')).not.toMatch(/another project/i);
+  });
+
   it('off says auto-wrap is still active globally when the plugin is installed', async () => {
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     await speculateOn(opts());
@@ -1175,6 +1202,55 @@ describe('the auto-wrap plugin', () => {
     );
   });
 
+  it('status says so when this project is opted out, plugin installed or not', async () => {
+    // Detection alone said "installed (new servers wrap at the next session
+    // start)" — which is exactly wrong right after `off`, and was the only
+    // place the opt-out could have surfaced at all.
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    await speculateOff(opts());
+    logs = [];
+    expect(await speculateStatus(opts())).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain('auto-wrap: installed');
+    expect(text).toContain('opted out');
+    expect(text).toContain("'speculate on'");
+    expect(text).not.toContain('new servers wrap at the next session start');
+
+    // `on` opts back in, and status says the plain thing again.
+    logs = [];
+    await speculateOn(opts());
+    logs = [];
+    expect(await speculateStatus(opts())).toBe(0);
+    expect(logs.join('\n')).toContain(
+      'auto-wrap: installed (new servers wrap at the next session start)',
+    );
+    expect(logs.join('\n')).not.toContain('opted out');
+  });
+
+  it('on removes its own shadow when the .mcp.json approval is revoked', async () => {
+    // Once a shadow exists, `effectiveServers` resolves the name to the LOCAL
+    // entry, which has no approval gate — so revoking the .mcp.json approval
+    // has to be what removes the shadow, or the server keeps running.
+    const mcpJson = { mcpServers: { team: { command: 'team-server', args: [] } } };
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify(mcpJson));
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readClaudeJson().projects[cwd].mcpServers.team.command).toBe(SELF.command);
+
+    const config = readClaudeJson();
+    config.projects[cwd].disabledMcpjsonServers = ['team'];
+    writeClaudeJson(config);
+    logs = [];
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readClaudeJson().projects[cwd].mcpServers?.team).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(cwd, '.mcp.json'), 'utf8'))).toEqual(mcpJson);
+    expect(logs.join('\n')).toContain('approval');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.projects[cwd].entries).toEqual([]);
+  });
+
   it('an install failure is logged once and never fails on', async () => {
     pluginSim = { installed: false, marketplace: false };
     const installFails: CmdRunner = async (cmd, args, o) => {
@@ -1210,9 +1286,10 @@ describe('the auto-wrap plugin', () => {
     // The wrapper is addressed through the host's own expansion for the
     // INSTALLED copy — a path into the npm package is the one that vanishes.
     expect(entry.command).toContain('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs');
-    // Must outlast sync's own last-resort 60s exit, or the host kills a wrap
-    // mid-flight and reopens the window the cooperative deadline closed.
-    expect(entry.timeout).toBeGreaterThanOrEqual(60);
+    // Must outlast sync's own last-resort 100s exit (the 5s budget plus three
+    // consecutive 30s execFile timeouts), or the host kills a wrap mid-flight
+    // and reopens the window the cooperative deadline closed.
+    expect(entry.timeout).toBeGreaterThan(100);
     expect(stagedHooks().hooks.SessionStart[0].matcher).toBe('startup');
     // The staged tree is what the host was pointed at, and it carries the
     // wrapper (the package dir may be root-owned or read-only).
@@ -1457,7 +1534,9 @@ describe('the auto-wrap plugin', () => {
     const entry = hookEntry(shipped);
     expect(entry.command).not.toMatch(/(^|["\s])speculate(\.cmd|\.bat)?(["\s]|$)/);
     expect(entry.command).toContain('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs');
-    expect(entry.timeout).toBeGreaterThanOrEqual(60);
+    // Same floor as the generated copy: the shipped template must not be the
+    // one that kills a wrap between a `remove` and its `add-json`.
+    expect(entry.timeout).toBeGreaterThan(100);
   });
 });
 
@@ -1698,6 +1777,24 @@ describe('effectiveServerHash', () => {
     const plain = fakeView({ github: { command: 'gh', args: [] } });
     const noisy: ClaudeConfigView = { ...plain, approvedProjectServers: new Set(['github']) };
     expect(effectiveServerHash(plain)).toBe(effectiveServerHash(noisy));
+  });
+
+  // The consent case the winner-only hash could not see: once a local shadow
+  // exists, the .mcp.json entry stops being the effective server, so its
+  // approval flag stopped reaching the hash — revoking approval left the hash
+  // identical, sync fast-pathed, and the wrapped shadow kept running behind a
+  // gate that had been closed.
+  it('changes when a SHADOWED project entry loses its approval', () => {
+    const shadowed = (approved: boolean): ClaudeConfigView => ({
+      servers: [
+        { name: 'team', scope: 'project', entry: { command: 'team-server', args: [] } },
+        { name: 'team', scope: 'local', entry: { command: 'speculate', args: ['wrap', '--', 'team-server'] } },
+      ],
+      approvedProjectServers: new Set(approved ? ['team'] : []),
+      projectApprovalKnown: true,
+      warnings: [],
+    });
+    expect(effectiveServerHash(shadowed(true))).not.toBe(effectiveServerHash(shadowed(false)));
   });
 
   it('hashes the same server name differently when its winning scope differs', () => {
