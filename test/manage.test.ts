@@ -1396,10 +1396,13 @@ describe('the auto-wrap plugin', () => {
     expect(logs.join('\n')).toContain('could not refresh');
     // The hint must be a full repair recipe, not just the uninstall half: a
     // user who only runs the uninstall lands in the exact no-plugin state
-    // this abort exists to avoid.
-    expect(logs.join('\n')).toContain(
-      'refresh it manually with: claude plugin uninstall -s user speculate-autowrap && speculate on',
-    );
+    // this abort exists to avoid. It must also be runnable as-is on the
+    // default Windows shell, where `&&` is a parse error, so the two commands
+    // are listed separately rather than chained.
+    const hint = logs.join('\n');
+    expect(hint).toContain('claude plugin uninstall -s user speculate-autowrap');
+    expect(hint).toContain('speculate on');
+    expect(hint).not.toContain('&&');
   });
 
   it('on leaves a matching install alone (no reinstall churn)', async () => {

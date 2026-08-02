@@ -201,8 +201,9 @@ function parseArgs(argv: string[]): Args {
  * that hook stays installed per-project until `speculate on` cleans it up.
  * Failing those calls would break the agent's basic workflow in every
  * not-yet-cleaned project, so exec survives one release as a VERBATIM
- * pass-through: no shell, no rewriting, the child's own exit code. Remove in
- * 0.12.
+ * pass-through: no shell, no rewriting, the child's own exit code. 0.12 kept
+ * it (a ≤0.10 hook can still sit in a project nobody has run `on` in yet);
+ * removal moves to 0.13.
  */
 interface ExecArgs {
   cwd: string | null;

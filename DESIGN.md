@@ -557,8 +557,10 @@ immediately reinstalls the current one; a plain install or update cannot
 get there, since both treat "already installed" as done. If the uninstall
 half of that repair fails, `on` aborts rather than attempting the install
 against an unknown state, and prints the exact recipe to finish the job by
-hand:
-`claude plugin uninstall -s user speculate-autowrap && speculate on`.
+hand: `claude plugin uninstall -s user speculate-autowrap`, then
+`speculate on`. The two are printed on separate lines rather than chained
+with `&&`, because PowerShell 5.1 is the default shell on stock Windows and
+parse-errors on `&&`, which would leave a stuck user running neither half.
 The honest cost of that abort: between the failure and someone
 running the recipe, the user has no auto-wrap plugin installed at all,
 which is a worse position than the stale copy they started with, and

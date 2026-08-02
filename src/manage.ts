@@ -1072,7 +1072,12 @@ async function installAutowrapPlugin(ctx: Ctx): Promise<void> {
       ctx.pluginList = undefined;
       if (un.code !== 0) {
         ctx.log(
-          `[speculate] auto-wrap: could not refresh the installed hook (${(un.stderr || un.stdout).trim() || `exit ${un.code}`}) — refresh it manually with: ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID} && speculate on`,
+          // Two lines, not one `&&` chain: PowerShell 5.1 (the default shell
+          // on stock Windows) parse-errors on `&&`, so a chained recipe would
+          // run NEITHER command at the moment the user is already stuck.
+          `[speculate] auto-wrap: could not refresh the installed hook (${(un.stderr || un.stdout).trim() || `exit ${un.code}`}). Refresh it manually by running these in order:\n` +
+            `[speculate]   ${ctx.claudeBin} plugin uninstall -s user ${AUTOWRAP_PLUGIN_ID}\n` +
+            `[speculate]   speculate on`,
         );
         return;
       }
