@@ -23,6 +23,7 @@
  * in place with no state at all.
  */
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -218,6 +219,14 @@ interface ManagedState {
    * removes a marketplace registration it doesn't know it owns.
    */
   marketplaceAddedByOn?: boolean;
+  /**
+   * `speculate sync`'s cheap "did anything change?" check: cwd ->
+   * effectiveServerHash(view) as of the last sync for that project. Absent
+   * from every file written before this field existed — `loadManagedState`
+   * must keep loading those unchanged, since the hash is keyed per project
+   * and there is nothing to migrate.
+   */
+  syncHashes?: Record<string, string>;
 }
 
 function readMarketplaceAddedByOn(state: ManagedState): boolean {
@@ -253,6 +262,24 @@ function saveManagedState(path: string, state: ManagedState): void {
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
   renameSync(tmp, path);
+}
+
+/**
+ * Stable hash of the effective server set (names + command lines) for a
+ * project: `speculate sync`'s fast path spawns no subprocess, so this is
+ * the whole "did anything change since last sync?" check. Sorted by name
+ * so key order in the source config can never change the hash — the state
+ * (which scope won, and its exact entry) is what must be stable, not the
+ * order the host happened to enumerate servers in.
+ */
+export function effectiveServerHash(view: ClaudeConfigView): string {
+  const parts: string[] = [];
+  for (const [name, scoped] of [...effectiveServers(view.servers)].sort((a, b) =>
+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+  )) {
+    parts.push(`${scoped.scope} ${name} ${JSON.stringify(scoped.entry)}`);
+  }
+  return createHash('sha256').update(parts.join('')).digest('hex');
 }
 
 // -- the claude mcp front door ---------------------------------------------------

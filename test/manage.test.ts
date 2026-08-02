@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  effectiveServerHash,
   execFileRunner,
   resolveClaudeBin,
   speculateOff,
@@ -19,7 +20,7 @@ import {
   type CmdRunner,
 } from '../src/manage.js';
 import { isWindows } from './platform.js';
-import { WORKSPACE_SERVER_NAME } from '../src/hostConfig.js';
+import { WORKSPACE_SERVER_NAME, type ClaudeConfigView } from '../src/hostConfig.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
 
@@ -1029,5 +1030,43 @@ describe('resolveClaudeBin', () => {
       resolveClaudeBin('C:\\tools\\claude.cmd', { platform: 'win32', pathEnv: binDir }),
     ).toBe('C:\\tools\\claude.cmd');
     expect(resolveClaudeBin('./claude', { platform: 'win32', pathEnv: binDir })).toBe('./claude');
+  });
+});
+
+describe('effectiveServerHash', () => {
+  /** Minimal real ClaudeConfigView: every server at user scope, unapproved/unwarned. */
+  function fakeView(servers: Record<string, { command: string; args: string[] }>): ClaudeConfigView {
+    return {
+      servers: Object.entries(servers).map(([name, entry]) => ({ name, scope: 'user', entry })),
+      approvedProjectServers: new Set(),
+      projectApprovalKnown: false,
+      warnings: [],
+    };
+  }
+
+  it('is stable across calls for identical input', () => {
+    const view = fakeView({ github: { command: 'gh', args: ['stdio'] } });
+    expect(effectiveServerHash(view)).toBe(effectiveServerHash(view));
+  });
+
+  it('changes when a server is added', () => {
+    const a = fakeView({ github: { command: 'gh', args: ['stdio'] } });
+    const b = fakeView({
+      github: { command: 'gh', args: ['stdio'] },
+      slack: { command: 'slack-mcp', args: [] },
+    });
+    expect(effectiveServerHash(a)).not.toBe(effectiveServerHash(b));
+  });
+
+  it('changes when a command line changes', () => {
+    const a = fakeView({ github: { command: 'gh', args: ['stdio'] } });
+    const b = fakeView({ github: { command: 'gh', args: ['stdio', '--v2'] } });
+    expect(effectiveServerHash(a)).not.toBe(effectiveServerHash(b));
+  });
+
+  it('ignores key order', () => {
+    const a = fakeView({ a: { command: 'x', args: [] }, b: { command: 'y', args: [] } });
+    const b = fakeView({ b: { command: 'y', args: [] }, a: { command: 'x', args: [] } });
+    expect(effectiveServerHash(a)).toBe(effectiveServerHash(b));
   });
 });
