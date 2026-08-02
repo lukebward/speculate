@@ -565,6 +565,13 @@ which is a worse position than the stale copy they started with, and
 exactly the reason the message names the fix instead of only the
 uninstall half of it.
 
+One correction to the v0.11 record above: it committed to removing the
+`speculate exec` compatibility pass-through in 0.12. That did not happen,
+and 0.12 still ships it. Nothing about auto-wrap depends on it either way,
+but a ≤0.10 Bash hook can still be sitting in a project nobody has run
+`speculate on` in yet, so the shim keeps earning its place. Removal moves
+to 0.13.
+
 Consent is unchanged throughout: sync wraps only servers
 `wrapEffectiveServers` would already wrap through `on`, including the
 `.mcp.json` approval gate, so nothing sync does can turn a pending server
