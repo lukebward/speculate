@@ -292,6 +292,18 @@ export interface ServerConfig {
    * echoes upstream error text runs it through Upstream#redact first.
    */
   headers?: Record<string, string>;
+  /**
+   * Path to Speculate's own OAuth credential store, when this `url` upstream
+   * is one the user has run `speculate auth` for. Set by the proxy at startup,
+   * not written by hand: the store is consulted by URL, so authorizing a
+   * server is the only step: nothing has to be added to a config file.
+   *
+   * Mutually exclusive with an `Authorization` header, and enforced as such,
+   * because the transport spreads configured headers AFTER the OAuth bearer
+   * (streamableHttp.js `_commonHeaders`) — a stale hand-set header would
+   * silently shadow a valid token and present as an inexplicable 401.
+   */
+  oauthStorePath?: string;
   /** Built-in profile name (e.g. 'github'). */
   profile?: string;
   /**
