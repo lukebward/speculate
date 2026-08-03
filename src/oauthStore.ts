@@ -120,29 +120,35 @@ export async function withOAuthLock<T>(path: string, fn: () => Promise<T> | T): 
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + LOCK_WAIT_MS;
   let held = false;
-  while (!held) {
+  // The deadline is checked at the TOP, and every failing path falls through
+  // to the same sleep. Both matter: an earlier version retried immediately
+  // when `statSync` failed, which meant a `writeFileSync` failing for any
+  // reason other than "already exists" (a read-only state dir, EACCES) span
+  // synchronously forever without ever yielding the event loop. Since
+  // `tokens()` is on the path of every outbound request, that hung the proxy
+  // rather than degrading it.
+  while (!held && Date.now() < deadline) {
     try {
       writeFileSync(lockPath, String(process.pid), { flag: 'wx', mode: 0o600 });
       held = true;
+      break;
     } catch {
-      let age = Infinity;
+      // Not ours. If the holder looks abandoned, take it over; otherwise wait.
       try {
-        age = Date.now() - statSync(lockPath).mtimeMs;
+        if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+          writeFileSync(lockPath, String(process.pid), { mode: 0o600 });
+          held = true;
+          break;
+        }
       } catch {
-        continue; // released between our write and our stat — retry at once
-      }
-      if (age > LOCK_STALE_MS) {
-        writeFileSync(lockPath, String(process.pid), { mode: 0o600 });
-        held = true;
-      } else if (Date.now() > deadline) {
-        // Proceeding unlocked beats failing the user's tool call outright:
-        // the worst case is a duplicate refresh, the alternative is no call.
-        break;
-      } else {
-        await new Promise((r) => setTimeout(r, LOCK_POLL_MS));
+        // Vanished between our write and our stat, or is unreadable. Either
+        // way the next attempt decides it; do not spin on it here.
       }
     }
+    await new Promise((r) => setTimeout(r, LOCK_POLL_MS));
   }
+  // Falling out unlocked beats failing the user's tool call outright: the
+  // worst case is a duplicate refresh, the alternative is no call at all.
   try {
     return await fn();
   } finally {

@@ -10,9 +10,9 @@
  * it would fail. Everything below pins the behaviour that avoids it.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 
 /** Hoisted so the module mock below can see it. */
@@ -127,6 +127,33 @@ describe('the store', () => {
     expect(readOAuthRecord(storePath, URL_)?.tokens?.access_token).toBe('a');
     expect(readOAuthRecord(storePath, other)?.tokens?.access_token).toBe('b');
   });
+
+  it('takes over a lock left behind by a crashed process', async () => {
+    // Without this, one killed process would wedge every later refresh.
+    mkdirSync(dirname(storePath), { recursive: true });
+    const lockPath = `${storePath}.lock`;
+    writeFileSync(lockPath, '999999');
+    const ancient = new Date(Date.now() - 10 * 60_000);
+    utimesSync(lockPath, ancient, ancient);
+
+    await expect(withOAuthLock(storePath, () => 'ran')).resolves.toBe('ran');
+  });
+
+  it('gives up and proceeds rather than spinning when the lock cannot be taken', async () => {
+    // Reproduces the class of bug this loop had: `writeFileSync` failing for
+    // a reason OTHER than "already exists". A DIRECTORY at the lock path does
+    // exactly that, and it also stats successfully with a recent mtime, so
+    // neither the create nor the stale-takeover branch can ever succeed.
+    //
+    // The old loop retried that case with no deadline check and no yield,
+    // which spun the event loop forever. Since tokens() runs on every
+    // outbound request, that hung the proxy instead of degrading it. The
+    // contract now is: bounded wait, then run anyway -- a duplicate refresh
+    // is survivable, a hang is not.
+    mkdirSync(`${storePath}.lock`, { recursive: true });
+
+    await expect(withOAuthLock(storePath, () => 'ran anyway')).resolves.toBe('ran anyway');
+  }, 30_000);
 
   it('serializes concurrent updates instead of losing one', async () => {
     // Two wrapped servers in one session share this file.

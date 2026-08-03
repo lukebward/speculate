@@ -10,7 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { speculateAuth } from '../src/authCommand.js';
@@ -303,6 +303,48 @@ describe('speculate auth, end to end', () => {
     // Says what it actually did: local deletion is not server-side revocation.
     expect(logs.join('\n')).toContain('local credentials deleted');
     expect(logs.join('\n')).toMatch(/revoke .* at the provider/);
+    // Nothing is wrapped in this fixture, so no restore advice is owed.
+    expect(logs.join('\n')).not.toContain('still wrapped');
+  });
+
+  it('warns when forgetting a credential the wrapped server still depends on', async () => {
+    // Deleting the token for a CURRENTLY WRAPPED server leaves it routed
+    // through a proxy that can no longer authenticate: it 401s at the next
+    // session with nothing on screen linking it to this command. `on` cannot
+    // clean that up, because it skips entries that are already wrapped.
+    await run();
+    const home = mkdtempSync(join(tmpdir(), 'speculate-forget-home-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'speculate-forget-proj-'));
+    try {
+      writeFileSync(
+        join(home, '.claude.json'),
+        JSON.stringify({
+          mcpServers: {
+            sentryish: {
+              command: 'node',
+              args: ['/opt/speculate/cli.js', 'wrap', '--url', `${base}/mcp`],
+            },
+          },
+        }),
+      );
+      logs = [];
+      expect(
+        await speculateAuth({
+          target: `${base}/mcp`,
+          forget: true,
+          storePath,
+          home,
+          cwd,
+          log: (l) => logs.push(l),
+        }),
+      ).toBe(0);
+      const out = logs.join('\n');
+      expect(out).toContain("'sentryish' is still wrapped");
+      expect(out).toContain('speculate off');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 

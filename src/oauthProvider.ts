@@ -302,10 +302,17 @@ export class SpeculateOAuthProvider implements OAuthClientProvider {
   async saveCodeVerifier(verifier: string): Promise<void> {
     await withOAuthLock(this.#storePath, () => {
       const current = this.#record();
+      // The SDK registers the client (saveClientInformation) BEFORE it starts
+      // the authorization it needs a verifier for, so a record always exists
+      // by now. Asserting that beats casting `undefined` into the type and
+      // writing a record whose `client` silently is not there.
+      if (!current?.client) {
+        throw new Error(`no registered client for ${this.serverUrl}`);
+      }
       writeOAuthRecord(this.#storePath, this.serverUrl, {
         ...current,
         serverUrl: this.serverUrl,
-        client: current?.client as OAuthClientInformationFull,
+        client: current.client,
         codeVerifier: verifier,
       });
     });

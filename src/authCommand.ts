@@ -27,7 +27,14 @@ import {
   readOAuthRecord,
   updateOAuthRecord,
 } from './oauthStore.js';
-import { effectiveServers, planRemoteWrap, readClaudeServers, resolveWrapHeaders } from './hostConfig.js';
+import {
+  effectiveServers,
+  isWrappedEntry,
+  planRemoteWrap,
+  readClaudeServers,
+  resolveWrapHeaders,
+  unwrapEntry,
+} from './hostConfig.js';
 import { probeRemote, type RemoteProber } from './remoteProbe.js';
 import { VERSION } from './version.js';
 
@@ -302,6 +309,33 @@ async function findServersNeedingAuth(
   return out;
 }
 
+/**
+ * Name of the server in this project that is currently wrapped and points at
+ * `url`, or undefined. Reads the WRAPPED invocation, since by definition the
+ * entry no longer carries `url` as a field once Speculate owns it.
+ */
+function wrappedServerFor(url: string, opts: AuthOptions): string | undefined {
+  let view;
+  try {
+    view = readClaudeServers(hostRoots(opts));
+  } catch {
+    return undefined;
+  }
+  for (const [name, scoped] of effectiveServers(view.servers)) {
+    if (!isWrappedEntry(scoped.entry)) continue;
+    const original = unwrapEntry(scoped.entry);
+    if (!original) continue; // not an invocation we can read back
+    const plan = planRemoteWrap(original);
+    if (!plan?.wrappable) continue;
+    try {
+      if (canonicalServerUrl(plan.url) === url) return name;
+    } catch {
+      // unparseable url on a wrapped entry: not the one we just forgot
+    }
+  }
+  return undefined;
+}
+
 /** Resolves a name from host config to its URL; passes a URL straight through. */
 function resolveTarget(target: string, opts: AuthOptions): string {
   try {
@@ -341,7 +375,19 @@ export async function speculateAuth(opts: AuthOptions = {}): Promise<number> {
     // so say what actually happened rather than implying more.
     await updateOAuthRecord(storePath, url, () => undefined);
     log(`[speculate] ${url}: local credentials deleted`);
-    log('[speculate] revoke Speculate\'s access at the provider to invalidate it server-side');
+    log("[speculate] revoke Speculate's access at the provider to invalidate it server-side");
+    // Deleting the credential for a server that is CURRENTLY WRAPPED would
+    // otherwise leave it routed through a proxy that can no longer
+    // authenticate: it would start 401ing at the next session with nothing on
+    // screen to connect it to this command. `on` cannot clean that up on its
+    // own, because it skips entries that are already wrapped.
+    const wrapped = wrappedServerFor(url, opts);
+    if (wrapped) {
+      log(
+        `[speculate] '${wrapped}' is still wrapped and can no longer authenticate. ` +
+          "Restore it with: speculate off, then speculate on",
+      );
+    }
     return 0;
   }
 
