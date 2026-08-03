@@ -1,12 +1,13 @@
-// Run the demo, capture stdout, render the SVG. Windows-safe: no /tmp, no
-// shell redirects — everything goes through execFileSync + a real tempdir.
+// Run the demo, capture stdout, render the README GIF from that capture.
+// Windows-safe: no /tmp, no shell redirects, everything through execFileSync
+// and a real tempdir.
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// scripts/demo-svg.mjs lives one level under the repo root, so '..' from
+// scripts/demo-gif.mjs lives one level under the repo root, so '..' from
 // this file's URL already lands on the root — same pattern as bench.ts.
 const root = fileURLToPath(new URL('..', import.meta.url));
 const tsxCli = join(root, 'node_modules', 'tsx', 'dist', 'cli.mjs');
@@ -28,7 +29,11 @@ try {
   writeFileSync(capture, out);
   execFileSync(
     process.execPath,
-    [join(root, 'scripts', 'gen-demo-svg.mjs'), capture, join(root, 'demo', 'speculate-demo.svg')],
+    [
+      join(root, 'scripts', 'gen-demo-gif.mjs'),
+      capture,
+      join(root, 'demo', 'speculate-demo.gif'),
+    ],
     { stdio: 'inherit' },
   );
 } finally {

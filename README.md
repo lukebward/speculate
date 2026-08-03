@@ -4,7 +4,7 @@
 
 Speculative prefetching for coding agents. Speculate sits between your MCP client (Claude Code, Cursor, any host) and its MCP servers, predicts the next read-only call, runs it early, and serves the result the moment it's asked for. Like Gmail preloading your inbox, applied to tool calls.
 
-![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.svg)
+![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.gif)
 
 The same workflow twice, against a mock server with injected latency. Reproduce with `npm run demo`.
 
@@ -33,7 +33,7 @@ Using a different MCP client? See [Any other MCP client](#any-other-mcp-client).
 |---|---|
 | `speculate on` | Wrap this project's MCP servers, and keep new ones wrapped |
 | `speculate off` | Restore this project exactly, and stop auto-wrapping it |
-| `speculate status` | What is wrapped here, and what changed since `on` |
+| `speculate status` | What is wrapped here, what needs a login, and what changed since `on` |
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |

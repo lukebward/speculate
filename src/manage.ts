@@ -35,7 +35,7 @@ import {
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { probeRemote, type RemoteProber } from './remoteProbe.js';
+import { probeRemote, type RemoteProbe, type RemoteProber } from './remoteProbe.js';
 import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import {
   WORKSPACE_SERVER_NAME,
@@ -1743,9 +1743,32 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
   const record = state.projects[ctx.cwd];
   const managedNames = new Set((record?.entries ?? []).map((e) => e.name));
   let unwrapped = 0;
+  let needAuth = 0;
   ctx.log(`[speculate] project: ${ctx.cwd}`);
   const effective = effectiveServers(view.servers);
   if (effective.size === 0) ctx.log('[speculate] no MCP servers visible to Claude Code here');
+  // Ask every unwrapped remote server whether it would take us, ALL AT ONCE.
+  // Without this, status reports "NOT wrapped (remote)" for an OAuth-protected
+  // server and then advises running `on`, which will not wrap it either --
+  // sending the user round a loop with no way to see why. Wrapped servers are
+  // not probed: they are already working, and the answer would cost a round
+  // trip to tell us so.
+  const reachability = new Map<string, RemoteProbe>();
+  await Promise.all(
+    [...effective].map(async ([name, scoped]) => {
+      if (name === WORKSPACE_SERVER_NAME || isWrappedEntry(scoped.entry)) return;
+      const plan = planRemoteWrap(scoped.entry);
+      if (!plan?.wrappable) return;
+      const headers = resolveWrapHeaders(plan.headers);
+      if (!headers.ok) return;
+      try {
+        reachability.set(name, await ctx.probeRemote(plan.url, headers.headers));
+      } catch {
+        // Diagnostics must not fail on a network hiccup; the label just falls
+        // back to the plain "NOT wrapped (remote)".
+      }
+    }),
+  );
   for (const [name, scoped] of effective) {
     if (name === WORKSPACE_SERVER_NAME) {
       // A leftover ≤0.10 artifact, not a healthy managed server — reporting
@@ -1761,11 +1784,24 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
       // A wrapped REMOTE server no longer looks remote — it is a `wrap --url`
       // command line — so say which kind it is rather than let it read as a
       // wrapped local process.
-      const kind = unwrapEntry(scoped.entry)?.url ? ', remote' : '';
+      const url = unwrapEntry(scoped.entry)?.url;
+      // Naming the login is what makes a later 401 legible: it is the
+      // difference between "this server is broken" and "my token expired".
+      const login = url && readOAuthRecord(ctx.oauthStorePath, url)?.tokens ? ', logged in' : '';
+      const kind = url ? `, remote${login}` : '';
       stateLabel = managedNames.has(name) ? `wrapped (managed${kind})` : `wrapped${kind}`;
     } else if (remote?.wrappable) {
-      stateLabel = 'NOT wrapped (remote)';
-      unwrapped++;
+      const probe = reachability.get(name);
+      const authorized = readOAuthRecord(ctx.oauthStorePath, remote.url)?.tokens !== undefined;
+      if (probe?.kind === 'needs-auth' && !authorized) {
+        stateLabel = `NOT wrapped (remote) — needs a login: run 'speculate auth ${name}'`;
+        needAuth++;
+      } else if (probe?.kind === 'unreachable') {
+        stateLabel = `NOT wrapped (remote) — ${probe.reason}`;
+      } else {
+        stateLabel = `NOT wrapped (remote${authorized ? ', logged in' : ''})`;
+        unwrapped++;
+      }
     } else if (!isStdioEntry(scoped.entry)) {
       stateLabel = `${remote ? remote.reason : 'non-stdio'} — passed through`;
     } else {
@@ -1787,6 +1823,13 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
     );
   } else if (!record && unwrapped > 0) {
     ctx.log(`[speculate] run 'speculate on' to wrap them (or 'speculate try' for a zero-write trial)`);
+  }
+  // Counted apart from `unwrapped` because `on` alone does NOT fix these, and
+  // advising it without saying so is the loop this whole block exists to break.
+  if (needAuth > 0) {
+    ctx.log(
+      `[speculate] ${needAuth} server(s) need a login first: run 'speculate auth' (or say yes when 'speculate on' offers)`,
+    );
   }
   if (await detectAutowrapPlugin(ctx)) {
     // The plugin being installed is only half the answer: `off` records a

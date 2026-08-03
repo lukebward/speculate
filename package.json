@@ -15,7 +15,7 @@
     "start": "tsx src/cli.ts",
     "prepare": "node scripts/prepare.cjs",
     "prepublishOnly": "npm run build && npm test",
-    "demo:svg": "node scripts/demo-svg.mjs"
+    "demo:gif": "node scripts/demo-gif.mjs"
   },
   "repository": {
     "type": "git",
@@ -44,6 +44,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@types/node": "^26.1.1",
     "tsx": "^4.23.0",
     "typescript": "^7.0.2",

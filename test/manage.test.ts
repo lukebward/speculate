@@ -1383,6 +1383,78 @@ describe('speculate off', () => {
 });
 
 describe('speculate status', () => {
+  it('names the login for a remote server that needs one, instead of sending you to `on`', async () => {
+    // Without this, status said "NOT wrapped (remote)" and then advised
+    // running `on` -- which will not wrap it either. That is a loop with no
+    // way to see why, so the two cases must be counted and worded apart.
+    probeResult = { kind: 'needs-auth' };
+    writeClaudeJson({ mcpServers: { sentry: { type: 'http', url: 'https://mcp.example.com/mcp' } } });
+
+    await speculateStatus(opts());
+    const text = logs.join('\n');
+    expect(text).toContain("sentry (user): NOT wrapped (remote) — needs a login: run 'speculate auth sentry'");
+    expect(text).toContain("1 server(s) need a login first");
+  });
+
+  it('says when it already holds a login, wrapped or not', async () => {
+    const url = 'https://mcp.example.com/mcp';
+    writeFileSync(
+      join(home, 'oauth.json'),
+      JSON.stringify({
+        version: 1,
+        servers: {
+          [url]: {
+            serverUrl: url,
+            client: { client_id: 'c' },
+            tokens: { access_token: 'tok', token_type: 'Bearer' },
+            expiresAt: Date.now() + 3_600_000,
+          },
+        },
+      }),
+    );
+    probeResult = { kind: 'needs-auth' };
+    writeClaudeJson({ mcpServers: { sentry: { type: 'http', url } } });
+
+    // Holding a token, the server is wrappable despite the 401 probe.
+    await speculateStatus(opts());
+    expect(logs.join('\n')).toContain('sentry (user): NOT wrapped (remote, logged in)');
+    expect(logs.join('\n')).not.toContain('need a login first');
+
+    logs = [];
+    await speculateOn(opts());
+    logs = [];
+    await speculateStatus(opts());
+    // And once wrapped, the login is still named -- which is what makes a
+    // later 401 legible as an expiry rather than a broken server.
+    expect(logs.join('\n')).toContain('sentry (user): wrapped (managed, remote, logged in)');
+  });
+
+  it('reports an unreachable remote server as unreachable, not as unwrapped', async () => {
+    probeResult = { kind: 'unreachable', reason: 'answered HTTP 502' };
+    writeClaudeJson({ mcpServers: { down: { type: 'http', url: 'https://down.example.com/mcp' } } });
+
+    await speculateStatus(opts());
+    expect(logs.join('\n')).toContain('down (user): NOT wrapped (remote) — answered HTTP 502');
+  });
+
+  it('probes neither stdio servers nor already-wrapped ones', async () => {
+    // status is run often; it must not pay a round trip to be told what it
+    // already knows.
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    await speculateOn(opts());
+    writeClaudeJson({
+      ...readClaudeJson(),
+      mcpServers: {
+        ...readClaudeJson().mcpServers,
+        remote: { type: 'http', url: 'https://api.example.com/mcp/' },
+      },
+    });
+    probes = [];
+
+    await speculateStatus(opts());
+    expect(probes.map((p) => p.url)).toEqual(['https://api.example.com/mcp/']);
+  });
+
   it('reports wrapped, unwrapped, and drift since on', async () => {
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     await speculateOn(opts());
