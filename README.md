@@ -16,18 +16,18 @@
 
 Measured against real hosted servers rather than mocks. One machine, one network, three alternating off/on runs:
 
-| Server | Credential | Warm tool wait | Served from buffer | Wasted calls |
+| Server | Credential | Warm tool wait | Best run | Wasted calls |
 |---|---|---|---|---|
-| GitHub hosted MCP | your token | 5.4 s to 0.6 s | 7 of 8 | 0 |
-| Hugging Face Hub | none needed | 258 ms to 10 ms | 6 of 6 | 0 |
+| GitHub hosted MCP | your token | 5.1 s to 1.5 s (-70%) | 5.4 s to 0.6 s | 0 |
+| Hugging Face Hub | none needed | 259 ms to 139 ms (-46%) | 258 ms to 10 ms | 0 |
 
-Both zero-config: no bundled profile matched either server, so this is what pointing Speculate at a URL gets you. The Hugging Face run needs no credential, so anyone can reproduce it:
+**Warm** means the median of runs 2 and 3, after the first pass has taught it the workflow. The **best run** column is the third pass, once every transition is learned: it is the ceiling, not the average, and it is there so the gap between the two is visible rather than hidden. Both zero-config: no bundled profile matched either server, so this is what pointing Speculate at a URL gets you. The Hugging Face run needs no credential, so anyone can reproduce it:
 
 ```bash
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario huggingface
 ```
 
-Two honest caveats. **The first pass gets no benefit at all** and can measure slightly slower, because nothing is predictable before it has been seen once; it takes two or three passes through a workflow to warm up. And **the win scales with how slow the server is**, which is why the fast one saves a quarter of a second and the slow one saves five. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+Three caveats, all of them load-bearing. **The first pass gets no benefit at all** and can measure slightly slower, because nothing is predictable before it has been seen once. **The benchmark repeats an identical session**, so it measures the best case for a workflow you actually repeat; vary the arguments and warming takes longer. And **the win scales with how slow the server is**, which is why the fast one saves 120 ms and the slow one saves 3.6 s. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
 
 ## Install
 

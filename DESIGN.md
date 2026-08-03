@@ -717,10 +717,12 @@ A separate, smaller bug found on the way: the `projects` lookup was an exact str
 
 Every latency number in this document except §13.20's came from a mock with injected delay, and §13.20's needed a GitHub token, so nobody could reproduce it without one. `bench/remote.ts` now takes a `--scenario`, and `bench/scenarios.ts` holds the servers. Three alternating off/on runs each, zero-config (no bundled profile matched either server):
 
-| Server | Credential | Warm tool wait | Served from buffer | Waste |
+| Server | Credential | Warm median (runs 2-3) | Best run (run 3) | Waste |
 |---|---|---|---|---|
-| GitHub hosted MCP | token | 5.43 s -> 605 ms | 7 of 8 | 0 |
-| Hugging Face Hub | **none** | 258 ms -> 10 ms | 6 of 6 | 0 |
+| GitHub hosted MCP | token | 5.09 s -> 1.51 s (-70%) | 5.43 s -> 605 ms, 7 of 8 buffered | 0 |
+| Hugging Face Hub | **none** | 259 ms -> 139 ms (-46%) | 258 ms -> 10 ms, 6 of 6 buffered | 0 |
+
+**Which column is the claim matters, and the first draft of the README got it wrong.** The bench prints both a warm median (runs 2-3) and a per-call table against the warmest single run, and the README quoted the latter under the word "warm". For Hugging Face that is the difference between -96% and -46%. The headline is now the median; the best run is kept beside it as a visible ceiling rather than deleted, because the gap between them is itself the finding: warming is gradual, not a step change.
 
 The Hugging Face run is the more useful of the two despite the smaller absolute win, for three reasons. It needs no credential, so it is the first number here anybody can check. It is a *harder* prediction problem: the Hub returns MARKDOWN, so the learner cannot parse an id out of the previous result the way it can with JSON, and what is left is memorising arguments across repeats. And it makes the shape of the benefit unmissable, because the same code saves a quarter of a second here and five seconds on GitHub: **value scales with upstream latency**, exactly as §13.7 argued when the CLI tier was cut.
 
