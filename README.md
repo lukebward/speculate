@@ -19,17 +19,13 @@ speculate on
 
 That is the whole setup. `speculate on` re-registers this project's MCP servers wrapped, using Claude Code's own `claude mcp` CLI rather than editing any file by hand, and installs a small hook so servers you add later get wrapped too, starting from your next session.
 
-Remote (streamable HTTP) servers are wrapped too, which is where most of the latency is. Ones that need a login (Sentry, Notion, Linear) take one extra step:
+Remote (streamable HTTP) servers are wrapped too, which is where most of the latency is. Ones that need a login (Sentry, Notion, Linear) take one browser click, once:
 
 ```bash
 speculate auth
 ```
 
-That authorizes Speculate with every server that needs it, once, in your browser. Nothing else to run afterwards. Speculate registers as its own OAuth client and keeps its own token rather than reusing Claude Code's, so refreshing ours never disturbs yours. `speculate auth --forget <server>` deletes it again.
-
-A server Speculate cannot reach is left alone and keeps working unwrapped. `on` checks before it changes anything, so it never trades a working server for a wrapped one.
-
-Connectors you added in the claude.ai UI are never wrapped: they are held by the host rather than written to local MCP config, so nothing here can see them.
+`on` checks it can reach a server before changing anything, so it never trades a working server for a wrapped one. Connectors you added in the claude.ai UI are never wrapped: the host holds them, so nothing here can see them.
 
 Nothing else to configure. Speculate recognizes servers by their live tool lists, ships predictions for GitHub, filesystem, and Slack, and learns the rest from your own traffic.
 
@@ -42,7 +38,7 @@ Using a different MCP client? See [Any other MCP client](#any-other-mcp-client).
 | `speculate on` | Wrap this project's MCP servers, and keep new ones wrapped |
 | `speculate off` | Restore this project exactly, and stop auto-wrapping it |
 | `speculate status` | What is wrapped here, and what changed since `on` |
-| `speculate auth [server]` | Log in to remote servers that need it (no argument: all of them) |
+| `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |
 
@@ -89,7 +85,7 @@ The client sees standard MCP: same tools, same results, except predicted reads c
 - Speculation only ever executes tools that are affirmatively read-only (`readOnlyHint` + allowlists in `strict` mode; annotations alone in `annotated`, the zero-config default). Unknown tools are never speculated; real calls, including writes, are forwarded verbatim, and any mutation flushes the cache.
 - Cached results are byte-identical, single-use, short-TTL, and never written to disk. Persisted learning contains tool names and argument templates, never results.
 - `speculate on` mutates config only through the host's own CLIs (`claude mcp`, `claude plugin`), records what it did, and `off` restores exactly.
-- Speculate never reads another application's credential store. For a remote server that needs a login it registers as its own OAuth client, and its token is stored apart from anything `status` prints and never written into your MCP config. `doctor` shows whether a server is authorized and when its token expires, never the token. On Windows that file is protected by its folder's ACL rather than by file mode, which `doctor` states.
+- Speculate registers as its own OAuth client and never reads another application's credential store, so refreshing its token cannot disturb Claude Code's. `doctor` shows authorization state and expiry, never the token.
 
 ## More control
 
@@ -118,9 +114,7 @@ Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation + drain queue), 
 
 ## Non-goals
 
-Speculating writes (permanent), general response caching, token savings. The win is wall-clock latency.
-
-Speculate holds auth only where it has to: for a remote server it is the MCP client, so it owns its own OAuth login for that server. It never brokers, mints, or reuses anyone else's credentials, and for stdio servers it never sees them at all.
+Speculating writes (permanent), brokering anyone else's credentials, general response caching, token savings. The win is wall-clock latency.
 
 ## License
 
