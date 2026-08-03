@@ -42,6 +42,7 @@ import {
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
+  normalizeProjectKey,
   planRemoteWrap,
   projectRoot,
   resolveWrapHeaders,
@@ -291,6 +292,43 @@ export function projectIsManaged(opts: { cwd?: string; statePath?: string } = {}
   const cwd = resolve(opts.cwd ?? process.cwd());
   const state = loadManagedState(opts.statePath ?? managedStatePath());
   return state.projects[cwd] !== undefined;
+}
+
+/**
+ * Fold in any record an older version wrote under a SUBDIRECTORY of this
+ * project, so upgrading does not orphan it.
+ *
+ * Through v0.14.3 the managed record was keyed by the current directory; from
+ * v0.14.4 it is keyed by the repository root (hostConfig.projectRoot). Without
+ * this, an `on` run from a subdirectory becomes unreachable the moment the
+ * user upgrades: `status` stops reporting those servers as managed, and `off`
+ * falls back to reconstructing each entry from its own wrapped command line.
+ * That fallback works, but it only recovers what the wrap carries, so any
+ * field the HOST had added to the entry is silently dropped on restore.
+ *
+ * Mutates `state`, so the next save writes one record and drops the strays.
+ * Callers that only read (`status`) simply do not persist it.
+ */
+export function adoptLegacyProjectRecords(state: ManagedState, cwd: string): void {
+  const root = normalizeProjectKey(cwd);
+  const legacy = Object.keys(state.projects).filter(
+    (key) => key !== cwd && normalizeProjectKey(key).startsWith(`${root}/`),
+  );
+  if (legacy.length === 0) return;
+  const current = state.projects[cwd] ?? { entries: [], updatedAt: 0 };
+  // The root's own entries win: they describe the most recent wrap.
+  const byKey = new Map<string, ManagedEntry>();
+  for (const key of legacy) {
+    for (const entry of state.projects[key]!.entries) {
+      byKey.set(managedKey(entry.scope, entry.name), entry);
+    }
+    delete state.projects[key];
+  }
+  for (const entry of current.entries) byKey.set(managedKey(entry.scope, entry.name), entry);
+  state.projects[cwd] = {
+    entries: [...byKey.values()],
+    updatedAt: Math.max(current.updatedAt, Date.now()),
+  };
 }
 
 export function loadManagedState(path: string): ManagedState {
@@ -1397,6 +1435,7 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
   const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
   for (const w of view.warnings) ctx.log(`[speculate] warning: ${w}`);
   const state = loadManagedState(ctx.statePath);
+  adoptLegacyProjectRecords(state, ctx.cwd);
   const record = state.projects[ctx.cwd] ?? { entries: [], updatedAt: Date.now() };
   let legacy: LegacyCleanupResult = NO_LEGACY_CLEANUP;
   try {
@@ -1495,6 +1534,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   }
   const preView = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
   const state = loadManagedState(ctx.statePath);
+  adoptLegacyProjectRecords(state, ctx.cwd);
   const record = state.projects[ctx.cwd];
   let legacyCleanup: LegacyCleanupResult = NO_LEGACY_CLEANUP;
   try {
@@ -1745,6 +1785,7 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
   const ctx = makeCtx(opts);
   const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
   const state = loadManagedState(ctx.statePath);
+  adoptLegacyProjectRecords(state, ctx.cwd);
   const record = state.projects[ctx.cwd];
   const managedNames = new Set((record?.entries ?? []).map((e) => e.name));
   let unwrapped = 0;

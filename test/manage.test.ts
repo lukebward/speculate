@@ -29,6 +29,7 @@ import {
   speculateStatus,
   win32ShimInvocation,
   type CmdRunner,
+  adoptLegacyProjectRecords,
 } from '../src/manage.js';
 import { isWindows } from './platform.js';
 import { WORKSPACE_SERVER_NAME, type ClaudeConfigView, type ClaudeScope } from '../src/hostConfig.js';
@@ -1379,6 +1380,76 @@ describe('speculate off', () => {
     expect(code).toBe(0);
     expect(logs.join('\n')).toContain('auto-wrap');
     expect(logs.join('\n')).toContain('claude plugin uninstall');
+  });
+});
+
+describe('upgrading from a cwd-keyed managed record', () => {
+  // Through v0.14.3 the record was keyed by the current directory; from
+  // v0.14.4 it is the repository root. Orphaning it is not cosmetic: `off`
+  // then reconstructs each entry from its own wrapped command line, which
+  // recovers only what the wrap carries and drops anything the HOST added.
+  const legacyKey = () => join(cwd, 'infrastructure', 'reviewStacks');
+
+  it('adopts a record written under a subdirectory', () => {
+    const state = {
+      version: 1 as const,
+      projects: {
+        [legacyKey()]: {
+          entries: [{ name: 'playwright', scope: 'user' as const, action: 'rewrote' as const }],
+          updatedAt: 1,
+        },
+      },
+    };
+    adoptLegacyProjectRecords(state, cwd);
+
+    expect(Object.keys(state.projects)).toEqual([cwd]);
+    expect(state.projects[cwd]!.entries.map((e) => e.name)).toEqual(['playwright']);
+  });
+
+  it('keeps the root record when both exist, and still drops the stray', () => {
+    const state = {
+      version: 1 as const,
+      projects: {
+        [legacyKey()]: {
+          entries: [
+            { name: 'playwright', scope: 'user' as const, action: 'rewrote' as const, original: { command: 'stale' } },
+          ],
+          updatedAt: 1,
+        },
+        [cwd]: {
+          entries: [
+            { name: 'playwright', scope: 'user' as const, action: 'rewrote' as const, original: { command: 'current' } },
+          ],
+          updatedAt: 2,
+        },
+      },
+    };
+    adoptLegacyProjectRecords(state, cwd);
+
+    expect(Object.keys(state.projects)).toEqual([cwd]);
+    expect(state.projects[cwd]!.entries).toHaveLength(1);
+    expect(state.projects[cwd]!.entries[0]!.original).toEqual({ command: 'current' });
+  });
+
+  it('never adopts a sibling project', () => {
+    // `.../pulumi-service-old` must not be swallowed by `.../pulumi-service`.
+    const sibling = `${cwd}-old`;
+    const state = {
+      version: 1 as const,
+      projects: {
+        [sibling]: { entries: [{ name: 'x', scope: 'user' as const, action: 'rewrote' as const }], updatedAt: 1 },
+      },
+    };
+    adoptLegacyProjectRecords(state, cwd);
+
+    expect(Object.keys(state.projects)).toEqual([sibling]);
+    expect(state.projects[cwd]).toBeUndefined();
+  });
+
+  it('does nothing when there is no legacy record', () => {
+    const state = { version: 1 as const, projects: {} };
+    adoptLegacyProjectRecords(state, cwd);
+    expect(state.projects).toEqual({});
   });
 });
 

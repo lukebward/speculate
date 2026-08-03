@@ -132,7 +132,7 @@ export function projectRoot(cwd: string): string {
  * folded on Windows only (where the filesystem is case-insensitive; folding on
  * Linux would merge two genuinely different directories).
  */
-function normalizeProjectKey(path: string): string {
+export function normalizeProjectKey(path: string): string {
   const unified = path.split('\\').join('/').replace(/\/+$/, '');
   return process.platform === 'win32' ? unified.toLowerCase() : unified;
 }
