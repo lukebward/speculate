@@ -44,6 +44,41 @@ function writeMcpJson(data: unknown): void {
 }
 
 describe('readClaudeServers + effectiveServers', () => {
+  describe('finding this project in the host config', () => {
+    // An exact string match on the project key silently lost every
+    // LOCAL-scope server on Windows: `claude mcp add-json` writes the key with
+    // forward slashes (C:/Users/...) while `resolve()` returns backslashes
+    // (C:\Users\...). `status` then reported "no MCP servers visible" for a
+    // server the user had just added, and `on` skipped it without a word.
+    const localServer = { mcpServers: { github: { type: 'http', url: 'https://api.example.com/mcp' } } };
+    const findsIt = (key: string) => {
+      writeClaudeJson({ projects: { [key]: localServer } });
+      const found = readClaudeServers({ home, cwd }).servers;
+      return found.length === 1 && found[0]!.name === 'github' && found[0]!.scope === 'local';
+    };
+
+    it('matches the key the host actually wrote', () => {
+      expect(findsIt(cwd)).toBe(true);
+    });
+
+    it('matches when the key uses forward slashes', () => {
+      // A no-op on POSIX (no backslashes to swap), the real case on Windows.
+      expect(findsIt(cwd.split('\\').join('/'))).toBe(true);
+    });
+
+    it('matches through a trailing slash', () => {
+      expect(findsIt(`${cwd}/`)).toBe(true);
+    });
+
+    it.runIf(process.platform === 'win32')('folds case on Windows only', () => {
+      expect(findsIt(cwd.toUpperCase())).toBe(true);
+    });
+
+    it('still ignores a genuinely different project', () => {
+      expect(findsIt(join(cwd, 'somewhere-else'))).toBe(false);
+    });
+  });
+
   it('reads all three scopes and resolves local > project > user', () => {
     writeClaudeJson({
       mcpServers: { github: { command: 'gh-user', args: [] }, solo: { command: 'solo' } },

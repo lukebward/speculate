@@ -1,14 +1,20 @@
 # Speculate
 
-> Built with heavy use of AI coding agents. Everything here is reviewed and tested, and the test suite runs on Linux, macOS, and Windows, but weigh that as you would any other statement about how software was made.
+[![npm](https://img.shields.io/npm/v/speculate-mcp)](https://www.npmjs.com/package/speculate-mcp)
+[![CI](https://github.com/lukebward/speculate/actions/workflows/ci.yml/badge.svg)](https://github.com/lukebward/speculate/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/speculate-mcp)](LICENSE)
 
-Speculative prefetching for coding agents. Speculate sits between your MCP client (Claude Code, Cursor, any host) and its MCP servers, predicts the next read-only call, runs it early, and serves the result the moment it's asked for. Like Gmail preloading your inbox, applied to tool calls.
+**Speculative prefetching for coding agents.** Speculate sits between your MCP client and its MCP servers, predicts the next read-only tool call, runs it early, and serves the result the moment it is asked for. Like Gmail preloading your inbox, applied to tool calls.
+
+> Built with heavy use of AI coding agents. Everything here is reviewed and tested, and the suite runs on Linux, macOS, and Windows, but weigh that as you would any other statement about how software was made.
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.gif)
 
-The same workflow twice, against a mock server with injected latency. Reproduce with `npm run demo`.
+- **No configuration.** Servers are recognized by their live tool lists, and the rest is learned from your own traffic.
+- **Read-only, always.** Speculation runs tools that are affirmatively read-only and nothing else.
+- **Nothing is taken away.** Every change goes through your client's own CLI, and `off` restores exactly.
 
-Against a real one: GitHub's hosted MCP server, an 8-call read-only session, one machine on one network. Once warm, 7 of the 8 calls are served from the buffer and total tool wait goes from about 4.3 s to about 0.55 s. Getting there takes two or three passes through the same workflow. The first pass gets no benefit at all: nothing can be predicted before it has been seen once, so that run pays one proxy hop and issues no speculative calls. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+Against a real server (GitHub's hosted MCP, one machine, one network): once warm, 7 of 8 calls come from the buffer and tool wait drops from about 4.3 s to about 0.55 s. Getting there takes two or three passes through the same workflow, and the first pass gets no benefit at all, because nothing can be predicted before it has been seen once. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
 
 ## Install
 
@@ -17,15 +23,11 @@ npm install -g speculate-mcp
 speculate on
 ```
 
-That is the whole setup. `speculate on` re-registers this project's MCP servers wrapped, using Claude Code's own `claude mcp` CLI rather than editing any file by hand, and installs a small hook so servers you add later get wrapped too, starting from your next session.
+That is the whole setup. `speculate on` re-registers this project's MCP servers wrapped, using Claude Code's own `claude mcp` CLI rather than editing any file by hand, and installs a small hook so servers you add later get wrapped too.
 
-Remote (streamable HTTP) servers are wrapped too, which is where most of the latency is. Ones that need a login (Sentry, Notion, Linear) are offered during `on`: say yes, click once in the browser, and they are wrapped straight away. `speculate auth` does the same thing later.
+Remote (streamable HTTP) servers are wrapped too, which is where most of the latency is. Ones that need a login (Sentry, Notion, Linear) are offered during `on`: say yes, click once in the browser, and they are wrapped straight away.
 
-`on` checks it can reach a server before changing anything, so it never trades a working server for a wrapped one. Connectors you added in the claude.ai UI are never wrapped: the host holds them, so nothing here can see them.
-
-Nothing else to configure. Speculate recognizes servers by their live tool lists, ships predictions for GitHub, filesystem, and Slack, and learns the rest from your own traffic.
-
-Using a different MCP client? See [Any other MCP client](#any-other-mcp-client).
+Connectors you added in the claude.ai UI are never wrapped: the host holds them, so nothing here can see them.
 
 ## Commands
 
@@ -37,9 +39,19 @@ Using a different MCP client? See [Any other MCP client](#any-other-mcp-client).
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |
+| `speculate doctor` | Why a given tool is or is not eligible for speculation |
+
+## Safety
+
+- Speculation only ever executes tools that are affirmatively read-only (`readOnlyHint` plus allowlists in `strict` mode; annotations alone in `annotated`, the zero-config default). Unknown tools are never speculated; real calls, including writes, are forwarded verbatim, and any mutation flushes the cache.
+- Cached results are byte-identical, single-use, short-TTL, and never written to disk. Persisted learning holds tool names and argument templates, never results.
+- `speculate on` mutates config only through the host's own CLIs, records what it did, and `off` restores exactly.
+- Speculate registers as its own OAuth client and never reads another application's credential store, so refreshing its token cannot disturb Claude Code's. Header values are never logged; `doctor` shows names and expiry, never the token.
+
+**Non-goals:** speculating writes (permanent), brokering anyone else's credentials, general response caching, token savings. The win is wall-clock latency.
 
 <details>
-<summary>How auto-wrapping behaves</summary>
+<summary><b>How auto-wrapping behaves</b></summary>
 
 `on` installs a hook-only plugin at Claude Code's user scope, shared by every project. At each session start it wraps any newly added, already-approved servers.
 
@@ -50,9 +62,10 @@ Using a different MCP client? See [Any other MCP client](#any-other-mcp-client).
 
 </details>
 
-## Any other MCP client
+<details>
+<summary><b>Any other MCP client</b> (no install, no Claude Code)</summary>
 
-No install and no Claude Code required: prefix the server command already in your client's config:
+Prefix the server command already in your client's config:
 
 ```jsonc
 // before
@@ -72,45 +85,24 @@ No install and no Claude Code required: prefix the server command already in you
 }
 ```
 
-`${VAR}` in a header value is resolved from the environment when Speculate starts, so the token stays out of the file. An unset variable is a startup error naming the variable, never a literal `${GITHUB_TOKEN}` sent upstream. The same `headers` block works in a config file. Header **values are never logged**; `doctor` shows names only.
+`${VAR}` in a header value is resolved from the environment when Speculate starts, so the token stays out of the file. An unset variable is a startup error naming the variable, never a literal `${GITHUB_TOKEN}` sent upstream.
 
-The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate, time saved, and `ageAtHit`, how stale the served prefetches were. `speculate stats` reports durable cumulative usage.
+The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the live hit rate, time saved, and how stale the served prefetches were.
 
-## Safety
+`speculate shims install` is the equivalent of auto-wrapping for these clients: opt-in `npx`/`uvx` shims that wrap any MCP server any client launches. It edits one marked block in your shell rc file, and it is POSIX-only.
 
-- Speculation only ever executes tools that are affirmatively read-only (`readOnlyHint` + allowlists in `strict` mode; annotations alone in `annotated`, the zero-config default). Unknown tools are never speculated; real calls, including writes, are forwarded verbatim, and any mutation flushes the cache.
-- Cached results are byte-identical, single-use, short-TTL, and never written to disk. Persisted learning contains tool names and argument templates, never results.
-- `speculate on` mutates config only through the host's own CLIs (`claude mcp`, `claude plugin`), records what it did, and `off` restores exactly.
-- Speculate registers as its own OAuth client and never reads another application's credential store, so refreshing its token cannot disturb Claude Code's. `doctor` shows authorization state and expiry, never the token.
+</details>
 
-## More control
+<details>
+<summary><b>Per-server configuration</b></summary>
 
-A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json). `speculate init` writes a starter; `speculate doctor` explains per-tool eligibility ("why isn't it speculating?").
+A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json); `speculate init` writes a starter.
 
-`speculate shims install` is the equivalent of auto-wrapping for clients other than Claude Code: opt-in `npx`/`uvx` shims that wrap any MCP server any client launches. It edits one marked block in your shell rc file, and it is POSIX-only.
+</details>
 
-Architecture, measured results, threat model, and design history: [DESIGN.md](DESIGN.md).
+## More
 
-## Development
-
-```bash
-npm install     # builds dist/ via the prepare hook
-npm test        # unit and end-to-end suite
-npm run bench   # speculation off vs on, bundled mock upstream
-npm run eval    # offline prediction recall, headline and floor
-npm run demo    # the README demo, against the bundled mock
-
-# a REAL hosted MCP server (opt-in, needs a credential, read-only calls only)
-SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
-```
-
-Running the test suite needs Node >= 20.19 (vitest's native rolldown binding; npm silently skips it on older Node). The runtime floor for *using* speculate is unchanged at Node >= 18.
-
-Layout: `src/proxy.ts` (router), `src/executor.ts` (speculation + drain queue), `src/predictor.ts`/`learner.ts`/`priming.ts` (prediction), `src/cache.ts`, `src/policy.ts`/`budget.ts` (safety and limits), `src/manage.ts`/`tryRun.ts` (on/off/try), `mock/`, `bench/`, `eval/`.
-
-## Non-goals
-
-Speculating writes (permanent), brokering anyone else's credentials, general response caching, token savings. The win is wall-clock latency.
+Architecture, measured results, and threat model: [DESIGN.md](DESIGN.md). Building and testing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

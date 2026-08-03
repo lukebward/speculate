@@ -98,6 +98,43 @@ export function claudeJsonPath(home: string): string {
   return dir && dir.length > 0 ? resolve(dir, '.claude.json') : resolve(home, '.claude.json');
 }
 
+/**
+ * Compare two project paths the way the filesystem would, not the way string
+ * equality does: separators unified, trailing slashes dropped, and case
+ * folded on Windows only (where the filesystem is case-insensitive; folding on
+ * Linux would merge two genuinely different directories).
+ */
+function normalizeProjectKey(path: string): string {
+  const unified = path.split('\\').join('/').replace(/\/+$/, '');
+  return process.platform === 'win32' ? unified.toLowerCase() : unified;
+}
+
+/**
+ * This project's record inside `~/.claude.json`'s `projects` map.
+ *
+ * The exact-match lookup this replaces silently lost every LOCAL-scope server
+ * on Windows: `claude mcp add-json` writes the key with forward slashes
+ * (`C:/Users/...`) while `resolve()` hands back backslashes (`C:\Users\...`),
+ * so the record was never found. The user saw `speculate status` report "no
+ * MCP servers visible" for a server they had just added, and `on` skip it
+ * without a word, which reads as Speculate ignoring them.
+ *
+ * The exact hit is still tried first, so the common case costs one lookup.
+ */
+function findProjectRecord(
+  projects: Record<string, unknown>,
+  cwd: string,
+): Record<string, unknown> {
+  const isRecord = (v: unknown): v is Record<string, unknown> =>
+    v !== null && typeof v === 'object';
+  if (isRecord(projects[cwd])) return projects[cwd];
+  const want = normalizeProjectKey(cwd);
+  for (const [key, value] of Object.entries(projects)) {
+    if (normalizeProjectKey(key) === want && isRecord(value)) return value;
+  }
+  return {};
+}
+
 /** Discover every MCP server Claude Code would see for `cwd`. Read-only. */
 export function readClaudeServers(opts: { home: string; cwd: string }): ClaudeConfigView {
   const warnings: string[] = [];
@@ -113,10 +150,7 @@ export function readClaudeServers(opts: { home: string; cwd: string }): ClaudeCo
     claudeJson?.projects && typeof claudeJson.projects === 'object'
       ? (claudeJson.projects as Record<string, unknown>)
       : {};
-  const projectRecord =
-    projects[cwd] !== null && typeof projects[cwd] === 'object'
-      ? (projects[cwd] as Record<string, unknown>)
-      : {};
+  const projectRecord = findProjectRecord(projects, cwd);
   for (const [name, entry] of Object.entries(serverMap(projectRecord.mcpServers))) {
     servers.push({ name, scope: 'local', entry });
   }
