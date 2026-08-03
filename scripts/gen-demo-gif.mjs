@@ -40,7 +40,15 @@ try {
 
 /** How long the finished frame sits before the loop restarts. */
 const HOLD_S = 2.2;
-/** Rendered at 2x and downscaled, so the text is not soft on HiDPI screens. */
+/**
+ * Rendered AND shipped at 2x, so the text stays sharp on HiDPI screens.
+ *
+ * An earlier version rendered at 2x and then downscaled back to 780px, which
+ * threw the extra detail away: a 780px image displayed at ~780 CSS px on a 2x
+ * display is soft, because one image pixel covers four device pixels. At 2x
+ * the browser scales it DOWN to the container width instead, which is the
+ * direction that stays crisp. Costs a few tens of KB.
+ */
 const SCALE = 2;
 
 const model = parseCapture(readFileSync(inPath, 'utf8'));
@@ -90,7 +98,9 @@ try {
       '-y', '-loglevel', 'error',
       '-f', 'concat', '-safe', '0', '-i', 'frames.txt',
       '-filter_complex',
-      `scale=${GEOM.W}:-1:flags=lanczos,split[a][b];` +
+      // No scale filter: the frames already come out of resvg at the final
+      // size, and re-scaling here is what made the asset soft.
+      `split[a][b];` +
         `[a]palettegen=max_colors=256:stats_mode=full:reserve_transparent=0[p];` +
         `[b][p]paletteuse=dither=none`,
       '-loop', '0',
