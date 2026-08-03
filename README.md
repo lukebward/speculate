@@ -19,6 +19,8 @@ speculate on
 
 That is the whole setup. `speculate on` re-registers this project's MCP servers wrapped, using Claude Code's own `claude mcp` CLI rather than editing any file by hand, and installs a small hook so servers you add later get wrapped too, starting from your next session.
 
+Remote (streamable HTTP) servers are wrapped too, which is where most of the latency is, as long as the entry in your config carries its own token or needs no auth at all. Connectors you added in the claude.ai UI are never wrapped: they are held by the host rather than written to local MCP config, so nothing here can see them.
+
 Nothing else to configure. Speculate recognizes servers by their live tool lists, ships predictions for GitHub, filesystem, and Slack, and learns the rest from your own traffic.
 
 Using a different MCP client? See [Any other MCP client](#any-other-mcp-client).

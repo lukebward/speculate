@@ -40,6 +40,7 @@ import {
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
+  planRemoteWrap,
   readClaudeServers,
   unwrapEntry,
   wrapEntry,
@@ -203,6 +204,15 @@ export interface ManagedEntry {
   scope: ClaudeScope;
   /** 'plugin' = the Claude Code plugin `on` installed at local scope. */
   action: 'rewrote' | 'shadowed' | 'added' | 'plugin';
+  /**
+   * The host's entry, VERBATIM, which is what makes `off` byte-exact —
+   * including any unknown field the host added, and including the `headers`
+   * of a remote server. A bearer token written inline in the host config is
+   * therefore copied into this state file in the clear. That is deliberate
+   * and it is the price of an exact restore: the alternative is an `off`
+   * that guesses. The file is written 0600 inside a 0700 directory (see
+   * saveManagedState), and no log line ever prints a header value.
+   */
   original?: McpServerEntry;
 }
 
@@ -368,6 +378,69 @@ export interface Ctx {
   log: (line: string) => void;
   /** Memoized `claude plugin list --json`; see fetchPluginList. */
   pluginList?: Promise<unknown | null>;
+}
+
+/**
+ * Shortest header value worth scrubbing out of a log line — the same floor
+ * Upstream#redact uses, for the same reason: below it a value is far likelier
+ * to be an innocuous literal ('1', 'v2') whose redaction would mangle
+ * unrelated text than a credential worth protecting.
+ */
+const MIN_REDACTABLE_LENGTH = 8;
+
+/**
+ * The secret strings an entry carries: HTTP header values, and nothing else.
+ * A `${VAR}` placeholder is not one — it is the reference, not the token.
+ *
+ * Both shapes an entry can be in are read, because both are logged about:
+ * the host's own `headers` map, and the `--header "Name: value"` pairs of an
+ * entry Speculate has already wrapped.
+ */
+function entrySecrets(entry: McpServerEntry): string[] {
+  const out: string[] = [];
+  const push = (value: unknown): void => {
+    if (typeof value === 'string' && value.length >= MIN_REDACTABLE_LENGTH) out.push(value);
+  };
+  const headers = entry.headers;
+  if (headers !== null && typeof headers === 'object' && !Array.isArray(headers)) {
+    for (const value of Object.values(headers as Record<string, unknown>)) push(value);
+  }
+  const args = entry.args ?? [];
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] !== '--header') continue;
+    const split = args[i + 1]!.indexOf(':');
+    if (split > 0) push(args[i + 1]!.slice(split + 1).trim());
+  }
+  return out;
+}
+
+/**
+ * Scrub `secrets` out of text on its way to a LOG LINE. `claude mcp add-json`
+ * is handed the entry as one argv element, and a host that rejects it may
+ * quote the payload back in its error — which is how a bearer token would
+ * otherwise reach stderr through a message nobody wrote by hand.
+ */
+export function redactSecrets(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (out.includes(secret)) out = out.split(secret).join('[redacted]');
+  }
+  return out;
+}
+
+/**
+ * An entry as JSON for a human to read, header VALUES masked. The names stay:
+ * they say what has to be re-supplied without disclosing any of it.
+ */
+function entryForLog(entry: McpServerEntry): string {
+  const headers = entry.headers;
+  if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) {
+    return JSON.stringify(entry);
+  }
+  const masked = Object.fromEntries(
+    Object.keys(headers as Record<string, unknown>).map((name) => [name, '<redacted>']),
+  );
+  return JSON.stringify({ ...entry, headers: masked });
 }
 
 async function mcpAddJson(
@@ -764,7 +837,9 @@ export async function wrapEffectiveServers(
     ) {
       const res = await mcpRemove(ctx, name, 'local');
       if (res.code !== 0) {
-        ctx.log(`[speculate] ${name}: shadow removal failed: ${(res.stderr || res.stdout).trim()}`);
+        ctx.log(
+          `[speculate] ${name}: shadow removal failed: ${redactSecrets((res.stderr || res.stdout).trim(), entrySecrets(scoped.entry))}`,
+        );
         failed++;
         continue;
       }
@@ -782,11 +857,22 @@ export async function wrapEffectiveServers(
       ctx.log(`[speculate] ${name}: already wrapped — skipping`);
       continue;
     }
-    if (!isStdioEntry(scoped.entry)) {
-      ctx.log(`[speculate] ${name}: ${scoped.entry.url ? 'http/sse' : 'non-stdio'} — passed through unwrapped`);
+    // Remote (streamable-HTTP) servers are wrapped too — that is where the
+    // latency is — but only when the entry ITSELF is enough to connect: its
+    // own token, or no auth at all. A connector the HOST holds credentials
+    // for is not in local config to begin with, so it is not reachable from
+    // here and nothing below goes looking for it.
+    const remote = planRemoteWrap(scoped.entry);
+    if (!isStdioEntry(scoped.entry) && !remote?.wrappable) {
+      ctx.log(
+        `[speculate] ${name}: ${remote ? remote.reason : 'non-stdio'} — passed through unwrapped`,
+      );
       continue;
     }
     const wrapped = wrapEntry(scoped.entry, ctx.self, { mode: opts.mode ?? undefined });
+    // Header values, for scrubbing every failure message below: the host CLI
+    // is handed the entry as one argv element and may quote it back.
+    const secrets = entrySecrets(scoped.entry);
 
     if (scoped.scope === 'project') {
       // Never touch the checked-in file; shadow at local scope instead —
@@ -802,7 +888,9 @@ export async function wrapEffectiveServers(
       }
       const res = await mcpAddJson(ctx, name, wrapped, 'local');
       if (res.code !== 0) {
-        ctx.log(`[speculate] ${name}: shadow failed: ${(res.stderr || res.stdout).trim()}`);
+        ctx.log(
+          `[speculate] ${name}: shadow failed: ${redactSecrets((res.stderr || res.stdout).trim(), secrets)}`,
+        );
         failed++;
         continue;
       }
@@ -816,7 +904,9 @@ export async function wrapEffectiveServers(
     // user/local scope: re-register wrapped in place, original recorded.
     const removed = await mcpRemove(ctx, name, scoped.scope);
     if (removed.code !== 0) {
-      ctx.log(`[speculate] ${name}: remove failed: ${(removed.stderr || removed.stdout).trim()}`);
+      ctx.log(
+        `[speculate] ${name}: remove failed: ${redactSecrets((removed.stderr || removed.stdout).trim(), secrets)}`,
+      );
       failed++;
       continue;
     }
@@ -824,11 +914,15 @@ export async function wrapEffectiveServers(
     if (added.code !== 0) {
       // Put the original back rather than leave the server missing.
       const restored = await mcpAddJson(ctx, name, scoped.entry, scoped.scope);
+      // The recovery command is printed with header VALUES masked: they are
+      // the user's own, from their own config, and printing them to a
+      // terminal (or a hook's captured output) would be irreversible.
       ctx.log(
-        `[speculate] ${name}: wrap failed (${(added.stderr || added.stdout).trim()}); ` +
+        `[speculate] ${name}: wrap failed (${redactSecrets((added.stderr || added.stdout).trim(), secrets)}); ` +
           (restored.code === 0
             ? 'original restored'
-            : `RESTORE ALSO FAILED — re-add manually: claude mcp add-json ${name} '${JSON.stringify(scoped.entry)}' -s ${scoped.scope}`),
+            : `RESTORE ALSO FAILED — re-add manually: claude mcp add-json ${name} '${entryForLog(scoped.entry)}' -s ${scoped.scope}` +
+              (secrets.length ? ' (header values are yours to fill back in)' : '')),
       );
       failed++;
       continue;
@@ -839,7 +933,9 @@ export async function wrapEffectiveServers(
       action: 'rewrote',
       original: scoped.entry,
     });
-    ctx.log(`[speculate] ${name}: wrapped (${scoped.scope} scope)`);
+    ctx.log(
+      `[speculate] ${name}: wrapped (${scoped.scope} scope${remote?.wrappable ? ', remote' : ''})`,
+    );
     opts.onWrapped?.(name);
     changed++;
   }
@@ -1303,6 +1399,14 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
    */
   let userScopeUnwrapped = 0;
   const handled = new Set<string>();
+  /**
+   * Records whose undo did not complete. They are KEPT in the state file
+   * rather than dropped with the rest: the recorded original is the only copy
+   * of the entry left once the host's has been removed, and for a remote
+   * server that entry holds the credential — which the failure message
+   * deliberately does not print. Dropping it would destroy it.
+   */
+  const unfinished: ManagedEntry[] = [];
 
   for (const entry of record?.entries ?? []) {
     handled.add(managedKey(entry.scope, entry.name));
@@ -1360,11 +1464,15 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       }
       continue;
     }
+    const secrets = entrySecrets(entry.original ?? {});
     if (entry.action === 'added' || entry.action === 'shadowed') {
       const res = await mcpRemove(ctx, entry.name, entry.scope);
       if (res.code !== 0) {
-        ctx.log(`[speculate] ${entry.name}: remove failed: ${(res.stderr || res.stdout).trim()}`);
+        ctx.log(
+          `[speculate] ${entry.name}: remove failed: ${redactSecrets((res.stderr || res.stdout).trim(), secrets)}`,
+        );
         failed++;
+        unfinished.push(entry);
         continue;
       }
       ctx.log(
@@ -1377,8 +1485,11 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     // rewrote: swap the wrapped entry back for the recorded original.
     const removed = await mcpRemove(ctx, entry.name, entry.scope);
     if (removed.code !== 0) {
-      ctx.log(`[speculate] ${entry.name}: remove failed: ${(removed.stderr || removed.stdout).trim()}`);
+      ctx.log(
+        `[speculate] ${entry.name}: remove failed: ${redactSecrets((removed.stderr || removed.stdout).trim(), secrets)}`,
+      );
       failed++;
+      unfinished.push(entry);
       continue;
     }
     const original = entry.original;
@@ -1389,10 +1500,18 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     }
     const res = await mcpAddJson(ctx, entry.name, original, entry.scope);
     if (res.code !== 0) {
+      // The entry is printed with header VALUES masked, so the recovery line
+      // is not itself a disclosure — which is exactly why the record has to
+      // survive: it is now the only place the real values exist.
       ctx.log(
-        `[speculate] ${entry.name}: restore failed — re-add manually: claude mcp add-json ${entry.name} '${JSON.stringify(original)}' -s ${entry.scope}`,
+        `[speculate] ${entry.name}: restore failed (${redactSecrets((res.stderr || res.stdout).trim(), secrets)}) — ` +
+          `re-add manually: claude mcp add-json ${entry.name} '${entryForLog(original)}' -s ${entry.scope}`,
+      );
+      ctx.log(
+        `[speculate]   the exact original is still recorded in ${ctx.statePath} — rerunning 'speculate off' retries it`,
       );
       failed++;
+      unfinished.push(entry);
       continue;
     }
     if (entry.scope === 'user') userScopeUnwrapped++;
@@ -1416,9 +1535,14 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       continue;
     }
     const original = unwrapEntry(scoped.entry);
+    // A wrapped remote entry carries its credential in `--header` args, so
+    // this net needs the same scrub the recorded path gets.
+    const secrets = entrySecrets(scoped.entry);
     const removed = await mcpRemove(ctx, scoped.name, scoped.scope);
     if (removed.code !== 0) {
-      ctx.log(`[speculate] ${scoped.name}: remove failed: ${(removed.stderr || removed.stdout).trim()}`);
+      ctx.log(
+        `[speculate] ${scoped.name}: remove failed: ${redactSecrets((removed.stderr || removed.stdout).trim(), secrets)}`,
+      );
       failed++;
       continue;
     }
@@ -1450,7 +1574,13 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     }
   }
 
-  if (record) delete state.projects[ctx.cwd];
+  if (record) {
+    if (unfinished.length > 0) {
+      state.projects[ctx.cwd] = { entries: unfinished, updatedAt: Date.now() };
+    } else {
+      delete state.projects[ctx.cwd];
+    }
+  }
   // Consume the marketplace-ownership flag exactly once (see on()).
   if (legacyCleanup.marketplaceRemoved) state.marketplaceAddedByOn = false;
   // Opt this project out of a later `sync`'s auto-wrap (see ManagedState.
@@ -1515,17 +1645,32 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
       );
       continue;
     }
+    const remote = planRemoteWrap(scoped.entry);
     let stateLabel: string;
     if (isWrappedEntry(scoped.entry)) {
-      stateLabel = managedNames.has(name) ? 'wrapped (managed)' : 'wrapped';
+      // A wrapped REMOTE server no longer looks remote — it is a `wrap --url`
+      // command line — so say which kind it is rather than let it read as a
+      // wrapped local process.
+      const kind = unwrapEntry(scoped.entry)?.url ? ', remote' : '';
+      stateLabel = managedNames.has(name) ? `wrapped (managed${kind})` : `wrapped${kind}`;
+    } else if (remote?.wrappable) {
+      stateLabel = 'NOT wrapped (remote)';
+      unwrapped++;
     } else if (!isStdioEntry(scoped.entry)) {
-      stateLabel = 'http/sse — passed through';
+      stateLabel = `${remote ? remote.reason : 'non-stdio'} — passed through`;
     } else {
       stateLabel = 'NOT wrapped';
       unwrapped++;
     }
     ctx.log(`[speculate]   ${name} (${scoped.scope}): ${stateLabel}`);
   }
+  // The limit of everything above, stated once. Connectors enabled through
+  // the claude.ai UI are held by the host, not written to any local MCP
+  // config, so they are invisible here — and this makes no claim about
+  // whether any exist, because from here that is unknowable.
+  ctx.log(
+    '[speculate] not listed: connectors added in the claude.ai UI — they are not in local MCP config, so nothing here can see or wrap them',
+  );
   if (unwrapped > 0 && record) {
     ctx.log(
       `[speculate] ${unwrapped} server(s) added since 'speculate on' — run it again to wrap them`,

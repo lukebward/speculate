@@ -8,13 +8,16 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  HOST_HEADER_NAME,
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
+  planRemoteWrap,
   readClaudeServers,
   unwrapEntry,
   wrapEntry,
 } from '../src/hostConfig.js';
+import { HEADER_NAME } from '../src/config.js';
 import { buildTryConfig, parseTryArgs, tryClientEnv } from '../src/tryRun.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
@@ -139,6 +142,127 @@ describe('entry classification and wrapping', () => {
     expect(
       isWrappedEntry({ command: 'npx', args: ['-y', 'github:lukebward/speculate', 'wrap', '--', 'x'] }),
     ).toBe(true);
+  });
+});
+
+describe('remote (http) entries', () => {
+  const URL_ = 'https://api.example.com/mcp/';
+
+  it('is not a remote entry at all when there is no url', () => {
+    expect(planRemoteWrap({ command: 'srv' })).toBeNull();
+    expect(planRemoteWrap({})).toBeNull();
+  });
+
+  it('wraps a streamable-http entry, with or without a declared type', () => {
+    for (const entry of [
+      { url: URL_ },
+      { url: URL_, type: 'http' },
+      { url: URL_, type: 'streamable-http' },
+    ]) {
+      const plan = planRemoteWrap(entry);
+      expect(plan).toMatchObject({ wrappable: true, url: URL_, headers: [] });
+    }
+  });
+
+  it('wraps an unauthenticated remote server (a self-hosted one on a trusted network)', () => {
+    const wrapped = wrapEntry({ url: 'http://10.0.0.4:9000/mcp' }, SELF);
+    expect(wrapped.args).toEqual([...SELF.args, 'wrap', '--url', 'http://10.0.0.4:9000/mcp']);
+    expect(wrapped.url).toBeUndefined();
+  });
+
+  it('never wraps an sse entry: Speculate speaks streamable HTTP only', () => {
+    const plan = planRemoteWrap({ url: URL_, type: 'sse' });
+    expect(plan).toEqual({ wrappable: false, reason: expect.stringContaining('sse') });
+  });
+
+  it('never wraps a non-http url scheme, which `wrap --url` would reject at launch', () => {
+    expect(planRemoteWrap({ url: 'ws://example.com/mcp' })).toMatchObject({ wrappable: false });
+    expect(planRemoteWrap({ url: 'not a url' })).toMatchObject({ wrappable: false });
+  });
+
+  it('never wraps headers it cannot carry through argv verbatim', () => {
+    // A non-string value, a name `wrap --header` would reject, and a value
+    // carrying the CR/LF that `--header` parsing (and HTTP) forbid.
+    expect(planRemoteWrap({ url: URL_, headers: { A: 1 } })).toMatchObject({ wrappable: false });
+    expect(planRemoteWrap({ url: URL_, headers: { 'A B': 'x' } })).toMatchObject({ wrappable: false });
+    expect(planRemoteWrap({ url: URL_, headers: { A: 'x\ny' } })).toMatchObject({ wrappable: false });
+    expect(planRemoteWrap({ url: URL_, headers: ['a'] })).toMatchObject({ wrappable: false });
+  });
+
+  it('a skip reason never quotes a header value', () => {
+    const plan = planRemoteWrap({ url: URL_, headers: { 'A B': 's3cret-token-value' } });
+    expect(plan).toMatchObject({ wrappable: false });
+    expect((plan as { reason: string }).reason).not.toContain('s3cret-token-value');
+  });
+
+  it('pins the header-name rule to the one `wrap --header` enforces', () => {
+    // hostConfig deliberately does not import config.ts (zod + every profile)
+    // into the session-start `sync` path, so the rule is duplicated. If they
+    // ever drift, `on` wraps a server `wrap` then refuses to start.
+    expect(HOST_HEADER_NAME.source).toBe(HEADER_NAME.source);
+    expect(HOST_HEADER_NAME.flags).toBe(HEADER_NAME.flags);
+  });
+
+  it('wraps and unwraps a remote entry, headers and unknown fields intact', () => {
+    const original = {
+      type: 'http',
+      url: URL_,
+      headers: { Authorization: 'Bearer ${API_TOKEN}', 'X-Api-Version': '2024-01-01' },
+      somethingTheHostAdded: { nested: true },
+    };
+    const wrapped = wrapEntry(original, SELF, { mode: 'strict' });
+    expect(wrapped.command).toBe(SELF.command);
+    expect(wrapped.args).toEqual([
+      ...SELF.args,
+      'wrap',
+      '--mode',
+      'strict',
+      '--url',
+      URL_,
+      '--header',
+      'Authorization: Bearer ${API_TOKEN}',
+      '--header',
+      'X-Api-Version: 2024-01-01',
+    ]);
+    // The transport fields must NOT survive on the wrapped entry: the host
+    // picks http over stdio whenever it sees a url, and the token must exist
+    // in exactly one place, not two.
+    expect(wrapped.url).toBeUndefined();
+    expect(wrapped.type).toBeUndefined();
+    expect(wrapped.headers).toBeUndefined();
+    expect(wrapped.somethingTheHostAdded).toEqual({ nested: true });
+    expect(isWrappedEntry(wrapped)).toBe(true);
+
+    expect(unwrapEntry(wrapped)).toEqual(original);
+  });
+
+  it('carries a ${VAR} placeholder through unresolved, so no token is copied anywhere', () => {
+    process.env.SPECULATE_TEST_TOKEN = 'tok-must-not-appear';
+    try {
+      const wrapped = wrapEntry(
+        { url: URL_, headers: { Authorization: 'Bearer ${SPECULATE_TEST_TOKEN}' } },
+        SELF,
+      );
+      expect(JSON.stringify(wrapped)).not.toContain('tok-must-not-appear');
+    } finally {
+      delete process.env.SPECULATE_TEST_TOKEN;
+    }
+  });
+
+  it('reconstructs a remote entry from the wrap invocation alone (no state file)', () => {
+    const wrapped = wrapEntry({ url: URL_, headers: { Authorization: 'Bearer x' } }, SELF);
+    // The no-state net cannot know whether `type` was written out, so it
+    // states the transport it was actually speaking.
+    expect(unwrapEntry(wrapped)).toEqual({
+      type: 'http',
+      url: URL_,
+      headers: { Authorization: 'Bearer x' },
+    });
+  });
+
+  it('keeps a header value containing colons whole', () => {
+    const original = { type: 'http', url: URL_, headers: { 'X-Trace': 'a:b:c' } };
+    expect(unwrapEntry(wrapEntry(original, SELF))).toEqual(original);
   });
 });
 

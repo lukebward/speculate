@@ -153,6 +153,38 @@ describe('speculate sync', () => {
     expect(logs[0]).toMatch(/wrapped 1 new server \(slack\).*next session/);
   });
 
+  it('wraps a newly added remote server, and says nothing about its token', async () => {
+    // The auto-wrap hook inherits the same rule `on` follows: a remote entry
+    // that carries its own auth is wrapped like any other.
+    const token = 'fake-token-never-for-logs';
+    writeClaudeJson({
+      mcpServers: {
+        hosted: {
+          type: 'http',
+          url: 'https://api.example.com/mcp/',
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      },
+    });
+    writeState({ syncHashes: { [cwd]: 'stale-hash-from-before-hosted-existed' } });
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(addJsonNames()).toEqual(['hosted']);
+    const wrapped = readClaudeJson().mcpServers.hosted;
+    expect(wrapped.command).toBe(SELF.command);
+    expect(wrapped.args).toContain('--url');
+    expect(wrapped.url).toBeUndefined();
+    expect(logs.join('\n')).not.toContain(token);
+
+    // And `off` puts it back exactly as it was.
+    expect(await speculateOff(opts())).toBe(0);
+    expect(readClaudeJson().mcpServers.hosted).toEqual({
+      type: 'http',
+      url: 'https://api.example.com/mcp/',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  });
+
   it('spawns only the wrap itself — no front-door probe, no legacy cleanup', async () => {
     writeClaudeJson({ mcpServers: { slack: { command: 'slack-server' } } });
     await speculateSync(opts());
