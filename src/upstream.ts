@@ -14,6 +14,7 @@ import {
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { VERSION } from './version.js';
+import { SpeculateOAuthProvider } from './oauthProvider.js';
 import type { ServerConfig, UpstreamTransport } from './types.js';
 
 /**
@@ -125,6 +126,13 @@ export class Upstream {
           // of the connection and must not observe later config edits.
           ...(this.config.headers
             ? { requestInit: { headers: { ...this.config.headers } } }
+            : {}),
+          ...(this.config.oauthStorePath
+            ? {
+                authProvider: new SpeculateOAuthProvider(this.config.url, {
+                  storePath: this.config.oauthStorePath,
+                }),
+              }
             : {}),
         })
       : new StdioClientTransport({

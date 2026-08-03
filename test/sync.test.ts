@@ -136,6 +136,8 @@ const opts = () => ({
   lockPath,
   log: (l: string) => logs.push(l),
   probeRemote: fakeProbe,
+  // Never the real store: a test must not read the developer's credentials.
+  oauthStorePath: join(home, 'oauth.json'),
 });
 
 describe('speculate sync', () => {

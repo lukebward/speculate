@@ -236,6 +236,8 @@ const opts = () => ({
   statePath,
   log: (l: string) => logs.push(l),
   probeRemote: fakeProbe,
+  // Never the real store: a test must not read the developer's credentials.
+  oauthStorePath: join(home, 'oauth.json'),
 });
 
 describe('speculate on', () => {
@@ -383,8 +385,39 @@ describe('speculate on: remote (http) servers', () => {
 
     expect(await speculateOn(opts())).toBe(0);
     expect(readClaudeJson().mcpServers.oauthed).toEqual(entry);
-    expect(logs.join('\n')).toContain('oauthed: needs an OAuth login');
+    // The message names the exact command that fixes it.
+    expect(logs.join('\n')).toContain('oauthed: needs authorization — run: speculate auth oauthed');
     expect(logs.join('\n')).toContain('passed through unwrapped');
+  });
+
+  it('wraps that same server once `speculate auth` has stored a token for it', async () => {
+    // The store is keyed by URL and read at proxy startup, so authorizing is
+    // the only step: no flag, no config edit, and the next `on` (or the
+    // session-start hook) picks the server up on its own.
+    probeResult = { kind: 'needs-auth' };
+    const url = 'https://mcp.example.com/mcp';
+    writeClaudeJson({ mcpServers: { oauthed: { type: 'http', url } } });
+    writeFileSync(
+      join(home, 'oauth.json'),
+      JSON.stringify({
+        version: 1,
+        servers: {
+          [url]: {
+            serverUrl: url,
+            client: { client_id: 'test-client' },
+            tokens: { access_token: 'stored-access-token', token_type: 'Bearer' },
+            expiresAt: Date.now() + 3_600_000,
+          },
+        },
+      }),
+    );
+
+    expect(await speculateOn(opts())).toBe(0);
+    const wrapped = readClaudeJson().mcpServers.oauthed;
+    expect(wrapped.args).toEqual([...SELF.args, 'wrap', '--url', url]);
+    // The token is NEVER copied into the host config: the wrapped entry names
+    // the url only, and the proxy looks the credential up at startup.
+    expect(JSON.stringify(readClaudeJson())).not.toContain('stored-access-token');
   });
 
   it('leaves an unreachable server alone, and quotes no response body', async () => {

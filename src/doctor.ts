@@ -16,6 +16,7 @@ import { compileConfigRules } from './configRules.js';
 import { StateStore } from './persistence.js';
 import { VERSION } from './version.js';
 import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
+import { readOAuthRecord } from './oauthStore.js';
 
 const CONNECT_TIMEOUT_MS = 15_000;
 
@@ -41,6 +42,26 @@ export async function runDoctor(
     const headerNames = Object.keys(sc.headers ?? {});
     if (headerNames.length > 0) {
       out(dim(`headers: ${headerNames.sort().join(', ')} (values redacted)`));
+    }
+    // "Am I using my own OAuth login for this server, and when does it run
+    // out?" Answering it here is the difference between a legible 401 and an
+    // hour of guessing. The token itself is never printed.
+    if (sc.oauthStorePath && sc.url) {
+      const record = readOAuthRecord(sc.oauthStorePath, sc.url);
+      const expiry = record?.expiresAt;
+      const when =
+        expiry === undefined
+          ? 'no recorded expiry'
+          : expiry <= Date.now()
+            ? 'expired, refreshing on next call'
+            : `valid for ${Math.round((expiry - Date.now()) / 60_000)} min, refreshed automatically`;
+      out(dim(`oauth: authorized via 'speculate auth' (${when})`));
+      if (process.platform === 'win32') {
+        // 0o600 is a verified no-op on Windows: Node writes the file 666 and
+        // the only protection is the ACL inherited from %LOCALAPPDATA%. Say
+        // so rather than implying a guarantee that is not there.
+        out(dim(`oauth: credentials at ${sc.oauthStorePath} (protected by folder ACL, not file mode)`));
+      }
     }
 
     const profile: ServerProfile | undefined =

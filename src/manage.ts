@@ -36,6 +36,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { probeRemote, type RemoteProber } from './remoteProbe.js';
+import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import {
   WORKSPACE_SERVER_NAME,
   effectiveServers,
@@ -385,6 +386,8 @@ export interface Ctx {
    * shape alone cannot answer the question.
    */
   probeRemote: RemoteProber;
+  /** Speculate's own OAuth credential store (oauthStore.ts). */
+  oauthStorePath: string;
   /** Memoized `claude plugin list --json`; see fetchPluginList. */
   pluginList?: Promise<unknown | null>;
 }
@@ -479,6 +482,7 @@ export interface ManageOptions {
   log?: (line: string) => void;
   mode?: 'strict' | 'annotated' | 'off' | null;
   probeRemote?: RemoteProber;
+  oauthStorePath?: string;
 }
 
 export function makeCtx(opts: ManageOptions): Ctx {
@@ -500,6 +504,7 @@ export function makeCtx(opts: ManageOptions): Ctx {
     statePath: opts.statePath ?? managedStatePath(),
     log: opts.log ?? ((line) => process.stderr.write(`${line}\n`)),
     probeRemote: opts.probeRemote ?? probeRemote,
+    oauthStorePath: opts.oauthStorePath ?? oauthStorePath(),
   };
 }
 
@@ -791,14 +796,19 @@ export interface WrapOutcome {
  */
 async function remoteWrapBlocker(
   ctx: Ctx,
+  name: string,
   remote: Extract<RemoteWrapPlan, { wrappable: true }>,
 ): Promise<string | null> {
   const resolved = resolveWrapHeaders(remote.headers);
   if (!resolved.ok) return `header variable \${${resolved.missing}} is not set`;
   const probe = await ctx.probeRemote(remote.url, resolved.headers);
   if (probe.kind === 'ok') return null;
-  if (probe.kind === 'needs-auth') return 'needs an OAuth login Speculate does not have';
-  return probe.reason;
+  if (probe.kind !== 'needs-auth') return probe.reason;
+  // The server wants a login. If the user has already given Speculate one,
+  // the wrapped proxy will connect with it (the store is consulted by URL at
+  // proxy startup), so this is wrappable after all.
+  if (readOAuthRecord(ctx.oauthStorePath, remote.url)?.tokens) return null;
+  return `needs authorization — run: speculate auth ${name}`;
 }
 
 /**
@@ -909,7 +919,7 @@ export async function wrapEffectiveServers(
     // working server away from the user, so a non-`ok` answer always leaves
     // the server exactly as it was.
     if (remote?.wrappable) {
-      const reason = await remoteWrapBlocker(ctx, remote);
+      const reason = await remoteWrapBlocker(ctx, name, remote);
       if (reason) {
         ctx.log(`[speculate] ${name}: ${reason} — passed through unwrapped`);
         continue;

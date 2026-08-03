@@ -23,6 +23,9 @@ import { speculateOff, speculateOn, speculateStatus } from './manage.js';
 import { speculateSync } from './sync.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
+import { speculateAuth } from './authCommand.js';
+import { attachStoredOAuth } from './oauthProvider.js';
+import { oauthStorePath } from './oauthStore.js';
 import { createUsageRecorder } from './usage.js';
 import { VERSION } from './version.js';
 
@@ -36,6 +39,8 @@ install-and-it-works (no config files edited by hand):
   speculate status                         what's wrapped here, and what drifted since 'on'
   speculate sync                           wrap MCP servers added since the last run (run by the auto-wrap hook)
   speculate stats [--json]                 cumulative speculation usage
+  speculate auth [server]                  authorize Speculate with remote servers that need a
+                                           login (no argument: every one that does)
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
                                            server any client launches, even ones added later
 
@@ -98,6 +103,7 @@ interface Args {
     | 'sync'
     | 'stats'
     | 'shims'
+    | 'auth'
     | 'exec';
   configPath: string;
   modeOverride: 'strict' | 'annotated' | 'off' | null;
@@ -114,6 +120,7 @@ const REST_COMMANDS = new Set([
   'sync',
   'stats',
   'shims',
+  'auth',
   'exec',
 ] as const);
 
@@ -379,6 +386,19 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args.command === 'auth') {
+    let target: string | undefined;
+    let forget = false;
+    for (const arg of args.rest) {
+      if (arg === '--forget') forget = true;
+      else if (arg.startsWith('-')) fail(`unknown auth argument '${arg}'`);
+      else if (target === undefined) target = arg;
+      else fail(`auth takes at most one server (got '${arg}' as well as '${target}')`);
+    }
+    process.exitCode = await speculateAuth({ target, forget });
+    return;
+  }
+
   if (args.command === 'wrap') {
     const wrapArgs = parseWrapArgs(args.rest);
     if ('error' in wrapArgs) fail(`wrap: ${wrapArgs.error}`);
@@ -428,6 +448,7 @@ async function main(): Promise<void> {
       : (config.persistence?.path ?? defaultStatePath(args.configPath));
 
   if (args.command === 'doctor') {
+    applyStoredOAuth(config);
     // Doctor's report can exceed the pipe buffer, and probed upstreams may
     // leave handles alive — flush-gated exit covers both.
     const ok = await runDoctor(config, statePath);
@@ -438,11 +459,22 @@ async function main(): Promise<void> {
   await runProxy(config, statePath, args.configPath);
 }
 
+/**
+ * Wire up any upstream the user has run `speculate auth` for. A conflict here
+ * is fatal rather than a warning: the failure it prevents (a stale header
+ * shadowing a valid token) surfaces as an unexplainable 401 much later.
+ */
+function applyStoredOAuth(config: import('./types.js').SpeculateConfig): void {
+  const errors = attachStoredOAuth(config.servers, oauthStorePath());
+  if (errors.length > 0) fail(errors.join('\n'));
+}
+
 async function runProxy(
   config: import('./types.js').SpeculateConfig,
   statePath: string | null,
   configLabel: string,
 ): Promise<void> {
+  applyStoredOAuth(config);
   const usageRecorder = createUsageRecorder({
     source: 'mcp',
     workspace: process.cwd(),
