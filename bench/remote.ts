@@ -39,15 +39,12 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import { resultText } from '../src/upstream.js';
 import type { SpeculationMode, StatsReport } from '../src/types.js';
+import { SCENARIOS, type Scenario, type ScenarioContext, type ScriptStep } from './scenarios.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const NODE = process.execPath;
 const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
-const DEFAULT_URL = 'https://api.githubcopilot.com/mcp/';
-/** A public repository with steady issue and PR traffic, readable by any token. */
-const DEFAULT_OWNER = 'modelcontextprotocol';
-const DEFAULT_REPO = 'servers';
 
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
@@ -64,10 +61,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface Options {
   runs: number;
-  owner: string;
-  repo: string;
-  url: string;
+  scenario: Scenario;
   profile: string | null;
+  /** Empty when the scenario needs no credential. */
   token: string;
 }
 
@@ -76,34 +72,52 @@ interface Options {
  * with exit code 0, because "no credentials" is not a failure, it is the default.
  */
 function gate(): Options | null {
-  const live = process.env['SPECULATE_E2E_LIVE'] === '1';
-  const token = process.env['GITHUB_TOKEN'] ?? '';
-  if (!live || token === '') {
-    console.log();
-    console.log(bold('  remote benchmark skipped'));
-    console.log(dim('  it calls a real hosted MCP server, so it is opt-in and needs a credential:'));
-    if (!live) console.log(`    ${yellow('SPECULATE_E2E_LIVE')} is not set to 1`);
-    if (token === '') console.log(`    ${yellow('GITHUB_TOKEN')} is empty or unset`);
-    console.log();
-    console.log(dim('  to run it:'));
-    console.log(
-      dim('    SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote'),
-    );
-    console.log(dim('  (PowerShell: $env:SPECULATE_E2E_LIVE=1; $env:GITHUB_TOKEN=(gh auth token))'));
-    console.log();
-    return null;
-  }
   const flag = (name: string): string | undefined => {
     const i = process.argv.indexOf(`--${name}`);
     return i !== -1 ? process.argv[i + 1] : undefined;
   };
+  const key = flag('scenario') ?? process.env['SPECULATE_BENCH_SCENARIO'] ?? 'github';
+  const scenario = SCENARIOS[key];
+  if (!scenario) {
+    console.log();
+    console.log(bold(`  unknown scenario '${key}'`));
+    console.log(dim(`  available: ${Object.keys(SCENARIOS).join(', ')}`));
+    console.log();
+    return null;
+  }
+
+  const live = process.env['SPECULATE_E2E_LIVE'] === '1';
+  // A scenario with no `tokenEnv` needs no credential, so demanding one would
+  // block the single most reproducible measurement in the repo.
+  const token = scenario.tokenEnv ? (process.env[scenario.tokenEnv] ?? '') : '';
+  const needsToken = scenario.tokenEnv !== null && token === '';
+  if (!live || needsToken) {
+    const invocation =
+      scenario.tokenEnv === null
+        ? `SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario ${scenario.key}`
+        : `SPECULATE_E2E_LIVE=1 ${scenario.tokenEnv}=$(gh auth token) npm run bench:remote`;
+    console.log();
+    console.log(bold('  remote benchmark skipped'));
+    console.log(dim('  it calls a real hosted MCP server, so it is opt-in:'));
+    if (!live) console.log(`    ${yellow('SPECULATE_E2E_LIVE')} is not set to 1`);
+    if (needsToken) console.log(`    ${yellow(scenario.tokenEnv!)} is empty or unset`);
+    console.log();
+    console.log(dim('  to run it:'));
+    console.log(dim(`    ${invocation}`));
+    if (scenario.tokenEnv !== null) {
+      console.log(
+        dim(`  (PowerShell: $env:SPECULATE_E2E_LIVE=1; $env:${scenario.tokenEnv}=(gh auth token))`),
+      );
+    }
+    console.log();
+    return null;
+  }
+
   const runsRaw = Number(flag('runs') ?? 3);
   const profile = flag('profile') ?? process.env['SPECULATE_BENCH_PROFILE'] ?? '';
   return {
     runs: Number.isFinite(runsRaw) && runsRaw >= 1 ? Math.floor(runsRaw) : 3,
-    owner: flag('owner') ?? process.env['SPECULATE_BENCH_OWNER'] ?? DEFAULT_OWNER,
-    repo: flag('repo') ?? process.env['SPECULATE_BENCH_REPO'] ?? DEFAULT_REPO,
-    url: process.env['SPECULATE_REMOTE_URL'] ?? DEFAULT_URL,
+    scenario,
     profile: profile === '' || profile === 'none' ? null : profile,
     token,
   };
@@ -113,47 +127,41 @@ function gate(): Options | null {
 // Discovery: what does this server actually offer, and what may we call?
 // ---------------------------------------------------------------------------
 
-interface ScriptStep {
-  kind: 'call' | 'think' | 'turn';
-  label?: string;
-  tool?: string;
-  args?: Record<string, unknown>;
-  ms?: number;
-}
-
 /**
- * Connect directly (no proxy) to read the tool list and pick real arguments.
- * The session below is built from what the server SAYS it has rather than
- * from hardcoded names, because hosted servers rename and consolidate tools
- * (this one now exposes `issue_read`, not the classic `get_issue`).
+ * Connect directly (no proxy) to read the tool list, prove every tool the
+ * session will call is affirmatively read-only, and let the scenario pick
+ * real arguments.
  */
 async function discover(
   opts: Options,
-): Promise<{ tools: Tool[]; script: ScriptStep[]; issues: number[]; pull: number }> {
+): Promise<{ tools: Tool[]; script: ScriptStep[]; ctx: ScenarioContext }> {
+  const { scenario } = opts;
   const client = new Client({ name: 'speculate-bench', version: '0.1.0' }, { capabilities: {} });
   await client.connect(
-    new StreamableHTTPClientTransport(new URL(opts.url), {
-      requestInit: { headers: { Authorization: `Bearer ${opts.token}` } },
+    new StreamableHTTPClientTransport(new URL(scenario.url), {
+      ...(opts.token
+        ? { requestInit: { headers: { Authorization: `Bearer ${opts.token}` } } }
+        : {}),
     }),
   );
-  const tools = (await client.listTools()).tools;
-
+  const { tools } = await client.listTools();
   const readOnly = new Set(
     tools.filter((t) => t.annotations?.readOnlyHint === true).map((t) => t.name),
   );
-  const need = ['list_issues', 'issue_read', 'list_pull_requests', 'pull_request_read'];
-  const missing = need.filter((n) => !tools.some((t) => t.name === n));
+
+  const missing = scenario.needTools.filter((n) => !tools.some((t) => t.name === n));
   if (missing.length > 0) {
     await client.close();
     throw new Error(
-      `server at ${opts.url} does not expose ${missing.join(', ')}: ` +
-        `this benchmark's session script needs them (available: ${tools.length} tools)`,
+      `server at ${scenario.url} does not expose ${missing.join(', ')}: ` +
+        `it has ${tools.length} tools (${tools.map((t) => t.name).slice(0, 8).join(', ')}…)`,
     );
   }
+
   // The safety gate. `readOnlyHint` is an untrusted hint in general (DESIGN.md
-  // §4), but here it is used only to make the benchmark REFUSE, never to grant
-  // permission: absence of an affirmative read-only annotation aborts.
-  const notReadOnly = need.filter((n) => !readOnly.has(n));
+  // threat model), but here it is the SERVER'S OWN claim about its own tools,
+  // and refusing to proceed without it is what keeps this benchmark harmless.
+  const notReadOnly = scenario.needTools.filter((n) => !readOnly.has(n));
   if (notReadOnly.length > 0) {
     await client.close();
     throw new Error(
@@ -163,97 +171,11 @@ async function discover(
     );
   }
 
-  // Real issue/PR numbers, so every call in the session actually succeeds.
-  const issuesRes = (await client.callTool({
-    name: 'list_issues',
-    arguments: { owner: opts.owner, repo: opts.repo, state: 'OPEN', perPage: 10 },
-  })) as CallToolResult;
-  const issues = extractNumbers(resultText(issuesRes), 'issues').slice(0, 2);
-  const prsRes = (await client.callTool({
-    name: 'list_pull_requests',
-    arguments: { owner: opts.owner, repo: opts.repo, state: 'open', perPage: 10 },
-  })) as CallToolResult;
-  const pulls = extractNumbers(resultText(prsRes), null);
+  const ctx = await scenario.plan(
+    (name, args) => client.callTool({ name, arguments: args }) as Promise<CallToolResult>,
+  );
   await client.close();
-
-  if (issues.length < 2 || pulls.length < 1) {
-    throw new Error(
-      `${opts.owner}/${opts.repo} needs at least 2 open issues and 1 open PR for this ` +
-        `session (found ${issues.length} and ${pulls.length}); pass --owner/--repo`,
-    );
-  }
-  return { tools, script: script(opts, issues, pulls[0]!), issues, pull: pulls[0]! };
-}
-
-/**
- * `number` fields out of a JSON tool result, whether the payload is a bare
- * array or an object wrapping one under `key`. Tolerant on purpose: the
- * benchmark should fail with a clear message, not a stack trace, if the
- * server changes its envelope.
- */
-function extractNumbers(text: string, key: string | null): number[] {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    const arr = Array.isArray(parsed)
-      ? parsed
-      : key !== null && isRecord(parsed) && Array.isArray(parsed[key])
-        ? (parsed[key] as unknown[])
-        : [];
-    return arr
-      .map((e) => (isRecord(e) && typeof e['number'] === 'number' ? e['number'] : null))
-      .filter((n): n is number => n !== null);
-  } catch {
-    return [];
-  }
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object';
-}
-
-/**
- * A realistic read-only triage session: skim open issues, open the top one
- * and read its comments, do the same for the next one, then switch to pull
- * requests and read a diff. Eight tool calls across three user turns.
- *
- * `think` steps stand in for model generation between calls and `turn` steps
- * for the user reading and typing: the windows speculation actually has to
- * work in. They are excluded from every reported total; only the wall clock
- * of `client.callTool` is measured.
- */
-function script(opts: Options, issues: number[], pull: number): ScriptStep[] {
-  const repo = { owner: opts.owner, repo: opts.repo };
-  const [first, second] = issues as [number, number];
-  return [
-    { kind: 'turn', label: `user: "what is open on ${opts.owner}/${opts.repo}?"` },
-    { kind: 'call', tool: 'list_issues', args: { ...repo, state: 'OPEN', perPage: 10 } },
-    { kind: 'think', ms: 1000 },
-    { kind: 'call', tool: 'issue_read', args: { ...repo, method: 'get', issue_number: first } },
-    { kind: 'think', ms: 1200 },
-    {
-      kind: 'call',
-      tool: 'issue_read',
-      args: { ...repo, method: 'get_comments', issue_number: first },
-    },
-    { kind: 'turn', label: 'user: "and the next one?"', ms: 2000 },
-    { kind: 'call', tool: 'issue_read', args: { ...repo, method: 'get', issue_number: second } },
-    { kind: 'think', ms: 1200 },
-    {
-      kind: 'call',
-      tool: 'issue_read',
-      args: { ...repo, method: 'get_comments', issue_number: second },
-    },
-    { kind: 'turn', label: 'user: "any pull requests in flight?"', ms: 2000 },
-    { kind: 'call', tool: 'list_pull_requests', args: { ...repo, state: 'open', perPage: 10 } },
-    { kind: 'think', ms: 1000 },
-    { kind: 'call', tool: 'pull_request_read', args: { ...repo, method: 'get', pullNumber: pull } },
-    { kind: 'think', ms: 1200 },
-    {
-      kind: 'call',
-      tool: 'pull_request_read',
-      args: { ...repo, method: 'get_files', pullNumber: pull },
-    },
-  ];
+  return { tools, script: scenario.script(ctx), ctx };
 }
 
 // ---------------------------------------------------------------------------
@@ -282,12 +204,15 @@ async function runSession(
         log: 'off',
         persistence: statePath ? { enabled: true, path: statePath } : { enabled: false },
         servers: {
-          github: {
-            url: opts.url,
+          upstream: {
+            url: opts.scenario.url,
             // The literal placeholder, NOT the token: the child proxy resolves
             // it from its environment at config load. Nothing secret is
-            // written to disk, and this is the code path under test.
-            headers: { Authorization: 'Bearer ${GITHUB_TOKEN}' },
+            // written to disk, and this is the code path under test. Scenarios
+            // that need no credential get no headers block at all.
+            ...(opts.scenario.tokenEnv
+              ? { headers: { Authorization: `Bearer \${${opts.scenario.tokenEnv}}` } }
+              : {}),
             ...(opts.profile ? { profile: opts.profile } : {}),
           },
         },
@@ -366,20 +291,17 @@ async function main(): Promise<void> {
 
   console.log();
   console.log(bold('  Speculate live remote benchmark'));
-  console.log(dim(`  upstream ${opts.url}`));
-  console.log(
-    dim(`  repository ${opts.owner}/${opts.repo} · profile ${opts.profile ?? 'none (zero-config)'}`),
-  );
+  console.log(dim(`  ${opts.scenario.label} — ${opts.scenario.url}`));
   console.log();
 
   console.log(dim('  discovering tools and picking read-only targets…'));
-  const { tools, script: steps, issues, pull } = await discover(opts);
+  const { tools, script: steps, ctx } = await discover(opts);
   const readOnlyCount = tools.filter((t) => t.annotations?.readOnlyHint === true).length;
   const calls = steps.filter((s) => s.kind === 'call').length;
   console.log(
     dim(
-      `  ${tools.length} tools (${readOnlyCount} annotated read-only) · session: ${calls} calls, ` +
-        `issues #${issues.join(', #')}, PR #${pull}`,
+      `  ${tools.length} tools (${readOnlyCount} annotated read-only) · session: ${calls} calls · ` +
+        `${opts.scenario.describe(ctx)} · profile ${opts.profile ?? 'none (zero-config)'}`,
     ),
   );
   console.log();

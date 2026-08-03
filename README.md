@@ -14,7 +14,20 @@
 - **Read-only, always.** Speculation runs tools that are affirmatively read-only and nothing else.
 - **Nothing is taken away.** Every change goes through your client's own CLI, and `off` restores exactly.
 
-Against a real server (GitHub's hosted MCP, one machine, one network): once warm, 7 of 8 calls come from the buffer and tool wait drops from about 4.3 s to about 0.55 s. Getting there takes two or three passes through the same workflow, and the first pass gets no benefit at all, because nothing can be predicted before it has been seen once. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+Measured against real hosted servers rather than mocks. One machine, one network, three alternating off/on runs:
+
+| Server | Credential | Warm tool wait | Served from buffer | Wasted calls |
+|---|---|---|---|---|
+| GitHub hosted MCP | your token | 5.4 s to 0.6 s | 7 of 8 | 0 |
+| Hugging Face Hub | none needed | 258 ms to 10 ms | 6 of 6 | 0 |
+
+Both zero-config: no bundled profile matched either server, so this is what pointing Speculate at a URL gets you. The Hugging Face run needs no credential, so anyone can reproduce it:
+
+```bash
+SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario huggingface
+```
+
+Two honest caveats. **The first pass gets no benefit at all** and can measure slightly slower, because nothing is predictable before it has been seen once; it takes two or three passes through a workflow to warm up. And **the win scales with how slow the server is**, which is why the fast one saves a quarter of a second and the slow one saves five. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
 
 ## Install
 

@@ -713,6 +713,21 @@ A separate, smaller bug found on the way: the `projects` lookup was an exact str
 
 **Plugin-provided servers are a fifth row.** The same report showed six servers registered as `plugin:<plugin>:<server>`, including hosted HTTP ones (`plugin:github:github`, `plugin:sentry:sentry`) that are exactly the high-latency population Speculate exists for. They are declared in `<plugin-install-path>/.mcp.json` and interpolate `${CLAUDE_PLUGIN_ROOT}`. Speculate cannot currently wrap them, and the reason is not the same as row 4: there *is* a file, but it belongs to a plugin cache that Claude Code owns and rewrites on update, so an edit there would be silently reverted and would also desync the plugin's git checkout. Wrapping them needs a mechanism that does not exist yet, and is recorded here rather than attempted.
 
+### 13.24 A second non-mock measurement, on a server anyone can reach (2026-08-03)
+
+Every latency number in this document except §13.20's came from a mock with injected delay, and §13.20's needed a GitHub token, so nobody could reproduce it without one. `bench/remote.ts` now takes a `--scenario`, and `bench/scenarios.ts` holds the servers. Three alternating off/on runs each, zero-config (no bundled profile matched either server):
+
+| Server | Credential | Warm tool wait | Served from buffer | Waste |
+|---|---|---|---|---|
+| GitHub hosted MCP | token | 5.43 s -> 605 ms | 7 of 8 | 0 |
+| Hugging Face Hub | **none** | 258 ms -> 10 ms | 6 of 6 | 0 |
+
+The Hugging Face run is the more useful of the two despite the smaller absolute win, for three reasons. It needs no credential, so it is the first number here anybody can check. It is a *harder* prediction problem: the Hub returns MARKDOWN, so the learner cannot parse an id out of the previous result the way it can with JSON, and what is left is memorising arguments across repeats. And it makes the shape of the benefit unmissable, because the same code saves a quarter of a second here and five seconds on GitHub: **value scales with upstream latency**, exactly as §13.7 argued when the CLI tier was cut.
+
+Both runs reproduce the cold-start cost rather than hiding it. GitHub run 1 was 5.14 s off versus 5.00 s on (no benefit); Hugging Face run 1 was 248 ms off versus 271 ms on, i.e. **measurably slower**. Full warmth arrived only at run 3 in both. The headline is therefore always quoted warm-only and always beside that caveat.
+
+A finding from surveying candidates, worth recording because it bounds what this tool can ever do: of the open servers probed, **DeepWiki annotates no `readOnlyHint` at all**. Speculate speculates nothing there, correctly and by design, in either shipped mode. Cloudflare's docs server annotates both its tools but exposes only a single search entry point, so there is no list-then-detail transition to learn. A server has to both annotate and have a chained workflow before any of this machinery can help, and neither is guaranteed.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.

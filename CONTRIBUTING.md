@@ -14,12 +14,25 @@ corpus, with an adversarial floor as the control), `bench` measures
 **mechanics** (proxy overhead and cache hits against a mock with injected
 latency). Neither is a claim about a real server.
 
-For that there is a live benchmark, opt-in, needing a credential, and making
-read-only calls only:
+For that there is a live benchmark against real hosted servers. Opt-in, and
+read-only by construction: every tool it calls is checked against the server's
+own `readOnlyHint` annotation at run time, and anything not affirmatively
+read-only aborts before a single call is made.
 
 ```bash
+# needs no credential, so anyone can reproduce it
+SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario huggingface
+
+# needs a token, which is never written to disk (the config carries the
+# ${VAR} placeholder and the child proxy resolves it from its environment)
 SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
 ```
+
+Scenarios live in `bench/scenarios.ts`; adding one is a URL, the tools the
+session calls, and how to find real arguments for them. The bar for adding a
+server: it annotates those tools read-only, the workflow is a genuine
+list-then-detail shape (which is what speculation can act on), and the calls
+are few, because these hit somebody else's service.
 
 The test suite needs Node >= 20.19 (vitest's native rolldown binding; npm
 silently skips it on older Node). The floor for *using* Speculate is
