@@ -630,11 +630,43 @@ Warm sessions: **7 of 8 calls served from the buffer, 88% hit rate, 0 wasted spe
 
 **Three honest caveats, none of which the table above should be read without.**
 
-1. **Run 1 is a wash, and can be slower.** Across the three invocations the cold session went 3.71 s / 5.10 s / 4.11 s against baselines of 10.21 s / 4.01 s / 4.59 s: once clearly better, once 27% *worse*, once level. A cold learner has nothing armed, so speculation contributes upstream calls and no hits. This is the fail-closed design working (§5.3: an argument no source has produced is never fabricated), not a defect, but "Speculate makes your first session faster" is not a claim this data supports.
-2. **It takes two to three passes through the same workflow to arm.** `minObservations` is 2 and `MIN_TEMPLATE_EVIDENCE` is 4, so run 2 is partial (3.08 / 3.62 / 2.16 s) and run 3 is the first fully warm one. The benchmark shares one state file across a mode's runs precisely because that is what a real user experiences (persistence is on by default), and reporting only the cold number would understate the tool exactly as much as reporting only the warm one overstates it.
+1. **Run 1 is a wash, and can be slower.** Across the three invocations the cold session went 3.71 s / 5.10 s / 4.11 s against baselines of 10.21 s / 4.01 s / 4.59 s: once clearly better, once 27% *worse*, once level. A cold learner has nothing armed and issues **no speculative calls at all** (§13.21 measures this), so the cold arm is the baseline plus one proxy hop, and the spread above is dominated by the same network variance caveat 3 describes. This is the fail-closed design working (§5.3: an argument no source has produced is never fabricated), not a defect, but "Speculate makes your first session faster" is not a claim this data supports.
+2. **It takes two to three passes through the same workflow to arm.** Run 2 is partial (3.08 / 3.62 / 2.16 s) and run 3 is the first fully warm one. §13.21 traces this to the shape of the model rather than to a tunable: a transition does not exist until its follow-up call has been seen once. The benchmark shares one state file across a mode's runs precisely because that is what a real user experiences (persistence is on by default), and reporting only the cold number would understate the tool exactly as much as reporting only the warm one overstates it.
 3. **The baseline itself is noisy.** Off-mode totals ranged 3.68–10.21 s for an identical 8-call script; the 10.21 s outlier is the first run against a cold connection. The benchmark interleaves the arms and reports every run rather than a single pair for this reason. The measured per-call latency of this server, 320–780 ms, is also notably *worse* than the ~233 ms median that motivated the work, which strengthens the premise rather than weakening it.
 
 What this does **not** measure: a second concurrent user, a server with tighter rate limits than GitHub's, or a workflow that varies more between passes than this one does. And the §6.2 staleness caveat is if anything sharper against a live SaaS backend than against a mock: a teammate commenting on the issue between the prefetch and the read is invisible to invalidation, bounded only by the TTL.
+
+### 13.21 Why the first pass cannot be fast, and why no threshold fixes it (2026-08-02)
+
+§13.20 caveats 1 and 2 asserted a cause without checking it: that `minObservations` (2) and `MIN_TEMPLATE_EVIDENCE` (4) are what hold the cold session back, and that a cold run pays for wasted prefetches. Both claims were wrong, and the way to find that out was to replay §13.20's exact 8-call script (`list_issues`, four `issue_read`, `list_pull_requests`, two `pull_request_read`) through the real `TransitionLearner` and the real priming path, and count what `predict()` actually emits.
+
+**Priming does fire against this server.** `morphologicalPairs` over the hosted tool names yields `list_issues → issue_read` and `list_pull_requests → pull_request_read`. This was not obvious and is worth recording: the lister is *prefix*-form (`list_issues`, `LISTER_PREFIX`) while the getter is *suffix*-form (`issue_read`, `GETTER_SUFFIX`), and they only meet because `stemCandidates` bridges the plural — `issues → {issues, issue}` intersects `issue → {issue}`. Priming is doing real work here: it takes pass 2 from 1 of 7 predictable calls served to 3 of 7. It simply cannot help pass 1.
+
+**Pass 1 emits zero predictions**, and that is the whole answer. A transition is created by `observe()` at the moment its follow-up call arrives, which is strictly after the instant it would have had to predict. Priming lowers the *count* threshold to one sighting; it cannot make a transition exist before it has happened, and argument templates come only from real traffic by construction (§5.3). So the first occurrence of any transition is unpredictable no matter what the thresholds say. **Neither threshold is the gate**, and a cold run therefore issues no speculative upstream calls at all — the cold cost is one proxy hop, not wasted work.
+
+Both knobs were swept against `npm run eval` anyway, since "is 4 the right value" is a fair question independent of cold start. The floor is the control: it is adversarial, unpredictable traffic, so a *rise* in floor recall is the model finding structure in noise.
+
+| `MIN_TEMPLATE_EVIDENCE` | workflow recall@3 | workflow waste/hit | floor recall@3 | floor waste/hit |
+|---|---|---|---|---|
+| 1 | 0.8510 | 2.01 | 0.0833 | **39.88** |
+| 2 | 0.8510 | 2.01 | 0.0833 | **39.88** |
+| 3 | 0.8490 | 2.00 | 0.0833 | 23.72 |
+| **4 (shipped)** | **0.8463** | **2.00** | **0.0867** | **9.08** |
+| 5 | 0.8456 | 2.00 | 0.0867 | 9.08 |
+| 6 | 0.8449 | 1.99 | 0.0867 | 9.08 |
+| 8 | 0.8401 | 1.98 | 0.0867 | 9.08 |
+
+| `minObservations` | workflow recall@3 | workflow waste/hit | floor recall@3 | floor waste/hit |
+|---|---|---|---|---|
+| 1 | 0.8510 | 2.00 | **0.1367** | 22.41 |
+| **2 (shipped)** | **0.8463** | **2.00** | **0.0867** | **9.08** |
+| 3 | 0.8408 | 2.00 | 0.0467 | 9.21 |
+
+**Nothing changed.** Both shipped values sit exactly on the knee. Dropping `MIN_TEMPLATE_EVIDENCE` to 1 or 2 buys +0.005 workflow recall and multiplies floor waste by 4.4x; dropping `minObservations` to 1 buys the same +0.005 and lifts floor recall 58% (0.0867 → 0.1367) with 2.5x the floor waste. Both are the trade §13.17 named and refused: "a change that merely made the learner fire harder would have lifted the floor first", which is precisely what `minObservations = 1` does. Raising either only loses recall. And on the replayed live workflow, `MIN_TEMPLATE_EVIDENCE = 1` changes pass 1 from *0 hits, 0 calls issued* to *0 hits, 2 calls issued* — strictly worse, which is the cleanest possible demonstration that it was never the gate.
+
+Fidelity limit, stated so the numbers are not over-read: the replay uses synthetic result payloads, and reaches a steady state of 5 of 7 where the live run measured 7 of 7. The pass-1 conclusion does not depend on payload shape, because it follows from whether a transition exists at all.
+
+**The honest statement of cold-start behaviour**, which the README now carries too: it takes two to three passes through the same workflow before speculation is fully armed, the first pass gets no benefit, and a first session can measure slower than no speculation at all.
 
 ## v0.11 (2026-08-01): MCP-only focus
 

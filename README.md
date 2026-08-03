@@ -8,6 +8,8 @@ Speculative prefetching for coding agents. Speculate sits between your MCP clien
 
 The same workflow twice, against a mock server with injected latency. Reproduce with `npm run demo`.
 
+Against a real one: GitHub's hosted MCP server, an 8-call read-only session, one machine on one network. Once warm, 7 of the 8 calls are served from the buffer and total tool wait goes from about 4.3 s to about 0.55 s. Getting there takes two or three passes through the same workflow; the first pass gets no benefit and can come out slower than no speculation at all. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+
 ## Install
 
 ```bash
@@ -56,15 +58,11 @@ No install and no Claude Code required: prefix the server command already in you
   "command": "npx",
   "args": ["-y", "speculate-mcp", "wrap", "--", "github-mcp-server", "stdio"]
 }
-```
 
-Remote (hosted) MCP servers are where the latency actually is, and they need credentials:
-
-```jsonc
+// or a remote (hosted) server, which is where the latency actually is
 "github": {
   "command": "npx",
-  "args": ["-y", "speculate-mcp", "wrap",
-           "--url", "https://api.githubcopilot.com/mcp/",
+  "args": ["-y", "speculate-mcp", "wrap", "--url", "https://api.githubcopilot.com/mcp/",
            "--header", "Authorization: Bearer ${GITHUB_TOKEN}"]
 }
 ```
@@ -94,10 +92,10 @@ npm install     # builds dist/ via the prepare hook
 npm test        # unit and end-to-end suite
 npm run bench   # speculation off vs on, bundled mock upstream
 npm run eval    # offline prediction recall, headline and floor
-
-# against a REAL hosted MCP server (opt-in, needs a credential, read-only calls only)
-SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
 npm run demo    # the README demo, against the bundled mock
+
+# a REAL hosted MCP server (opt-in, needs a credential, read-only calls only)
+SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
 ```
 
 Running the test suite needs Node >= 20.19 (vitest's native rolldown binding; npm silently skips it on older Node). The runtime floor for *using* speculate is unchanged at Node >= 18.
