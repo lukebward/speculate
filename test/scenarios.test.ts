@@ -24,7 +24,7 @@ import {
   GITHUB_RULES,
   SLACK_ALLOW,
   SLACK_RULES,
-} from './mockRules.js';
+} from '../mock/rules.js';
 import type { ServerConfig, StatsReport } from '../src/types.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));

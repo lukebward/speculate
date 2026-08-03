@@ -9,6 +9,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GITHUB_ALLOW, GITHUB_RULES } from '../mock/rules.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -29,77 +30,6 @@ interface Harness {
 }
 
 const harnesses: Harness[] = [];
-
-/**
- * What the bundled `github` profile used to supply, expressed as config rules.
- *
- * Profiles were removed, so these tests source their predictions from the
- * declarative mechanism that survived. That is a better test of the pipeline
- * anyway: it proves speculate -> cache -> serve works from user-authored
- * rules, which is now the only hand-written prediction path.
- */
-const MOCK_RULES = [
-  {
-    trigger: 'get_issue',
-    predict: [
-      {
-        tool: 'get_issue_comments',
-        args: { owner: '$args.owner', repo: '$args.repo', issue_number: '$args.issue_number' },
-        confidence: 0.8,
-      },
-      {
-        tool: 'list_pull_requests',
-        args: { owner: '$args.owner', repo: '$args.repo', state: 'open' },
-        confidence: 0.6,
-      },
-    ],
-  },
-  {
-    trigger: 'list_pull_requests',
-    predict: [
-      {
-        tool: 'get_pull_request',
-        args: { owner: '$args.owner', repo: '$args.repo', pull_number: '$item.number' },
-        forEach: '$parsed',
-        limit: 2,
-        confidence: 0.5,
-      },
-    ],
-  },
-  {
-    trigger: 'get_pull_request',
-    predict: [
-      {
-        tool: 'get_pull_request_diff',
-        args: { owner: '$args.owner', repo: '$args.repo', pull_number: '$args.pull_number' },
-        confidence: 0.7,
-      },
-    ],
-  },
-  {
-    trigger: 'list_issues',
-    predict: [
-      {
-        tool: 'get_issue',
-        args: { owner: '$args.owner', repo: '$args.repo', issue_number: '$item.number' },
-        forEach: '$parsed',
-        limit: 2,
-        confidence: 0.45,
-      },
-    ],
-  },
-];
-
-/** The allowlist the profile used to contribute; `strict` needs it declared. */
-const MOCK_ALLOW = [
-  'get_issue',
-  'get_issue_comments',
-  'list_issues',
-  'list_pull_requests',
-  'get_pull_request',
-  'get_pull_request_diff',
-  'get_file_contents',
-];
 
 async function startProxy(
   mode: 'strict' | 'annotated' | 'off',
@@ -125,8 +55,8 @@ async function startProxy(
           },
           // `predict: false` leaves the server with no hand-written rules at
           // all, so only the learner can produce predictions.
-          ...(opts.predict === false ? {} : { rules: MOCK_RULES, allowTools: MOCK_ALLOW }),
-          ...(opts.rules ? { rules: opts.rules, allowTools: MOCK_ALLOW } : {}),
+          ...(opts.predict === false ? {} : { rules: GITHUB_RULES, allowTools: GITHUB_ALLOW }),
+          ...(opts.rules ? { rules: opts.rules, allowTools: GITHUB_ALLOW } : {}),
         },
       },
     }),

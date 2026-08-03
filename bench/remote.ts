@@ -25,9 +25,6 @@
  *   --runs N        alternating off/on session pairs (default 3)
  *   --owner OWNER   repository owner   (env SPECULATE_BENCH_OWNER)
  *   --repo REPO     repository name    (env SPECULATE_BENCH_REPO)
- *   --profile NAME  attach a vetted profile to the remote server
- *                   (env SPECULATE_BENCH_PROFILE); default: none, which is
- *                   what a user gets by simply pointing Speculate at the URL
  */
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -62,7 +59,6 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 interface Options {
   runs: number;
   scenario: Scenario;
-  profile: string | null;
   /** Empty when the scenario needs no credential. */
   token: string;
 }
@@ -114,11 +110,9 @@ function gate(): Options | null {
   }
 
   const runsRaw = Number(flag('runs') ?? 3);
-  const profile = flag('profile') ?? process.env['SPECULATE_BENCH_PROFILE'] ?? '';
   return {
     runs: Number.isFinite(runsRaw) && runsRaw >= 1 ? Math.floor(runsRaw) : 3,
     scenario,
-    profile: profile === '' || profile === 'none' ? null : profile,
     token,
   };
 }
@@ -213,7 +207,6 @@ async function runSession(
             ...(opts.scenario.tokenEnv
               ? { headers: { Authorization: `Bearer \${${opts.scenario.tokenEnv}}` } }
               : {}),
-            ...(opts.profile ? { profile: opts.profile } : {}),
           },
         },
       },
@@ -301,7 +294,7 @@ async function main(): Promise<void> {
   console.log(
     dim(
       `  ${tools.length} tools (${readOnlyCount} annotated read-only) · session: ${calls} calls · ` +
-        `${opts.scenario.describe(ctx)} · profile ${opts.profile ?? 'none (zero-config)'}`,
+        `${opts.scenario.describe(ctx)} · zero-config (prediction is learned)`,
     ),
   );
   console.log();

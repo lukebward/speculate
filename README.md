@@ -10,7 +10,7 @@
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.gif)
 
-- **No configuration.** Servers are recognized by their live tool lists, and the rest is learned from your own traffic.
+- **No configuration, and nothing per-server.** Prediction is learned from your own traffic, so it works the same on a server nobody has ever heard of.
 - **Read-only, always.** Speculation runs tools that are affirmatively read-only and nothing else.
 - **Nothing is taken away.** Every change goes through your client's own CLI, and `off` restores exactly.
 
@@ -19,13 +19,13 @@ Measured against real hosted MCP servers, not mocks. Three alternating off/on ru
 | Server | Auth | Warm tool wait | Cut |
 |---|---|---|---|
 | Context7 | none | 9.4 s to 3.1 s | -67% |
-| GitHub hosted MCP | token | 5.1 s to 1.5 s | -70% |
+| GitHub hosted MCP | token | 5.0 s to 1.6 s | -67% |
 | Microsoft Learn | none | 2.3 s to 1.1 s | -54% |
 | Hugging Face Hub | none | 259 ms to 139 ms | -46% |
 
 Zero wasted calls on any of them. The saving tracks how slow the server is, which is the whole point: a local stdio server answering in single-digit milliseconds has nothing worth hiding.
 
-**Warm** is the median of runs 2 and 3. The first pass gets no benefit at all and can measure slightly slower, because nothing is predictable before it has been seen once. The benchmark also repeats an identical session, so it is the best case for a workflow you actually repeat. Three of the four need no credential, so you can check them yourself:
+**Warm** is the median of runs 2 and 3. The first pass gets little or no benefit, because nothing is predictable before it has been seen once, and it takes two or three passes to warm up. The benchmark also repeats an identical session, so it is the best case for a workflow you actually repeat. Three of the four need no credential, so you can check them yourself:
 
 ```bash
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7

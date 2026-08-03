@@ -16,6 +16,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { resultText } from '../src/upstream.js';
 import type { StatsReport } from '../src/types.js';
+import { GITHUB_ALLOW, GITHUB_RULES } from '../mock/rules.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TSX = process.execPath;
@@ -82,7 +83,11 @@ async function runSession(mode: 'strict' | 'off', latencyMs: number): Promise<Ru
           command: TSX,
           args: [TSX_CLI, join(ROOT, 'mock', 'mock-github.ts')],
           env: { SPECULATE_MOCK_LATENCY_MS: String(latencyMs) },
-          profile: 'github',
+          // The vetted `github` profile used to supply these; profiles were
+          // removed, so the bench drives the same predictions through the
+          // config `rules` DSL, which is what a user actually has.
+          rules: GITHUB_RULES,
+          allowTools: GITHUB_ALLOW,
         },
       },
     }),
