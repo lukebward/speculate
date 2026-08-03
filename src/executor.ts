@@ -13,12 +13,10 @@ import type { SafetyPolicy } from './policy.js';
 import type { BudgetManager } from './budget.js';
 import type { Metrics } from './metrics.js';
 import { canonicalKey } from './keys.js';
-import { profileCanonicalizer, profileTtlMs } from './profiles/index.js';
 import { looksLikeAuthError, resultText, type Upstream } from './upstream.js';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import type {
   Prediction,
-  ServerProfile,
   SpeculateConfig,
 } from './types.js';
 
@@ -54,7 +52,6 @@ export class SpeculationExecutor {
       policy: SafetyPolicy;
       budget: BudgetManager;
       metrics: Metrics;
-      profiles: Record<string, ServerProfile>;
       config: SpeculateConfig;
       now?: () => number;
     },
@@ -101,7 +98,7 @@ export class SpeculationExecutor {
     p: Prediction,
     opts: { queueOnBusy: boolean },
   ): 'issued' | 'dropped' | 'busy' {
-    const { cache, policy, budget, metrics, profiles, upstreams } = this.deps;
+    const { cache, policy, budget, metrics, upstreams } = this.deps;
     const now = this.deps.now ?? Date.now;
 
     const upstream = upstreams.get(p.server);
@@ -122,10 +119,9 @@ export class SpeculationExecutor {
       return 'dropped';
     }
 
-    const profile = profiles[p.server];
     const key =
       p.key ??
-      canonicalKey(p.server, p.tool, p.args, profileCanonicalizer(profile, p.tool));
+      canonicalKey(p.server, p.tool, p.args);
     if (cache.has(key)) {
       this.suppress(p, 'dedup');
       return 'dropped';
@@ -224,8 +220,8 @@ export class SpeculationExecutor {
 
   /**
    * The TTL this prediction is fetched with (§6.2). Resolution order is
-   * unchanged — operator per-tool, profile per-tool, operator default,
-   * profile default, hardcoded fallback — and a long-horizon prediction then
+   * unchanged — operator per-tool, operator default, hardcoded fallback —
+   * and a long-horizon prediction then
    * gets a FRACTION of whatever won, so an operator's per-tool freshness
    * decision still sets the ceiling.
    */
@@ -234,17 +230,14 @@ export class SpeculationExecutor {
     tool: string,
     horizon: Prediction['horizon'],
   ): number {
-    const { profiles, config } = this.deps;
+    const { config } = this.deps;
     const serverCfg = config.servers[server];
-    const profile = profiles[server];
     const cfgByTool = serverCfg?.speculation?.ttlMsByTool;
     const operatorTtl =
       cfgByTool && Object.hasOwn(cfgByTool, tool) ? cfgByTool[tool] : undefined;
     const base =
       operatorTtl ?? // operator per-tool beats everything (incl. 0 = never)
-      profileTtlMs(profile, tool) ??
       serverCfg?.speculation?.defaultTtlMs ??
-      profile?.defaultTtlMs ??
       DEFAULT_TTL_MS;
     if (horizon !== 'standing' || base <= 0) return base; // 0 stays disabled
     const factor = serverCfg?.speculation?.longHorizonTtlFactor ?? LONG_HORIZON_TTL_FACTOR;

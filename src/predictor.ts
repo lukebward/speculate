@@ -13,7 +13,6 @@ import type {
   ObservedCall,
   Prediction,
   Rule,
-  ServerProfile,
 } from './types.js';
 
 /** Per-rule outcome counters consumed by the §5.6 feedback loop. */
@@ -30,15 +29,13 @@ export interface PredictorMetrics {
 }
 
 export interface PredictorOptions {
-  /** Profiles keyed by SERVER LABEL (the config name, e.g. 'github'). */
-  profiles: Record<string, ServerProfile>;
   /** Per-trigger prediction cap (§5.6). */
   maxPerTrigger: number;
   metrics: PredictorMetrics;
   /**
-   * Extra rules per server label (compiled from config `rules`), run
-   * alongside profile rules. Lets any server get predictions without a
-   * vetted profile.
+   * Declarative rules per server label, compiled from config `rules`. The
+   * only hand-written prediction source left; everything else comes from the
+   * learner, which needs no per-server code at all.
    */
   extraRules?: Record<string, Rule[]>;
   /**
@@ -77,24 +74,7 @@ interface ScoredPrediction {
   order: number;
 }
 
-/**
- * Stand-in profile for servers with no vetted profile: no rules or parsers
- * of its own, but result access still works via structuredContent and the
- * generic JSON-in-text fallback, and config rules / the learner still fire.
- */
-const GENERIC_PROFILE: ServerProfile = {
-  name: 'generic',
-  validatedAgainst: 'n/a',
-  readOnlyAllowlist: [],
-  defaultTtlMs: 30_000,
-  ttlMsByTool: {},
-  parsers: {},
-  canonicalizers: {},
-  rules: [],
-};
-
 export class Predictor {
-  private readonly profiles: Map<string, ServerProfile>;
   private readonly extraRules: Map<string, Rule[]>;
   private readonly learner: PredictorOptions['learner'];
   private readonly maxPerTrigger: number;
@@ -102,26 +82,17 @@ export class Predictor {
 
   constructor(opts: PredictorOptions) {
     // A Map avoids Object.prototype lookups for hostile server labels.
-    this.profiles = new Map(Object.entries(opts.profiles));
     this.extraRules = new Map(Object.entries(opts.extraRules ?? {}));
     this.learner = opts.learner;
     this.maxPerTrigger = opts.maxPerTrigger;
     this.metrics = opts.metrics;
   }
 
-  /** Late-bind a fingerprinted profile (§13.11). */
-  setProfile(server: string, profile: ServerProfile): void {
-    this.profiles.set(server, profile);
-  }
-
   observe(call: CompletedCall): Prediction[] {
-    const profile = this.profiles.get(call.server) ?? GENERIC_PROFILE;
-
-    // §5.1 result access: structuredContent first, profile parser second,
-    // generic JSON-in-text sniffing last (most servers serialize JSON into a
-    // text block), fail closed to null. A parse failure costs a prefetch,
-    // never correctness.
-    const { parsed, parserMiss } = parseResultDetail(profile, call.tool, call.result);
+    // §5.1 result access: structuredContent first, then generic JSON-in-text
+    // sniffing (most servers serialize JSON into a text block), fail closed
+    // to null. A parse failure costs a prefetch, never correctness.
+    const { parsed, parserMiss } = parseResultDetail(call.result);
     if (parserMiss) {
       this.metrics.record({
         type: 'parser_miss',
@@ -142,8 +113,8 @@ export class Predictor {
     };
 
     // §5.2 run every matching rule (contained), §5.6 feedback-weight the
-    // output. Profile rules and config-authored rules share one pipeline.
-    const rules: Rule[] = [...profile.rules, ...(this.extraRules.get(call.server) ?? [])];
+    // output. Config-authored rules and the learner share one pipeline.
+    const rules: Rule[] = this.extraRules.get(call.server) ?? [];
     const candidates: ScoredPrediction[] = [];
     let order = 0;
     for (const rule of rules) {
@@ -228,7 +199,7 @@ export class Predictor {
       }
     }
 
-    return this.selectBatch(profile, candidates, call.timestamp);
+    return this.selectBatch(candidates, call.timestamp);
   }
 
   /**
@@ -238,7 +209,7 @@ export class Predictor {
    */
   sessionStart(server: string): Prediction[] {
     if (!this.learner?.openerPredictions) return [];
-    const profile = this.profiles.get(server) ?? GENERIC_PROFILE;
+
     const candidates: ScoredPrediction[] = [];
     let order = 0;
     try {
@@ -267,7 +238,7 @@ export class Predictor {
     } catch {
       return [];
     }
-    return this.selectBatch(profile, candidates);
+    return this.selectBatch(candidates);
   }
 
   /**
@@ -276,13 +247,12 @@ export class Predictor {
    * instead of recomputing), rank by score, cap (§5.6), and record events.
    */
   private selectBatch(
-    profile: ServerProfile,
     candidates: ScoredPrediction[],
     timestamp?: number,
   ): Prediction[] {
     const byKey = new Map<string, ScoredPrediction>();
     for (const cand of candidates) {
-      const key = dedupeKey(profile, cand.prediction, cand.order);
+      const key = dedupeKey(cand.prediction, cand.order);
       if (!key.startsWith('\x00unkeyable:')) cand.prediction.key = key;
       const existing = byKey.get(key);
       if (!existing || cand.score > existing.score) byKey.set(key, cand);
@@ -323,40 +293,28 @@ export class Predictor {
  * when present and non-null; else the profile parser's output (null on
  * throw/null, i.e. fail closed); null when neither source exists.
  */
-export function parseResult(
-  profile: ServerProfile,
-  tool: string,
-  result: CallToolResult,
-): unknown | null {
-  return parseResultDetail(profile, tool, result).parsed;
+export function parseResult(result: CallToolResult): unknown | null {
+  return parseResultDetail(result).parsed;
 }
 
-function parseResultDetail(
-  profile: ServerProfile,
-  tool: string,
-  result: CallToolResult,
-): { parsed: unknown | null; parserMiss: boolean } {
+/**
+ * Server-agnostic by construction. Hand-written per-server parsers used to
+ * sit between these two branches, but every one of them did exactly what the
+ * generic fallback does, so removing them cost nothing and removed a thing
+ * that could rot when a server changed its envelope.
+ *
+ * `parserMiss` survives for config-declared parsing failures elsewhere; this
+ * path treats a non-JSON result as ordinary, not as a miss.
+ */
+function parseResultDetail(result: CallToolResult): {
+  parsed: unknown | null;
+  parserMiss: boolean;
+} {
   const structured: unknown = result.structuredContent;
   if (structured !== undefined && structured !== null) {
     return { parsed: structured, parserMiss: false };
   }
-  const parser = Object.prototype.hasOwnProperty.call(profile.parsers, tool)
-    ? profile.parsers[tool]
-    : undefined;
-  if (!parser) {
-    // Generic fallback (server-agnostic): most servers serialize JSON into a
-    // text block. A non-JSON result is normal here, so no parser_miss.
-    return { parsed: genericJsonText(result), parserMiss: false };
-  }
-  try {
-    const parsed = parser(result);
-    if (parsed === null || parsed === undefined) {
-      return { parsed: null, parserMiss: true };
-    }
-    return { parsed, parserMiss: false };
-  } catch {
-    return { parsed: null, parserMiss: true };
-  }
+  return { parsed: genericJsonText(result), parserMiss: false };
 }
 
 /** Best-effort JSON extraction from the first text block; null otherwise. */
@@ -417,21 +375,18 @@ function validatePrediction(raw: unknown, server: string, ruleId: string): Predi
 }
 
 /** Canonical key for in-batch dedupe; degrades rather than throws. */
-function dedupeKey(profile: ServerProfile, p: Prediction, order: number): string {
-  const canonicalizer = Object.prototype.hasOwnProperty.call(profile.canonicalizers, p.tool)
-    ? profile.canonicalizers[p.tool]
-    : undefined;
-  if (canonicalizer) {
-    try {
-      return canonicalKey(p.server, p.tool, p.args, canonicalizer);
-    } catch {
-      // Broken canonicalizer: fall back to the raw-args key below.
-    }
-  }
+function dedupeKey(p: Prediction, order: number): string {
+  // Raw args, no canonicalization. Per-server canonicalizers used to fold a
+  // missing argument into the server's default so both spellings shared a
+  // key; they were removed with profiles because guessing a default wrong
+  // does not merely miss a cache share, it serves one query's answer for
+  // another. The cost is a missed merge, which is the safe direction.
   try {
     return canonicalKey(p.server, p.tool, p.args);
   } catch {
-    // Unkeyable args (e.g. circular): opt this prediction out of dedupe.
-    return `\x00unkeyable:${order}`;
+    // Unkeyable args (cycles, exotic values): fall back to emission order so
+    // the prediction is still deduped against itself and nothing else.
+    return `${p.server}:${p.tool}:#${order}`;
   }
 }
+

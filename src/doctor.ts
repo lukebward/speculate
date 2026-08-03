@@ -8,14 +8,12 @@
  * speculation is enabled but zero tools are eligible).
  */
 import { SafetyPolicy } from './policy.js';
-import { detectProfile } from './profiles/index.js';
 import { morphologicalPairs } from './priming.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
-import { builtinProfiles } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
 import { StateStore } from './persistence.js';
 import { VERSION } from './version.js';
-import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
+import type { Rule, SpeculateConfig } from './types.js';
 import { readOAuthRecord } from './oauthStore.js';
 
 const CONNECT_TIMEOUT_MS = 15_000;
@@ -64,17 +62,10 @@ export async function runDoctor(
       }
     }
 
-    const profile: ServerProfile | undefined =
-      sc.profile && sc.profile !== 'none' ? builtinProfiles[sc.profile] : undefined;
-    if (sc.profile && sc.profile !== 'none' && !profile) {
-      out(bad(`unknown profile '${sc.profile}'`));
-      healthy = false;
-      continue;
-    }
 
     const policy = new SafetyPolicy(config.mode, {
       [name]: {
-        allowlist: [...(profile?.readOnlyAllowlist ?? []), ...(sc.allowTools ?? [])],
+        allowlist: [...(sc.allowTools ?? [])],
         denylist: sc.denyTools ?? [],
       },
     });
@@ -90,26 +81,6 @@ export async function runDoctor(
 
     policy.updateTools(name, upstream.tools);
     out(ok(`connected — ${upstream.tools.length} tools`));
-
-    // Mirror runtime fingerprinting (§13.11) so this report matches reality.
-    if (!profile && sc.profile !== 'none') {
-      const match = detectProfile(upstream.tools.map((t) => t.name));
-      if (match) {
-        if (config.mode === 'strict') {
-          out(
-            dim(
-              `looks like '${match.profile.name}' (${Math.round(match.score * 100)}% tool match) — add "profile": "${match.profile.name}" to enable its rules in strict mode`,
-            ),
-          );
-        } else {
-          out(
-            ok(
-              `will be recognized as '${match.profile.name}' at runtime (${Math.round(match.score * 100)}% tool match) — rules and priors apply automatically`,
-            ),
-          );
-        }
-      }
-    }
 
     const eligible: string[] = [];
     const blocked: { tool: string; reason: string }[] = [];
@@ -132,30 +103,22 @@ export async function runDoctor(
     }
 
     // Rules that can actually fire against this server's tools.
-    const rules: Rule[] = [
-      ...(profile?.rules ?? []),
-      ...(sc.rules?.length ? compileConfigRules(name, sc.rules) : []),
-    ];
+    const rules: Rule[] = sc.rules?.length ? compileConfigRules(name, sc.rules) : [];
     const toolNames = new Set(upstream.tools.map((t) => t.name));
     const armed = rules.filter((r) => toolNames.has(r.trigger));
     const orphaned = rules.filter((r) => !toolNames.has(r.trigger));
     if (rules.length > 0) {
-      out(ok(`${armed.length} prediction rule(s) armed${profile ? ` (profile '${profile.name}')` : ''}`));
+      out(ok(`${armed.length} config rule(s) armed`));
       for (const r of orphaned) {
         out(dim(`rule '${r.id}' never fires: server has no tool '${r.trigger}'`));
       }
     } else {
-      out(dim('no profile/config rules — relying on the transition learner'));
+      out(dim('no config rules — prediction comes from the transition learner'));
     }
 
     // §13.9 pre-loaded priors: what will predict after a single sighting.
     const toolNamesAll = upstream.tools.map((t) => t.name);
     const primes = new Set<string>();
-    for (const [prev, next] of profile?.primes ?? []) {
-      if (toolNames.has(prev) && toolNames.has(next) && policy.eligibility(name, next).eligible) {
-        primes.add(`${prev}→${next}`);
-      }
-    }
     for (const [prev, next] of morphologicalPairs(toolNamesAll)) {
       if (policy.eligibility(name, next).eligible) primes.add(`${prev}→${next}`);
     }
@@ -186,7 +149,7 @@ export async function runDoctor(
   if (config.mode !== 'off' && !anyEligible) {
     out('');
     out(bad('speculation is on but NO tools are eligible anywhere.'));
-    out(dim(`strict mode requires readOnlyHint annotations AND an allowlist (profile or allowTools);`));
+    out(dim(`strict mode requires readOnlyHint annotations AND an allowTools entry;`));
     out(dim(`use "mode": "annotated" for servers you trust to annotate honestly.`));
     healthy = false;
   }
@@ -201,7 +164,7 @@ function explain(reason: string, mode: string): string {
     return `tool does not declare readOnlyHint: true (write, or unannotated read)`;
   }
   if (reason === 'not-allowlisted') {
-    return `annotated read-only, but strict mode also needs it in allowTools/profile allowlist`;
+    return `annotated read-only, but strict mode also needs it in allowTools`;
   }
   if (reason === 'denylisted') return 'explicitly denied via denyTools';
   if (reason === 'mode-off') return 'speculation mode is off';

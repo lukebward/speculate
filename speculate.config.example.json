@@ -12,7 +12,6 @@
       "env": {
         "SPECULATE_MOCK_LATENCY_MS": "400"
       },
-      "profile": "github",
       "speculation": {
         "defaultTtlMs": 30000,
         "maxPerMinute": 30,

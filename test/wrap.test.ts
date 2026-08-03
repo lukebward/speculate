@@ -1,6 +1,8 @@
 /**
  * wrap.ts tests (DESIGN.md §13.9): parseWrapArgs flag handling and
- * buildWrapConfig assembly (profile autodetect, allowlist, state keys).
+ * buildWrapConfig assembly (allowlist, state keys). Vetted profiles were
+ * removed, so `--profile` is accepted and ignored: wrapped entries already
+ * written into people's MCP config must not start failing.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { buildWrapConfig, parseWrapArgs, type WrapArgs } from '../src/wrap.js';
@@ -34,11 +36,11 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
 describe('parseWrapArgs', () => {
   it('parses the happy path with flags before -- and a command after', () => {
     const args = ok(
-      parseWrapArgs(['--mode', 'strict', '--profile', 'github', '--allow', 'a, b', '--', 'github-mcp-server', 'stdio']),
+      parseWrapArgs(['--mode', 'strict', '--allow', 'a, b', '--', 'github-mcp-server', 'stdio']),
     );
     expect(args).toEqual({
       mode: 'strict',
-      profile: 'github',
+      profile: null,
       allow: ['a', 'b'],
       sniff: false,
       command: ['github-mcp-server', 'stdio'],
@@ -61,27 +63,26 @@ describe('parseWrapArgs', () => {
     );
   });
 
-  it('rejects an unknown --profile and lists the available ones', () => {
-    const e = err(parseWrapArgs(['--profile', 'gitlab', '--', 'srv']));
-    expect(e).toContain("unknown profile 'gitlab'");
-    expect(e).toContain('github');
-    expect(e).toContain('filesystem');
-  });
-
-  it("degrades a retired --profile shell instead of failing the wrap", () => {
-    // Same contract as a config file naming it (config.ts RETIRED_PROFILES):
-    // a ≤0.10 invocation still runs, profile-less, with one stderr warning.
-    // Failing here would break a wrapped server that works fine unprofiled.
+  it('accepts and ignores --profile, warning once', () => {
+    // A wrapped entry in someone's MCP config may still carry the flag from
+    // an older install; failing the launch would take their server down.
     const written: string[] = [];
-    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown): boolean => {
+    const orig = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string) => {
       written.push(String(chunk));
       return true;
-    });
-    const args = ok(parseWrapArgs(['--profile', 'shell', '--', 'srv']));
-    expect(args.profile).toBeNull();
-    expect(written.join('')).toContain("profile 'shell'");
-    expect(written.join('')).toContain('retired in 0.11');
-    vi.restoreAllMocks();
+    };
+    try {
+      const args = ok(parseWrapArgs(['--profile', 'github', '--', 'srv']));
+      expect(args.profile).toBeNull();
+    } finally {
+      (process.stderr as { write: unknown }).write = orig;
+    }
+    expect(written.join('')).toContain('no longer exists');
+  });
+
+  it('still requires a value after --profile', () => {
+    expect(err(parseWrapArgs(['--profile']))).toContain('--profile requires a name');
   });
 
   it('parses --allow csv: trims spaces, drops empties', () => {
@@ -122,23 +123,13 @@ describe('parseWrapArgs', () => {
 // --- buildWrapConfig ------------------------------------------------------------
 
 describe('buildWrapConfig', () => {
-  it('auto-detects the github profile from github-mcp-server anywhere in the command line', () => {
-    const { config } = buildWrapConfig(
-      mkArgs({ command: ['docker', 'run', 'ghcr.io/github/github-mcp-server', 'stdio'] }),
-    );
-    expect(config.servers['upstream']!.profile).toBe('github');
-  });
-
-  it('sets no profile when nothing matches', () => {
-    const { config } = buildWrapConfig(mkArgs({ command: ['my-server', 'stdio'] }));
-    expect('profile' in config.servers['upstream']!).toBe(false);
-  });
-
-  it('lets an explicit --profile win over autodetect', () => {
-    const { config } = buildWrapConfig(
-      mkArgs({ profile: 'filesystem', command: ['github-mcp-server', 'stdio'] }),
-    );
-    expect(config.servers['upstream']!.profile).toBe('filesystem');
+  it('never writes a profile into the built config', () => {
+    // Autodetect from the command line went with profiles; a wrapped
+    // github-mcp-server is predicted by the learner like anything else.
+    for (const command of [['github-mcp-server', 'stdio'], ['some-other-server']]) {
+      const { config } = buildWrapConfig(mkArgs({ command }));
+      expect('profile' in config.servers['upstream']!).toBe(false);
+    }
   });
 
   it('places the allow list in allowTools (and omits the key when empty)', () => {

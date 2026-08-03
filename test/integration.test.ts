@@ -30,9 +30,80 @@ interface Harness {
 
 const harnesses: Harness[] = [];
 
+/**
+ * What the bundled `github` profile used to supply, expressed as config rules.
+ *
+ * Profiles were removed, so these tests source their predictions from the
+ * declarative mechanism that survived. That is a better test of the pipeline
+ * anyway: it proves speculate -> cache -> serve works from user-authored
+ * rules, which is now the only hand-written prediction path.
+ */
+const MOCK_RULES = [
+  {
+    trigger: 'get_issue',
+    predict: [
+      {
+        tool: 'get_issue_comments',
+        args: { owner: '$args.owner', repo: '$args.repo', issue_number: '$args.issue_number' },
+        confidence: 0.8,
+      },
+      {
+        tool: 'list_pull_requests',
+        args: { owner: '$args.owner', repo: '$args.repo', state: 'open' },
+        confidence: 0.6,
+      },
+    ],
+  },
+  {
+    trigger: 'list_pull_requests',
+    predict: [
+      {
+        tool: 'get_pull_request',
+        args: { owner: '$args.owner', repo: '$args.repo', pull_number: '$item.number' },
+        forEach: '$parsed',
+        limit: 2,
+        confidence: 0.5,
+      },
+    ],
+  },
+  {
+    trigger: 'get_pull_request',
+    predict: [
+      {
+        tool: 'get_pull_request_diff',
+        args: { owner: '$args.owner', repo: '$args.repo', pull_number: '$args.pull_number' },
+        confidence: 0.7,
+      },
+    ],
+  },
+  {
+    trigger: 'list_issues',
+    predict: [
+      {
+        tool: 'get_issue',
+        args: { owner: '$args.owner', repo: '$args.repo', issue_number: '$item.number' },
+        forEach: '$parsed',
+        limit: 2,
+        confidence: 0.45,
+      },
+    ],
+  },
+];
+
+/** The allowlist the profile used to contribute; `strict` needs it declared. */
+const MOCK_ALLOW = [
+  'get_issue',
+  'get_issue_comments',
+  'list_issues',
+  'list_pull_requests',
+  'get_pull_request',
+  'get_pull_request_diff',
+  'get_file_contents',
+];
+
 async function startProxy(
   mode: 'strict' | 'annotated' | 'off',
-  opts: { profile?: boolean | 'omit'; rules?: unknown[]; statePath?: string } = {},
+  opts: { predict?: boolean; rules?: unknown[]; statePath?: string } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'speculate-itest-'));
   const callLogPath = join(dir, 'calls.jsonl');
@@ -52,14 +123,10 @@ async function startProxy(
             SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
           },
-          // 'none' opts out of profiles AND §13.11 fingerprinting; 'omit'
-          // leaves the field absent so fingerprinting can run.
-          ...(opts.profile === false
-            ? { profile: 'none' }
-            : opts.profile === 'omit'
-              ? {}
-              : { profile: 'github' }),
-          ...(opts.rules ? { rules: opts.rules } : {}),
+          // `predict: false` leaves the server with no hand-written rules at
+          // all, so only the learner can produce predictions.
+          ...(opts.predict === false ? {} : { rules: MOCK_RULES, allowTools: MOCK_ALLOW }),
+          ...(opts.rules ? { rules: opts.rules, allowTools: MOCK_ALLOW } : {}),
         },
       },
     }),
@@ -251,7 +318,7 @@ describe('speculate end-to-end', () => {
   }, 30_000);
 
   it('unprofiled server + annotated mode: the learner earns speculation from repetition', async () => {
-    const { client } = await startProxy('annotated', { profile: false });
+    const { client } = await startProxy('annotated', { predict: false });
     // Two observations of the get_issue → get_issue_comments transition…
     for (const n of [41, 42]) {
       await timedCall(client, 'get_issue', { ...REPO, issue_number: n });
@@ -273,7 +340,7 @@ describe('speculate end-to-end', () => {
 
   it('unprofiled server + config rules: declarative speculation, including forEach', async () => {
     const { client } = await startProxy('annotated', {
-      profile: false,
+      predict: false,
       rules: [
         {
           trigger: 'get_issue',
@@ -327,7 +394,7 @@ describe('speculate end-to-end', () => {
     const statePath = join(stateDir, 'state.json');
 
     // Session 1: teach the learner the transition, then shut down cleanly.
-    const first = await startProxy('annotated', { profile: false, statePath });
+    const first = await startProxy('annotated', { predict: false, statePath });
     for (const n of [41, 42]) {
       await timedCall(first.client, 'get_issue', { ...REPO, issue_number: n });
       await timedCall(first.client, 'get_issue_comments', { ...REPO, issue_number: n });
@@ -337,7 +404,7 @@ describe('speculate end-to-end', () => {
     await first.client.close();
 
     // Session 2, same state file: the FIRST trigger already prefetches.
-    const second = await startProxy('annotated', { profile: false, statePath });
+    const second = await startProxy('annotated', { predict: false, statePath });
     await timedCall(second.client, 'get_issue', { ...REPO, issue_number: 43 });
     await sleep(LATENCY_MS * 3 + 200);
     const warm = await timedCall(second.client, 'get_issue_comments', {
@@ -352,7 +419,7 @@ describe('speculate end-to-end', () => {
   }, 60_000);
 
   it('persistence disabled: no state file is written', async () => {
-    const { client } = await startProxy('annotated', { profile: false });
+    const { client } = await startProxy('annotated', { predict: false });
     await timedCall(client, 'get_issue', { ...REPO, issue_number: 42 });
     await timedCall(client, 'get_issue_comments', { ...REPO, issue_number: 42 });
     await sleep(1_500);
@@ -362,21 +429,14 @@ describe('speculate end-to-end', () => {
     expect(stats.realCalls).toBeGreaterThanOrEqual(2);
   }, 30_000);
 
-  it('fingerprinting: an unconfigured server is recognized in annotated mode', async () => {
-    const { client } = await startProxy('annotated', { profile: 'omit' });
-    await timedCall(client, 'get_issue', { ...REPO, issue_number: 42 });
-    await sleep(LATENCY_MS * 3 + 200);
-    const followUp = await timedCall(client, 'get_issue_comments', {
-      ...REPO,
-      issue_number: 42,
-    });
-    expect(followUp.ms).toBeLessThan(LATENCY_MS * 0.5); // profile rule prefetched it
-    const stats = await readStats(client);
-    expect(stats.perRule.some((r) => r.ruleId === 'gh:issue→comments')).toBe(true);
-  }, 30_000);
+  // The fingerprinting test that lived here asserted a server was recognized
+  // by its tool list and had a vetted profile's rules applied automatically.
+  // Both the recognition and the profiles are gone; the case it protected
+  // (an unconfigured server still earning speculation) is covered by the
+  // learner test above, which needs no per-server knowledge at all.
 
-  it('fingerprinting: strict mode only suggests, never auto-applies', async () => {
-    const { client, callLogPath } = await startProxy('strict', { profile: 'omit' });
+  it('strict mode with no allowTools speculates nothing at all', async () => {
+    const { client, callLogPath } = await startProxy('strict', { predict: false });
     await timedCall(client, 'get_issue', { ...REPO, issue_number: 42 });
     await sleep(LATENCY_MS * 3 + 200);
     const followUp = await timedCall(client, 'get_issue_comments', {

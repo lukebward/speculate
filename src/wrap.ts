@@ -14,7 +14,6 @@
  * the wrapped command line), known servers auto-matched to vetted profiles.
  */
 import { RETIRED_PROFILES, resolveHeaderValue } from './config.js';
-import { builtinProfiles } from './profiles/index.js';
 import type { SpeculateConfig, SpeculationMode } from './types.js';
 
 export interface WrapArgs {
@@ -40,11 +39,6 @@ export interface WrapArgs {
   headers: Record<string, string>;
 }
 
-/** Substring → vetted profile, checked against the wrapped command line. */
-const PROFILE_AUTODETECT: [string, string][] = [
-  ['github-mcp-server', 'github'],
-];
-
 export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
   const out: WrapArgs = {
     mode: 'annotated',
@@ -69,6 +63,9 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       }
       out.mode = m;
     } else if (a === '--profile') {
+      // Accepted and ignored: vetted profiles were removed, and failing an
+      // invocation over a flag that used to work would break wrapped entries
+      // already written into people's MCP config.
       const p = argv[++i];
       if (!p) return { error: '--profile requires a name' };
       out.profile = p;
@@ -127,20 +124,13 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
   if (!out.url && Object.keys(out.headers).length > 0) {
     return { error: '--header applies to --url servers only (a stdio server takes env vars)' };
   }
-  if (out.profile && RETIRED_PROFILES.has(out.profile)) {
-    // Same contract a config file gets (config.ts): a ≤0.10 invocation naming
-    // a profile 0.11 retired must not lose the user a working server. Warn,
-    // drop the profile — the server is then fingerprinted like any unprofiled
-    // one — and carry on.
+  if (out.profile) {
     process.stderr.write(
-      `[speculate] warning: profile '${out.profile}' was retired in 0.11 with CLI ` +
-        `speculation — ignoring it (drop the --profile flag).\n`,
+      `[speculate] warning: --profile '${out.profile}' no longer exists and is ignored. ` +
+        `Prediction is learned per server; use a config file's "rules" for hand-written ones.
+`,
     );
     out.profile = null;
-  } else if (out.profile && out.profile !== 'none' && !Object.hasOwn(builtinProfiles, out.profile)) {
-    return {
-      error: `unknown profile '${out.profile}' (available: ${Object.keys(builtinProfiles).join(', ')}, none)`,
-    };
   }
   return out;
 }
@@ -148,12 +138,6 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
 /** Build the in-memory SpeculateConfig for a wrap invocation. */
 export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stateKey: string } {
   const commandLine = args.command.join(' ');
-  const profile =
-    args.profile ??
-    // Autodetect reads the command line; a remote server has none, and is
-    // fingerprinted from its tool list at runtime instead (§13.11).
-    (args.url ? null : PROFILE_AUTODETECT.find(([needle]) => commandLine.includes(needle))?.[1]) ??
-    null;
   // The state key must NEVER carry the headers: it names the on-disk state
   // file. The URL alone identifies the upstream.
   const upstream = args.url
@@ -170,7 +154,6 @@ export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stat
       servers: {
         upstream: {
           ...upstream,
-          ...(profile ? { profile } : {}),
           ...(args.allow.length ? { allowTools: args.allow } : {}),
         },
       },

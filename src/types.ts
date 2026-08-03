@@ -94,30 +94,6 @@ export type ArgsCanonicalizer = (
   args: Record<string, unknown>,
 ) => Record<string, unknown>;
 
-/** A vetted server profile (DESIGN.md §4, §5.1, §6.1). */
-export interface ServerProfile {
-  name: string;
-  /** Upstream server release(s) this profile was validated against. */
-  validatedAgainst: string;
-  /** Tools affirmatively known read-only (the `strict`-mode allowlist). */
-  readOnlyAllowlist: string[];
-  defaultTtlMs: number;
-  /** Per-tool TTL overrides; 0 means "never speculate on this tool". */
-  ttlMsByTool: Record<string, number>;
-  /** Per-tool result parsers (§5.1). */
-  parsers: Record<string, ResultParser>;
-  /** Per-tool argument canonicalizers (§6.1). */
-  canonicalizers: Record<string, ArgsCanonicalizer>;
-  rules: Rule[];
-  /**
-   * Pre-loaded transition priors (§13.9): (prevTool, nextTool) pairs the
-   * learner arms after a SINGLE sighting instead of two. Curated product
-   * knowledge that then adapts to the individual user via the normal
-   * learn/suppress/persist loop.
-   */
-  primes?: Array<[string, string]>;
-}
-
 // ---------------------------------------------------------------------------
 // Cache (DESIGN.md §6)
 // ---------------------------------------------------------------------------
@@ -304,20 +280,24 @@ export interface ServerConfig {
    * silently shadow a valid token and present as an inexplicable 401.
    */
   oauthStorePath?: string;
-  /** Built-in profile name (e.g. 'github'). */
+  /**
+   * Accepted and ignored. Vetted per-server profiles were removed; the field
+   * stays in the type so an older config still LOADS (config.ts warns and
+   * drops it) rather than failing a working setup over a dead line.
+   */
   profile?: string;
   /**
    * Declarative prediction rules (validated by configRules.ts) so ANY
    * server gets speculation without a vetted profile.
    */
   rules?: import('./configRules.js').ConfigRuleSpec[];
-  /** Extra allowlist entries beyond the profile's. */
+  /** Tools the operator vouches for; the whole `strict`-mode allowlist. */
   allowTools?: string[];
-  /** Denylist: never speculate on these, regardless of mode/profile. */
+  /** Denylist: never speculate on these, regardless of mode. */
   denyTools?: string[];
   speculation?: {
     defaultTtlMs?: number;
-    /** Per-tool TTL overrides (operator wins over profile); 0 disables. */
+    /** Per-tool TTL overrides; 0 disables. */
     ttlMsByTool?: Record<string, number>;
     /**
      * TTL multiplier for long-horizon ('standing') predictions, in (0,1].

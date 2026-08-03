@@ -1,7 +1,7 @@
 /**
- * Config loading: a ≤0.10 config naming the retired 'shell' profile must
- * degrade to a profile-less server (its healthy siblings keep working), while
- * a genuinely typo'd profile still fails loudly at load.
+ * Config loading. Vetted profiles were removed, so a `profile` field from an
+ * older config is accepted and ignored rather than fatal: the server it names
+ * still works, predicted by the learner and by any config `rules`.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -25,31 +25,34 @@ afterEach(() => {
 });
 
 describe('loadConfig', () => {
-  it("degrades a retired 'shell' profile instead of failing the whole config", () => {
-    const path = writeConfig({
-      servers: {
-        github: { command: 'gh-server', profile: 'github' },
-        workspace: { command: 'speculate-shell', profile: 'shell' },
-      },
-    });
+  it('ignores a profile from an older config instead of failing the whole file', () => {
+    // Vetted profiles were removed. A config still naming one must LOAD --
+    // taking a working setup down over a dead field would be the worse
+    // failure -- and say so once on stderr.
     const written: string[] = [];
-    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown): boolean => {
+    const orig = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string) => {
       written.push(String(chunk));
       return true;
-    });
+    };
+    let cfg;
+    try {
+      cfg = loadConfig(
+        writeConfig({
+          servers: {
+            github: { command: 'gh-server', profile: 'github' },
+            workspace: { command: 'other', profile: 'anything-at-all' },
+          },
+        }),
+      );
+    } finally {
+      (process.stderr as { write: unknown }).write = orig;
+    }
 
-    const cfg = loadConfig(path);
-
-    expect(Object.keys(cfg.servers).sort()).toEqual(['github', 'workspace']);
+    expect(cfg.servers['github']?.profile).toBeUndefined();
     expect(cfg.servers['workspace']?.profile).toBeUndefined();
-    expect(cfg.servers['github']?.profile).toBe('github'); // healthy sibling intact
-    expect(written.join('')).toContain("profile 'shell'");
-    expect(written.join('')).toContain('retired in 0.11');
-  });
-
-  it('still rejects a genuinely unknown profile', () => {
-    const path = writeConfig({ servers: { github: { command: 'gh', profile: 'gitlab' } } });
-    expect(() => loadConfig(path)).toThrow(/unknown profile 'gitlab'/);
+    expect(Object.keys(cfg.servers).sort()).toEqual(['github', 'workspace']);
+    expect(written.join('')).toContain('no longer exists');
   });
 
   it('loads a pre-0.14 config (no headers anywhere) unchanged', () => {

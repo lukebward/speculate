@@ -10,7 +10,6 @@ import type {
   Prediction,
   ResultParser,
   Rule,
-  ServerProfile,
 } from '../src/types.js';
 
 // --- fixtures ---------------------------------------------------------------
@@ -37,18 +36,14 @@ const jsonTextParser: ResultParser = (result) => {
   }
 };
 
-function makeProfile(overrides: Partial<ServerProfile>): ServerProfile {
-  return {
-    name: 'fakeprof',
-    validatedAgainst: 'test fixture',
-    readOnlyAllowlist: [],
-    defaultTtlMs: 1_000,
-    ttlMsByTool: {},
-    parsers: {},
-    canonicalizers: {},
-    rules: [],
-    ...overrides,
-  };
+/**
+ * Rules for one server. Was a full `ServerProfile`; profiles are gone, and
+ * declarative config rules are the only hand-written prediction source left,
+ * so a rule list is the whole fixture. `parsers` and `canonicalizers` used to
+ * be settable here too and no longer exist anywhere.
+ */
+function makeProfile(overrides: { rules?: Rule[] }): Rule[] {
+  return overrides.rules ?? [];
 }
 
 interface Feedback {
@@ -71,14 +66,14 @@ function makeMetrics(feedback: Record<string, Feedback> = {}) {
 }
 
 function setup(
-  profile: ServerProfile,
+  rules: Rule[],
   opts: { maxPerTrigger?: number; feedback?: Record<string, Feedback> } = {},
 ) {
   const metrics = makeMetrics(opts.feedback);
   const predictor = new Predictor({
-    profiles: { [SERVER]: profile },
     maxPerTrigger: opts.maxPerTrigger ?? 3,
     metrics,
+    extraRules: { [SERVER]: rules },
   });
   const observe = (tool: string, args: Record<string, unknown>, result: CallToolResult) =>
     predictor
@@ -135,7 +130,6 @@ describe('Predictor.observe', () => {
       predict: () => [pred('never', {}, 1, 'r-other')],
     };
     const profile = makeProfile({
-      parsers: { list: jsonTextParser },
       rules: [resultRule, otherTrigger, argRule('r-alt', 'list', 'meta', 0.5)],
     });
     const { observe, metrics } = setup(profile);
@@ -151,7 +145,11 @@ describe('Predictor.observe', () => {
     expect(metrics.events.filter((e) => e.type === 'predicted')).toHaveLength(3);
   });
 
-  it('fails closed on parser failure: result rules silent, arg rules fire, one parser_miss', () => {
+  it('fails closed on unparseable output: result rules silent, arg rules still fire', () => {
+    // With per-server parsers gone, a non-JSON body is ORDINARY rather than a
+    // parser failure, so it produces no `parser_miss`. What must not change is
+    // the containment: a rule that needs `parsed` sees null and stays quiet
+    // while a rule reading only trigger args is unaffected.
     const resultRule: Rule = {
       id: 'r-items',
       trigger: 'list',
@@ -163,7 +161,6 @@ describe('Predictor.observe', () => {
       },
     };
     const profile = makeProfile({
-      parsers: { list: jsonTextParser },
       rules: [resultRule, argRule('r-alt', 'list', 'meta', 0.5)],
     });
     const { observe, metrics } = setup(profile);
@@ -171,9 +168,7 @@ describe('Predictor.observe', () => {
     const out = observe('list', { scope: 'x' }, textResult('{not-json'));
 
     expect(out).toEqual([pred('meta', { scope: 'x' }, 0.5, 'r-alt')]);
-    const misses = metrics.events.filter((e) => e.type === 'parser_miss');
-    expect(misses).toHaveLength(1);
-    expect(misses[0]).toMatchObject({ server: SERVER, tool: 'list' });
+    expect(metrics.events.filter((e) => e.type === 'parser_miss')).toHaveLength(0);
     expect(metrics.events.filter((e) => e.type === 'predicted')).toHaveLength(1);
   });
 
@@ -205,7 +200,6 @@ describe('Predictor.observe', () => {
       predict: (call) => [pred('echo', { seen: call.parsed }, 0.7, 'r-echo')],
     };
     const profile = makeProfile({
-      parsers: { list: jsonTextParser },
       rules: [echoRule],
     });
     const { observe, metrics } = setup(profile);
@@ -300,10 +294,11 @@ describe('Predictor.observe', () => {
   });
 
   it('dedupes within a batch on canonical key, keeping the higher-scored prediction', () => {
+    // Args are compared as-is now. Per-tool canonicalizers used to fold a
+    // missing argument into a server default so two spellings shared a key;
+    // they went with profiles, because guessing a default wrong serves one
+    // query's answer for another. Identical args still collapse.
     const profile = makeProfile({
-      canonicalizers: {
-        get: (args) => ({ ...args, mode: args.mode ?? 'full' }),
-      },
       rules: [
         {
           id: 'r-one',
@@ -313,9 +308,8 @@ describe('Predictor.observe', () => {
         {
           id: 'r-two',
           trigger: 'list',
-          // {id:'X', mode:'full'} canonicalizes to the same key as {id:'X'}.
           predict: () => [
-            pred('get', { id: 'X', mode: 'full' }, 0.8, 'r-two'),
+            pred('get', { id: 'X' }, 0.8, 'r-two'),
             pred('get', { id: 'Y' }, 0.2, 'r-two'),
           ],
         },
@@ -502,45 +496,31 @@ describe('prediction horizon passes through validation', () => {
 });
 
 describe('parseResult', () => {
-  const profile = makeProfile({
-    parsers: {
-      list: jsonTextParser,
-      boom: () => {
-        throw new Error('parser exploded');
-      },
-    },
-  });
-
   it('returns structuredContent when present and non-null', () => {
     const r: CallToolResult = { content: [], structuredContent: { a: 1 } };
-    expect(parseResult(profile, 'list', r)).toEqual({ a: 1 });
+    expect(parseResult(r)).toEqual({ a: 1 });
   });
 
-  it('falls back to the parser when structuredContent is null', () => {
+  it('falls back to text sniffing when structuredContent is null', () => {
     const r = {
       content: [{ type: 'text', text: '{"b":2}' }],
       structuredContent: null,
     } as unknown as CallToolResult;
-    expect(parseResult(profile, 'list', r)).toEqual({ b: 2 });
+    expect(parseResult(r)).toEqual({ b: 2 });
   });
 
-  it('uses the parser when structuredContent is absent', () => {
-    expect(parseResult(profile, 'list', jsonResult([1, 2]))).toEqual([1, 2]);
+  it('sniffs JSON out of a text block when structuredContent is absent', () => {
+    expect(parseResult(jsonResult([1, 2]))).toEqual([1, 2]);
   });
 
-  it('returns null when the parser throws', () => {
-    expect(parseResult(profile, 'boom', textResult('anything'))).toBeNull();
+  it('returns null for a body that is not JSON', () => {
+    expect(parseResult(textResult('{nope'))).toBeNull();
+    expect(parseResult(textResult('plain prose'))).toBeNull();
   });
 
-  it('returns null when the parser fails to parse', () => {
-    expect(parseResult(profile, 'list', textResult('{nope'))).toBeNull();
-  });
-
-  it('falls back to generic JSON-in-text parsing with no vetted parser', () => {
-    expect(parseResult(profile, 'unknown_tool', textResult('{"a":1}'))).toEqual({ a: 1 });
-    expect(parseResult(profile, 'unknown_tool', textResult('plain prose'))).toBeNull();
-    expect(
-      parseResult(profile, 'unknown_tool', { content: [{ type: 'text', text: '{"a":1}' }], isError: true }),
-    ).toBeNull();
+  it('parses any tool, since nothing is per-tool any more', () => {
+    // Previously a tool with no vetted parser fell to a generic path; now
+    // there is only the generic path, so every tool behaves identically.
+    expect(parseResult(textResult('{"a":1}'))).toEqual({ a: 1 });
   });
 });

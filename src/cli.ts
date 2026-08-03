@@ -56,7 +56,6 @@ manual wrapping:
 
 wrap flags (before the '--'):
   --mode <mode>       strict|annotated|off (default for wrap: annotated)
-  --profile <name>    force a vetted profile (auto-detected for known servers)
   --allow <t1,t2>     extra read-only allowlist entries
   --sniff             engage only if the client speaks MCP; else byte-transparent pipe
   --url <url>         wrap a remote http MCP server instead of a child process
@@ -83,7 +82,6 @@ const STARTER_CONFIG = `{
       "command": "github-mcp-server",
       "args": ["stdio"],
       "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." },
-      "profile": "github",
     },
   },
   // "persistence": { "enabled": false },

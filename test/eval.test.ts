@@ -15,7 +15,6 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { builtinProfiles } from '../src/profiles/index.js';
 import {
   ARCHETYPES,
   FLOOR_ARCHETYPES,
@@ -484,29 +483,13 @@ describe('waste accounting', () => {
 // --- the corpus must not be shaped to the hand-written rules ------------------
 
 describe('corpus independence', () => {
-  it('shares no tool name or server label with any built-in profile', () => {
-    const forbidden = new Set<string>();
-    for (const profile of Object.values(builtinProfiles)) {
-      for (const tool of profile.readOnlyAllowlist) forbidden.add(tool);
-      for (const rule of profile.rules) forbidden.add(rule.trigger);
-      for (const prime of profile.primes ?? []) for (const tool of prime) forbidden.add(tool);
-    }
-    expect(forbidden.size).toBeGreaterThan(0);
-    const labels = new Set(Object.keys(builtinProfiles));
-    for (const archetype of ARCHETYPES) {
-      for (const session of archetype.sessions(1)) {
-        expect(labels.has(session.server), `${archetype.name}: ${session.server}`).toBe(
-          false,
-        );
-        for (const call of session.calls) {
-          expect(forbidden.has(call.tool), `${archetype.name}: ${call.tool}`).toBe(false);
-        }
-      }
-    }
-  });
+  // The "shares no tool name with any built-in profile" test lived here to
+  // prove the eval was not quietly measuring hand-written rules. Built-in
+  // profiles are gone, so that independence is structural now and the test
+  // has nothing left to assert.
 
   it('never assumes the agent opens the top of a list', () => {
-    // The one assumption the hand-written `gh:pr-list->pr` rule encodes. Every
+    // An assumption a hand-written rule would be tempted to encode. Every
     // workflow archetype opens something other than row 0 in a good share of
     // its sessions, so a corpus-wide "just predict element 0" shortcut cannot
     // score well here.

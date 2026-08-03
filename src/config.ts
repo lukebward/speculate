@@ -5,7 +5,6 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { parseJsonc } from './jsonc.js';
 import { configRuleSpecSchema } from './configRules.js';
-import { builtinProfiles } from './profiles/index.js';
 import type { SpeculateConfig } from './types.js';
 
 /**
@@ -141,11 +140,21 @@ const configSchema = z.object({
 });
 
 /**
- * Profiles that existed in ≤0.10 and no longer do. Referencing one is a
- * warning, not a fatal: the rest of the config still loads. Shared with
- * `speculate wrap --profile` (wrap.ts), which degrades the same way.
+ * Vetted per-server profiles were removed entirely: they were hand-written
+ * code that rotted silently (GitHub's hosted server renamed its tools and the
+ * bundled profile simply stopped matching, with nothing failing), and
+ * measurement showed the generic learner delivered the bulk of the benefit
+ * without any of it. A config still naming one loads fine; the field is
+ * ignored with a warning rather than being a fatal error, because taking a
+ * working setup down over a dead field would be the worse failure.
  */
-export const RETIRED_PROFILES: ReadonlySet<string> = new Set(['shell']);
+export const RETIRED_PROFILES: ReadonlySet<string> = new Set([
+  'shell',
+  'github',
+  'filesystem',
+  'slack',
+  'none',
+]);
 
 export function parseConfig(raw: unknown): SpeculateConfig {
   const result = configSchema.safeParse(raw);
@@ -198,24 +207,19 @@ export function loadConfig(path: string): SpeculateConfig {
   if (Object.keys(cfg.servers).length === 0) {
     throw new Error(`config ${path}: at least one upstream server is required`);
   }
-  // Catch typo'd profile names here so `validate` catches them, not just run.
-  // 'none' is the explicit opt-out from profiles AND fingerprinting (§13.11).
+  // A `profile` from an older config is ignored, not fatal: prediction now
+  // comes from the learner and from config `rules`, neither of which needs a
+  // profile name to work. Failing a working setup over a dead field would be
+  // the worse outcome.
   for (const [name, sc] of Object.entries(cfg.servers)) {
-    if (sc.profile && RETIRED_PROFILES.has(sc.profile)) {
-      // A ≤0.10 config naming a profile 0.11 retired must not take the
-      // user's healthy servers down with it: warn, drop the profile (the
-      // server is then fingerprinted like any unprofiled one), carry on.
+    if (sc.profile) {
       process.stderr.write(
-        `[speculate] warning: config ${path}: server '${name}' uses profile '${sc.profile}', ` +
-          `retired in 0.11 with CLI speculation — ignoring it (delete that line).\n`,
+        `[speculate] warning: config ${path}: server '${name}' sets "profile": ` +
+          `"${sc.profile}", which no longer exists - ignoring it (delete that line). ` +
+          `Prediction is learned per server now; use "rules" for hand-written ones.
+`,
       );
       delete (sc as { profile?: string }).profile;
-      continue;
-    }
-    if (sc.profile && sc.profile !== 'none' && !Object.hasOwn(builtinProfiles, sc.profile)) {
-      throw new Error(
-        `config ${path}: server '${name}' references unknown profile '${sc.profile}' (available: ${Object.keys(builtinProfiles).join(', ')})`,
-      );
     }
   }
   return cfg;

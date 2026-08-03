@@ -27,14 +27,13 @@ import { Metrics } from './metrics.js';
 import { Predictor } from './predictor.js';
 import { TransitionLearner } from './learner.js';
 import { SpeculationExecutor } from './executor.js';
-import { builtinProfiles, detectProfile, profileCanonicalizer } from './profiles/index.js';
 import { compileConfigRules } from './configRules.js';
 import { morphologicalPairs } from './priming.js';
 import { StateStore } from './persistence.js';
 import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
-import type { Rule, ServerProfile, SpeculateConfig } from './types.js';
+import type { Rule, SpeculateConfig } from './types.js';
 import type { UsageRecorder } from './usage.js';
 
 const STATS_TOOL = 'speculate__stats';
@@ -61,14 +60,12 @@ export class SpeculateProxy {
 
   private readonly server: Server;
   private readonly config: SpeculateConfig;
-  private readonly profiles: Record<string, ServerProfile> = {};
   private readonly now: () => number;
   private routes = new Map<string, Route>();
   private sweeper: NodeJS.Timeout | null = null;
   private initialized = false;
   private closing = false;
   private readonly learner: TransitionLearner;
-  private readonly noProfile = new Set<string>();
   private readonly store: StateStore | null;
   private readonly usageRecorder: UsageRecorder | null;
   private saveTimer: NodeJS.Timeout | null = null;
@@ -88,18 +85,6 @@ export class SpeculateProxy {
     this.now = opts.now ?? Date.now;
     this.usageRecorder = opts.usageRecorder ?? null;
     const now = this.now;
-
-    // Per-server profile resolution (config profile name -> builtin profile).
-    // 'none' explicitly opts a server out of profiles and fingerprinting.
-    for (const [name, sc] of Object.entries(config.servers)) {
-      if (sc.profile === 'none') {
-        this.noProfile.add(name);
-      } else if (sc.profile) {
-        const profile = builtinProfiles[sc.profile];
-        if (!profile) throw new Error(`unknown profile '${sc.profile}' for server '${name}'`);
-        this.profiles[name] = profile;
-      }
-    }
 
     this.metrics = new Metrics({
       mode: config.mode,
@@ -124,10 +109,10 @@ export class SpeculateProxy {
         Object.entries(config.servers).map(([name, sc]) => [
           name,
           {
-            allowlist: [
-              ...(this.profiles[name]?.readOnlyAllowlist ?? []),
-              ...(sc.allowTools ?? []),
-            ],
+            // Operator-declared only. Built-in profiles used to contribute
+            // an allowlist here; with them gone, `strict` means exactly what
+            // its name says -- tools the operator listed themselves.
+            allowlist: [...(sc.allowTools ?? [])],
             denylist: sc.denyTools ?? [],
           },
         ]),
@@ -174,7 +159,6 @@ export class SpeculateProxy {
     }
 
     this.predictor = new Predictor({
-      profiles: this.profiles,
       maxPerTrigger: config.maxPredictionsPerTrigger,
       metrics: this.metrics,
       extraRules,
@@ -188,7 +172,6 @@ export class SpeculateProxy {
       policy: this.policy,
       budget: this.budget,
       metrics: this.metrics,
-      profiles: this.profiles,
       config,
       now,
     });
@@ -311,7 +294,6 @@ export class SpeculateProxy {
         try {
           await up.connect();
           this.policy.updateTools(up.name, up.tools);
-          this.fingerprintProfile(up);
           this.primeLearner(up);
           up.setToolsChangedHandler(() => this.handleUpstreamToolsChanged(up));
           up.setDisconnectHandler(() => this.handleUpstreamDisconnect(up));
@@ -464,43 +446,11 @@ export class SpeculateProxy {
     // §3.4: flush that server's entries and re-run eligibility on new tools.
     this.policy.updateTools(up.name, up.tools);
     this.cache.invalidateServer(up.name);
-    this.fingerprintProfile(up);
     this.primeLearner(up);
     this.rebuildRoutes();
     this.notifyToolListChanged();
   }
 
-  /**
-   * §13.11 dynamic profile detection: when no profile is configured, match
-   * the LIVE tool list against builtin profiles' allowlists — a server is
-   * recognized by what it serves, not by how it was launched (dockerized
-   * or renamed github-mcp-server still fingerprints). Applying a profile
-   * only ever adds vetted read-only knowledge: allowlist entries, rules,
-   * TTLs, canonicalizers, primes.
-   */
-  private fingerprintProfile(up: Upstream): void {
-    if (this.profiles[up.name] || this.noProfile.has(up.name)) return;
-    const match = detectProfile(up.tools.map((t) => t.name));
-    if (!match) return;
-    if (this.config.mode === 'strict') {
-      // Strict means EXPLICIT operator consent: recognition is only a hint,
-      // never an allowlist. (Auto-applying here would let a server earn
-      // strict-mode speculation by naming its tools like a known profile.)
-      process.stderr.write(
-        `[speculate] ${up.name}: looks like '${match.profile.name}' (${Math.round(match.score * 100)}% tool match) — add "profile": "${match.profile.name}" to enable its rules in strict mode\n`,
-      );
-      this.noProfile.add(up.name); // don't repeat the hint on tools_changed
-      return;
-    }
-    // Annotated/off: apply rules, TTLs, canonicalizers, and primes. NOT the
-    // allowlist — eligibility stays annotation-based, and a name-colliding
-    // unannotated write must keep triggering §6.2 mutation invalidation.
-    this.profiles[up.name] = match.profile; // shared record: executor/router see it
-    this.predictor.setProfile(up.name, match.profile);
-    process.stderr.write(
-      `[speculate] ${up.name}: recognized as '${match.profile.name}' (${Math.round(match.score * 100)}% tool match) — profile applied\n`,
-    );
-  }
 
   /**
    * §13.9 pre-loaded priors: profile-curated pairs plus lister→getter
@@ -512,11 +462,11 @@ export class SpeculateProxy {
     const present = new Set(names);
     const eligibleTarget = (tool: string): boolean =>
       this.policy.eligibility(up.name, tool).eligible;
-    for (const [prev, next] of this.profiles[up.name]?.primes ?? []) {
-      if (present.has(prev) && present.has(next) && eligibleTarget(next)) {
-        this.learner.prime(up.name, prev, next);
-      }
-    }
+    // Name morphology only. Hand-written per-server primes lived here too;
+    // they are gone with profiles, and this derivation covers the same
+    // list-then-detail shape without any per-server code (it finds
+    // `list_issues -> issue_read` on GitHub's hosted server, which no
+    // hand-written list had).
     for (const [prev, next] of morphologicalPairs(names)) {
       if (eligibleTarget(next)) this.learner.prime(up.name, prev, next);
     }
@@ -647,13 +597,12 @@ export class SpeculateProxy {
     let latencyMs = 0;
 
     if (isReadOnly) {
-      const profile = this.profiles[server];
       let key: string;
       try {
-        key = canonicalKey(server, tool, args, profileCanonicalizer(profile, tool));
+        key = canonicalKey(server, tool, args);
       } catch {
-        // A broken canonicalizer must never fail a real call (§3.3): fall
-        // back to the raw-args key (worst case: a cache miss).
+        // Unkeyable args must never fail a real call (§3.3): fall back to
+        // the raw-args key (worst case: a cache miss).
         key = canonicalKey(server, tool, args);
       }
       const found = this.cache.lookup(key);

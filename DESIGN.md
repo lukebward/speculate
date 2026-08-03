@@ -734,6 +734,20 @@ Every run reproduces the cold-start cost rather than hiding it. GitHub run 1 was
 
 Findings from surveying candidates, worth recording because they bound what this tool can ever do. **DeepWiki, GitMCP and grep.app annotate no `readOnlyHint` at all**, so Speculate speculates nothing against any of them, correctly and by design, in either shipped mode. Cloudflare's docs server annotates both its tools but exposes a single search entry point, so there is no list-then-detail transition to learn. Cloudflare Radar and Chroma require credentials. A server has to annotate its read-only tools AND expose a chained workflow before any of this machinery can help; of the candidates probed, more failed that bar than passed it.
 
+### 13.25 Vetted profiles removed (2026-08-03)
+
+Asked whether the mock's examples were realistic. They were not, and chasing that turned up a shipped defect which in turn argued the whole subsystem away.
+
+**The defect.** GitHub's hosted server consolidated its per-operation readers into two tools discriminated by a `method` argument (`get_issue` -> `issue_read {method:'get'}`, `get_pull_request_diff` -> `pull_request_read {method:'get_files'}`). Only 3 of the `github` profile's 7 allowlisted tools survive there, which is 0.43 against a 0.6 fingerprint threshold, so `detectProfile` returned NO MATCH. Every hosted-GitHub user ran with no vetted rules at all. Nothing failed, no test caught it, and the bundled mock still used the classic names and matched at 100%, so `npm run bench` exercised a rules path no real GitHub user had. **Profiles rot silently, and the benchmark hid the rot.**
+
+**The measurement that settled it.** A `github-hosted` profile was written and did work: the cold run went 5.65 s off versus 1.60 s on, where before it had been 5.14 s versus 5.00 s, i.e. no benefit. So profiles buy cold start, and buy it decisively, because vetted rules fire on first sighting where the learner must observe a transition before predicting it. But three benchmark servers (Context7, Microsoft Learn, Hugging Face) match no profile, never have, and reach -67%, -54% and -46% on the learner alone. And `morphologicalPairs` already derives `list_issues -> issue_read` generically from tool names, including on the hosted server that no hand-written list covered. What a profile uniquely supplied was ARGUMENTS: the `method: 'get'` constant, `issue_number` versus `pullNumber`, the `issues` envelope.
+
+**The trade, taken deliberately.** Cold start on servers somebody had written code for, against ~1,700 lines, a silent-rot failure mode, and a correctness hazard: per-tool canonicalizers folded a missing argument into a server's default, and a default guessed wrong does not merely miss a cache share, it serves one query's answer for another. The learner needs no per-server code, cannot go stale, and covers every server rather than four.
+
+What went: `src/profiles/` entirely, `detectProfile` fingerprinting, per-tool parsers and canonicalizers, `ServerProfile`, `--profile`, and the `profile` config field (accepted and ignored now, never fatal, because failing a working setup over a dead field is the worse outcome). What stayed: the config `rules` DSL, `morphologicalPairs` priming, and the generic JSON-in-text parsing that every deleted parser was a copy of.
+
+**Two costs worth naming, since neither is zero.** `strict` mode now takes its allowlist only from `allowTools`, which is what the name always implied but used to be softened by a profile. And a server answering in NON-JSON TEXT loses result-derived prediction entirely: the filesystem mock returns newline-joined paths, the old profile shipped a parser to split them, and the `rules` DSL copies values rather than computing them. Such servers keep memorisation across repeats and nothing else, which S10 now asserts directly rather than papering over.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.

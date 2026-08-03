@@ -17,6 +17,14 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import {
+  FILESYSTEM_ALLOW,
+  FILESYSTEM_RULES,
+  GITHUB_ALLOW,
+  GITHUB_RULES,
+  SLACK_ALLOW,
+  SLACK_RULES,
+} from './mockRules.js';
 import type { ServerConfig, StatsReport } from '../src/types.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -88,11 +96,23 @@ const MOCK_SERVERS = {
   slack: 'mock-slack.ts',
 } as const;
 
+const RULES_FOR: Record<string, unknown[]> = {
+  github: GITHUB_RULES,
+  filesystem: FILESYSTEM_RULES,
+  slack: SLACK_RULES,
+};
+const ALLOW_FOR: Record<string, string[]> = {
+  github: GITHUB_ALLOW,
+  filesystem: FILESYSTEM_ALLOW,
+  slack: SLACK_ALLOW,
+};
+
 async function startProxy(
   opts: {
     mode?: 'strict' | 'annotated' | 'off';
     server?: keyof typeof MOCK_SERVERS;
-    profile?: string;
+    /** false = no hand-written rules at all, so only the learner predicts. */
+    predict?: boolean;
     speculation?: ServerConfig['speculation'];
     /** Enables persistence at this path (default: hermetic, no state). */
     statePath?: string;
@@ -118,7 +138,12 @@ async function startProxy(
             SPECULATE_MOCK_LATENCY_MS: String(L),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
           },
-          profile: opts.profile ?? server,
+          // Vetted profiles used to supply these. They are gone; the same
+          // predictions now come from the config `rules` DSL, which is what a
+          // user would actually write (test/mockRules.ts).
+          ...(opts.predict === false
+            ? {}
+            : { rules: RULES_FOR[server], allowTools: ALLOW_FOR[server] }),
           ...(opts.speculation ? { speculation: opts.speculation } : {}),
         },
       },
@@ -464,9 +489,9 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
       call('get_issue_comments', { ...REPO, issue_number: n }),
     ]);
 
-    const off = await startProxy({ mode: 'off', profile: 'none' });
+    const off = await startProxy({ mode: 'off', predict: false });
     const offRun = await runScript(off.client, script);
-    const on = await startProxy({ mode: 'annotated', profile: 'none' });
+    const on = await startProxy({ mode: 'annotated', predict: false });
     const onRun = await runScript(on.client, script);
     const stats = await readStats(on.client);
 
@@ -640,34 +665,44 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
     ).toBe(true);
   }, 120_000);
 
-  it('S10 filesystem profile: listing/search flows meet the §10 criteria (v0.10)', async () => {
-    const script = [
+  it('S10 filesystem: a text-only server earns hits from repetition (v0.10)', async () => {
+    // This was "the filesystem profile meets the §10 criteria", driven by a
+    // vetted rule that read `list_directory` output. It cannot be that any
+    // more, and the reason is worth pinning: the filesystem mock answers in
+    // NEWLINE-JOINED TEXT, not JSON, so there is nothing to parse a path out
+    // of. The old profile shipped a custom parser to split those lines;
+    // profiles are gone and the config `rules` DSL copies values rather than
+    // computing them, so no declarative rule can reach inside that text.
+    //
+    // What survives is memorisation: the learner recognises the repeated
+    // transition itself and replays the argument it saw last time. That is
+    // the real behaviour a text-only server gets now, so it is what the test
+    // asserts.
+    // The SAME file each time, deliberately. With no parseable result the
+    // only argument source left is memorising the value itself, so a target
+    // that alternates has no stable source and stays unpredictable. Revisiting
+    // one file is the shape a text-only server can actually support.
+    const script = [1, 2, 3, 4].flatMap(() => [
       call('list_directory', { path: '/ws/src' }),
-      think(600), // fs:list→read prefetches the first files
+      think(500),
       call('read_text_file', { path: '/ws/src/app.ts' }),
-      think(400),
-      call('read_text_file', { path: '/ws/src/util.ts' }),
-      think(400),
-      call('search_files', { path: '/ws', pattern: 'limiter' }),
-      think(600), // fs:search→read prefetches the match
-      call('read_text_file', { path: '/ws/src/lib/limiter.ts' }),
-      think(400),
-    ];
+    ]);
 
-    const off = await startProxy({ mode: 'off', server: 'filesystem' });
+    const off = await startProxy({ mode: 'off', server: 'filesystem', predict: false });
     const offRun = await runScript(off.client, script);
-    const on = await startProxy({ mode: 'strict', server: 'filesystem' });
+    const on = await startProxy({ mode: 'annotated', server: 'filesystem', predict: false });
     const onRun = await runScript(on.client, script);
     const stats = await readStats(on.client);
 
-    const eligible = stats.hits + stats.joins + stats.misses;
-    const hitRate = ((stats.hits + stats.joins) / eligible) * 100;
-    const reduction = (1 - onRun.toolWaitMs / offRun.toolWaitMs) * 100;
-    record('filesystem profile', stats, onRun.toolWaitMs, offRun.toolWaitMs, 'new vetted profile');
+    const curve = onRun.perCall.filter((c) => c.tool === 'read_text_file').map((c) => c.ms);
+    console.log(
+      `  S10 filesystem learner curve: ${curve.map((ms, i) => `#${i + 1} ${fmtMs(ms)}`).join(' · ')}`,
+    );
+    record('filesystem learner', stats, onRun.toolWaitMs, offRun.toolWaitMs, 'text-only server');
 
-    expect(hitRate, 'hit rate ≥ 40%').toBeGreaterThanOrEqual(40);
-    expectToolWaitReduction(reduction, stats.estimatedSavedMs, 'tool-wait reduction ≥ 30%');
-    expect(stats.wastePerHit ?? 0).toBeLessThanOrEqual(2);
+    expect(curve[0]!, 'iteration 1 is cold (live)').toBeGreaterThanOrEqual(LIVE_MS);
+    expect(curve[2]!, 'the repeat is prefetched').toBeLessThan(HIT_MS);
+    expect(stats.perRule.some((r) => r.ruleId.startsWith('learned:'))).toBe(true);
   }, 120_000);
 
   it('S11 slack profile: channel/thread/user flows meet the §10 criteria (v0.10)', async () => {
