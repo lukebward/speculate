@@ -12,6 +12,10 @@ import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 import { Upstream, friendlySpawnError } from '../src/upstream.js';
 import { runDoctor } from '../src/doctor.js';
+import { canonicalServerUrl, writeOAuthRecord } from '../src/oauthStore.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { SpeculateConfig } from '../src/types.js';
 
 const TOKEN = 'ghp_super_secret_token_value';
@@ -135,5 +139,38 @@ describe('doctor with an authenticated http upstream', () => {
     expect(out).toContain('X-Api-Version');
     expect(out).toContain('redacted');
     expect(out).not.toContain(TOKEN);
+  }, 30_000);
+
+  it('reports OAuth authorization and expiry, but never the token', async () => {
+    // "Is this server using my `speculate auth` login, and when does it run
+    // out?" is the question a 401 sends someone here to answer.
+    const dir = mkdtempSync(join(tmpdir(), 'speculate-doctor-'));
+    const storePath = join(dir, 'oauth.json');
+    const url = 'http://127.0.0.1:1/mcp';
+    const ACCESS = 'access-token-that-must-not-be-printed';
+    try {
+      writeOAuthRecord(storePath, url, {
+        serverUrl: canonicalServerUrl(url),
+        client: { client_id: 'c' },
+        tokens: { access_token: ACCESS, token_type: 'Bearer' },
+        expiresAt: Date.now() + 45 * 60_000,
+      });
+      const config: SpeculateConfig = {
+        mode: 'annotated',
+        maxPredictionsPerTrigger: 3,
+        log: 'stderr',
+        servers: { remote: { url, oauthStorePath: storePath } },
+      };
+      const lines: string[] = [];
+
+      await runDoctor(config, null, (line) => lines.push(line));
+
+      const out = lines.join('\n');
+      expect(out).toContain("authorized via 'speculate auth'");
+      expect(out).toMatch(/valid for 4[45] min/);
+      expect(out).not.toContain(ACCESS);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 30_000);
 });

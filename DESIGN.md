@@ -668,6 +668,37 @@ Fidelity limit, stated so the numbers are not over-read: the replay uses synthet
 
 **The honest statement of cold-start behaviour**, which the README now carries too: it takes two to three passes through the same workflow before speculation is fully armed, the first pass gets no benefit, and a first session can measure slower than no speculation at all.
 
+### 13.22 The four kinds of MCP server, and which ones Speculate can reach (2026-08-02)
+
+Auto-wrap (§13.19) made "which servers get wrapped" a question with a real answer, and the answer was uncomfortable: **we wrapped most of what is fast and little of what is slow.** Sorting every way a server can reach a host:
+
+| | How the host reaches it | Reachable? |
+|---|---|---|
+| 1 | stdio, local child process | yes, and wrapped since v0.1. Low value: single-digit ms |
+| 2 | streamable HTTP, token in the config entry | yes, since v0.14 (§13.20) |
+| 3 | streamable HTTP, OAuth held by the host | **yes, as of this section** |
+| 4 | claude.ai connector | **no, permanently** |
+
+Row 3 is where the latency actually is: Sentry, Notion and Linear are all OAuth-protected, and none of them carries a token in `~/.claude.json`.
+
+**Row 4 was tested, not assumed, and is closed.** A `SessionStart` hook of type `mcp_tool` does successfully call a claude.ai connector with the host's own auth and does get real data back, but the host discards it (`Hook JSON output had unrecognized keys (ignored): …`), an A/B with sentinel tokens confirmed the result never reaches the model, and the connectors are fetched *after* session-start hooks run (hook at 01:21:58.240, `[claudeai-mcp] Fetched 6 servers` at 01:21:58.620). More fundamentally these servers have no local config entry, and rewriting local config is Speculate's entire insertion mechanism. There is nothing to rewrite. OAuth does not help: holding our own Notion token does not put us between the host and a connector the host talks to directly.
+
+**A bug found on the way in, and the rule that fixes it.** A row-3 entry is *byte-identical* to an unauthenticated self-hosted one: `{"type":"http","url":"…"}` either way. `planRemoteWrap` called that wrappable, so `on` and the unattended session-start hook would rewrite it, and the wrapped proxy would connect with no credential and 401. A server that worked yesterday would fail today with no user action to blame. Config shape cannot answer the question, so the rule is now **ask the server**: one MCP `initialize` with exactly the credentials the wrapped proxy would send, before any config is touched, and wrap only on a definite yes (`src/remoteProbe.ts`). `${VAR}` is resolved for the probe the same way the proxy resolves it, or the placeholder itself earns the 401. Cost is one round trip per *new* remote server; already-wrapped servers return earlier, so steady-state `sync` pays nothing.
+
+**Row 3: our own OAuth client, not the host's token.** Borrowing the access token out of `~/.claude/.credentials.json` is the obvious zero-friction move and it is wrong twice. It buys exactly one token lifetime unless Speculate also takes over refresh; and once it does, on any server that rotates refresh tokens the first refresh invalidates the host's copy and breaks the user's real connection. It is also platform-contingent (that file exists on Windows; macOS uses the Keychain). So Speculate registers itself (RFC 7591), verified working unauthenticated against `mcp.sentry.dev` and `mcp.notion.com`, and discovery resolves cleanly against Sentry, Notion and Linear through our own code path.
+
+The friction is held to one browser click: `speculate auth` with no argument authorizes every server that needs one, and nothing else has to be run afterwards, because the store is keyed by URL and consulted at proxy startup. A server that has not been authorized is left working and unwrapped, with the fixing command named in the log line.
+
+**Expiry is ours, because the SDK has none.** `Date.now()` appears nowhere in the SDK's auth or transport code, so it learns a token is dead only by sending a request and reading the 401 — and `_hasCompletedAuthFlow` makes the retry after that a *one-shot* circuit breaker. For a prefetcher that is a correctness bug rather than an inefficiency: a speculative call burns the single retry and the user's real call behind it fails outright. `tokens()` therefore refreshes ahead of expiry (120 s skew), which works because the transport awaits `tokens()` on every outbound request. Single-flight in-process, and under a cross-process lock that **re-reads inside the lock** — without that re-read two proxies both refresh, and against a rotating server the loser holds a token the server already invalidated.
+
+Three smaller things that each have a specific failure behind them:
+
+- **Every candidate loopback port is registered at once.** Neither Sentry nor Notion returns a `registration_access_token`, so RFC 7592 client management is unavailable and a registration can never be updated or deleted. Registering only the bound port would strand a dead client on the authorization server every time the port changed.
+- **An `Authorization` header alongside a stored token is a startup error.** `streamableHttp.js` spreads `requestInit.headers` *after* the bearer it derives from the provider, so the hand-set header wins silently and presents as a 401 from a token that is perfectly valid and never sent.
+- **The callback promise is marked handled at creation.** `auth()` opens the browser from inside `connect()`, so a fast redirect rejects that promise while `connect` is still unwinding. An unhandled rejection in that window terminates the process on Node >= 15.
+
+**Two limits stated rather than papered over.** The SDK puts the resource server's advertised `scopes_supported` ahead of the client's own, so on Sentry our token carries `project:write team:write event:write`. That is the same scope set the host already holds, not a widening, and Speculate never *exercises* it: the policy layer only ever executes affirmatively read-only tools. Narrowing was rejected because Sentry advertises no `project:read`, so a narrowed token would break reads. Separately, `mode: 0o600` is a **verified no-op on Windows** (Node writes 666; protection comes only from the `%LOCALAPPDATA%` ACL). `doctor` says so rather than implying a guarantee that is not there.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.
