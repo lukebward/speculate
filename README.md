@@ -8,7 +8,7 @@ Speculative prefetching for coding agents. Speculate sits between your MCP clien
 
 The same workflow twice, against a mock server with injected latency. Reproduce with `npm run demo`.
 
-Against a real one: GitHub's hosted MCP server, an 8-call read-only session, one machine on one network. Once warm, 7 of the 8 calls are served from the buffer and total tool wait goes from about 4.3 s to about 0.55 s. Getting there takes two or three passes through the same workflow; the first pass gets no benefit and can come out slower than no speculation at all. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+Against a real one: GitHub's hosted MCP server, an 8-call read-only session, one machine on one network. Once warm, 7 of the 8 calls are served from the buffer and total tool wait goes from about 4.3 s to about 0.55 s. Getting there takes two or three passes through the same workflow. The first pass gets no benefit at all: nothing can be predicted before it has been seen once, so that run pays one proxy hop and issues no speculative calls. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
 
 ## Install
 
