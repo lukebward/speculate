@@ -14,7 +14,7 @@ import type { SpeculateConfig } from './types.js';
  * `${VAR:-default}` is NOT matched, so it stays a literal rather than
  * silently resolving to something the user did not intend.
  */
-const ENV_PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+export const ENV_PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 /**
  * RFC 9110 field-name token. Anything else is rejected at load.
  *

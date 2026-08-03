@@ -180,6 +180,42 @@ export function isStdioEntry(entry: McpServerEntry): boolean {
  */
 export const HOST_HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
+/**
+ * `${VAR}` placeholder, duplicated from config.ts ENV_PLACEHOLDER for the same
+ * reason as HOST_HEADER_NAME above, and pinned to it by the same test.
+ */
+export const HOST_ENV_PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/**
+ * The header values a wrapped entry would really send, with `${VAR}` resolved
+ * exactly as the proxy resolves it at startup.
+ *
+ * Needed because the probe must present the SAME credentials the wrapped proxy
+ * will: probing with a literal `${GITHUB_TOKEN}` earns a 401 and would make us
+ * skip a server that works perfectly. An unset variable is reported rather
+ * than substituted, matching config.ts's fail-loud contract — and it is the
+ * NAME that comes back, never a value.
+ */
+export function resolveWrapHeaders(
+  headers: [string, string][],
+  env: Record<string, string | undefined> = process.env,
+): { ok: true; headers: Record<string, string> } | { ok: false; missing: string } {
+  const out: Record<string, string> = {};
+  for (const [name, raw] of headers) {
+    let missing: string | null = null;
+    out[name] = raw.replace(HOST_ENV_PLACEHOLDER, (_m, variable: string) => {
+      const value = env[variable];
+      if (value === undefined || value === '') {
+        missing ??= variable;
+        return '';
+      }
+      return value;
+    });
+    if (missing) return { ok: false, missing };
+  }
+  return { ok: true, headers: out };
+}
+
 export type RemoteWrapPlan =
   | { wrappable: true; url: string; headers: [string, string][] }
   | { wrappable: false; reason: string };

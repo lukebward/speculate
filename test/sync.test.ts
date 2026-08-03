@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { effectiveServerHash, speculateOff, speculateOn, type CmdRunner } from '../src/manage.js';
 import { speculateSync } from '../src/sync.js';
 import { readClaudeServers } from '../src/hostConfig.js';
+import type { RemoteProbe, RemoteProber } from '../src/remoteProbe.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
 
@@ -45,6 +46,8 @@ beforeEach(() => {
   calls = [];
   logs = [];
   hostBroken = false;
+  probeResult = { kind: 'ok' };
+  probes = [];
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -112,6 +115,17 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
   return { code: 2, stdout: '', stderr: 'unknown mcp subcommand' };
 };
 
+/**
+ * Remote reachability, stubbed. The real prober makes an HTTP request, which
+ * the suite must never do; tests that care set `probeResult` first.
+ */
+let probeResult: RemoteProbe = { kind: 'ok' };
+let probes: { url: string; headers: Record<string, string> }[] = [];
+const fakeProbe: RemoteProber = async (url, headers) => {
+  probes.push({ url, headers });
+  return probeResult;
+};
+
 const opts = () => ({
   home,
   cwd,
@@ -121,6 +135,7 @@ const opts = () => ({
   statePath,
   lockPath,
   log: (l: string) => logs.push(l),
+  probeRemote: fakeProbe,
 });
 
 describe('speculate sync', () => {
@@ -183,6 +198,23 @@ describe('speculate sync', () => {
       url: 'https://api.example.com/mcp/',
       headers: { Authorization: `Bearer ${token}` },
     });
+  });
+
+  it('leaves an OAuth-protected server alone, silently', async () => {
+    // The unattended path matters most here: nobody is watching, and an
+    // OAuth'd entry is indistinguishable from an open one by shape alone. If
+    // the hook wrapped it, the user would open a new session to find a server
+    // that worked yesterday now failing, with no action of their own to blame.
+    probeResult = { kind: 'needs-auth' };
+    const entry = { type: 'http', url: 'https://mcp.example.com/mcp' };
+    writeClaudeJson({ mcpServers: { oauthed: { ...entry } } });
+    writeState({ syncHashes: { [cwd]: 'stale-hash-from-before-oauthed-existed' } });
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(addJsonNames()).toEqual([]);
+    expect(readClaudeJson().mcpServers.oauthed).toEqual(entry);
+    // sync is silent unless it changed something; it changed nothing.
+    expect(logs).toEqual([]);
   });
 
   it('spawns only the wrap itself — no front-door probe, no legacy cleanup', async () => {

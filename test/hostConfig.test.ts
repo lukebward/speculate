@@ -8,16 +8,18 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  HOST_ENV_PLACEHOLDER,
   HOST_HEADER_NAME,
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
   planRemoteWrap,
   readClaudeServers,
+  resolveWrapHeaders,
   unwrapEntry,
   wrapEntry,
 } from '../src/hostConfig.js';
-import { HEADER_NAME } from '../src/config.js';
+import { ENV_PLACEHOLDER, HEADER_NAME } from '../src/config.js';
 import { buildTryConfig, parseTryArgs, tryClientEnv } from '../src/tryRun.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
@@ -201,6 +203,55 @@ describe('remote (http) entries', () => {
     // ever drift, `on` wraps a server `wrap` then refuses to start.
     expect(HOST_HEADER_NAME.source).toBe(HEADER_NAME.source);
     expect(HOST_HEADER_NAME.flags).toBe(HEADER_NAME.flags);
+  });
+
+  it('pins the ${VAR} rule to the one the proxy resolves with', () => {
+    // Duplicated for the same reason, and with a sharper failure mode: if
+    // these drift, the probe resolves a placeholder the proxy does not (or
+    // vice versa), so `on` decides wrappability from credentials the running
+    // proxy will never send.
+    expect(HOST_ENV_PLACEHOLDER.source).toBe(ENV_PLACEHOLDER.source);
+    expect(HOST_ENV_PLACEHOLDER.flags).toBe(ENV_PLACEHOLDER.flags);
+  });
+
+  describe('resolveWrapHeaders', () => {
+    it('resolves ${VAR} from the environment', () => {
+      const out = resolveWrapHeaders([['Authorization', 'Bearer ${TOK}']], { TOK: 'abc123' });
+      expect(out).toEqual({ ok: true, headers: { Authorization: 'Bearer abc123' } });
+    });
+
+    it('passes a literal value through untouched', () => {
+      const out = resolveWrapHeaders([['X-Api-Version', '2024-01-01']], {});
+      expect(out).toEqual({ ok: true, headers: { 'X-Api-Version': '2024-01-01' } });
+    });
+
+    it('reports an unset or empty variable by NAME, never substituting silently', () => {
+      // Substituting nothing would probe with `Authorization: Bearer `, earn a
+      // 401, and make `on` report "needs an OAuth login" for what is really a
+      // missing environment variable.
+      expect(resolveWrapHeaders([['Authorization', 'Bearer ${TOK}']], {})).toEqual({
+        ok: false,
+        missing: 'TOK',
+      });
+      expect(resolveWrapHeaders([['Authorization', 'Bearer ${TOK}']], { TOK: '' })).toEqual({
+        ok: false,
+        missing: 'TOK',
+      });
+    });
+
+    it('never returns a resolved value alongside a failure', () => {
+      // The failure branch is logged; a partially-resolved map reaching it
+      // would put a real token into that log line.
+      const out = resolveWrapHeaders(
+        [
+          ['X-First', '${PRESENT}'],
+          ['X-Second', '${ABSENT}'],
+        ],
+        { PRESENT: 'secret-value-here' },
+      );
+      expect(out).toEqual({ ok: false, missing: 'ABSENT' });
+      expect(JSON.stringify(out)).not.toContain('secret-value-here');
+    });
   });
 
   it('wraps and unwraps a remote entry, headers and unknown fields intact', () => {

@@ -35,18 +35,21 @@ import {
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { probeRemote, type RemoteProber } from './remoteProbe.js';
 import {
   WORKSPACE_SERVER_NAME,
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
   planRemoteWrap,
+  resolveWrapHeaders,
   readClaudeServers,
   unwrapEntry,
   wrapEntry,
   type ClaudeConfigView,
   type ClaudeScope,
   type McpServerEntry,
+  type RemoteWrapPlan,
   type ScopedServer,
 } from './hostConfig.js';
 import type { SpeculationMode } from './types.js';
@@ -376,6 +379,12 @@ export interface Ctx {
   claudeBin: string;
   statePath: string;
   log: (line: string) => void;
+  /**
+   * Asks a remote server whether Speculate can connect to it. Injectable so
+   * the suite never touches the network; see remoteProbe.ts for why config
+   * shape alone cannot answer the question.
+   */
+  probeRemote: RemoteProber;
   /** Memoized `claude plugin list --json`; see fetchPluginList. */
   pluginList?: Promise<unknown | null>;
 }
@@ -469,6 +478,7 @@ export interface ManageOptions {
   statePath?: string;
   log?: (line: string) => void;
   mode?: 'strict' | 'annotated' | 'off' | null;
+  probeRemote?: RemoteProber;
 }
 
 export function makeCtx(opts: ManageOptions): Ctx {
@@ -489,6 +499,7 @@ export function makeCtx(opts: ManageOptions): Ctx {
     },
     statePath: opts.statePath ?? managedStatePath(),
     log: opts.log ?? ((line) => process.stderr.write(`${line}\n`)),
+    probeRemote: opts.probeRemote ?? probeRemote,
   };
 }
 
@@ -769,6 +780,28 @@ export interface WrapOutcome {
 }
 
 /**
+ * Why this remote server must be left unwrapped, or null to go ahead.
+ *
+ * Costs one HTTP round trip per NEW remote server. Already-wrapped servers
+ * return earlier (isWrappedEntry), so a steady-state `sync` pays nothing, and
+ * a probe that times out only defers wrapping to the next session.
+ *
+ * The returned string is logged: it names header VARIABLES but never values,
+ * and never the server's response body.
+ */
+async function remoteWrapBlocker(
+  ctx: Ctx,
+  remote: Extract<RemoteWrapPlan, { wrappable: true }>,
+): Promise<string | null> {
+  const resolved = resolveWrapHeaders(remote.headers);
+  if (!resolved.ok) return `header variable \${${resolved.missing}} is not set`;
+  const probe = await ctx.probeRemote(remote.url, resolved.headers);
+  if (probe.kind === 'ok') return null;
+  if (probe.kind === 'needs-auth') return 'needs an OAuth login Speculate does not have';
+  return probe.reason;
+}
+
+/**
  * Wraps every eligible server in `view` into `managed`, applying all consent
  * gates. Mutates `managed` in place. Used by both `on` and `sync`.
  *
@@ -868,6 +901,19 @@ export async function wrapEffectiveServers(
         `[speculate] ${name}: ${remote ? remote.reason : 'non-stdio'} — passed through unwrapped`,
       );
       continue;
+    }
+    // The entry LOOKS connectable. Now find out whether it actually is,
+    // because for a remote server those are different questions: an
+    // OAuth-protected server and an open one are byte-identical in host
+    // config (remoteProbe.ts). Wrapping one we cannot reach would take a
+    // working server away from the user, so a non-`ok` answer always leaves
+    // the server exactly as it was.
+    if (remote?.wrappable) {
+      const reason = await remoteWrapBlocker(ctx, remote);
+      if (reason) {
+        ctx.log(`[speculate] ${name}: ${reason} — passed through unwrapped`);
+        continue;
+      }
     }
     const wrapped = wrapEntry(scoped.entry, ctx.self, { mode: opts.mode ?? undefined });
     // Header values, for scrubbing every failure message below: the host CLI

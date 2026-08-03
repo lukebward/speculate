@@ -5,7 +5,7 @@
  * config files to verify the full on → off round trip, including the
  * shadow-don't-touch rule for .mcp.json and the state-less unwrap net.
  */
-import { beforeEach, afterEach, describe, expect, it } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import {
   copyFileSync,
@@ -32,6 +32,7 @@ import {
 } from '../src/manage.js';
 import { isWindows } from './platform.js';
 import { WORKSPACE_SERVER_NAME, type ClaudeConfigView, type ClaudeScope } from '../src/hostConfig.js';
+import type { RemoteProbe, RemoteProber } from '../src/remoteProbe.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
 
@@ -80,6 +81,8 @@ beforeEach(() => {
   pluginListShape = 'array';
   autowrapMarketplace = '';
   autowrapInstall = { version: PLUGIN_MANIFEST.version! };
+  probeResult = { kind: 'ok' };
+  probes = [];
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -213,6 +216,17 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
   return { code: 2, stdout: '', stderr: 'unknown mcp subcommand' };
 };
 
+/**
+ * Remote reachability, stubbed. The real prober makes an HTTP request, which
+ * the suite must never do; tests that care set `probeResult` first.
+ */
+let probeResult: RemoteProbe = { kind: 'ok' };
+let probes: { url: string; headers: Record<string, string> }[] = [];
+const fakeProbe: RemoteProber = async (url, headers) => {
+  probes.push({ url, headers });
+  return probeResult;
+};
+
 const opts = () => ({
   home,
   cwd,
@@ -221,6 +235,7 @@ const opts = () => ({
   claudeBin: 'claude',
   statePath,
   log: (l: string) => logs.push(l),
+  probeRemote: fakeProbe,
 });
 
 describe('speculate on', () => {
@@ -354,6 +369,89 @@ describe('speculate on: remote (http) servers', () => {
       '--url',
       'http://10.0.0.4:9000/mcp',
     ]);
+  });
+
+  it('leaves an OAuth-protected server alone rather than wrapping it into a 401', async () => {
+    // The case this gate exists for. An OAuth'd remote server is BYTE-
+    // IDENTICAL in host config to an open one (its token lives in the host's
+    // credential store, not the entry), so shape cannot tell them apart —
+    // only the server can. Verified against mcp.sentry.dev, which answers 401
+    // to exactly this entry. Wrapping it would take a working server away.
+    probeResult = { kind: 'needs-auth' };
+    const entry = { type: 'http', url: 'https://mcp.example.com/mcp' };
+    writeClaudeJson({ mcpServers: { oauthed: { ...entry } } });
+
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readClaudeJson().mcpServers.oauthed).toEqual(entry);
+    expect(logs.join('\n')).toContain('oauthed: needs an OAuth login');
+    expect(logs.join('\n')).toContain('passed through unwrapped');
+  });
+
+  it('leaves an unreachable server alone, and quotes no response body', async () => {
+    probeResult = { kind: 'unreachable', reason: 'answered HTTP 502' };
+    const entry = { type: 'http', url: 'https://down.example.com/mcp' };
+    writeClaudeJson({ mcpServers: { down: { ...entry } } });
+
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readClaudeJson().mcpServers.down).toEqual(entry);
+    expect(logs.join('\n')).toContain('down: answered HTTP 502 — passed through unwrapped');
+  });
+
+  it('probes with the SAME credentials the wrapped proxy would send', async () => {
+    // A probe that omitted the token would 401 on a server that works fine.
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(probes).toEqual([
+      {
+        url: 'https://api.example.com/mcp/',
+        headers: { Authorization: `Bearer ${TOKEN}`, 'X-Api-Version': '2024-01-01' },
+      },
+    ]);
+  });
+
+  it('resolves ${VAR} before probing, and skips the server when it is unset', async () => {
+    // `${VAR}` is resolved by the proxy at startup, so the probe must resolve
+    // it too — otherwise we would send the literal placeholder, earn a 401,
+    // and skip a server that works.
+    const entry = {
+      type: 'http',
+      url: 'https://api.example.com/mcp/',
+      headers: { Authorization: 'Bearer ${SPECULATE_TEST_TOKEN}' },
+    };
+    writeClaudeJson({ mcpServers: { remote: { ...entry } } });
+
+    expect(await speculateOn(opts())).toBe(0);
+    expect(probes).toEqual([]);
+    expect(readClaudeJson().mcpServers.remote).toEqual(entry);
+    // Names the variable so the user can fix it; a value is never printed.
+    expect(logs.join('\n')).toContain('header variable ${SPECULATE_TEST_TOKEN} is not set');
+
+    vi.stubEnv('SPECULATE_TEST_TOKEN', 'resolved-secret-value');
+    try {
+      logs = [];
+      expect(await speculateOn(opts())).toBe(0);
+      expect(probes).toEqual([
+        {
+          url: 'https://api.example.com/mcp/',
+          headers: { Authorization: 'Bearer resolved-secret-value' },
+        },
+      ]);
+      expect(readClaudeJson().mcpServers.remote.args).toContain('--url');
+      // The wrapped entry keeps the PLACEHOLDER, never the resolved secret.
+      expect(readClaudeJson().mcpServers.remote.args).toContain(
+        'Authorization: Bearer ${SPECULATE_TEST_TOKEN}',
+      );
+      expect(logs.join('\n')).not.toContain('resolved-secret-value');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('never probes a stdio server', async () => {
+    // The common case must cost zero network.
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server', args: ['stdio'] } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(probes).toEqual([]);
   });
 
   it('is idempotent: a second run leaves the wrapped remote server alone', async () => {
