@@ -202,6 +202,22 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
               '(approval revoked, or the server is gone from .mcp.json)',
           );
         }
+        // The one thing the automatic path cannot do for you. Worth a line
+        // BECAUSE this path is otherwise silent: a user who adds an
+        // OAuth-protected server would otherwise get prefetching on
+        // everything except the server that would benefit most, and never
+        // learn that one command fixes it.
+        //
+        // Said once, not every session: the hash gate above means this whole
+        // block is only reached when the effective server set changed, so
+        // this is a notification rather than a nag. Never interactive here —
+        // a session-start hook must not open a browser.
+        if (outcome.needsAuth.length > 0) {
+          const names = outcome.needsAuth.map((s) => s.name).join(', ');
+          report(
+            `[speculate] ${names}: needs a login before it can be sped up — run 'speculate auth'`,
+          );
+        }
       }
     } finally {
       release();

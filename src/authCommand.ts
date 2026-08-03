@@ -376,6 +376,9 @@ export async function speculateAuth(opts: AuthOptions = {}): Promise<number> {
     }
   }
   if (failed > 0) return 1;
-  log('[speculate] done — these servers are wrapped from your next session');
+  // Deliberately says nothing about WHEN wrapping happens: the CLI wraps
+  // straight after this returns when the project is already managed by `on`,
+  // and this function is also called from inside `on` itself.
+  log('[speculate] done');
   return 0;
 }

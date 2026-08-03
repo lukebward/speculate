@@ -10,6 +10,7 @@
  * go to stderr. `doctor` and `validate` are human-facing and use stdout.
  */
 import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline/promises';
 import { writeFileSync, existsSync } from 'node:fs';
 import { loadConfig } from './config.js';
 import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
@@ -19,7 +20,7 @@ import { buildWrapConfig, parseWrapArgs } from './wrap.js';
 import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
 import { nodeSignalNumber, parseTryArgs, runTry } from './tryRun.js';
-import { speculateOff, speculateOn, speculateStatus } from './manage.js';
+import { projectIsManaged, speculateOff, speculateOn, speculateStatus } from './manage.js';
 import { speculateSync } from './sync.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
@@ -375,7 +376,7 @@ async function main(): Promise<void> {
         fail(`unknown ${args.command} argument '${args.rest[i]}'`);
       }
     }
-    const manageOpts = { self: selfCommand(), mode };
+    const manageOpts = { self: selfCommand(), mode, onNeedsAuth };
     const code =
       args.command === 'on'
         ? await speculateOn(manageOpts)
@@ -395,7 +396,15 @@ async function main(): Promise<void> {
       else if (target === undefined) target = arg;
       else fail(`auth takes at most one server (got '${arg}' as well as '${target}')`);
     }
-    process.exitCode = await speculateAuth({ target, forget });
+    const code = await speculateAuth({ target, forget });
+    // Finish the job rather than leaving a second command as homework: a
+    // server authorized just now is still unwrapped until a wrap pass runs.
+    // Only where `on` was already run, though -- wrapping a project that
+    // never opted in would be a config change nobody asked for.
+    if (code === 0 && !forget && projectIsManaged()) {
+      await speculateOn({ self: selfCommand(), mode: null });
+    }
+    process.exitCode = code;
     return;
   }
 
@@ -457,6 +466,42 @@ async function main(): Promise<void> {
   }
 
   await runProxy(config, statePath, args.configPath);
+}
+
+/** One y/n question on stderr, so stdout stays clean for real output. */
+async function confirm(question: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = (await rl.question(question)).trim().toLowerCase();
+    return answer === '' || answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * `on`'s offer to run the login for you.
+ *
+ * Gated on a TTY on BOTH ends, because this opens a browser: `on` inside a
+ * script, a CI job, or a piped shell must stay non-interactive and just say
+ * what to run. Returns true only if something was actually authorized, which
+ * is what tells `on` to re-run the wrap.
+ */
+async function onNeedsAuth(servers: { name: string; url: string }[]): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stderr.isTTY) return false;
+  const names = servers.map((s) => s.name).join(', ');
+  const subject = servers.length > 1 ? `${servers.length} servers` : names;
+  process.stderr.write(
+    `\n[speculate] ${subject} can be sped up, but ${servers.length > 1 ? 'they need' : 'it needs'} a login first${servers.length > 1 ? ` (${names})` : ''}.\n`,
+  );
+  if (!(await confirm('[speculate] Open your browser to authorize now? [Y/n] '))) {
+    return false;
+  }
+  let authorized = false;
+  for (const server of servers) {
+    if ((await speculateAuth({ target: server.url })) === 0) authorized = true;
+  }
+  return authorized;
 }
 
 /**

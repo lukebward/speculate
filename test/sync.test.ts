@@ -202,11 +202,15 @@ describe('speculate sync', () => {
     });
   });
 
-  it('leaves an OAuth-protected server alone, silently', async () => {
+  it('leaves an OAuth-protected server alone, and names the one command that fixes it', async () => {
     // The unattended path matters most here: nobody is watching, and an
     // OAuth'd entry is indistinguishable from an open one by shape alone. If
     // the hook wrapped it, the user would open a new session to find a server
     // that worked yesterday now failing, with no action of their own to blame.
+    //
+    // But staying SILENT is its own failure: the user would get prefetching
+    // on everything except the server that would benefit most, and never
+    // learn why. So it is left working and unwrapped, and mentioned.
     probeResult = { kind: 'needs-auth' };
     const entry = { type: 'http', url: 'https://mcp.example.com/mcp' };
     writeClaudeJson({ mcpServers: { oauthed: { ...entry } } });
@@ -215,8 +219,59 @@ describe('speculate sync', () => {
     expect(await speculateSync(opts())).toBe(0);
     expect(addJsonNames()).toEqual([]);
     expect(readClaudeJson().mcpServers.oauthed).toEqual(entry);
-    // sync is silent unless it changed something; it changed nothing.
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("oauthed: needs a login");
+    expect(logs[0]).toContain("speculate auth");
+  });
+
+  it('says that once, not at every session start', async () => {
+    // The difference between a notification and a nag. The hash gate is what
+    // provides it: a second run over an unchanged config never reaches the
+    // reporting block at all, and never even spawns a subprocess.
+    probeResult = { kind: 'needs-auth' };
+    writeClaudeJson({ mcpServers: { oauthed: { type: 'http', url: 'https://mcp.example.com/mcp' } } });
+    writeState({ syncHashes: { [cwd]: 'stale-hash-from-before-oauthed-existed' } });
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(logs).toHaveLength(1);
+
+    logs = [];
+    calls = [];
+    expect(await speculateSync(opts())).toBe(0);
     expect(logs).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it('stops mentioning it once the server is authorized, and wraps it', async () => {
+    probeResult = { kind: 'needs-auth' };
+    const url = 'https://mcp.example.com/mcp';
+    writeClaudeJson({ mcpServers: { oauthed: { type: 'http', url } } });
+    writeState({ syncHashes: { [cwd]: 'stale-hash-from-before-oauthed-existed' } });
+    expect(await speculateSync(opts())).toBe(0);
+    expect(logs[0]).toContain('needs a login');
+
+    // The user runs `speculate auth`; a token lands in the store.
+    writeFileSync(
+      join(home, 'oauth.json'),
+      JSON.stringify({
+        version: 1,
+        servers: {
+          [url]: {
+            serverUrl: url,
+            client: { client_id: 'c' },
+            tokens: { access_token: 'tok', token_type: 'Bearer' },
+            expiresAt: Date.now() + 3_600_000,
+          },
+        },
+      }),
+    );
+    logs = [];
+    writeState({ syncHashes: { [cwd]: 'stale-again-so-the-pass-reruns' } });
+
+    expect(await speculateSync(opts())).toBe(0);
+    expect(addJsonNames()).toEqual(['oauthed']);
+    expect(logs.join('\n')).not.toContain('needs a login');
+    expect(logs.join('\n')).toContain('wrapped 1 new server');
   });
 
   it('spawns only the wrap itself — no front-door probe, no legacy cleanup', async () => {

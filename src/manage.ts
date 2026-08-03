@@ -278,6 +278,20 @@ export function managedStatePath(): string {
   return join(stateHome, 'speculate', 'managed.json');
 }
 
+/**
+ * Has `on` already been run for this project?
+ *
+ * Lets `speculate auth` finish the job: after a login it can re-run the wrap
+ * so the newly reachable servers go live now, but only where the user has
+ * already opted this project in. Running `on` off the back of `auth` in a
+ * project that never had it would be a config change nobody asked for.
+ */
+export function projectIsManaged(opts: { cwd?: string; statePath?: string } = {}): boolean {
+  const cwd = resolve(opts.cwd ?? process.cwd());
+  const state = loadManagedState(opts.statePath ?? managedStatePath());
+  return state.projects[cwd] !== undefined;
+}
+
 export function loadManagedState(path: string): ManagedState {
   try {
     const data = JSON.parse(readFileSync(path, 'utf8')) as ManagedState;
@@ -483,6 +497,15 @@ export interface ManageOptions {
   mode?: 'strict' | 'annotated' | 'off' | null;
   probeRemote?: RemoteProber;
   oauthStorePath?: string;
+  /**
+   * Offered the servers that only need a login. Returns true if it obtained
+   * one, which makes `on` re-run the wrap so they go live immediately.
+   *
+   * Supplied ONLY by the interactive CLI: it opens a browser, so a hook or a
+   * script must never trigger it. Its absence is what keeps `sync` silent
+   * here and `on` non-interactive when piped.
+   */
+  onNeedsAuth?: (servers: { name: string; url: string }[]) => Promise<boolean>;
 }
 
 export function makeCtx(opts: ManageOptions): Ctx {
@@ -782,6 +805,13 @@ export interface WrapOutcome {
    * record anything that claims the whole set was handled (`sync`'s hash).
    */
   timedOut: boolean;
+  /**
+   * Servers left unwrapped ONLY because Speculate has no login for them, and
+   * that `speculate auth` would fix. Carried out of the pass rather than just
+   * logged, because it is the single manual step in an otherwise automatic
+   * tool: `on` offers to do it on the spot, and `sync` names it once.
+   */
+  needsAuth: { name: string; url: string }[];
 }
 
 /**
@@ -798,17 +828,17 @@ async function remoteWrapBlocker(
   ctx: Ctx,
   name: string,
   remote: Extract<RemoteWrapPlan, { wrappable: true }>,
-): Promise<string | null> {
+): Promise<{ reason: string; fixableByAuth?: boolean } | null> {
   const resolved = resolveWrapHeaders(remote.headers);
-  if (!resolved.ok) return `header variable \${${resolved.missing}} is not set`;
+  if (!resolved.ok) return { reason: `header variable \${${resolved.missing}} is not set` };
   const probe = await ctx.probeRemote(remote.url, resolved.headers);
   if (probe.kind === 'ok') return null;
-  if (probe.kind !== 'needs-auth') return probe.reason;
+  if (probe.kind !== 'needs-auth') return { reason: probe.reason };
   // The server wants a login. If the user has already given Speculate one,
   // the wrapped proxy will connect with it (the store is consulted by URL at
   // proxy startup), so this is wrappable after all.
   if (readOAuthRecord(ctx.oauthStorePath, remote.url)?.tokens) return null;
-  return `needs authorization — run: speculate auth ${name}`;
+  return { reason: `needs authorization — run: speculate auth ${name}`, fixableByAuth: true };
 }
 
 /**
@@ -836,6 +866,7 @@ export async function wrapEffectiveServers(
   let changed = 0;
   let failed = 0;
   let shadowsRemoved = 0;
+  const needsAuth: { name: string; url: string }[] = [];
   const projectScopeNames = new Set(
     view.servers.filter((s) => s.scope === 'project').map((s) => s.name),
   );
@@ -843,7 +874,7 @@ export async function wrapEffectiveServers(
   for (const [name, scoped] of effectiveServers(view.servers)) {
     if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
       ctx.log(`[speculate] out of time before ${name} — the next run picks it up`);
-      return { changed, failed, shadowsRemoved, timedOut: true };
+      return { changed, failed, shadowsRemoved, timedOut: true, needsAuth };
     }
     if (name === WORKSPACE_SERVER_NAME) continue;
     if (name.startsWith('-')) {
@@ -919,9 +950,10 @@ export async function wrapEffectiveServers(
     // working server away from the user, so a non-`ok` answer always leaves
     // the server exactly as it was.
     if (remote?.wrappable) {
-      const reason = await remoteWrapBlocker(ctx, name, remote);
-      if (reason) {
-        ctx.log(`[speculate] ${name}: ${reason} — passed through unwrapped`);
+      const blocker = await remoteWrapBlocker(ctx, name, remote);
+      if (blocker) {
+        if (blocker.fixableByAuth) needsAuth.push({ name, url: remote.url });
+        ctx.log(`[speculate] ${name}: ${blocker.reason} — passed through unwrapped`);
         continue;
       }
     }
@@ -996,7 +1028,7 @@ export async function wrapEffectiveServers(
     changed++;
   }
 
-  return { changed, failed, shadowsRemoved, timedOut: false };
+  return { changed, failed, shadowsRemoved, timedOut: false, needsAuth };
 }
 
 // -- the auto-wrap plugin -------------------------------------------------------
@@ -1390,9 +1422,31 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
   );
   // `changed` counts a revoked shadow's removal too: it is a change `on`
   // made to the host, and the summary line must not under-report it.
-  const { changed, failed } = await wrapEffectiveServers(ctx, view, managed, {
+  let { changed, failed, needsAuth } = await wrapEffectiveServers(ctx, view, managed, {
     mode: opts.mode ?? undefined,
   });
+  // The one manual step in the whole tool, offered here instead of left as
+  // homework. `opts.onNeedsAuth` is supplied only by the interactive CLI (it
+  // opens a browser, so it must never fire from a hook or a script); when it
+  // authorizes something, the wrap pass runs AGAIN so those servers are live
+  // now rather than next session.
+  if (needsAuth.length > 0 && opts.onNeedsAuth) {
+    const authorized = await opts.onNeedsAuth(needsAuth);
+    if (authorized) {
+      const second = await wrapEffectiveServers(ctx, readClaudeServers({ home: ctx.home, cwd: ctx.cwd }), managed, {
+        mode: opts.mode ?? undefined,
+      });
+      changed += second.changed;
+      failed += second.failed;
+      needsAuth = second.needsAuth;
+    }
+  }
+  if (needsAuth.length > 0) {
+    ctx.log(
+      `[speculate] ${needsAuth.length} server${needsAuth.length > 1 ? 's need' : ' needs'} a login: ` +
+        `run 'speculate auth' (${needsAuth.map((s) => s.name).join(', ')})`,
+    );
+  }
   // Servers added AFTER this run are the auto-wrap plugin's job. Installed
   // after the wrap so its one line lands with the summary rather than in the
   // middle of the per-server output — and it can never fail `on`.

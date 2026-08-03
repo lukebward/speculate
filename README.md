@@ -19,11 +19,7 @@ speculate on
 
 That is the whole setup. `speculate on` re-registers this project's MCP servers wrapped, using Claude Code's own `claude mcp` CLI rather than editing any file by hand, and installs a small hook so servers you add later get wrapped too, starting from your next session.
 
-Remote (streamable HTTP) servers are wrapped too, which is where most of the latency is. Ones that need a login (Sentry, Notion, Linear) take one browser click, once:
-
-```bash
-speculate auth
-```
+Remote (streamable HTTP) servers are wrapped too, which is where most of the latency is. Ones that need a login (Sentry, Notion, Linear) are offered during `on`: say yes, click once in the browser, and they are wrapped straight away. `speculate auth` does the same thing later.
 
 `on` checks it can reach a server before changing anything, so it never trades a working server for a wrapped one. Connectors you added in the claude.ai UI are never wrapped: the host holds them, so nothing here can see them.
 

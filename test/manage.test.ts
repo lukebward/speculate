@@ -390,6 +390,67 @@ describe('speculate on: remote (http) servers', () => {
     expect(logs.join('\n')).toContain('passed through unwrapped');
   });
 
+  it('offers the login, and wraps immediately when it is granted', async () => {
+    // The whole point of the offer: no second command, and no waiting a
+    // session. `on` re-runs the wrap pass itself once a token exists.
+    const url = 'https://mcp.example.com/mcp';
+    probeResult = { kind: 'needs-auth' };
+    writeClaudeJson({ mcpServers: { oauthed: { type: 'http', url } } });
+
+    const offered: { name: string; url: string }[][] = [];
+    const code = await speculateOn({
+      ...opts(),
+      onNeedsAuth: async (servers) => {
+        offered.push(servers);
+        // Stand in for the browser flow: a token appears, and the server
+        // starts answering.
+        writeFileSync(
+          join(home, 'oauth.json'),
+          JSON.stringify({
+            version: 1,
+            servers: {
+              [url]: {
+                serverUrl: url,
+                client: { client_id: 'c' },
+                tokens: { access_token: 'tok', token_type: 'Bearer' },
+                expiresAt: Date.now() + 3_600_000,
+              },
+            },
+          }),
+        );
+        return true;
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(offered).toEqual([[{ name: 'oauthed', url }]]);
+    expect(readClaudeJson().mcpServers.oauthed.args).toEqual([...SELF.args, 'wrap', '--url', url]);
+    // Having fixed it, `on` must not still be telling the user to fix it.
+    expect(logs.join('\n')).not.toContain("run 'speculate auth'");
+  });
+
+  it('falls back to naming the command when the offer is declined', async () => {
+    const url = 'https://mcp.example.com/mcp';
+    probeResult = { kind: 'needs-auth' };
+    writeClaudeJson({ mcpServers: { oauthed: { type: 'http', url } } });
+
+    const code = await speculateOn({ ...opts(), onNeedsAuth: async () => false });
+
+    expect(code).toBe(0);
+    expect(readClaudeJson().mcpServers.oauthed).toEqual({ type: 'http', url });
+    expect(logs.join('\n')).toContain("1 server needs a login: run 'speculate auth' (oauthed)");
+  });
+
+  it('never offers when no handler is supplied, which is how hooks and scripts run', async () => {
+    // `onNeedsAuth` opens a browser. Its absence is the guard that keeps
+    // `sync`, CI, and a piped shell non-interactive.
+    probeResult = { kind: 'needs-auth' };
+    writeClaudeJson({ mcpServers: { oauthed: { type: 'http', url: 'https://mcp.example.com/mcp' } } });
+
+    expect(await speculateOn(opts())).toBe(0);
+    expect(logs.join('\n')).toContain("needs a login: run 'speculate auth'");
+  });
+
   it('wraps that same server once `speculate auth` has stored a token for it', async () => {
     // The store is keyed by URL and read at proxy startup, so authorizing is
     // the only step: no flag, no config edit, and the next `on` (or the
