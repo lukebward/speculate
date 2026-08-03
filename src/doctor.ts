@@ -35,6 +35,13 @@ export async function runDoctor(
   for (const [name, sc] of Object.entries(config.servers)) {
     out('');
     out(`server '${name}' (${sc.url ? `http ${sc.url}` : `stdio: ${sc.command}`})`);
+    // Header NAMES answer "did my Authorization header actually get through?"
+    // (the only question a user has here). A VALUE is a credential and is
+    // never printed, by doctor or anything else.
+    const headerNames = Object.keys(sc.headers ?? {});
+    if (headerNames.length > 0) {
+      out(dim(`headers: ${headerNames.sort().join(', ')} (values redacted)`));
+    }
 
     const profile: ServerProfile | undefined =
       sc.profile && sc.profile !== 'none' ? builtinProfiles[sc.profile] : undefined;

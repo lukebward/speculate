@@ -8,6 +8,8 @@ Speculative prefetching for coding agents. Speculate sits between your MCP clien
 
 The same workflow twice, against a mock server with injected latency. Reproduce with `npm run demo`.
 
+Against a real one: GitHub's hosted MCP server, an 8-call read-only session, one machine on one network. Once warm, 7 of the 8 calls are served from the buffer and total tool wait goes from about 4.3 s to about 0.55 s. Getting there takes two or three passes through the same workflow. The first pass gets no benefit at all: nothing can be predicted before it has been seen once, so that run pays one proxy hop and issues no speculative calls. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+
 ## Install
 
 ```bash
@@ -56,7 +58,16 @@ No install and no Claude Code required: prefix the server command already in you
   "command": "npx",
   "args": ["-y", "speculate-mcp", "wrap", "--", "github-mcp-server", "stdio"]
 }
+
+// or a remote (hosted) server, which is where the latency actually is
+"github": {
+  "command": "npx",
+  "args": ["-y", "speculate-mcp", "wrap", "--url", "https://api.githubcopilot.com/mcp/",
+           "--header", "Authorization: Bearer ${GITHUB_TOKEN}"]
+}
 ```
+
+`${VAR}` in a header value is resolved from the environment when Speculate starts, so the token stays out of the file. An unset variable is a startup error naming the variable, never a literal `${GITHUB_TOKEN}` sent upstream. The same `headers` block works in a config file. Header **values are never logged**; `doctor` shows names only.
 
 The client sees standard MCP: same tools, same results, except predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the current MCP session's live hit rate, time saved, and `ageAtHit`, how stale the served prefetches were. `speculate stats` reports durable cumulative usage.
 
@@ -79,9 +90,12 @@ Architecture, measured results, threat model, and design history: [DESIGN.md](DE
 ```bash
 npm install     # builds dist/ via the prepare hook
 npm test        # unit and end-to-end suite
-npm run bench   # speculation off vs on
+npm run bench   # speculation off vs on, bundled mock upstream
 npm run eval    # offline prediction recall, headline and floor
 npm run demo    # the README demo, against the bundled mock
+
+# a REAL hosted MCP server (opt-in, needs a credential, read-only calls only)
+SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
 ```
 
 Running the test suite needs Node >= 20.19 (vitest's native rolldown binding; npm silently skips it on older Node). The runtime floor for *using* speculate is unchanged at Node >= 18.

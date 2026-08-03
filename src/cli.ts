@@ -41,6 +41,7 @@ install-and-it-works (no config files edited by hand):
 
 manual wrapping:
   speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
+  speculate wrap --url <url> [--header "K: V"]               wrap a remote (http) MCP server
   speculate --config <path> [--mode strict|annotated|off]    run the proxy from a config file
   speculate init [path]                                      write a starter config
   speculate doctor --config <path>                           connect upstreams, explain
@@ -52,6 +53,10 @@ wrap flags (before the '--'):
   --profile <name>    force a vetted profile (auto-detected for known servers)
   --allow <t1,t2>     extra read-only allowlist entries
   --sniff             engage only if the client speaks MCP; else byte-transparent pipe
+  --url <url>         wrap a remote http MCP server instead of a child process
+  --header "K: V"     request header for --url; repeatable. Values may use
+                      \${VAR}, resolved from the environment (unset = fatal),
+                      so a token need never be written down
 
 options:
   --config <path>   path to speculate config (JSON with comments allowed)

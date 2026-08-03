@@ -16,6 +16,13 @@ import {
 import { VERSION } from './version.js';
 import type { ServerConfig, UpstreamTransport } from './types.js';
 
+/**
+ * Shortest header value Upstream#redact will scrub. Below this a value is far
+ * more likely to be an innocuous literal ('1', 'v2') whose redaction would
+ * mangle unrelated text than a credential worth protecting.
+ */
+const MIN_REDACTABLE_LENGTH = 8;
+
 export interface CallOptions {
   timeoutMs?: number;
   /** Restart the timeout clock on each progress notification (long tools). */
@@ -50,13 +57,76 @@ export class Upstream {
     this.onDisconnect = fn;
   }
 
+  /**
+   * HTTP header NAMES this upstream sends. Names are safe to print; VALUES
+   * are credentials and are deliberately unreachable from outside this
+   * class; the only thing that ever touches them is redact() below.
+   */
+  headerNames(): string[] {
+    return Object.keys(this.config.headers ?? {});
+  }
+
+  /**
+   * Remove any configured header value from text that is about to be LOGGED.
+   *
+   * Defense in depth, not the primary guard: no code path here prints a
+   * header, and no current transport echoes request headers back in an error.
+   * But upstream error text is arbitrary remote-influenced data that several
+   * modules write straight to stderr (proxy connect failures, executor
+   * suppression reasons, the §9 decision log), and a token reaching any of
+   * them would be unrecoverable: the user would have to rotate it. So the
+   * scrub happens at this boundary, once, rather than at each of those call
+   * sites, and covers ones added later for free.
+   *
+   * Short values are skipped: redacting a 3-character header value would
+   * corrupt unrelated messages far more often than it would protect anything,
+   * and no credential is that short.
+   */
+  redact(text: string): string {
+    let out = text;
+    for (const value of Object.values(this.config.headers ?? {})) {
+      if (value.length >= MIN_REDACTABLE_LENGTH && out.includes(value)) {
+        out = out.split(value).join('[redacted]');
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Scrub an error on its way out of this class. Mutates `message` in place
+   * rather than re-wrapping so the error's prototype survives: callers do
+   * `instanceof McpError` and regex the message (executor.ts), and a
+   * defensive log guard must not change how errors are classified.
+   */
+  private scrubError(err: unknown): unknown {
+    if (err instanceof Error) {
+      const redacted = this.redact(err.message);
+      if (redacted !== err.message) err.message = redacted;
+    }
+    return err;
+  }
+
   async connect(): Promise<void> {
+    try {
+      await this.connectInner();
+    } catch (err) {
+      throw this.scrubError(err);
+    }
+  }
+
+  private async connectInner(): Promise<void> {
     const client = new Client(
       { name: 'speculate', version: VERSION },
       { capabilities: {} },
     );
     const transport = this.config.url
-      ? new StreamableHTTPClientTransport(new URL(this.config.url))
+      ? new StreamableHTTPClientTransport(new URL(this.config.url), {
+          // Copied, not aliased: the transport keeps this object for the life
+          // of the connection and must not observe later config edits.
+          ...(this.config.headers
+            ? { requestInit: { headers: { ...this.config.headers } } }
+            : {}),
+        })
       : new StdioClientTransport({
           command: this.config.command!,
           args: this.config.args ?? [],
@@ -107,15 +177,18 @@ export class Upstream {
     opts: CallOptions = {},
   ): Promise<CallToolResult> {
     if (!this.client) throw new Error(`upstream ${this.name} not connected`);
-    const result = await this.client.callTool(
-      { name: tool, arguments: args },
-      CallToolResultSchema,
-      {
+    let result;
+    try {
+      result = await this.client.callTool({ name: tool, arguments: args }, CallToolResultSchema, {
         timeout: opts.timeoutMs ?? 60_000,
         resetTimeoutOnProgress: opts.resetTimeoutOnProgress ?? false,
         onprogress: opts.onprogress,
-      },
-    );
+      });
+    } catch (err) {
+      // Call errors reach the decision log and the executor's suppression
+      // reason, both of which are written to stderr verbatim.
+      throw this.scrubError(err);
+    }
     return result as CallToolResult;
   }
 
@@ -157,9 +230,14 @@ export class Upstream {
   }
 }
 
-/** ENOENT and friends deserve a human sentence, not a raw errno. */
+/**
+ * ENOENT and friends deserve a human sentence, not a raw errno.
+ *
+ * Every return path goes through `up.redact`, including the `String(err)`
+ * branch that Upstream#scrubError cannot reach (a thrown non-Error).
+ */
 export function friendlySpawnError(err: unknown, up: Upstream): string {
-  const msg = err instanceof Error ? err.message : String(err);
+  const msg = up.redact(err instanceof Error ? err.message : String(err));
   if (/ENOENT/.test(msg) && up.transport === 'stdio') {
     return `command not found (is it installed and on PATH?): ${msg}`;
   }

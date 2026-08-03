@@ -13,7 +13,7 @@
  * trade-off, overridable with --mode/--allow), persistence on (keyed by
  * the wrapped command line), known servers auto-matched to vetted profiles.
  */
-import { RETIRED_PROFILES } from './config.js';
+import { RETIRED_PROFILES, resolveHeaderValue } from './config.js';
 import { builtinProfiles } from './profiles/index.js';
 import type { SpeculateConfig, SpeculationMode } from './types.js';
 
@@ -28,6 +28,16 @@ export interface WrapArgs {
    */
   sniff: boolean;
   command: string[];
+  /**
+   * A remote (streamable-HTTP) upstream instead of a wrapped child process.
+   * Exclusive with `command`: there is nothing to spawn.
+   */
+  url: string | null;
+  /**
+   * Request headers for `url`, already env-resolved. SECRETS: never print a
+   * value (see Upstream#redact).
+   */
+  headers: Record<string, string>;
 }
 
 /** Substring → vetted profile, checked against the wrapped command line. */
@@ -36,7 +46,15 @@ const PROFILE_AUTODETECT: [string, string][] = [
 ];
 
 export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
-  const out: WrapArgs = { mode: 'annotated', profile: null, allow: [], sniff: false, command: [] };
+  const out: WrapArgs = {
+    mode: 'annotated',
+    profile: null,
+    allow: [],
+    sniff: false,
+    command: [],
+    url: null,
+    headers: {},
+  };
   let i = 0;
   for (; i < argv.length; i++) {
     const a = argv[i]!;
@@ -60,12 +78,54 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       out.allow.push(...list.split(',').map((s) => s.trim()).filter(Boolean));
     } else if (a === '--sniff') {
       out.sniff = true;
+    } else if (a === '--url') {
+      const u = argv[++i];
+      if (!u) return { error: '--url requires a URL' };
+      let parsed: URL;
+      try {
+        parsed = new URL(u);
+      } catch {
+        return { error: `--url is not a valid URL: '${u}'` };
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return { error: `--url must be http or https (got '${parsed.protocol}')` };
+      }
+      out.url = u;
+    } else if (a === '--header') {
+      const raw = argv[++i];
+      if (!raw) return { error: '--header requires a "Name: value" pair' };
+      // First colon only: a value may contain colons (a URL, a timestamp).
+      const split = raw.indexOf(':');
+      if (split <= 0) {
+        return { error: `--header must be "Name: value" (got '${raw}')` };
+      }
+      const name = raw.slice(0, split).trim();
+      const value = raw.slice(split + 1).trim();
+      try {
+        // Same contract as a config file's headers, from the same function:
+        // ${VAR} resolved here, an unset variable fatal and named.
+        out.headers[name] = resolveHeaderValue(name, value);
+      } catch (err) {
+        return { error: `--header ${name}: ${(err as Error).message}` };
+      }
     } else {
       return { error: `unknown wrap argument '${a}' (flags go before '--', the wrapped command after)` };
     }
   }
-  if (out.command.length === 0) {
-    return { error: "wrap needs a server command after '--'" };
+  // Exactly one upstream: a remote URL or a child process, never both.
+  if (out.url && out.command.length > 0) {
+    return { error: "--url wraps a remote server; drop the command after '--'" };
+  }
+  if (!out.url && out.command.length === 0) {
+    return { error: "wrap needs a server command after '--', or --url <url> for a remote server" };
+  }
+  if (out.url && out.sniff) {
+    // Sniffing degrades to piping the WRAPPED COMMAND's bytes; with no child
+    // to pipe to, "non-MCP client" has no safe fallback to offer.
+    return { error: '--sniff applies to a wrapped command, not to --url' };
+  }
+  if (!out.url && Object.keys(out.headers).length > 0) {
+    return { error: '--header applies to --url servers only (a stdio server takes env vars)' };
   }
   if (out.profile && RETIRED_PROFILES.has(out.profile)) {
     // Same contract a config file gets (config.ts): a ≤0.10 invocation naming
@@ -90,8 +150,18 @@ export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stat
   const commandLine = args.command.join(' ');
   const profile =
     args.profile ??
-    PROFILE_AUTODETECT.find(([needle]) => commandLine.includes(needle))?.[1] ??
+    // Autodetect reads the command line; a remote server has none, and is
+    // fingerprinted from its tool list at runtime instead (§13.11).
+    (args.url ? null : PROFILE_AUTODETECT.find(([needle]) => commandLine.includes(needle))?.[1]) ??
     null;
+  // The state key must NEVER carry the headers: it names the on-disk state
+  // file. The URL alone identifies the upstream.
+  const upstream = args.url
+    ? {
+        url: args.url,
+        ...(Object.keys(args.headers).length ? { headers: { ...args.headers } } : {}),
+      }
+    : { command: args.command[0]!, args: args.command.slice(1) };
   return {
     config: {
       mode: args.mode,
@@ -99,13 +169,12 @@ export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stat
       log: 'stderr',
       servers: {
         upstream: {
-          command: args.command[0]!,
-          args: args.command.slice(1),
+          ...upstream,
           ...(profile ? { profile } : {}),
           ...(args.allow.length ? { allowTools: args.allow } : {}),
         },
       },
     },
-    stateKey: `wrap:${commandLine}`,
+    stateKey: args.url ? `wrap:url:${args.url}` : `wrap:${commandLine}`,
   };
 }
