@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -294,13 +295,183 @@ describe('speculate on', () => {
     expect(calls.filter((c) => c[1] === 'add-json' || c[1] === 'remove')).toEqual([]);
   });
 
-  it('passes http servers through untouched', async () => {
-    writeClaudeJson({ mcpServers: { sentry: { url: 'https://mcp.sentry.dev', type: 'http' } } });
+  it('passes an sse server through untouched: Speculate speaks streamable HTTP', async () => {
+    writeClaudeJson({ mcpServers: { sentry: { url: 'https://mcp.sentry.dev', type: 'sse' } } });
     await speculateOn(opts());
     expect(readClaudeJson().mcpServers.sentry).toEqual({
       url: 'https://mcp.sentry.dev',
-      type: 'http',
+      type: 'sse',
     });
+    expect(logs.join('\n')).toContain('sentry: sse transport');
+  });
+});
+
+/**
+ * Remote servers that carry their own auth (or need none) — where the latency
+ * actually is. A connector added through the claude.ai UI is NOT any of this:
+ * it never appears in local MCP config, so nothing below can see it.
+ */
+describe('speculate on: remote (http) servers', () => {
+  /** Written inline in the host config, the way `claude mcp add --header` leaves it. */
+  const TOKEN = 'not-a-real-token-abcdef123456';
+  const remoteEntry = {
+    type: 'http',
+    url: 'https://api.example.com/mcp/',
+    headers: { Authorization: `Bearer ${TOKEN}`, 'X-Api-Version': '2024-01-01' },
+    somethingTheHostAdded: { nested: [1, 2] },
+  };
+
+  it('wraps a token-authenticated remote server as a wrap --url invocation', async () => {
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    expect(await speculateOn(opts())).toBe(0);
+
+    const wrapped = readClaudeJson().mcpServers.remote;
+    expect(wrapped.command).toBe(SELF.command);
+    expect(wrapped.args).toEqual([
+      ...SELF.args,
+      'wrap',
+      '--url',
+      'https://api.example.com/mcp/',
+      '--header',
+      `Authorization: Bearer ${TOKEN}`,
+      '--header',
+      'X-Api-Version: 2024-01-01',
+    ]);
+    // A url left on the entry would make the host speak http to it directly
+    // and never launch us; a leftover `headers` would duplicate the token.
+    expect(wrapped.url).toBeUndefined();
+    expect(wrapped.type).toBeUndefined();
+    expect(wrapped.headers).toBeUndefined();
+    expect(wrapped.somethingTheHostAdded).toEqual({ nested: [1, 2] });
+  });
+
+  it('wraps a remote server with no auth at all', async () => {
+    writeClaudeJson({ mcpServers: { lan: { url: 'http://10.0.0.4:9000/mcp' } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readClaudeJson().mcpServers.lan.args).toEqual([
+      ...SELF.args,
+      'wrap',
+      '--url',
+      'http://10.0.0.4:9000/mcp',
+    ]);
+  });
+
+  it('is idempotent: a second run leaves the wrapped remote server alone', async () => {
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    await speculateOn(opts());
+    const after1 = readClaudeJson();
+    calls = [];
+    logs = [];
+    await speculateOn(opts());
+    expect(readClaudeJson()).toEqual(after1);
+    expect(calls.filter((c) => c[1] === 'add-json' || c[1] === 'remove')).toEqual([]);
+    expect(logs.join('\n')).toContain('remote: already wrapped');
+  });
+
+  it('still refuses to widen consent for an unapproved .mcp.json remote server', async () => {
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { team: { ...remoteEntry } } }),
+    );
+    writeClaudeJson({});
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readClaudeJson().projects?.[cwd]?.mcpServers?.team).toBeUndefined();
+    expect(logs.join('\n')).toContain('not approved');
+  });
+
+  it('shadows an APPROVED .mcp.json remote server at local scope, file untouched', async () => {
+    const mcpJson = { mcpServers: { team: { ...remoteEntry } } };
+    writeFileSync(join(cwd, '.mcp.json'), JSON.stringify(mcpJson));
+    writeClaudeJson({ projects: { [cwd]: { enableAllProjectMcpServers: true } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(JSON.parse(readFileSync(join(cwd, '.mcp.json'), 'utf8'))).toEqual(mcpJson);
+    expect(readClaudeJson().projects[cwd].mcpServers.team.args).toContain('--url');
+  });
+
+  it('off restores the remote entry BYTE-EXACTLY, headers and unknown fields included', async () => {
+    const originalJson = JSON.stringify(remoteEntry);
+    writeClaudeJson({ mcpServers: { remote: JSON.parse(originalJson) } });
+    expect(await speculateOn(opts())).toBe(0);
+    calls = [];
+    expect(await speculateOff(opts())).toBe(0);
+
+    // The bytes handed back to the host's own CLI, key order and all.
+    const restore = calls.find((c) => c[2] === 'add-json' && c[3] === 'remote');
+    expect(restore?.[4]).toBe(originalJson);
+    expect(JSON.stringify(readClaudeJson().mcpServers.remote)).toBe(originalJson);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).projects[cwd]).toBeUndefined();
+  });
+
+  it('off reconstructs a remote entry with no state file at all', async () => {
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    await speculateOn(opts());
+    rmSync(statePath, { force: true });
+    expect(await speculateOff(opts())).toBe(0);
+    // Exact but for `type`, which the invocation records as the transport
+    // Speculate was speaking rather than as the host had spelled it.
+    expect(readClaudeJson().mcpServers.remote).toEqual({
+      type: 'http',
+      url: remoteEntry.url,
+      headers: remoteEntry.headers,
+      somethingTheHostAdded: { nested: [1, 2] },
+    });
+  });
+
+  it('never writes a header VALUE to a log line: on, status, off', async () => {
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    await speculateOn(opts());
+    await speculateStatus(opts());
+    await speculateOff(opts());
+    expect(logs.length).toBeGreaterThan(0);
+    expect(logs.join('\n')).not.toContain(TOKEN);
+  });
+
+  it('scrubs a header value the host CLI echoes back in an error', async () => {
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    // A host that rejects the wrapped entry AND quotes the payload back, then
+    // rejects the restore too: the loudest path `on` has, and the one that
+    // would otherwise print the token twice.
+    const echoing: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'add-json') {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: `rejected entry: ${args[3]}` };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    expect(await speculateOn({ ...opts(), runner: echoing })).toBe(1);
+    expect(logs.join('\n')).toContain('RESTORE ALSO FAILED');
+    expect(logs.join('\n')).not.toContain(TOKEN);
+  });
+
+  it('keeps the recorded original when a restore fails, so the token is not lost', async () => {
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    await speculateOn(opts());
+    logs = [];
+    const noRestore: CmdRunner = async (cmd, args, o) => {
+      if (args[0] === 'mcp' && args[1] === 'add-json' && args[2] === 'remote') {
+        calls.push([cmd, ...args]);
+        return { code: 1, stdout: '', stderr: 'disk full' };
+      }
+      return fakeRunner(cmd, args, o);
+    };
+    expect(await speculateOff({ ...opts(), runner: noRestore })).toBe(1);
+    expect(logs.join('\n')).not.toContain(TOKEN);
+    // Dropping the record here would destroy the only remaining copy of the
+    // entry: the host's is removed and the log is redacted.
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.projects[cwd].entries.map((e: AnyRecord) => e.name)).toEqual(['remote']);
+    expect(logs.join('\n')).toContain(statePath);
+  });
+
+  it('DOES record the token in the state file — the price of an exact restore', async () => {
+    // Deliberate and pinned: `off` restores from this record, so it holds the
+    // entry verbatim. The file is written 0600 inside a 0700 directory.
+    writeClaudeJson({ mcpServers: { remote: { ...remoteEntry } } });
+    await speculateOn(opts());
+    expect(readFileSync(statePath, 'utf8')).toContain(TOKEN);
+    if (!isWindows) {
+      expect(statSync(statePath).mode & 0o777).toBe(0o600);
+    }
   });
 });
 
@@ -1034,6 +1205,29 @@ describe('speculate status', () => {
     expect(text).toContain('github (user): wrapped (managed)');
     expect(text).toContain('linear (user): NOT wrapped');
     expect(text).toContain("run it again");
+  });
+
+  it('tells the truth about remote servers, and about the ones it cannot see', async () => {
+    writeClaudeJson({
+      mcpServers: {
+        wrapme: { type: 'http', url: 'https://api.example.com/mcp/' },
+        legacy: { type: 'sse', url: 'https://sse.example.com/mcp' },
+      },
+    });
+    await speculateOn(opts());
+    const config = readClaudeJson();
+    config.mcpServers.fresh = { type: 'http', url: 'https://other.example.com/mcp' };
+    writeClaudeJson(config);
+
+    logs = [];
+    expect(await speculateStatus(opts())).toBe(0);
+    const text = logs.join('\n');
+    expect(text).toContain('wrapme (user): wrapped (managed, remote)');
+    expect(text).toContain('fresh (user): NOT wrapped (remote)');
+    expect(text).toContain('legacy (user): sse transport');
+    // Claimed about nothing it cannot see, and it cannot see these.
+    expect(text).toContain('claude.ai');
+    expect(text).not.toContain('Sentry');
   });
 
   it('flags a leftover ≤0.10 speculate-workspace server as legacy, not healthy', async () => {

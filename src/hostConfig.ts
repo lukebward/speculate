@@ -165,11 +165,75 @@ export function effectiveServers(servers: ScopedServer[]): Map<string, ScopedSer
   return out;
 }
 
-/** stdio entries are wrappable; url/http/sse entries pass through verbatim. */
+/** stdio entries are wrappable as a child process; remote ones via --url. */
 export function isStdioEntry(entry: McpServerEntry): boolean {
   if (typeof entry.url === 'string' && entry.url.length > 0) return false;
   if (entry.type !== undefined && entry.type !== 'stdio') return false;
   return typeof entry.command === 'string' && entry.command.length > 0;
+}
+
+/**
+ * RFC 9110 field-name token, the rule `speculate wrap --header` enforces
+ * (config.ts HEADER_NAME, which a test pins this copy to). Duplicated rather
+ * than imported: config.ts pulls in zod and every profile, and this module is
+ * on `sync`'s session-start path, which must stay cheap.
+ */
+export const HOST_HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+export type RemoteWrapPlan =
+  | { wrappable: true; url: string; headers: [string, string][] }
+  | { wrappable: false; reason: string };
+
+/**
+ * How (or whether) a REMOTE entry can be re-expressed as `speculate wrap
+ * --url … --header …`. Null means the entry is not remote at all.
+ *
+ * Wrappable means the entry ALONE is enough to connect: its own token, or no
+ * auth at all (plenty of self-hosted servers are unauthenticated on a trusted
+ * network). Nothing here goes looking for credentials the entry does not
+ * carry — an OAuth connector the host holds tokens for is not wrappable and
+ * is not discoverable from here.
+ *
+ * The bar is deliberately "can we carry it through argv, verbatim and
+ * losslessly?", and everything it rejects is something `wrap` would refuse
+ * at launch or a transport Speculate does not speak. Refusing here leaves a
+ * working unwrapped server; wrapping optimistically would break it.
+ *
+ * REASONS NEVER QUOTE A HEADER VALUE — they are logged by `on` and `status`.
+ */
+export function planRemoteWrap(entry: McpServerEntry): RemoteWrapPlan | null {
+  if (typeof entry.url !== 'string' || entry.url.length === 0) return null;
+  const bad = (reason: string): RemoteWrapPlan => ({ wrappable: false, reason });
+  if (typeof entry.command === 'string' && entry.command.length > 0) {
+    return bad('both a url and a command — ambiguous transport');
+  }
+  if (entry.type !== undefined && entry.type !== 'http' && entry.type !== 'streamable-http') {
+    return bad(`${String(entry.type)} transport (Speculate speaks streamable HTTP)`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(entry.url);
+  } catch {
+    return bad('url is not parseable');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return bad(`url scheme '${parsed.protocol.replace(':', '')}' is not http or https`);
+  }
+  const headers: [string, string][] = [];
+  if (entry.headers !== undefined) {
+    if (entry.headers === null || typeof entry.headers !== 'object' || Array.isArray(entry.headers)) {
+      return bad('headers is not an object');
+    }
+    for (const [name, value] of Object.entries(entry.headers as Record<string, unknown>)) {
+      if (!HOST_HEADER_NAME.test(name)) return bad(`header '${name}' is not a valid header name`);
+      if (typeof value !== 'string') return bad(`header '${name}' is not a string`);
+      // A raw newline also truncates the command line through the Windows
+      // .cmd shim `claude mcp add-json` may go through (win32ShimInvocation).
+      if (/[\r\n]/.test(value)) return bad(`header '${name}' contains a line break`);
+      headers.push([name, value]);
+    }
+  }
+  return { wrappable: true, url: entry.url, headers };
 }
 
 /** Already behind Speculate? (a `wrap` token inside a speculate invocation) */
@@ -201,37 +265,85 @@ export function selfCommand(): { command: string; args: string[] } {
 }
 
 /**
- * Wrap one stdio entry: same env, same everything, the command line
- * prefixed with `speculate wrap --`. The original survives verbatim
- * after the `--` (self-describing; see unwrapEntry).
+ * Wrap one entry: same env, same everything, the upstream expressed as
+ * Speculate's own command line.
+ *
+ *   stdio   `speculate wrap -- <command> <args…>`  (original after the `--`)
+ *   remote  `speculate wrap --url <url> --header "Name: value"…`
+ *
+ * A remote entry becomes a STDIO entry, so `url`, `type` and `headers` are
+ * dropped from it: the host chooses http transport the moment it sees a url,
+ * and leaving `headers` behind would copy the credential into a second place
+ * for no gain. A header value is carried through EXACTLY as written — a
+ * `${VAR}` placeholder stays a placeholder, resolved by `wrap` at launch, so
+ * no token that was not already inline is ever written out.
  */
 export function wrapEntry(
   entry: McpServerEntry,
   self: { command: string; args: string[] },
   opts: { mode?: 'strict' | 'annotated' | 'off' } = {},
 ): McpServerEntry {
+  const modeArgs = opts.mode ? ['--mode', opts.mode] : [];
+  const remote = planRemoteWrap(entry);
+  if (remote?.wrappable) {
+    const { url, type, headers, ...rest } = entry;
+    return {
+      ...rest,
+      command: self.command,
+      args: [
+        ...self.args,
+        'wrap',
+        ...modeArgs,
+        '--url',
+        remote.url,
+        ...remote.headers.flatMap(([name, value]) => ['--header', `${name}: ${value}`]),
+      ],
+    };
+  }
   return {
     ...entry,
     command: self.command,
-    args: [
-      ...self.args,
-      'wrap',
-      ...(opts.mode ? ['--mode', opts.mode] : []),
-      '--',
-      entry.command!,
-      ...(entry.args ?? []),
-    ],
+    args: [...self.args, 'wrap', ...modeArgs, '--', entry.command!, ...(entry.args ?? [])],
   };
 }
 
-/** Reconstruct the original entry from a wrapped one; null if not wrapped. */
+/**
+ * Reconstruct the original entry from a wrapped one; null if not wrapped.
+ *
+ * This is the no-state-file net, not the primary restore: `off` prefers the
+ * entry recorded verbatim in the managed-state file, which is exact. What is
+ * reconstructed here is exact for stdio, and for remote it is exact except
+ * that `type` reads back as `http` — the invocation records the transport
+ * Speculate was speaking, not whether the host had spelled it out.
+ */
 export function unwrapEntry(entry: McpServerEntry): McpServerEntry | null {
   if (!isWrappedEntry(entry)) return null;
   const args = entry.args ?? [];
   const wrapIdx = args.indexOf('wrap');
-  const dashIdx = args.indexOf('--', wrapIdx + 1);
-  if (dashIdx === -1 || dashIdx + 1 >= args.length) return null; // no wrapped command to restore
-  const original = args.slice(dashIdx + 1);
-  const out: McpServerEntry = { ...entry, command: original[0]!, args: original.slice(1) };
-  return out;
+  const flags = args.slice(wrapIdx + 1);
+  const dashIdx = flags.indexOf('--');
+  // Flags stop at `--`; everything after it is the wrapped command line.
+  const scan = dashIdx === -1 ? flags : flags.slice(0, dashIdx);
+  const urlIdx = scan.indexOf('--url');
+  if (urlIdx !== -1 && urlIdx + 1 < scan.length) {
+    const headers: Record<string, string> = {};
+    for (let i = 0; i < scan.length - 1; i++) {
+      if (scan[i] !== '--header') continue;
+      const raw = scan[i + 1]!;
+      // First colon only, exactly as parseWrapArgs splits it.
+      const split = raw.indexOf(':');
+      if (split <= 0) continue;
+      headers[raw.slice(0, split).trim()] = raw.slice(split + 1).trim();
+    }
+    const { command, args: _args, ...rest } = entry;
+    return {
+      ...rest,
+      type: 'http',
+      url: scan[urlIdx + 1]!,
+      ...(Object.keys(headers).length ? { headers } : {}),
+    };
+  }
+  if (dashIdx === -1 || dashIdx + 1 >= flags.length) return null; // no wrapped command to restore
+  const original = flags.slice(dashIdx + 1);
+  return { ...entry, command: original[0]!, args: original.slice(1) };
 }

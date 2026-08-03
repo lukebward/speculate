@@ -15,8 +15,15 @@ import type { SpeculateConfig } from './types.js';
  * silently resolving to something the user did not intend.
  */
 const ENV_PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
-/** RFC 9110 field-name token. Anything else is rejected at load. */
-const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/**
+ * RFC 9110 field-name token. Anything else is rejected at load.
+ *
+ * Exported for hostConfig.ts, which must apply the SAME rule before `on`
+ * rewrites a remote server into a `wrap --header` invocation, but cannot
+ * import this module (zod plus every profile) into the session-start `sync`
+ * path. It keeps its own copy; a test pins the two together.
+ */
+export const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
 /**
  * One HTTP header value, with `${VAR}` placeholders resolved from the
