@@ -43,6 +43,7 @@ import {
   isStdioEntry,
   isWrappedEntry,
   planRemoteWrap,
+  projectRoot,
   resolveWrapHeaders,
   readClaudeServers,
   unwrapEntry,
@@ -517,7 +518,11 @@ export function makeCtx(opts: ManageOptions): Ctx {
   let bin = opts.claudeBin;
   return {
     home: opts.home ?? homedir(),
-    cwd: resolve(opts.cwd ?? process.cwd()),
+    // The REPOSITORY ROOT, matching what the host calls this project (see
+    // hostConfig.projectRoot). Using it here too keeps one identity across
+    // discovery, the managed-state key and sync's hash, so `on` from a
+    // subdirectory and `off` from the root are the same project.
+    cwd: projectRoot(opts.cwd ?? process.cwd()),
     self: opts.self,
     runner: opts.runner ?? execFileRunner,
     get claudeBin(): string {

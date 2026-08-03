@@ -14,6 +14,7 @@ import {
   isStdioEntry,
   isWrappedEntry,
   planRemoteWrap,
+  projectRoot,
   readClaudeServers,
   resolveWrapHeaders,
   unwrapEntry,
@@ -42,6 +43,52 @@ function writeClaudeJson(data: unknown): void {
 function writeMcpJson(data: unknown): void {
   writeFileSync(join(cwd, '.mcp.json'), JSON.stringify(data));
 }
+
+describe('the project root', () => {
+  // Verified against the real CLI: `claude mcp add-json` run from
+  // <repo>/infrastructure/reviewStacks writes its local entry under the
+  // <repo> key, and `claude mcp list` from there picks up <repo>/.mcp.json.
+  // Resolving either against cwd found NOTHING from any subdirectory, so in a
+  // monorepo `status` listed only user-scope servers and `on` wrapped nothing
+  // while reporting success.
+  it('walks up to the repository root', () => {
+    const sub = join(cwd, 'infrastructure', 'reviewStacks');
+    mkdirSync(sub, { recursive: true });
+    mkdirSync(join(cwd, '.git'));
+    expect(projectRoot(sub)).toBe(cwd);
+  });
+
+  it('treats a .git FILE as a root, for worktrees and submodules', () => {
+    const sub = join(cwd, 'pkg');
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(cwd, '.git'), 'gitdir: /elsewhere/.git/worktrees/x');
+    expect(projectRoot(sub)).toBe(cwd);
+  });
+
+  it('falls back to the directory itself outside a repository', () => {
+    const sub = join(cwd, 'plain');
+    mkdirSync(sub, { recursive: true });
+    expect(projectRoot(sub)).toBe(sub);
+  });
+
+  it('finds local-scope and .mcp.json servers from a subdirectory', () => {
+    const sub = join(cwd, 'infrastructure', 'reviewStacks');
+    mkdirSync(sub, { recursive: true });
+    mkdirSync(join(cwd, '.git'));
+    writeClaudeJson({
+      mcpServers: { playwright: { command: 'pw' } },
+      projects: { [cwd]: { mcpServers: { github: { type: 'http', url: 'https://api.example.com/mcp' } } } },
+    });
+    writeMcpJson({ mcpServers: { honeycomb: { type: 'http', url: 'https://hc.example.com/mcp' } } });
+
+    const byName = new Map(
+      readClaudeServers({ home, cwd: sub }).servers.map((s) => [s.name, s.scope]),
+    );
+    expect(byName.get('github')).toBe('local');
+    expect(byName.get('honeycomb')).toBe('project');
+    expect(byName.get('playwright')).toBe('user');
+  });
+});
 
 describe('readClaudeServers + effectiveServers', () => {
   describe('finding this project in the host config', () => {

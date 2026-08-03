@@ -23,7 +23,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 export interface McpServerEntry {
   command?: string;
@@ -99,6 +99,34 @@ export function claudeJsonPath(home: string): string {
 }
 
 /**
+ * The directory Claude Code calls "this project", which is the REPOSITORY
+ * ROOT, not the current directory.
+ *
+ * Verified against the real CLI: `claude mcp add-json` run from
+ * `<repo>/infrastructure/reviewStacks` writes its local-scope entry under the
+ * `<repo>` key, and `claude mcp list` from that same subdirectory picks up
+ * `<repo>/.mcp.json`. Speculate resolved both against `cwd` instead, so in any
+ * monorepo subdirectory it saw NONE of the project's servers: `status` listed
+ * only user-scope ones and `on` silently wrapped nothing. That is the single
+ * most confusing way this tool can fail, because everything reports success.
+ *
+ * `.git` is tested with `existsSync` rather than a directory check on purpose:
+ * in a worktree or a submodule it is a FILE, and those are still repo roots.
+ * With no repository anywhere above, the current directory is the project,
+ * which is also what the host does.
+ */
+export function projectRoot(cwd: string): string {
+  const start = resolve(cwd);
+  let dir = start;
+  for (;;) {
+    if (existsSync(join(dir, '.git'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return start;
+    dir = parent;
+  }
+}
+
+/**
  * Compare two project paths the way the filesystem would, not the way string
  * equality does: separators unified, trailing slashes dropped, and case
  * folded on Windows only (where the filesystem is case-insensitive; folding on
@@ -139,7 +167,10 @@ function findProjectRecord(
 export function readClaudeServers(opts: { home: string; cwd: string }): ClaudeConfigView {
   const warnings: string[] = [];
   const servers: ScopedServer[] = [];
-  const cwd = resolve(opts.cwd);
+  // Both LOCAL scope and `.mcp.json` are keyed to the repository root by the
+  // host, so resolving them against the current directory finds nothing from
+  // any subdirectory. See projectRoot.
+  const cwd = projectRoot(opts.cwd);
 
   const claudeJson = readJsonFile(claudeJsonPath(opts.home), warnings);
   for (const [name, entry] of Object.entries(serverMap(claudeJson?.mcpServers))) {

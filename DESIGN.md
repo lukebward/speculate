@@ -703,6 +703,16 @@ Three smaller things that each have a specific failure behind them:
 
 **Two limits stated rather than papered over.** The SDK puts the resource server's advertised `scopes_supported` ahead of the client's own, so on Sentry our token carries `project:write team:write event:write`. That is the same scope set the host already holds, not a widening, and Speculate never *exercises* it: the policy layer only ever executes affirmatively read-only tools. Narrowing was rejected because Sentry advertises no `project:read`, so a narrowed token would break reads. Separately, `mode: 0o600` is a **verified no-op on Windows** (Node writes 666; protection comes only from the `%LOCALAPPDATA%` ACL). `doctor` says so rather than implying a guarantee that is not there.
 
+### 13.23 The project is the repo root, and two categories we still cannot see (2026-08-03)
+
+A user in a monorepo reported `speculate status` listing one server while `claude mcp list` listed sixteen. Two distinct causes, both found by running the real CLI rather than reading its docs.
+
+**Discovery was anchored to the wrong directory.** Claude Code scopes both LOCAL entries and `.mcp.json` to the **repository root**; Speculate resolved both against `cwd`. Verified directly: `claude mcp add-json` run from `<repo>/infrastructure/reviewStacks` wrote its entry under the `<repo>` key, and `claude mcp list` from that same subdirectory picked up `<repo>/.mcp.json`. So from any subdirectory Speculate saw *none* of the project's servers, and reported success while doing nothing, which is the most confusing way this tool can fail. `projectRoot()` now walks up to `.git` (tested with `existsSync`, since a worktree or submodule has a `.git` FILE) and falls back to the directory itself outside a repository. That root is now the single project identity: discovery, the managed-state key, and sync's hash all use it, so `on` from a subdirectory and `off` from the root are the same project.
+
+A separate, smaller bug found on the way: the `projects` lookup was an exact string match, and on Windows `claude mcp add-json` writes the key with forward slashes while `resolve()` returns backslashes, so local scope was invisible there too. Keys are now compared normalized (separators, trailing slash, case folded on Windows only).
+
+**Plugin-provided servers are a fifth row.** The same report showed six servers registered as `plugin:<plugin>:<server>`, including hosted HTTP ones (`plugin:github:github`, `plugin:sentry:sentry`) that are exactly the high-latency population Speculate exists for. They are declared in `<plugin-install-path>/.mcp.json` and interpolate `${CLAUDE_PLUGIN_ROOT}`. Speculate cannot currently wrap them, and the reason is not the same as row 4: there *is* a file, but it belongs to a plugin cache that Claude Code owns and rewrites on update, so an edit there would be silently reverted and would also desync the plugin's git checkout. Wrapping them needs a mechanism that does not exist yet, and is recorded here rather than attempted.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.
