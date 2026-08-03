@@ -719,16 +719,20 @@ Every latency number in this document except §13.20's came from a mock with inj
 
 | Server | Credential | Warm median (runs 2-3) | Best run (run 3) | Waste |
 |---|---|---|---|---|
+| Context7 | none | 9.40 s -> 3.09 s (-67%) | 9.31 s -> 1.32 s, 5 of 6 buffered | 0 |
 | GitHub hosted MCP | token | 5.09 s -> 1.51 s (-70%) | 5.43 s -> 605 ms, 7 of 8 buffered | 0 |
-| Hugging Face Hub | **none** | 259 ms -> 139 ms (-46%) | 258 ms -> 10 ms, 6 of 6 buffered | 0 |
+| Microsoft Learn | none | 2.30 s -> 1.05 s (-54%) | 2.62 s -> 783 ms, 5 of 6 buffered | 0 |
+| Hugging Face Hub | none | 259 ms -> 139 ms (-46%) | 258 ms -> 10 ms, 6 of 6 buffered | 0 |
 
 **Which column is the claim matters, and the first draft of the README got it wrong.** The bench prints both a warm median (runs 2-3) and a per-call table against the warmest single run, and the README quoted the latter under the word "warm". For Hugging Face that is the difference between -96% and -46%. The headline is now the median; the best run is kept beside it as a visible ceiling rather than deleted, because the gap between them is itself the finding: warming is gradual, not a step change.
 
-The Hugging Face run is the more useful of the two despite the smaller absolute win, for three reasons. It needs no credential, so it is the first number here anybody can check. It is a *harder* prediction problem: the Hub returns MARKDOWN, so the learner cannot parse an id out of the previous result the way it can with JSON, and what is left is memorising arguments across repeats. And it makes the shape of the benefit unmissable, because the same code saves a quarter of a second here and five seconds on GitHub: **value scales with upstream latency**, exactly as §13.7 argued when the CLI tier was cut.
+Three of the four need no credential, which matters more than the size of any single number: they are the first figures in this document a stranger can check. Spanning four servers also makes the shape of the benefit unarguable, because the same code and the same session structure produce a 3.6 s saving against Context7 and a 120 ms saving against the Hub. **Value scales with upstream latency**, exactly as §13.7 argued when the CLI tier was cut, and the table is now the evidence rather than the assertion.
 
-Both runs reproduce the cold-start cost rather than hiding it. GitHub run 1 was 5.14 s off versus 5.00 s on (no benefit); Hugging Face run 1 was 248 ms off versus 271 ms on, i.e. **measurably slower**. Full warmth arrived only at run 3 in both. The headline is therefore always quoted warm-only and always beside that caveat.
+Microsoft Learn is the most informative of the four and was chosen for it: it answers in JSON (`results[].contentUrl`), so the learner can PARSE the next argument out of the previous result instead of only recalling one it has seen. Context7 and the Hub both answer in markdown, where no parsed path exists and memorisation across repeats is all that is available. That the markdown pair still reach -67% and -46% says the memorisation path carries real weight on its own.
 
-A finding from surveying candidates, worth recording because it bounds what this tool can ever do: of the open servers probed, **DeepWiki annotates no `readOnlyHint` at all**. Speculate speculates nothing there, correctly and by design, in either shipped mode. Cloudflare's docs server annotates both its tools but exposes only a single search entry point, so there is no list-then-detail transition to learn. A server has to both annotate and have a chained workflow before any of this machinery can help, and neither is guaranteed.
+Every run reproduces the cold-start cost rather than hiding it. GitHub run 1 was 5.14 s off versus 5.00 s on (no benefit); Hugging Face run 1 was 248 ms off versus 271 ms on, i.e. **measurably slower**. Full warmth arrived only at run 3 in both. The headline is therefore always quoted warm-only and always beside that caveat.
+
+Findings from surveying candidates, worth recording because they bound what this tool can ever do. **DeepWiki, GitMCP and grep.app annotate no `readOnlyHint` at all**, so Speculate speculates nothing against any of them, correctly and by design, in either shipped mode. Cloudflare's docs server annotates both its tools but exposes a single search entry point, so there is no list-then-detail transition to learn. Cloudflare Radar and Chroma require credentials. A server has to annotate its read-only tools AND expose a chained workflow before any of this machinery can help; of the candidates probed, more failed that bar than passed it.
 
 ## v0.11 (2026-08-01): MCP-only focus
 

@@ -14,20 +14,24 @@
 - **Read-only, always.** Speculation runs tools that are affirmatively read-only and nothing else.
 - **Nothing is taken away.** Every change goes through your client's own CLI, and `off` restores exactly.
 
-Measured against real hosted servers rather than mocks. One machine, one network, three alternating off/on runs:
+Measured against real hosted MCP servers, not mocks. Three alternating off/on runs each, zero config:
 
-| Server | Credential | Warm tool wait | Best run | Wasted calls |
-|---|---|---|---|---|
-| GitHub hosted MCP | your token | 5.1 s to 1.5 s (-70%) | 5.4 s to 0.6 s | 0 |
-| Hugging Face Hub | none needed | 259 ms to 139 ms (-46%) | 258 ms to 10 ms | 0 |
+| Server | Auth | Warm tool wait | Cut |
+|---|---|---|---|
+| Context7 | none | 9.4 s to 3.1 s | -67% |
+| GitHub hosted MCP | token | 5.1 s to 1.5 s | -70% |
+| Microsoft Learn | none | 2.3 s to 1.1 s | -54% |
+| Hugging Face Hub | none | 259 ms to 139 ms | -46% |
 
-**Warm** means the median of runs 2 and 3, after the first pass has taught it the workflow. The **best run** column is the third pass, once every transition is learned: it is the ceiling, not the average, and it is there so the gap between the two is visible rather than hidden. Both zero-config: no bundled profile matched either server, so this is what pointing Speculate at a URL gets you. The Hugging Face run needs no credential, so anyone can reproduce it:
+Zero wasted calls on any of them. The saving tracks how slow the server is, which is the whole point: a local stdio server answering in single-digit milliseconds has nothing worth hiding.
+
+**Warm** is the median of runs 2 and 3. The first pass gets no benefit at all and can measure slightly slower, because nothing is predictable before it has been seen once. The benchmark also repeats an identical session, so it is the best case for a workflow you actually repeat. Three of the four need no credential, so you can check them yourself:
 
 ```bash
-SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario huggingface
+SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
 ```
 
-Three caveats, all of them load-bearing. **The first pass gets no benefit at all** and can measure slightly slower, because nothing is predictable before it has been seen once. **The benchmark repeats an identical session**, so it measures the best case for a workflow you actually repeat; vary the arguments and warming takes longer. And **the win scales with how slow the server is**, which is why the fast one saves 120 ms and the slow one saves 3.6 s. [DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+[DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
 
 ## Install
 

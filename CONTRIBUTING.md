@@ -20,7 +20,9 @@ own `readOnlyHint` annotation at run time, and anything not affirmatively
 read-only aborts before a single call is made.
 
 ```bash
-# needs no credential, so anyone can reproduce it
+# these need no credential, so anyone can reproduce them
+SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
+SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario mslearn
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario huggingface
 
 # needs a token, which is never written to disk (the config carries the

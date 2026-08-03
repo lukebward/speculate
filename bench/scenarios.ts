@@ -199,4 +199,115 @@ const huggingface: Scenario = {
   },
 };
 
-export const SCENARIOS: Record<string, Scenario> = { github, huggingface };
+/** `Context7-compatible library ID: /org/lib` out of the resolver's markdown. */
+function extractLibraryIds(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/Context7-compatible library ID:\s*(\S+)/g)) out.push(m[1]!);
+  return out;
+}
+
+/**
+ * Context7: resolve a library name to an id, then pull docs for it.
+ *
+ * The tightest list-then-detail shape of the four, and no credential. Like
+ * the Hub it answers in markdown, so the id cannot be parsed out of the
+ * previous result and only memorisation across repeats is available.
+ */
+const context7: Scenario = {
+  key: 'context7',
+  label: 'Context7',
+  url: 'https://mcp.context7.com/mcp',
+  tokenEnv: null,
+  needTools: ['resolve-library-id', 'query-docs'],
+  describe: (ctx) => `libraries ${(ctx['libs'] as string[]).join(', ')}`,
+  async plan(call) {
+    const libs = ['react', 'fastapi'];
+    const ids: string[] = [];
+    for (const libraryName of libs) {
+      const found = extractLibraryIds(
+        resultText(await call('resolve-library-id', { libraryName, query: 'getting started' })),
+      );
+      if (found.length === 0) throw new Error(`resolve-library-id("${libraryName}") returned no id`);
+      ids.push(found[0]!);
+    }
+    return { libs, ids };
+  },
+  script(ctx) {
+    const libs = ctx['libs'] as string[];
+    const ids = ctx['ids'] as string[];
+    const steps: ScriptStep[] = [];
+    libs.forEach((lib, i) => {
+      steps.push({ kind: 'turn', label: `user: "how do I get started with ${lib}?"`, ms: i === 0 ? undefined : 2000 });
+      steps.push({ kind: 'call', tool: 'resolve-library-id', args: { libraryName: lib, query: 'getting started' } });
+      steps.push({ kind: 'think', ms: 1000 });
+      steps.push({ kind: 'call', tool: 'query-docs', args: { libraryId: ids[i]!, query: 'getting started' } });
+      steps.push({ kind: 'think', ms: 1200 });
+      steps.push({ kind: 'call', tool: 'query-docs', args: { libraryId: ids[i]!, query: 'configuration' } });
+    });
+    return steps;
+  },
+};
+
+/** `results[].contentUrl` out of the docs search envelope. */
+function extractContentUrls(text: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isRecord(parsed) || !Array.isArray(parsed['results'])) return [];
+    return (parsed['results'] as unknown[])
+      .map((r) => (isRecord(r) && typeof r['contentUrl'] === 'string' ? r['contentUrl'] : null))
+      .filter((u): u is string => u !== null);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Microsoft Learn: search the docs, then fetch two of the hits.
+ *
+ * The most informative scenario here, because it answers in JSON. That is the
+ * one case where the learner can PARSE the next argument out of the previous
+ * result (`results[i].contentUrl`) rather than only recalling an argument it
+ * has seen before, so it exercises generalisation and not just memory.
+ */
+const mslearn: Scenario = {
+  key: 'mslearn',
+  label: 'Microsoft Learn',
+  url: 'https://learn.microsoft.com/api/mcp',
+  tokenEnv: null,
+  needTools: ['microsoft_docs_search', 'microsoft_docs_fetch'],
+  describe: (ctx) => `queries ${(ctx['queries'] as string[]).map((q) => `"${q}"`).join(' then ')}`,
+  async plan(call) {
+    const queries = ['azure functions python', 'azure storage lifecycle'];
+    const picked: string[][] = [];
+    for (const query of queries) {
+      const urls = extractContentUrls(resultText(await call('microsoft_docs_search', { query })));
+      if (urls.length < 2) {
+        throw new Error(`microsoft_docs_search("${query}") returned ${urls.length} urls, need 2`);
+      }
+      picked.push(urls.slice(0, 2));
+    }
+    return { queries, picked };
+  },
+  script(ctx) {
+    const queries = ctx['queries'] as string[];
+    const picked = ctx['picked'] as string[][];
+    const steps: ScriptStep[] = [];
+    queries.forEach((query, i) => {
+      const [a, b] = picked[i] as [string, string];
+      steps.push({ kind: 'turn', label: `user: "docs on ${query}"`, ms: i === 0 ? undefined : 2000 });
+      steps.push({ kind: 'call', tool: 'microsoft_docs_search', args: { query } });
+      steps.push({ kind: 'think', ms: 1000 });
+      steps.push({ kind: 'call', tool: 'microsoft_docs_fetch', args: { url: a } });
+      steps.push({ kind: 'think', ms: 1200 });
+      steps.push({ kind: 'call', tool: 'microsoft_docs_fetch', args: { url: b } });
+    });
+    return steps;
+  },
+};
+
+export const SCENARIOS: Record<string, Scenario> = {
+  github,
+  huggingface,
+  context7,
+  mslearn,
+};
