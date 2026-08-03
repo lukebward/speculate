@@ -184,6 +184,29 @@ async function listenForCallback(state: string): Promise<Callback> {
   };
 }
 
+/**
+ * Turn a dead end into a next step.
+ *
+ * Some authorization servers advertise no `registration_endpoint`, so
+ * Speculate cannot register itself and no amount of retrying will help.
+ * GitHub's hosted MCP server is the one that matters in practice: it
+ * advertises metadata at `https://github.com/login/oauth` with no
+ * registration endpoint, because it expects clients to be registered by hand
+ * as GitHub OAuth apps. That server is still perfectly usable through a token
+ * (which is how the README and the live benchmark drive it), so say so
+ * instead of surfacing the SDK's accurate but terminal sentence.
+ */
+function explainAuthFailure(err: unknown, url: string): string {
+  const message = err instanceof Error ? err.message : String(err);
+  if (/does not support dynamic client registration/i.test(message)) {
+    return (
+      `${url} does not offer dynamic client registration, so Speculate cannot register itself.\n` +
+      `  Use a token instead: speculate wrap --url ${url} --header "Authorization: Bearer \${YOUR_TOKEN}"`
+    );
+  }
+  return message;
+}
+
 /** Fresh client + transport, so verification never reuses a failed one. */
 function connectAttempt(url: string, provider: SpeculateOAuthProvider) {
   const transport = new StreamableHTTPClientTransport(new URL(url), { authProvider: provider });
@@ -349,7 +372,7 @@ export async function speculateAuth(opts: AuthOptions = {}): Promise<number> {
       await authorizeServer(target.url, { storePath, log, openBrowser });
     } catch (err) {
       failed++;
-      log(`[speculate] ${target.name}: authorization failed: ${(err as Error).message}`);
+      log(`[speculate] ${target.name}: authorization failed: ${explainAuthFailure(err, target.url)}`);
     }
   }
   if (failed > 0) return 1;

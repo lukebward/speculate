@@ -256,6 +256,44 @@ describe('speculate auth, end to end', () => {
     expect(logs.join('\n')).not.toContain(record.tokens!.refresh_token);
   });
 
+  it('points at the token route when the server offers no dynamic registration', async () => {
+    // GitHub's hosted MCP server is exactly this: metadata at
+    // https://github.com/login/oauth with no registration_endpoint, because
+    // it expects hand-registered OAuth apps. Speculate cannot register
+    // itself there, but the server is perfectly usable with a token, so the
+    // failure has to name that instead of dead-ending.
+    const noDcr = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      if (url.pathname === '/.well-known/oauth-authorization-server') {
+        return json(res, 200, {
+          issuer: 'http://x',
+          authorization_endpoint: 'http://x/authorize',
+          token_endpoint: 'http://x/token',
+          // no registration_endpoint
+          response_types_supported: ['code'],
+        });
+      }
+      res.writeHead(401, { 'www-authenticate': 'Bearer realm="OAuth"' }).end();
+    });
+    await new Promise<void>((r) => noDcr.listen(0, '127.0.0.1', r));
+    const port = (noDcr.address() as { port: number }).port;
+    try {
+      const code = await speculateAuth({
+        target: `http://127.0.0.1:${port}/mcp`,
+        storePath,
+        log: (l) => logs.push(l),
+        openBrowser: browser,
+      });
+      expect(code).toBe(1);
+      const out = logs.join('\n');
+      expect(out).toContain('does not offer dynamic client registration');
+      expect(out).toContain('speculate wrap --url');
+      expect(out).toContain('Authorization: Bearer');
+    } finally {
+      await new Promise<void>((r) => noDcr.close(() => r()));
+    }
+  });
+
   it('--forget deletes the local credentials', async () => {
     await run();
     expect(readOAuthRecord(storePath, `${base}/mcp`)?.tokens).toBeDefined();
