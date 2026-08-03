@@ -60,10 +60,10 @@ async function main(): Promise<void> {
           command: TSX,
           args: [TSX_CLI, join(ROOT, 'mock', 'mock-github.ts')],
           env: { SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS) },
-          // No vetted profile: this run demonstrates Tier 2 (the
-          // server-agnostic learner), the same path any unprofiled MCP
-          // server gets — not the GitHub profile's pre-loaded rules.
-          profile: 'none',
+          // No rules of any kind: this run is the server-agnostic learner
+          // alone, which is what every MCP server now gets. It used to say
+          // `profile: 'none'` to opt out of the vetted profiles; those were
+          // removed, so opting out is the only behaviour there is.
         },
       },
     }),

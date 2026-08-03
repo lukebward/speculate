@@ -60,7 +60,7 @@ Connectors you added in the claude.ai UI are never wrapped: the host holds them,
 
 ## Safety
 
-- Speculation only ever executes tools that are affirmatively read-only (`readOnlyHint` plus allowlists in `strict` mode; annotations alone in `annotated`, the zero-config default). Unknown tools are never speculated; real calls, including writes, are forwarded verbatim, and any mutation flushes the cache.
+- Speculation only ever executes tools that are affirmatively read-only (`readOnlyHint` plus your own `allowTools` in `strict` mode; annotations alone in `annotated`, the zero-config default). Unknown tools are never speculated; real calls, including writes, are forwarded verbatim, and any mutation flushes the cache.
 - Cached results are byte-identical, single-use, short-TTL, and never written to disk. Persisted learning holds tool names and argument templates, never results.
 - `speculate on` mutates config only through the host's own CLIs, records what it did, and `off` restores exactly.
 - Speculate registers as its own OAuth client and never reads another application's credential store, so refreshing its token cannot disturb Claude Code's. Header values are never logged; `doctor` shows names and expiry, never the token.
@@ -114,6 +114,8 @@ The client sees standard MCP: same tools, same results, except predicted reads c
 <summary><b>Per-server configuration</b></summary>
 
 A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json); `speculate init` writes a starter.
+
+Rules are the only hand-written prediction source, and you only need them to skip the warm-up: a rule fires on the first call, where the learner has to see a transition before it can predict one. They select values out of the trigger's arguments or its parsed result (`$args.owner`, `$item.number`, `forEach: "$parsed"`), so a server returning non-JSON text can only be learned, not ruled.
 
 </details>
 
