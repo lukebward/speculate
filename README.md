@@ -12,7 +12,7 @@
 
 - **No configuration, nothing per-server.** Speculate learns from your own traffic, so it works the same on a server nobody has heard of.
 - **Read-only, always.** It runs tools the server marks read-only, and nothing else.
-- **Nothing taken away.** Every change goes through your client's own CLI, and `off` puts it all back.
+- **Nothing taken away.** Every change is recorded, and `off` reverses it exactly.
 
 Measured against real hosted MCP servers, not mocks. Three alternating off/on runs each, zero config:
 
@@ -44,7 +44,7 @@ That is the whole setup. `speculate on` re-registers this project's MCP servers 
 
 Speculate wraps remote (streamable HTTP) servers too, which is where most of the latency lives. For the ones needing a login (Sentry, Notion, Linear), `on` offers to sign you in: say yes, click once in the browser, done.
 
-Servers that come from Claude Code **plugins** (`plugin:github:github` and friends) are wrapped too: `on` registers a wrapped copy under the server's bare name and switches the plugin's own copy off through the host's per-project disable list — the same switch the `/mcp` screen uses. One visible cost: tool names follow the copy, so permission rules keyed `mcp__plugin_github_github__*` become `mcp__github__*`. Disabling either half in `/mcp` is respected: the plugin server stays disabled if you disabled it, and disabling the wrapped copy makes Speculate stand down and put the original back.
+Servers that **plugins** provide (`plugin:github:github` and friends) are wrapped too: `on` registers a wrapped copy under the bare server name and turns the plugin's own copy off with the same per-project switch the `/mcp` screen uses. Tool names follow the copy, so a permission rule keyed `mcp__plugin_github_github__*` becomes `mcp__github__*` — the one rename to expect.
 
 Speculate never touches connectors you added in the claude.ai UI. The host holds those, so nothing here can see them.
 
@@ -64,7 +64,7 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 
 - Speculate only ever executes tools the server marks read-only (`readOnlyHint` plus your own `allowTools` in `strict` mode; annotations alone in `annotated`, the zero-config default). It never speculates on an unknown tool. It forwards every real call verbatim, writes included, and flushes the cache on any mutation.
 - Cached results are byte-identical, single-use, short-lived, and never hit the disk. What Speculate persists is tool names and argument templates, never results.
-- `speculate on` changes config only through the host's own CLIs and records everything it did, so `off` can undo it exactly. The one scoped exception: to wrap a plugin's server it also adds that server's name to the `disabledMcpServers` list in your own `~/.claude.json` — the key the `/mcp` screen writes, for which no CLI exists — and `off` removes exactly that entry.
+- `speculate on` changes config through the host's own CLIs and records everything it did, so `off` can undo it exactly. One scoped exception: wrapping a plugin's server also adds that server's name to `disabledMcpServers` in your own `~/.claude.json` — the key the `/mcp` screen writes and no CLI does — and `off` removes exactly that entry.
 - Speculate registers as its own OAuth client and never reads another application's credential store, so refreshing its token cannot disturb Claude Code's. It never logs a header value: `doctor` shows names and expiry, never the token.
 
 **Non-goals:** speculating writes (permanent), brokering anyone else's credentials, general response caching, token savings. The win is wall-clock latency.
@@ -76,7 +76,8 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 
 - **One session behind.** Claude Code reads MCP config before session-start hooks run, so a server you add now gets wrapped from your *next* session. It works normally meanwhile, just without prefetching.
 - **Approval never widens.** A server pending approval in `.mcp.json` stays pending. Revoke it, or delete the server, and the next session start removes the wrapped copy.
-- **GUI-launched apps work too.** The hook bakes absolute paths for both `node` and `claude` with PATH fallbacks, so a desktop app opened from a dock icon — whose minimal OS PATH has neither — still auto-wraps. If the hook ever stops firing, `speculate status` says so instead of leaving it silent.
+- **The `/mcp` switches win.** A plugin server you disabled there is never wrapped, and your entry is never removed. Disable a wrapped copy instead and Speculate stands down: copy removed, plugin original back.
+- **GUI-launched apps work too.** The hook bakes absolute paths for `node` and `claude` with PATH fallbacks, so a desktop app opened from a dock icon — whose minimal OS PATH has neither — still auto-wraps. If the hook ever stops firing, `speculate status` says so instead of staying silent.
 - **Removing it everywhere:** `off` covers one project. To stop it globally, `claude plugin uninstall -s user speculate-autowrap`, then `claude plugin marketplace remove speculate-mcp`.
 
 </details>
