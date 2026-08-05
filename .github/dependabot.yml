@@ -1,0 +1,10 @@
+# Weekly PRs for dependency advisories and updates. The github-actions
+# ecosystem also bumps SHA-pinned actions and their version comments.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }

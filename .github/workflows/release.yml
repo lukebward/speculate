@@ -20,16 +20,18 @@ jobs:
       contents: read
       id-token: write # required for OIDC auth and provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
 
       # Trusted publishing needs npm >= 11.5.1; Node 22 ships an older npm.
-      - run: npm install -g npm@latest
+      # Pinned to an exact version so this job never runs an npm release
+      # nobody has looked at yet (dependabot does not cover this line).
+      - run: npm install -g npm@12.0.2
 
       - run: npm ci
 
