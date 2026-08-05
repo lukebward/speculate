@@ -51,7 +51,44 @@ export interface ClaudeConfigView {
    */
   approvedProjectServers: Set<string>;
   projectApprovalKnown: boolean;
+  /**
+   * Servers declared by installed-and-enabled Claude Code plugins — the
+   * "fifth row" of §13.23, registered by the host as `plugin:<plugin>:<name>`.
+   * They live outside the scope contest (a plain entry cannot carry that
+   * name), so they ride beside `servers` rather than in it.
+   */
+  pluginServers: PluginScopedServer[];
+  /**
+   * The project record's `disabledMcpServers` array, verbatim: the host's
+   * per-project switch for plugin-qualified servers (its /mcp UI writes it).
+   * Read here both to respect a user's own disable and so the sync hash can
+   * see it move.
+   */
+  disabledMcpServers: string[];
   warnings: string[];
+}
+
+/** One plugin-declared MCP server, with host placeholders already expanded. */
+export interface PluginScopedServer {
+  /** `plugin:<plugin>:<server>` — exactly the name the host registers. */
+  qualifiedName: string;
+  /** `<plugin>@<marketplace>`, the id `enabledPlugins` and installs key on. */
+  pluginKey: string;
+  /** The bare server name inside the plugin's manifest. */
+  serverName: string;
+  /**
+   * The declared entry with `${CLAUDE_PLUGIN_ROOT}` and
+   * `${CLAUDE_PROJECT_DIR}` interpolated the way the host would at launch.
+   */
+  entry: McpServerEntry;
+  /** The plugin root the interpolation used. */
+  root: string;
+  /**
+   * Why Speculate can never wrap this entry (host expansion it cannot
+   * reproduce), or null when the entry is a wrap candidate. Fail-closed:
+   * anything here leaves the server exactly as the plugin declared it.
+   */
+  unwrappableReason: string | null;
 }
 
 /**
@@ -163,6 +200,228 @@ function findProjectRecord(
   return {};
 }
 
+// -- plugin-declared servers (DESIGN.md §13.23's fifth row) -----------------------
+
+/**
+ * Where the host keeps plugin state. `CLAUDE_CONFIG_DIR` relocates the whole
+ * directory (verified: `plugins/` lands inside it); without the override the
+ * plugins tree lives under `~/.claude` even though `.claude.json` does not.
+ */
+function claudeConfigDir(home: string): string {
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  return dir && dir.length > 0 ? resolve(dir) : resolve(home, '.claude');
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * `enabledPlugins` merged across the host's settings files, any explicit
+ * `false` winning — `claude plugin disable` writes exactly that (measured),
+ * and when the levels disagree the conservative reading is "disabled".
+ */
+function readEnabledPlugins(home: string, projectDir: string, warnings: string[]): Map<string, boolean> {
+  const out = new Map<string, boolean>();
+  const files = [
+    join(claudeConfigDir(home), 'settings.json'),
+    join(projectDir, '.claude', 'settings.json'),
+    join(projectDir, '.claude', 'settings.local.json'),
+  ];
+  for (const file of files) {
+    const parsed = readJsonFile(file, warnings);
+    if (!parsed || !isRecord(parsed.enabledPlugins)) continue;
+    for (const [key, value] of Object.entries(parsed.enabledPlugins)) {
+      if (value === false) out.set(key, false);
+      else if (value === true && out.get(key) !== false) out.set(key, true);
+    }
+  }
+  return out;
+}
+
+/**
+ * The plugin root the host would expand `${CLAUDE_PLUGIN_ROOT}` to.
+ *
+ * Measured on Claude Code 2.1.222: for a DIRECTORY-sourced marketplace the
+ * live source directory wins — an edit there takes effect while the versioned
+ * cache copy under `installPath` is ignored — so that candidate is tried
+ * first; for everything else (git-sourced marketplaces, the normal install)
+ * the recorded `installPath` is the root. A candidate only counts if it
+ * actually holds a plugin manifest; no usable root means no servers, never a
+ * guess.
+ */
+function pluginRootFor(
+  configDir: string,
+  pluginKey: string,
+  installPath: string | null,
+  warnings: string[],
+): string | null {
+  const candidates: string[] = [];
+  const at = pluginKey.lastIndexOf('@');
+  const pluginName = at > 0 ? pluginKey.slice(0, at) : pluginKey;
+  const marketplace = at > 0 ? pluginKey.slice(at + 1) : '';
+  if (marketplace) {
+    const known = readJsonFile(join(configDir, 'plugins', 'known_marketplaces.json'), warnings);
+    const record = known && isRecord(known[marketplace]) ? (known[marketplace] as Record<string, unknown>) : null;
+    const source = record && isRecord(record.source) ? (record.source as Record<string, unknown>) : null;
+    const installLocation = typeof record?.installLocation === 'string' ? record.installLocation : null;
+    if (source?.source === 'directory' && installLocation) {
+      const manifest = readJsonFile(join(installLocation, '.claude-plugin', 'marketplace.json'), warnings);
+      const plugins = Array.isArray(manifest?.plugins) ? (manifest.plugins as unknown[]) : [];
+      for (const item of plugins) {
+        if (!isRecord(item) || item.name !== pluginName) continue;
+        if (typeof item.source === 'string') candidates.push(resolve(installLocation, item.source));
+      }
+    }
+  }
+  if (installPath) candidates.push(installPath);
+  for (const dir of candidates) {
+    if (existsSync(join(dir, '.mcp.json')) || existsSync(join(dir, '.claude-plugin', 'plugin.json'))) {
+      return dir;
+    }
+  }
+  return null;
+}
+
+/**
+ * The server declarations at a plugin root. Two files can declare them —
+ * `plugin.json`'s `mcpServers` (an inline map, or a string path to a JSON
+ * file) and the root's `.mcp.json` (bare map, or `mcpServers`-wrapped) —
+ * merged with `.mcp.json` winning a name collision.
+ */
+function pluginServerMap(root: string, warnings: string[]): Record<string, McpServerEntry> {
+  const out: Record<string, McpServerEntry> = {};
+  const pluginJson = readJsonFile(join(root, '.claude-plugin', 'plugin.json'), warnings);
+  const declared = pluginJson?.mcpServers;
+  if (isRecord(declared)) {
+    Object.assign(out, serverMap(declared));
+  } else if (typeof declared === 'string' && declared.length > 0) {
+    const file = resolve(root, declared.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, root));
+    const referenced = readJsonFile(file, warnings);
+    if (referenced) {
+      Object.assign(out, serverMap(isRecord(referenced.mcpServers) ? referenced.mcpServers : referenced));
+    }
+  }
+  const mcpJson = readJsonFile(join(root, '.mcp.json'), warnings);
+  if (mcpJson) {
+    Object.assign(out, serverMap(isRecord(mcpJson.mcpServers) ? mcpJson.mcpServers : mcpJson));
+  }
+  return out;
+}
+
+/**
+ * Interpolate a declared entry the way the host does at launch, and decide
+ * whether a wrapped copy could be faithful to it.
+ *
+ * `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PROJECT_DIR}` substitute per-element
+ * as plain strings (the host's own rule) across command, args, env values,
+ * url, and header values. Everything else is fail-closed rather than
+ * approximated:
+ *
+ *   - `${CLAUDE_PLUGIN_DATA}` and `${user_config.*}` are host expansions
+ *     Speculate cannot reproduce.
+ *   - `headersHelper` is a dynamic-header hook the wrapped proxy cannot run.
+ *   - A STDIO entry still carrying any `${…}` placeholder is refused: the
+ *     host resolves `${VAR}` from the session environment at launch, and a
+ *     wrapped copy would hand the child the literal text — while resolving it
+ *     ourselves would bake a secret into config. (HTTP `headers` keep their
+ *     `${VAR}` placeholders on purpose: the existing wrap machinery resolves
+ *     those at launch under the v0.14 contract.)
+ */
+function interpolatePluginEntry(
+  raw: McpServerEntry,
+  root: string,
+  projectDir: string,
+): { entry: McpServerEntry; unwrappableReason: string | null } {
+  const sub = (s: string): string =>
+    s
+      .replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, root)
+      .replace(/\$\{CLAUDE_PROJECT_DIR\}/g, projectDir);
+  const entry: McpServerEntry = { ...raw };
+  if (typeof entry.command === 'string') entry.command = sub(entry.command);
+  if (Array.isArray(entry.args)) entry.args = entry.args.map((a) => (typeof a === 'string' ? sub(a) : a));
+  if (typeof entry.url === 'string') entry.url = sub(entry.url);
+  if (isRecord(entry.env)) {
+    entry.env = Object.fromEntries(
+      Object.entries(entry.env).map(([k, v]) => [k, typeof v === 'string' ? sub(v) : v]),
+    ) as Record<string, string>;
+  }
+  if (isRecord(entry.headers)) {
+    entry.headers = Object.fromEntries(
+      Object.entries(entry.headers).map(([k, v]) => [k, typeof v === 'string' ? sub(v) : v]),
+    );
+  }
+  const texts: string[] = [
+    entry.command ?? '',
+    ...(Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === 'string') : []),
+    typeof entry.url === 'string' ? entry.url : '',
+    ...(isRecord(entry.env) ? Object.values(entry.env).filter((v): v is string => typeof v === 'string') : []),
+    ...(isRecord(entry.headers) ? Object.values(entry.headers).filter((v): v is string => typeof v === 'string') : []),
+  ];
+  const anywhere = (re: RegExp): boolean => texts.some((t) => re.test(t));
+  if (anywhere(/\$\{CLAUDE_PLUGIN_DATA\}/)) {
+    return { entry, unwrappableReason: 'uses ${CLAUDE_PLUGIN_DATA}, a host expansion Speculate cannot reproduce' };
+  }
+  if (anywhere(/\$\{user_config\./)) {
+    return { entry, unwrappableReason: 'uses ${user_config.*}, a host expansion Speculate cannot reproduce' };
+  }
+  if (typeof (raw as Record<string, unknown>).headersHelper === 'string') {
+    return { entry, unwrappableReason: 'uses headersHelper, a dynamic-header hook the wrapped proxy cannot run' };
+  }
+  if (isStdioEntry(entry)) {
+    const stdioTexts = [
+      entry.command ?? '',
+      ...(Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === 'string') : []),
+      ...(isRecord(entry.env) ? Object.values(entry.env).filter((v): v is string => typeof v === 'string') : []),
+    ];
+    if (stdioTexts.some((t) => /\$\{[A-Za-z_]/.test(t))) {
+      return {
+        entry,
+        unwrappableReason:
+          'stdio entry carries ${…} placeholders the host resolves at launch — a wrapped copy would pass them through as literal text',
+      };
+    }
+  }
+  return { entry, unwrappableReason: null };
+}
+
+/**
+ * Every MCP server the host's installed-and-enabled plugins declare for this
+ * project. Read-only, fail-soft: a missing plugins tree (no plugins, older
+ * host) is simply an empty list.
+ */
+function readPluginServers(home: string, projectDir: string, warnings: string[]): PluginScopedServer[] {
+  const configDir = claudeConfigDir(home);
+  const installed = readJsonFile(join(configDir, 'plugins', 'installed_plugins.json'), warnings);
+  const plugins = installed && isRecord(installed.plugins) ? installed.plugins : null;
+  if (!plugins) return [];
+  const enabled = readEnabledPlugins(home, projectDir, warnings);
+  const out: PluginScopedServer[] = [];
+  for (const [pluginKey, rawInstalls] of Object.entries(plugins)) {
+    if (enabled.get(pluginKey) === false) continue;
+    const installs = Array.isArray(rawInstalls) ? rawInstalls : [rawInstalls];
+    const installPath = installs
+      .filter(isRecord)
+      .map((i) => (typeof i.installPath === 'string' ? i.installPath : null))
+      .find((p): p is string => p !== null) ?? null;
+    const root = pluginRootFor(configDir, pluginKey, installPath, warnings);
+    if (!root) continue;
+    const at = pluginKey.lastIndexOf('@');
+    const pluginName = at > 0 ? pluginKey.slice(0, at) : pluginKey;
+    for (const [serverName, raw] of Object.entries(pluginServerMap(root, warnings))) {
+      const { entry, unwrappableReason } = interpolatePluginEntry(raw, root, projectDir);
+      out.push({
+        qualifiedName: `plugin:${pluginName}:${serverName}`,
+        pluginKey,
+        serverName,
+        entry,
+        root,
+        unwrappableReason,
+      });
+    }
+  }
+  return out.sort((a, b) => (a.qualifiedName < b.qualifiedName ? -1 : a.qualifiedName > b.qualifiedName ? 1 : 0));
+}
+
 /** Discover every MCP server Claude Code would see for `cwd`. Read-only. */
 export function readClaudeServers(opts: { home: string; cwd: string }): ClaudeConfigView {
   const warnings: string[] = [];
@@ -213,7 +472,21 @@ export function readClaudeServers(opts: { home: string; cwd: string }): ClaudeCo
   const projectApprovalKnown =
     enabledAll || enabledList.length > 0 || disabledList.length > 0;
 
-  return { servers, approvedProjectServers: approved, projectApprovalKnown, warnings };
+  // The host's per-project switch for plugin-qualified servers (its /mcp UI
+  // writes it). Distinct from disabledMcpjsonServers above, which carries
+  // .mcp.json approval.
+  const disabledMcpServers = Array.isArray(projectRecord.disabledMcpServers)
+    ? (projectRecord.disabledMcpServers as unknown[]).filter((v): v is string => typeof v === 'string')
+    : [];
+
+  return {
+    servers,
+    approvedProjectServers: approved,
+    projectApprovalKnown,
+    pluginServers: readPluginServers(opts.home, cwd, warnings),
+    disabledMcpServers,
+    warnings,
+  };
 }
 
 const SCOPE_PRECEDENCE: Record<ClaudeScope, number> = { local: 3, project: 2, user: 1 };

@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  PLUGIN_ORIGIN_ENV,
   effectiveServerHash,
   execFileRunner,
   resolveClaudeBin,
@@ -31,6 +32,7 @@ import {
   type CmdRunner,
   adoptLegacyProjectRecords,
 } from '../src/manage.js';
+import { speculateSync } from '../src/sync.js';
 import { isWindows } from './platform.js';
 import { WORKSPACE_SERVER_NAME, type ClaudeConfigView, type ClaudeScope } from '../src/hostConfig.js';
 import type { RemoteProbe, RemoteProber } from '../src/remoteProbe.js';
@@ -2251,6 +2253,8 @@ describe('effectiveServerHash', () => {
       })),
       approvedProjectServers: new Set(),
       projectApprovalKnown: false,
+      pluginServers: [],
+      disabledMcpServers: [],
       warnings: [],
     };
   }
@@ -2340,14 +2344,356 @@ describe('effectiveServerHash', () => {
       ],
       approvedProjectServers: new Set(approved ? ['team'] : []),
       projectApprovalKnown: true,
+      pluginServers: [],
+      disabledMcpServers: [],
       warnings: [],
     });
     expect(effectiveServerHash(shadowed(true))).not.toBe(effectiveServerHash(shadowed(false)));
+  });
+
+  // The plugin analog of the shadowed-entry case above: plugin servers and
+  // the host's per-project disable list never appear in `servers`, so
+  // without their own hash parts a plugin install, update (the versioned
+  // root moves), disable, or un-disable is invisible to sync's fast path
+  // forever.
+  it('changes when a plugin server appears, changes, or its disable list moves', () => {
+    const base = fakeView({ github: { command: 'gh', args: [] } });
+    const withPlugin: ClaudeConfigView = {
+      ...base,
+      pluginServers: [
+        {
+          qualifiedName: 'plugin:testplug:probesrv',
+          pluginKey: 'testplug@probe-mkt',
+          serverName: 'probesrv',
+          entry: { command: 'node', args: ['/cache/1.0.0/server.js'] },
+          root: '/cache/1.0.0',
+          unwrappableReason: null,
+        },
+      ],
+    };
+    const updated: ClaudeConfigView = {
+      ...withPlugin,
+      pluginServers: [
+        {
+          ...withPlugin.pluginServers[0]!,
+          entry: { command: 'node', args: ['/cache/2.0.0/server.js'] },
+          root: '/cache/2.0.0',
+        },
+      ],
+    };
+    const disabled: ClaudeConfigView = {
+      ...withPlugin,
+      disabledMcpServers: ['plugin:testplug:probesrv'],
+    };
+    expect(effectiveServerHash(base)).not.toBe(effectiveServerHash(withPlugin));
+    expect(effectiveServerHash(withPlugin)).not.toBe(effectiveServerHash(updated));
+    expect(effectiveServerHash(withPlugin)).not.toBe(effectiveServerHash(disabled));
   });
 
   it('hashes the same server name differently when its winning scope differs', () => {
     const a = fakeView({ github: { command: 'gh', args: ['stdio'], scope: 'user' } });
     const b = fakeView({ github: { command: 'gh', args: ['stdio'], scope: 'local' } });
     expect(effectiveServerHash(a)).not.toBe(effectiveServerHash(b));
+  });
+});
+
+describe('plugin server wrapping (the §13.23 fifth row)', () => {
+  const QUAL = 'plugin:testplug:probesrv';
+  let savedConfigDir: string | undefined;
+
+  beforeEach(() => {
+    savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
+  });
+  afterEach(() => {
+    if (savedConfigDir !== undefined) process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+  });
+
+  /** The measured cache layout: cache/<marketplace>/<plugin>/<version>/. */
+  function installPluginFixture(
+    mcpJson: unknown,
+    o: { plugin?: string; marketplace?: string; version?: string } = {},
+  ): string {
+    const plugin = o.plugin ?? 'testplug';
+    const mkt = o.marketplace ?? 'mkt';
+    const version = o.version ?? '1.0.0';
+    const root = join(home, '.claude', 'plugins', 'cache', mkt, plugin, version);
+    mkdirSync(join(root, '.claude-plugin'), { recursive: true });
+    writeFileSync(
+      join(root, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: plugin, version }),
+    );
+    writeFileSync(join(root, '.mcp.json'), JSON.stringify(mcpJson));
+    writeFileSync(
+      join(home, '.claude', 'plugins', 'installed_plugins.json'),
+      JSON.stringify({
+        version: 2,
+        plugins: { [`${plugin}@${mkt}`]: [{ scope: 'user', installPath: root, version }] },
+      }),
+    );
+    writeFileSync(
+      join(home, '.claude', 'settings.json'),
+      JSON.stringify({ enabledPlugins: { [`${plugin}@${mkt}`]: true } }),
+    );
+    return root;
+  }
+
+  /** A realistic wrapped copy, as a previous `on` would have registered it. */
+  function wrappedCopyFor(root: string): AnyRecord {
+    return {
+      command: SELF.command,
+      args: [...SELF.args, 'wrap', '--', 'node', `${root}/server.js`],
+      env: { CLAUDE_PLUGIN_ROOT: root, [PLUGIN_ORIGIN_ENV]: QUAL },
+    };
+  }
+
+  function seedManagedRecord(): void {
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          [cwd]: {
+            entries: [
+              { name: 'probesrv', scope: 'local', action: 'pluginShadowed', pluginServer: QUAL },
+            ],
+            updatedAt: 1,
+          },
+        },
+      }),
+    );
+  }
+
+  it('wraps a stdio plugin server: copy at local scope, original disabled, record kept', async () => {
+    const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    expect(await speculateOn(opts())).toBe(0);
+
+    const config = readClaudeJson();
+    const copy = config.projects[cwd].mcpServers.probesrv;
+    expect(copy.command).toBe(SELF.command);
+    expect(copy.args).toContain('wrap');
+    expect(copy.args.slice(-2)).toEqual(['node', `${root}/server.js`]);
+    // The copy is faithful to the host's env injection, and self-describing.
+    expect(copy.env.CLAUDE_PLUGIN_ROOT).toBe(root);
+    expect(copy.env[PLUGIN_ORIGIN_ENV]).toBe(QUAL);
+    // The original is disabled through the host's own per-project switch.
+    expect(config.projects[cwd].disabledMcpServers).toEqual([QUAL]);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    const rec = state.projects[cwd].entries.find((e: AnyRecord) => e.name === 'probesrv');
+    expect(rec.action).toBe('pluginShadowed');
+    expect(rec.pluginServer).toBe(QUAL);
+  });
+
+  it('wraps a remote plugin server only on a definite probe yes', async () => {
+    installPluginFixture({ probesrv: { type: 'http', url: 'https://api.example/mcp' } });
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    const copy = config.projects[cwd].mcpServers.probesrv;
+    expect(copy.args).toContain('--url');
+    expect(copy.args).toContain('https://api.example/mcp');
+    expect(config.projects[cwd].disabledMcpServers).toEqual([QUAL]);
+    expect(probes.map((p) => p.url)).toContain('https://api.example/mcp');
+  });
+
+  it('leaves a remote plugin server alone when it needs a login, and says so', async () => {
+    installPluginFixture({ probesrv: { type: 'http', url: 'https://api.example/mcp' } });
+    probeResult = { kind: 'needs-auth' };
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects?.[cwd]?.mcpServers?.probesrv).toBeUndefined();
+    expect(config.projects?.[cwd]?.disabledMcpServers ?? []).toEqual([]);
+    expect(logs.join('\n')).toContain('needs authorization');
+    expect(logs.join('\n')).toContain('needs a login');
+  });
+
+  it('rolls the copy back when the disable cannot be written', async () => {
+    installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    // A ~/.claude.json that is not a JSON object: the fake front door still
+    // "succeeds" (its writes round-trip through JSON.stringify of an array,
+    // dropping the added properties), but the disable write has no object to
+    // land in — exactly the shape of a disable failure after a copy success.
+    writeFileSync(join(home, '.claude.json'), '[]');
+    expect(await speculateOn(opts())).toBe(1);
+    expect(logs.join('\n')).toContain('could not disable the plugin original');
+    // No record claims a wrap that is not standing.
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    const entries = state.projects[cwd]?.entries ?? [];
+    expect(entries.find((e: AnyRecord) => e.action === 'pluginShadowed')).toBeUndefined();
+  });
+
+  it("never wraps a plugin server the user's own disable list names", async () => {
+    installPluginFixture({ probesrv: { command: 'node', args: [] } });
+    writeClaudeJson({ projects: { [cwd]: { disabledMcpServers: [QUAL] } } });
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects[cwd].mcpServers?.probesrv).toBeUndefined();
+    // The user's entry is untouched.
+    expect(config.projects[cwd].disabledMcpServers).toEqual([QUAL]);
+    expect(logs.join('\n')).toContain('disabled in Claude Code — left alone');
+  });
+
+  it('skips a plugin server whose bare name an existing server already holds', async () => {
+    installPluginFixture({ probesrv: { command: 'node', args: [] } });
+    writeClaudeJson({ mcpServers: { probesrv: { command: 'mine', args: [] } } });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(logs.join('\n')).toContain("copy name 'probesrv' is taken");
+    expect(readClaudeJson().projects?.[cwd]?.disabledMcpServers ?? []).toEqual([]);
+  });
+
+  it('tears down a wrap whose plugin is gone: copy removed, original re-enabled', async () => {
+    // Managed record + copy + disable, but NO plugin fixture (uninstalled).
+    const root = join(home, '.claude', 'plugins', 'cache', 'mkt', 'testplug', '1.0.0');
+    seedManagedRecord();
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: { probesrv: wrappedCopyFor(root) },
+          disabledMcpServers: [QUAL, 'other-entry'],
+        },
+      },
+    });
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects[cwd].mcpServers?.probesrv).toBeUndefined();
+    // Only OUR entry leaves the disable list.
+    expect(config.projects[cwd].disabledMcpServers).toEqual(['other-entry']);
+    // The project stays managed (`on` ran here); the wrap record is gone.
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.projects[cwd].entries).toEqual([]);
+    expect(logs.join('\n')).toContain('plugin server gone or no longer wrappable');
+  });
+
+  it('re-disables the original when the disable entry alone has been lost', async () => {
+    const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    seedManagedRecord();
+    writeClaudeJson({
+      projects: { [cwd]: { mcpServers: { probesrv: wrappedCopyFor(root) }, disabledMcpServers: [] } },
+    });
+    expect(await speculateOn(opts())).toBe(0);
+    expect(readClaudeJson().projects[cwd].disabledMcpServers).toEqual([QUAL]);
+    expect(logs.join('\n')).toContain('re-disabled the plugin original');
+  });
+
+  it('honors the per-server opt-out: a disabled copy tears the wrap down and stays down', async () => {
+    const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    seedManagedRecord();
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: { probesrv: wrappedCopyFor(root) },
+          // The user disabled the COPY through the host's own switch.
+          disabledMcpServers: [QUAL, 'probesrv'],
+        },
+      },
+    });
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects[cwd].mcpServers?.probesrv).toBeUndefined();
+    // The original is re-enabled; the user's own opt-out entry stays.
+    expect(config.projects[cwd].disabledMcpServers).toEqual(['probesrv']);
+    // And the wrap pass refuses to re-wrap while the opt-out stands.
+    expect(logs.join('\n')).toContain('wrap opted out');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.projects[cwd].entries).toEqual([]);
+  });
+
+  it('adopts a half-finished wrap: copy present, no record, no disable', async () => {
+    const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    writeClaudeJson({
+      projects: { [cwd]: { mcpServers: { probesrv: wrappedCopyFor(root) } } },
+    });
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects[cwd].disabledMcpServers).toEqual([QUAL]);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    const rec = state.projects[cwd].entries.find((e: AnyRecord) => e.name === 'probesrv');
+    expect(rec.action).toBe('pluginShadowed');
+    expect(logs.join('\n')).toContain('adopted a half-finished wrap');
+  });
+
+  it('refreshes the copy when a plugin update moves the versioned root', async () => {
+    const oldRoot = join(home, '.claude', 'plugins', 'cache', 'mkt', 'testplug', '1.0.0');
+    const newRoot = installPluginFixture(
+      { probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } },
+      { version: '2.0.0' },
+    );
+    seedManagedRecord();
+    writeClaudeJson({
+      projects: {
+        [cwd]: { mcpServers: { probesrv: wrappedCopyFor(oldRoot) }, disabledMcpServers: [QUAL] },
+      },
+    });
+    expect(await speculateOn(opts())).toBe(0);
+    const copy = readClaudeJson().projects[cwd].mcpServers.probesrv;
+    expect(copy.args.slice(-1)).toEqual([`${newRoot}/server.js`]);
+    expect(copy.env.CLAUDE_PLUGIN_ROOT).toBe(newRoot);
+    expect(logs.join('\n')).toContain('refreshed the wrapped copy');
+  });
+
+  it('off restores the pair: original re-enabled, copy removed, record dropped', async () => {
+    const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    seedManagedRecord();
+    writeClaudeJson({
+      projects: {
+        [cwd]: { mcpServers: { probesrv: wrappedCopyFor(root) }, disabledMcpServers: [QUAL] },
+      },
+    });
+    expect(await speculateOff(opts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects[cwd].mcpServers?.probesrv).toBeUndefined();
+    expect(config.projects[cwd].disabledMcpServers).toEqual([]);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.projects[cwd]).toBeUndefined();
+  });
+
+  it('off with no state file recognizes the marker: copy removed, disable lifted, nothing re-added', async () => {
+    const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    writeClaudeJson({
+      projects: {
+        [cwd]: { mcpServers: { probesrv: wrappedCopyFor(root) }, disabledMcpServers: [QUAL] },
+      },
+    });
+    expect(await speculateOff(opts())).toBe(0);
+    const config = readClaudeJson();
+    // Never re-added as a plain local clone of the plugin's server.
+    expect(config.projects[cwd].mcpServers?.probesrv).toBeUndefined();
+    expect(config.projects[cwd].disabledMcpServers).toEqual([]);
+    expect(logs.join('\n')).toContain(`plugin copy removed (${QUAL} back in effect)`);
+  });
+
+  it('sync wraps a new plugin server and reports it, then fast-paths the next session', async () => {
+    installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    const reports: string[] = [];
+    const syncOpts = () => ({
+      ...opts(),
+      log: (l: string) => reports.push(l),
+      lockPath: join(home, 'sync.lock'),
+    });
+    expect(await speculateSync(syncOpts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects[cwd].mcpServers.probesrv.args).toContain('wrap');
+    expect(config.projects[cwd].disabledMcpServers).toEqual([QUAL]);
+    expect(reports.join('\n')).toContain(`wrapped 1 new server (${QUAL})`);
+    // Unchanged config: the next session's sync is a no-subprocess no-op.
+    const callsBefore = calls.length;
+    expect(await speculateSync(syncOpts())).toBe(0);
+    expect(calls.length).toBe(callsBefore);
+  });
+
+  it('status ties each plugin server to its copy, or says why it was left alone', async () => {
+    const root = installPluginFixture({
+      probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] },
+      helper: { type: 'http', url: 'https://y.example/mcp', headersHelper: './h.sh' },
+    });
+    seedManagedRecord();
+    writeClaudeJson({
+      projects: {
+        [cwd]: { mcpServers: { probesrv: wrappedCopyFor(root) }, disabledMcpServers: [QUAL] },
+      },
+    });
+    expect(await speculateStatus(opts())).toBe(0);
+    const out = logs.join('\n');
+    expect(out).toContain(`${QUAL} (plugin): wrapped as 'probesrv'`);
+    expect(out).toContain('plugin:testplug:helper (plugin): uses headersHelper');
   });
 });

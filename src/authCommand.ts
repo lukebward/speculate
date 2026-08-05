@@ -298,8 +298,18 @@ async function findServersNeedingAuth(
 ): Promise<{ name: string; url: string }[]> {
   const view = readClaudeServers(hostRoots(opts));
   const out: { name: string; url: string }[] = [];
-  for (const [name, scoped] of effectiveServers(view.servers)) {
-    const plan = planRemoteWrap(scoped.entry);
+  const candidates: { name: string; entry: Parameters<typeof planRemoteWrap>[0] }[] = [
+    ...[...effectiveServers(view.servers)].map(([name, scoped]) => ({ name, entry: scoped.entry })),
+    // Plugin-declared servers (the §13.23 fifth row) are authorization
+    // candidates too — the hosted OAuth ones are the whole point of wrapping
+    // them — except where the user disabled the server or the entry is one
+    // Speculate could never wrap anyway.
+    ...view.pluginServers
+      .filter((ps) => ps.unwrappableReason === null && !view.disabledMcpServers.includes(ps.qualifiedName))
+      .map((ps) => ({ name: ps.qualifiedName, entry: ps.entry })),
+  ];
+  for (const { name, entry } of candidates) {
+    const plan = planRemoteWrap(entry);
     if (!plan?.wrappable) continue;
     const headers = resolveWrapHeaders(plan.headers);
     if (!headers.ok) continue;
@@ -345,8 +355,19 @@ function resolveTarget(target: string, opts: AuthOptions): string {
   }
   const view = readClaudeServers(hostRoots(opts));
   const scoped = effectiveServers(view.servers).get(target);
-  if (!scoped) throw new Error(`no MCP server named '${target}' in this project`);
-  const plan = planRemoteWrap(scoped.entry);
+  // A plugin server is addressable by its qualified name, or by its bare
+  // server name when that resolves nothing else and is unambiguous.
+  const plugin =
+    view.pluginServers.find((ps) => ps.qualifiedName === target) ??
+    (scoped === undefined
+      ? (() => {
+          const bare = view.pluginServers.filter((ps) => ps.serverName === target);
+          return bare.length === 1 ? bare[0] : undefined;
+        })()
+      : undefined);
+  const entry = scoped?.entry ?? plugin?.entry;
+  if (!entry) throw new Error(`no MCP server named '${target}' in this project`);
+  const plan = planRemoteWrap(entry);
   if (!plan) throw new Error(`'${target}' is a local (stdio) server — it needs no authorization`);
   if (!plan.wrappable) throw new Error(`'${target}' cannot be wrapped: ${plan.reason}`);
   return canonicalServerUrl(plan.url);

@@ -748,6 +748,98 @@ What went: `src/profiles/` entirely, `detectProfile` fingerprinting, per-tool pa
 
 **Two costs worth naming, since neither is zero.** `strict` mode now takes its allowlist only from `allowTools`, which is what the name always implied but used to be softened by a profile. And a server answering in NON-JSON TEXT loses result-derived prediction entirely: the filesystem mock returns newline-joined paths, the old profile shipped a parser to split them, and the `rules` DSL copies values rather than computing them. Such servers keep memorisation across repeats and nothing else, which S10 now asserts directly rather than papering over.
 
+### 13.26 The fifth row wrapped: plugin servers (2026-08-05)
+
+§13.23 ended "wrapping them needs a mechanism that does not exist yet, and is
+recorded here rather than attempted." The mechanism exists; this section
+supersedes that sentence. Full spec:
+docs/superpowers/specs/2026-08-05-plugin-wrap-design.md.
+
+**The mechanism was measured, not designed first.** Running the real CLI
+(Claude Code 2.1.222, isolated `CLAUDE_CONFIG_DIR`) established: installed
+plugins are recorded in `plugins/installed_plugins.json` (v2, per-plugin
+install arrays) with enablement in `settings.json` `enabledPlugins`; server
+declarations live at the plugin root as `.mcp.json` (bare or wrapped) or in
+`plugin.json`; `${CLAUDE_PLUGIN_ROOT}` substitutes per-element across
+command/args/env/url/headers — and for a DIRECTORY-sourced marketplace it is
+the live source directory, not the versioned cache copy, that wins; the host
+injects `CLAUDE_PLUGIN_ROOT`/`CLAUDE_PLUGIN_DATA` as real env vars into
+stdio plugin children; and — the load-bearing fact — the per-project
+`disabledMcpServers` array in `~/.claude.json` disables a single plugin
+server at every connect path (the shipped bundle checks it before launch,
+reconnect, and OAuth resume, and excludes disabled servers from endpoint
+dedup), while `claude mcp list` still *enumerates* it, because list is not
+launch. The host's own `/mcp` screen writes exactly that key. No CLI does.
+
+**The shape: a shadow whose precedence is a disable.** A plain entry cannot
+carry a `plugin:x:y` name, so the scope contest can never shadow a plugin
+server; and endpoint dedup cannot suppress a wrapped copy, whose endpoint is
+a `speculate wrap` invocation by construction. So `on` registers the wrapped
+copy at LOCAL scope under the server's bare name through the front door,
+then adds the qualified name to `disabledMcpServers` — a surgical
+read-merge-write of that one array, tmp+rename atomic, never creating the
+project record (the preceding `add-json` already made the host create it).
+Order is load-bearing in both directions: copy before disable, and on
+restore, re-enable before removal — each so that a crash between the two
+steps leaves both halves running for a session, never neither. The copy
+carries `SPECULATE_PLUGIN_ORIGIN=<qualified name>` in its env (plus
+`CLAUDE_PLUGIN_ROOT`, replicating the host's injection), so a stateless
+`off` can prove ownership, lift the disable, and remove the copy without
+ever re-adding an unwrapped clone. Verified end-to-end against the real
+host: wrap, both halves in place, exact restore.
+
+**The invariant amendment, named rather than smuggled.** §13.12's "never a
+JSON edit" cannot produce a disable, and the alternatives measured worse:
+editing the plugin cache is reverted on update (§13.23), and a copy without
+the disable is the duplicate-tool-list aggregator §13.12 rejected. So the
+rule is amended, narrowly: Speculate writes exactly one key it does not own
+— the `disabledMcpServers` array of the current project's record, in the
+user's own `~/.claude.json`, in the same shape the host's own UI writes —
+and nothing else, with `off` removing exactly the entry `on` added. The
+upstream seam §13.12 pitched remains the durable endgame; this mechanism is
+strictly removable when it lands.
+
+**Consent runs through the host's own switches, in both directions.** A
+qualified name already in `disabledMcpServers` that no managed record
+claims is the user's disable: skipped, never removed. A plugin disabled via
+`enabledPlugins` contributes nothing, and an existing wrap whose plugin is
+uninstalled, disabled, or no longer declares the server is torn down —
+disable lifted, copy removed (the §13.12 revoked-shadow rule's third
+instance). Disabling the wrapped COPY in `/mcp` is the per-server opt-out:
+the wrap is torn down and not re-created while that entry stands. The one
+deliberate asymmetry: re-enabling the plugin ORIGINAL under a live wrap is
+repaired (re-disabled) rather than read as revocation, because the state is
+degraded (every tool doubled) rather than expressive — the opt-outs are the
+copy-disable and `speculate off`, and the repair says so out loud.
+
+**Fail-closed discovery.** Interpolation covers `${CLAUDE_PLUGIN_ROOT}` and
+`${CLAUDE_PROJECT_DIR}`; anything else refuses the wrap with a reason:
+`${CLAUDE_PLUGIN_DATA}` and `${user_config.*}` (host expansions Speculate
+cannot reproduce), `headersHelper` (a hook the wrapped proxy cannot run),
+and any stdio entry still carrying `${…}` after interpolation — the host
+resolves those from the session env at launch, and a wrapped copy would
+pass the literal through, while resolving them ourselves would bake a
+secret into config. HTTP `headers` keep the v0.14 `${VAR}` contract.
+Remote plugin servers pass the same §13.22 probe, join the same
+`needsAuth` → `speculate auth` flow, and an unauthorized server is always
+left working and unwrapped. The sync hash covers the plugin server set
+(post-interpolation, so a version bump moves it), each unwrappable reason,
+and the sorted disable list — the same argument that put shadowed
+`.mcp.json` entries in the hash, §13.23's monorepo fix having already made
+the project identity shared.
+
+**Costs, stated.** Tool names follow the copy (`mcp__plugin_github_github__*`
+becomes `mcp__github__*`), so permission rules keyed to the old prefix stop
+matching — §3.4's proxying caveat with a rename attached. The disable is
+per-project, so the wrap is too, with auto-wrap carrying other projects one
+session behind as ever. `claude mcp list` shows original and copy both
+(list is not launch); `status` ties each pair together. `speculate try`
+ignores plugin servers for now — `--strict-mcp-config`'s treatment of them
+is unverified, and a wrapped copy in the trial could double every tool
+list. And a stdio plugin server whose *code* reads `CLAUDE_PLUGIN_DATA`
+loses that env var under the wrap: derivation unknown, documented rather
+than approximated.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.

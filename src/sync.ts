@@ -107,10 +107,11 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
   // `makeCtx` defaults `log` to a stderr write, and `wrapEffectiveServers`
   // logs one line per server. A session-start hook must not spray that into
   // the user's terminal, so the ctx logger is silenced and `sync` emits only
-  // its own summary through `report`: AT MOST TWO lines, since one pass can
-  // both wrap new servers and remove a shadow whose licence is gone. The hook
-  // wrapper (plugin/hooks/autowrap.mjs) forwards every line it is given, not
-  // just the last — dropping one was a real bug.
+  // its own summary through `report`: a handful of lines at most — wraps,
+  // .mcp.json shadows removed, plugin copies removed, and the needs-auth
+  // notice — each gated on something actually changing. The hook wrapper
+  // (plugin/hooks/autowrap.mjs) forwards every line it is given, not just
+  // the last — dropping one was a real bug.
   const report = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   try {
     const ctx = makeCtx({ ...opts, log: () => {} });
@@ -167,7 +168,7 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
       // possible. Nothing wrapped and nothing removed means nothing to
       // record: writing an empty entry list would make `status` report drift
       // "since 'speculate on'" in a project where `on` has never run.
-      if (wrapped.length > 0 || outcome.shadowsRemoved > 0) {
+      if (wrapped.length > 0 || outcome.shadowsRemoved > 0 || outcome.pluginShadowsRemoved > 0) {
         const entries = [...managed.values()];
         if (entries.length > 0) merged.projects[ctx.cwd] = { entries, updatedAt: Date.now() };
         else delete merged.projects[ctx.cwd];
@@ -200,6 +201,16 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
             `[speculate] removed ${outcome.shadowsRemoved} wrapped .mcp.json shadow` +
               `${outcome.shadowsRemoved > 1 ? 's' : ''} ` +
               '(approval revoked, or the server is gone from .mcp.json)',
+          );
+        }
+        // Same consent-moving-the-other-way rule as the .mcp.json line: a
+        // wrapped plugin copy going away takes a running server shape with
+        // it, and silence would look like Speculate ignored the change.
+        if (outcome.pluginShadowsRemoved > 0) {
+          report(
+            `[speculate] removed ${outcome.pluginShadowsRemoved} wrapped plugin ` +
+              `${outcome.pluginShadowsRemoved > 1 ? 'copies' : 'copy'} ` +
+              '(plugin gone or disabled, or the wrap was opted out in Claude Code)',
           );
         }
         // The one thing the automatic path cannot do for you. Worth a line

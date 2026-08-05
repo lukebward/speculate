@@ -30,6 +30,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -39,6 +40,7 @@ import { probeRemote, type RemoteProbe, type RemoteProber } from './remoteProbe.
 import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import {
   WORKSPACE_SERVER_NAME,
+  claudeJsonPath,
   effectiveServers,
   isStdioEntry,
   isWrappedEntry,
@@ -52,6 +54,7 @@ import {
   type ClaudeConfigView,
   type ClaudeScope,
   type McpServerEntry,
+  type PluginScopedServer,
   type RemoteWrapPlan,
   type ScopedServer,
 } from './hostConfig.js';
@@ -208,8 +211,23 @@ export function resolveClaudeBin(
 export interface ManagedEntry {
   name: string;
   scope: ClaudeScope;
-  /** 'plugin' = the Claude Code plugin `on` installed at local scope. */
-  action: 'rewrote' | 'shadowed' | 'added' | 'plugin';
+  /**
+   * 'plugin' = the Claude Code plugin `on` installed at local scope (≤0.10).
+   * 'pluginShadowed' = a wrapped copy of a PLUGIN-declared server registered
+   * at local scope, with the original disabled via the host's per-project
+   * `disabledMcpServers` switch (spec:
+   * docs/superpowers/specs/2026-08-05-plugin-wrap-design.md).
+   */
+  action: 'rewrote' | 'shadowed' | 'added' | 'plugin' | 'pluginShadowed';
+  /**
+   * For 'pluginShadowed' only: the plugin-qualified server name
+   * (`plugin:<plugin>:<server>`) — both the identity of the wrapped original
+   * and the EXACT string this wrap added to `disabledMcpServers`, which is
+   * what `off` removes. The disable has no self-describing fallback in the
+   * entry itself beyond the SPECULATE_PLUGIN_ORIGIN env marker, so this
+   * record (or that marker) is what makes the restore exact.
+   */
+  pluginServer?: string;
   /**
    * The host's entry, VERBATIM, which is what makes `off` byte-exact —
    * including any unknown field the host added, and including the `headers`
@@ -420,6 +438,23 @@ export function effectiveServerHash(view: ClaudeConfigView): string {
     const shadowed = scoped.scope === 'project' ? undefined : shadowedProjectEntries.get(name);
     if (shadowed) parts.push(part(shadowed));
   }
+  // Plugin-declared servers and the host's per-project disable list are in
+  // the hash for the same reason shadowed project entries are: they carry
+  // consent and identity the effective map cannot see. Without them,
+  // installing, updating, disabling, or un-disabling a plugin changes nothing
+  // sync's fast path can observe — so the wrap (or the restore consent
+  // requires) would never happen. The entry is hashed post-interpolation, so
+  // a plugin update that moves the versioned root moves the hash even when
+  // nothing else changed, which is exactly the drift the refresh pass needs
+  // to be woken for. (One extra slow-path sync per project on upgrade to a
+  // build that adds these parts: the price of any hash-format change.)
+  for (const ps of view.pluginServers) {
+    parts.push(
+      `plugin ${ps.qualifiedName} ${ps.unwrappableReason ?? ''} ` +
+        JSON.stringify(canonicalizeForHash(ps.entry)),
+    );
+  }
+  parts.push(`disabledMcpServers ${JSON.stringify([...view.disabledMcpServers].sort())}`);
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
 }
 
@@ -843,6 +878,13 @@ export interface WrapOutcome {
    */
   shadowsRemoved: number;
   /**
+   * How many wrapped PLUGIN copies were torn down because their licence is
+   * gone — the plugin uninstalled or disabled, its server gone from the
+   * manifest, or the user opting out through the host's own switches.
+   * Counted apart from `shadowsRemoved` so `sync` can name each kind.
+   */
+  pluginShadowsRemoved: number;
+  /**
    * True when the pass stopped early because `opts.deadline` had passed, so
    * servers were left unvisited. The pass is INCOMPLETE: callers must not
    * record anything that claims the whole set was handled (`sync`'s hash).
@@ -884,6 +926,138 @@ async function remoteWrapBlocker(
   return { reason: `needs authorization — run: speculate auth ${name}`, fixableByAuth: true };
 }
 
+// -- plugin-declared servers (the §13.23 fifth row) -------------------------------
+
+/**
+ * Env marker stamped into every wrapped plugin copy, holding the qualified
+ * name of the plugin server it stands in for. Env survives verbatim in host
+ * config and is inert in the child, so the copy stays self-describing even
+ * with the state file lost — which is what lets a stateless `off` remove the
+ * copy AND the disable entry instead of leaking a disabled original forever.
+ */
+export const PLUGIN_ORIGIN_ENV = 'SPECULATE_PLUGIN_ORIGIN';
+
+/** The qualified plugin name a wrapped copy claims to stand in for, if any. */
+function pluginOriginOf(entry: McpServerEntry): string | null {
+  if (!isWrappedEntry(entry)) return null;
+  const env = entry.env;
+  if (env === null || typeof env !== 'object' || Array.isArray(env)) return null;
+  const marker = (env as Record<string, unknown>)[PLUGIN_ORIGIN_ENV];
+  return typeof marker === 'string' && marker.length > 0 ? marker : null;
+}
+
+/**
+ * The wrapped copy for one plugin server. Beyond the ordinary wrap, two env
+ * additions keep the copy faithful and self-describing:
+ *
+ *   - stdio children get `CLAUDE_PLUGIN_ROOT`, because the host injects it
+ *     into plugin-declared processes (measured) and a server's code may read
+ *     it. Injected FIRST so a plugin's own env value wins, matching the
+ *     host's spread order. (`CLAUDE_PLUGIN_DATA` is NOT replicated — its
+ *     derivation is the host's — which is a documented limitation for stdio
+ *     servers whose code reads it.)
+ *   - the SPECULATE_PLUGIN_ORIGIN marker, last, so nothing overrides it.
+ */
+function wrapPluginCopy(
+  ps: PluginScopedServer,
+  self: { command: string; args: string[] },
+  mode?: SpeculationMode,
+): McpServerEntry {
+  const env: Record<string, string> = {
+    ...(isStdioEntry(ps.entry) ? { CLAUDE_PLUGIN_ROOT: ps.root } : {}),
+    ...(ps.entry.env ?? {}),
+    [PLUGIN_ORIGIN_ENV]: ps.qualifiedName,
+  };
+  return wrapEntry({ ...ps.entry, env }, self, { mode });
+}
+
+/**
+ * Add or remove one plugin-qualified name in the project record's
+ * `disabledMcpServers` array — the host's own per-project switch for plugin
+ * servers, the key its /mcp UI writes, and the ONE key Speculate edits in a
+ * host-owned file directly (no CLI writes it; the invariant amendment is
+ * documented in the spec and DESIGN.md).
+ *
+ * The write is held to the same discipline as managed.json: re-read the file
+ * at call time, mutate only this one array in this one project record, and
+ * write tmp + rename so a crash never leaves a torn file. The project record
+ * is never CREATED here — by the time a disable is needed, the front-door
+ * `add-json` that registered the copy has already made the host create it,
+ * so a missing record means something is wrong and the caller rolls back.
+ *
+ * Removing is tolerant where adding is strict: `off` must succeed against a
+ * record (or file) that is already gone, because there is nothing left to
+ * re-enable and failing would strand the restore.
+ */
+function setPluginServerDisabled(
+  ctx: Ctx,
+  qualifiedName: string,
+  disabled: boolean,
+): { ok: true } | { ok: false; reason: string } {
+  const path = claudeJsonPath(ctx.home);
+  let config: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return disabled ? { ok: false, reason: `${path} is not a JSON object` } : { ok: true };
+    }
+    config = parsed as Record<string, unknown>;
+  } catch (err) {
+    // Unreadable file: nothing can have been disabled in it, so a removal is
+    // already complete; an add has nowhere safe to land.
+    return disabled ? { ok: false, reason: `cannot read ${path}: ${(err as Error).message}` } : { ok: true };
+  }
+  const projects =
+    config.projects !== null && typeof config.projects === 'object' && !Array.isArray(config.projects)
+      ? (config.projects as Record<string, unknown>)
+      : null;
+  if (!projects) {
+    return disabled ? { ok: false, reason: `no projects record in ${path}` } : { ok: true };
+  }
+  // The EXISTING key, found the way the host would (exact first, then
+  // separator/case-normalized): writing under a second spelling of the same
+  // project would leave two records disagreeing about the same server.
+  let key: string | null = Object.prototype.hasOwnProperty.call(projects, ctx.cwd) ? ctx.cwd : null;
+  if (key === null) {
+    const want = normalizeProjectKey(ctx.cwd);
+    for (const candidate of Object.keys(projects)) {
+      if (normalizeProjectKey(candidate) === want) {
+        key = candidate;
+        break;
+      }
+    }
+  }
+  if (key === null || projects[key] === null || typeof projects[key] !== 'object') {
+    return disabled ? { ok: false, reason: `no project record for ${ctx.cwd} in ${path}` } : { ok: true };
+  }
+  const record = projects[key] as Record<string, unknown>;
+  // The raw array is preserved verbatim — junk elements included — and only
+  // our one entry is added or removed. This function edits a host-owned
+  // file; the least it can do is touch nothing it does not own.
+  const current = Array.isArray(record.disabledMcpServers)
+    ? (record.disabledMcpServers as unknown[])
+    : [];
+  // Already in the desired state — never rewrite the host's file for a no-op.
+  if (disabled === current.includes(qualifiedName)) return { ok: true };
+  record.disabledMcpServers = disabled
+    ? [...current, qualifiedName]
+    : current.filter((v) => v !== qualifiedName);
+  try {
+    const tmp = `${path}.speculate-tmp`;
+    let mode = 0o600;
+    try {
+      mode = statSync(path).mode & 0o777;
+    } catch {
+      // stat raced a concurrent rewrite: keep the restrictive default.
+    }
+    writeFileSync(tmp, JSON.stringify(config, null, 2), { mode });
+    renameSync(tmp, path);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: `cannot write ${path}: ${(err as Error).message}` };
+  }
+}
+
 /**
  * Wraps every eligible server in `view` into `managed`, applying all consent
  * gates. Mutates `managed` in place. Used by both `on` and `sync`.
@@ -909,15 +1083,19 @@ export async function wrapEffectiveServers(
   let changed = 0;
   let failed = 0;
   let shadowsRemoved = 0;
+  let pluginShadowsRemoved = 0;
   const needsAuth: { name: string; url: string }[] = [];
   const projectScopeNames = new Set(
     view.servers.filter((s) => s.scope === 'project').map((s) => s.name),
   );
+  const outOfTime = (name: string): WrapOutcome => {
+    ctx.log(`[speculate] out of time before ${name} — the next run picks it up`);
+    return { changed, failed, shadowsRemoved, pluginShadowsRemoved, timedOut: true, needsAuth };
+  };
 
   for (const [name, scoped] of effectiveServers(view.servers)) {
     if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
-      ctx.log(`[speculate] out of time before ${name} — the next run picks it up`);
-      return { changed, failed, shadowsRemoved, timedOut: true, needsAuth };
+      return outOfTime(name);
     }
     if (name === WORKSPACE_SERVER_NAME) continue;
     if (name.startsWith('-')) {
@@ -1071,7 +1249,259 @@ export async function wrapEffectiveServers(
     changed++;
   }
 
-  return { changed, failed, shadowsRemoved, timedOut: false, needsAuth };
+  // -- plugin-declared servers (the §13.23 fifth row; see the 2026-08-05 spec).
+  //
+  // Two passes. The first audits every existing plugin wrap against its
+  // licence and tears down the ones whose licence is gone; the second wraps
+  // what is eligible and repairs drift. Teardown runs first so a record it
+  // deletes cannot confuse the wrap pass.
+  const localByName = new Map(
+    view.servers.filter((s) => s.scope === 'local').map((s) => [s.name, s]),
+  );
+  const anyScopeNames = new Map<string, ScopedServer>();
+  for (const s of view.servers) if (!anyScopeNames.has(s.name)) anyScopeNames.set(s.name, s);
+  const pluginByQual = new Map(view.pluginServers.map((p) => [p.qualifiedName, p]));
+  const disabledSet = new Set(view.disabledMcpServers);
+
+  for (const rec of [...managed.values()]) {
+    if (rec.action !== 'pluginShadowed') continue;
+    if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
+      return outOfTime(rec.name);
+    }
+    const qual = rec.pluginServer;
+    const current = qual ? pluginByQual.get(qual) : undefined;
+    const local = localByName.get(rec.name);
+    const copyIsOurs =
+      local !== undefined && isWrappedEntry(local.entry) && pluginOriginOf(local.entry) === qual;
+    // The user disabling the COPY through the host's own switch is the
+    // per-server opt-out: honor it by restoring the original and standing
+    // down (the wrap pass below refuses to re-wrap while that entry stands).
+    const userOptedOut = disabledSet.has(rec.name);
+    const healthy =
+      !userOptedOut &&
+      qual !== undefined &&
+      current !== undefined &&
+      current.unwrappableReason === null &&
+      copyIsOurs &&
+      disabledSet.has(qual);
+    if (healthy) continue; // drift, if any, is the wrap pass's job
+    // Repair before teardown: a live wrap whose disable entry alone is gone
+    // (the original re-enabled in /mcp, or the entry lost) is DEGRADED — both
+    // copies run and every tool doubles — not revoked. The wrap opt-outs are
+    // `speculate off` and disabling the copy; the managed record plus the
+    // still-present copy says the wrap itself is wanted, so the pair is made
+    // whole again, and status says so rather than leaving the repair silent.
+    if (
+      !userOptedOut &&
+      qual !== undefined &&
+      current !== undefined &&
+      current.unwrappableReason === null &&
+      copyIsOurs &&
+      !disabledSet.has(qual)
+    ) {
+      const repaired = setPluginServerDisabled(ctx, qual, true);
+      if (repaired.ok) {
+        disabledSet.add(qual);
+        ctx.log(
+          `[speculate] ${qual}: re-disabled the plugin original (its wrapped copy '${rec.name}' is live; ` +
+            `to unwrap it, disable '${rec.name}' in /mcp or run 'speculate off')`,
+        );
+        changed++;
+      } else {
+        ctx.log(`[speculate] ${qual}: could not re-disable the plugin original: ${repaired.reason}`);
+        failed++;
+      }
+      continue;
+    }
+    // Teardown: re-enable first, then remove the copy — the mirror of the
+    // wrap order, so a crash in between leaves both running, never neither.
+    if (qual !== undefined && disabledSet.has(qual)) {
+      const enabled = setPluginServerDisabled(ctx, qual, false);
+      if (!enabled.ok) {
+        ctx.log(`[speculate] ${qual}: could not re-enable the plugin original: ${enabled.reason}`);
+        failed++;
+        continue; // keep the record; the next pass retries the whole restore
+      }
+      disabledSet.delete(qual);
+    }
+    if (copyIsOurs) {
+      const res = await mcpRemove(ctx, rec.name, 'local');
+      if (res.code !== 0) {
+        ctx.log(
+          `[speculate] ${rec.name}: plugin copy removal failed: ${redactSecrets((res.stderr || res.stdout).trim(), entrySecrets(local!.entry))}`,
+        );
+        failed++;
+        continue; // record kept: the disable is already lifted, so retrying is safe
+      }
+      localByName.delete(rec.name);
+      anyScopeNames.delete(rec.name);
+    }
+    managed.delete(managedKey('local', rec.name));
+    ctx.log(
+      userOptedOut
+        ? `[speculate] ${qual ?? rec.name}: copy disabled in Claude Code — wrap removed, plugin original back in effect`
+        : `[speculate] ${qual ?? rec.name}: plugin server gone or no longer wrappable — wrap removed`,
+    );
+    pluginShadowsRemoved++;
+    changed++;
+  }
+
+  for (const ps of view.pluginServers) {
+    if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
+      return outOfTime(ps.qualifiedName);
+    }
+    const qual = ps.qualifiedName;
+    const copyName = ps.serverName;
+    const rec = managed.get(managedKey('local', copyName));
+    const recIsThis = rec?.action === 'pluginShadowed' && rec.pluginServer === qual;
+    // A qualified name in the disable list that no record of ours claims is
+    // the USER's disable — their consent decision, never overridden and
+    // never removed.
+    if (disabledSet.has(qual) && !recIsThis) {
+      ctx.log(`[speculate] ${qual}: disabled in Claude Code — left alone`);
+      continue;
+    }
+    // A disabled COPY name is the per-server opt-out the teardown pass
+    // honors; while the user keeps that entry, the server stays unwrapped.
+    if (disabledSet.has(copyName)) {
+      ctx.log(`[speculate] ${qual}: wrap opted out ('${copyName}' is disabled in Claude Code) — skipping`);
+      continue;
+    }
+    if (recIsThis) {
+      // Healthy wrap (teardown above already handled everything else) —
+      // refresh the copy if the plugin's declaration has drifted under it
+      // (a plugin update moves the versioned root, changing baked paths).
+      const local = localByName.get(copyName);
+      if (!local) continue;
+      const expected = wrapPluginCopy(ps, ctx.self, opts.mode);
+      const canon = (e: McpServerEntry): string => JSON.stringify(canonicalizeForHash(e));
+      if (canon(local.entry) === canon(expected)) {
+        ctx.log(`[speculate] ${qual}: already wrapped as '${copyName}' — skipping`);
+        continue;
+      }
+      const secrets = [...entrySecrets(local.entry), ...entrySecrets(ps.entry)];
+      const removed = await mcpRemove(ctx, copyName, 'local');
+      if (removed.code !== 0) {
+        ctx.log(
+          `[speculate] ${qual}: stale copy removal failed: ${redactSecrets((removed.stderr || removed.stdout).trim(), secrets)}`,
+        );
+        failed++;
+        continue;
+      }
+      const added = await mcpAddJson(ctx, copyName, expected, 'local');
+      if (added.code !== 0) {
+        // Put the previous copy back rather than leave the pair broken.
+        const restored = await mcpAddJson(ctx, copyName, local.entry, 'local');
+        ctx.log(
+          `[speculate] ${qual}: refresh failed (${redactSecrets((added.stderr || added.stdout).trim(), secrets)}); ` +
+            (restored.code === 0 ? 'previous copy restored' : 'RESTORE ALSO FAILED — run speculate off'),
+        );
+        failed++;
+        continue;
+      }
+      ctx.log(`[speculate] ${qual}: refreshed the wrapped copy (plugin updated)`);
+      changed++;
+      continue;
+    }
+    if (copyName.startsWith('-') || copyName === WORKSPACE_SERVER_NAME) {
+      ctx.log(`[speculate] ${qual}: copy name '${copyName}' is not usable — skipping`);
+      continue;
+    }
+    if (ps.unwrappableReason !== null) {
+      ctx.log(`[speculate] ${qual}: ${ps.unwrappableReason} — passed through unwrapped`);
+      continue;
+    }
+    const existing = anyScopeNames.get(copyName);
+    if (existing) {
+      // Crash recovery: a marked copy with no record means a previous pass
+      // died between `add-json` and the disable. Adopt it — complete the
+      // disable and the record — instead of skipping a half-made wrap.
+      if (
+        existing.scope === 'local' &&
+        isWrappedEntry(existing.entry) &&
+        pluginOriginOf(existing.entry) === qual
+      ) {
+        if (!disabledSet.has(qual)) {
+          const dis = setPluginServerDisabled(ctx, qual, true);
+          if (!dis.ok) {
+            ctx.log(`[speculate] ${qual}: could not disable the plugin original: ${dis.reason}`);
+            failed++;
+            continue;
+          }
+          disabledSet.add(qual);
+        }
+        managed.set(managedKey('local', copyName), {
+          name: copyName,
+          scope: 'local',
+          action: 'pluginShadowed',
+          pluginServer: qual,
+        });
+        ctx.log(`[speculate] ${qual}: adopted a half-finished wrap as '${copyName}' (disable completed)`);
+        opts.onWrapped?.(qual);
+        changed++;
+        continue;
+      }
+      ctx.log(
+        `[speculate] ${qual}: copy name '${copyName}' is taken by an existing ${existing.scope} server — skipping`,
+      );
+      continue;
+    }
+    const remote = planRemoteWrap(ps.entry);
+    if (!isStdioEntry(ps.entry) && !remote?.wrappable) {
+      ctx.log(
+        `[speculate] ${qual}: ${remote ? remote.reason : 'non-stdio'} — passed through unwrapped`,
+      );
+      continue;
+    }
+    if (remote?.wrappable) {
+      const blocker = await remoteWrapBlocker(ctx, qual, remote);
+      if (blocker) {
+        if (blocker.fixableByAuth) needsAuth.push({ name: qual, url: remote.url });
+        ctx.log(`[speculate] ${qual}: ${blocker.reason} — passed through unwrapped`);
+        continue;
+      }
+    }
+    // Copy first, then disable: a crash in between leaves BOTH running
+    // (duplicated tools for one session, adopted and completed by the next
+    // pass via the marker) — disable-first would leave the server gone.
+    const wrapped = wrapPluginCopy(ps, ctx.self, opts.mode);
+    const secrets = entrySecrets(ps.entry);
+    const added = await mcpAddJson(ctx, copyName, wrapped, 'local');
+    if (added.code !== 0) {
+      ctx.log(
+        `[speculate] ${qual}: wrap failed: ${redactSecrets((added.stderr || added.stdout).trim(), secrets)}`,
+      );
+      failed++;
+      continue;
+    }
+    const dis = setPluginServerDisabled(ctx, qual, true);
+    if (!dis.ok) {
+      // Roll the copy back rather than leave a permanent duplicate pair.
+      const rolledBack = await mcpRemove(ctx, copyName, 'local');
+      ctx.log(
+        `[speculate] ${qual}: could not disable the plugin original (${dis.reason}) — ` +
+          (rolledBack.code === 0 ? 'copy rolled back' : `ROLLBACK ALSO FAILED — remove manually: claude mcp remove ${copyName} -s local`),
+      );
+      failed++;
+      continue;
+    }
+    disabledSet.add(qual);
+    managed.set(managedKey('local', copyName), {
+      name: copyName,
+      scope: 'local',
+      action: 'pluginShadowed',
+      pluginServer: qual,
+    });
+    anyScopeNames.set(copyName, { name: copyName, scope: 'local', entry: wrapped });
+    localByName.set(copyName, { name: copyName, scope: 'local', entry: wrapped });
+    ctx.log(
+      `[speculate] ${qual}: wrapped as '${copyName}' (local copy; plugin original disabled${remote?.wrappable ? ', remote' : ''})`,
+    );
+    opts.onWrapped?.(qual);
+    changed++;
+  }
+
+  return { changed, failed, shadowsRemoved, pluginShadowsRemoved, timedOut: false, needsAuth };
 }
 
 // -- the auto-wrap plugin -------------------------------------------------------
@@ -1619,6 +2049,36 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       }
       continue;
     }
+    if (entry.action === 'pluginShadowed') {
+      // Restore order is the mirror of the wrap order: re-enable the plugin
+      // original FIRST, then remove the copy — a crash in between leaves
+      // both running for one session, never neither.
+      if (entry.pluginServer) {
+        const enabled = setPluginServerDisabled(ctx, entry.pluginServer, false);
+        if (!enabled.ok) {
+          ctx.log(
+            `[speculate] ${entry.name}: could not re-enable ${entry.pluginServer}: ${enabled.reason}`,
+          );
+          failed++;
+          unfinished.push(entry);
+          continue;
+        }
+      }
+      const res = await mcpRemove(ctx, entry.name, 'local');
+      if (res.code !== 0) {
+        ctx.log(
+          `[speculate] ${entry.name}: plugin copy removal failed: ${(res.stderr || res.stdout).trim()}`,
+        );
+        failed++;
+        unfinished.push(entry);
+        continue;
+      }
+      ctx.log(
+        `[speculate] ${entry.name}: plugin copy removed` +
+          (entry.pluginServer ? ` (${entry.pluginServer} back in effect)` : ''),
+      );
+      continue;
+    }
     const secrets = entrySecrets(entry.original ?? {});
     if (entry.action === 'added' || entry.action === 'shadowed') {
       const res = await mcpRemove(ctx, entry.name, entry.scope);
@@ -1690,6 +2150,21 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
       continue;
     }
     const original = unwrapEntry(scoped.entry);
+    // A wrapped copy of a PLUGIN server carries its origin in the
+    // SPECULATE_PLUGIN_ORIGIN env marker — the no-state proof of ownership.
+    // Its restore lifts the disable BEFORE removing the copy (the same order
+    // the recorded path uses: a crash in between leaves both running, never
+    // neither), and never re-adds an unwrapped clone at local scope, which
+    // would leak a plain copy of a server the plugin should own.
+    const pluginOrigin = pluginOriginOf(scoped.entry);
+    if (pluginOrigin) {
+      const enabled = setPluginServerDisabled(ctx, pluginOrigin, false);
+      if (!enabled.ok) {
+        ctx.log(`[speculate] ${scoped.name}: could not re-enable ${pluginOrigin}: ${enabled.reason}`);
+        failed++;
+        continue; // keep the copy while the original stays disabled
+      }
+    }
     // A wrapped remote entry carries its credential in `--header` args, so
     // this net needs the same scrub the recorded path gets.
     const secrets = entrySecrets(scoped.entry);
@@ -1699,6 +2174,10 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
         `[speculate] ${scoped.name}: remove failed: ${redactSecrets((removed.stderr || removed.stdout).trim(), secrets)}`,
       );
       failed++;
+      continue;
+    }
+    if (pluginOrigin) {
+      ctx.log(`[speculate] ${scoped.name}: plugin copy removed (${pluginOrigin} back in effect)`);
       continue;
     }
     // A wrapped LOCAL entry that shadows a same-named .mcp.json server was a
@@ -1792,16 +2271,25 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
   let needAuth = 0;
   ctx.log(`[speculate] project: ${ctx.cwd}`);
   const effective = effectiveServers(view.servers);
-  if (effective.size === 0) ctx.log('[speculate] no MCP servers visible to Claude Code here');
+  if (effective.size === 0 && view.pluginServers.length === 0) {
+    ctx.log('[speculate] no MCP servers visible to Claude Code here');
+  }
+  const disabledSet = new Set(view.disabledMcpServers);
+  const managedPluginByQual = new Map(
+    (record?.entries ?? [])
+      .filter((e) => e.action === 'pluginShadowed' && typeof e.pluginServer === 'string')
+      .map((e) => [e.pluginServer!, e]),
+  );
   // Ask every unwrapped remote server whether it would take us, ALL AT ONCE.
   // Without this, status reports "NOT wrapped (remote)" for an OAuth-protected
   // server and then advises running `on`, which will not wrap it either --
   // sending the user round a loop with no way to see why. Wrapped servers are
   // not probed: they are already working, and the answer would cost a round
-  // trip to tell us so.
+  // trip to tell us so. Plugin-declared remotes are probed for the same
+  // reason, keyed by their qualified name.
   const reachability = new Map<string, RemoteProbe>();
-  await Promise.all(
-    [...effective].map(async ([name, scoped]) => {
+  await Promise.all([
+    ...[...effective].map(async ([name, scoped]) => {
       if (name === WORKSPACE_SERVER_NAME || isWrappedEntry(scoped.entry)) return;
       const plan = planRemoteWrap(scoped.entry);
       if (!plan?.wrappable) return;
@@ -1814,7 +2302,21 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
         // back to the plain "NOT wrapped (remote)".
       }
     }),
-  );
+    ...view.pluginServers.map(async (ps) => {
+      if (managedPluginByQual.has(ps.qualifiedName)) return;
+      if (disabledSet.has(ps.qualifiedName) || disabledSet.has(ps.serverName)) return;
+      if (ps.unwrappableReason !== null) return;
+      const plan = planRemoteWrap(ps.entry);
+      if (!plan?.wrappable) return;
+      const headers = resolveWrapHeaders(plan.headers);
+      if (!headers.ok) return;
+      try {
+        reachability.set(ps.qualifiedName, await ctx.probeRemote(plan.url, headers.headers));
+      } catch {
+        // Same fallback as above.
+      }
+    }),
+  ]);
   for (const [name, scoped] of effective) {
     if (name === WORKSPACE_SERVER_NAME) {
       // A leftover ≤0.10 artifact, not a healthy managed server — reporting
@@ -1855,6 +2357,48 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
       unwrapped++;
     }
     ctx.log(`[speculate]   ${name} (${scoped.scope}): ${stateLabel}`);
+  }
+  // The fifth row (§13.23): servers installed plugins declare. Their wrapped
+  // copies already printed above as ordinary local servers; these lines tie
+  // each original to its copy, or say why it was left alone.
+  for (const ps of view.pluginServers) {
+    const rec = managedPluginByQual.get(ps.qualifiedName);
+    const copy = rec ? effective.get(rec.name) : undefined;
+    const copyIsOurs =
+      copy !== undefined &&
+      isWrappedEntry(copy.entry) &&
+      pluginOriginOf(copy.entry) === ps.qualifiedName;
+    let stateLabel: string;
+    if (copyIsOurs) {
+      stateLabel = `wrapped as '${rec!.name}' (local copy; the plugin original is disabled)`;
+    } else if (disabledSet.has(ps.qualifiedName)) {
+      stateLabel = 'disabled in Claude Code — left alone';
+    } else if (disabledSet.has(ps.serverName)) {
+      stateLabel = `wrap opted out ('${ps.serverName}' is disabled in Claude Code)`;
+    } else if (ps.unwrappableReason !== null) {
+      stateLabel = `${ps.unwrappableReason} — passed through`;
+    } else {
+      const remote = planRemoteWrap(ps.entry);
+      if (remote?.wrappable) {
+        const probe = reachability.get(ps.qualifiedName);
+        const authorized = readOAuthRecord(ctx.oauthStorePath, remote.url)?.tokens !== undefined;
+        if (probe?.kind === 'needs-auth' && !authorized) {
+          stateLabel = `NOT wrapped (remote) — needs a login: run 'speculate auth ${ps.qualifiedName}'`;
+          needAuth++;
+        } else if (probe?.kind === 'unreachable') {
+          stateLabel = `NOT wrapped (remote) — ${probe.reason}`;
+        } else {
+          stateLabel = `NOT wrapped (remote${authorized ? ', logged in' : ''})`;
+          unwrapped++;
+        }
+      } else if (!isStdioEntry(ps.entry)) {
+        stateLabel = `${remote ? remote.reason : 'non-stdio'} — passed through`;
+      } else {
+        stateLabel = 'NOT wrapped';
+        unwrapped++;
+      }
+    }
+    ctx.log(`[speculate]   ${ps.qualifiedName} (plugin): ${stateLabel}`);
   }
   // The limit of everything above, stated once. Connectors enabled through
   // the claude.ai UI are held by the host, not written to any local MCP
