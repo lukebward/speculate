@@ -1810,14 +1810,21 @@ describe('the auto-wrap plugin', () => {
     await speculateOn(opts());
     const entry = hookEntry(stagedHooks());
     expect(entry.type).toBe('command');
-    // POSIX (this suite): the ABSOLUTE interpreter this install ran under is
-    // tried first — a GUI-launched host inherits launchd's minimal PATH,
-    // where a bare `node` resolves to nothing — with PATH `node` as the
-    // fallback that survives a version-manager switch deleting the baked
-    // one. Hooks run through a shell (measured on the real host: an `x || y`
-    // command executed its fallback), which is what makes the chain legal.
-    expect(entry.command.startsWith(`"${SELF.command}" `)).toBe(true);
-    expect(entry.command).toContain(' || node "');
+    // POSIX: the ABSOLUTE interpreter this install ran under is tried
+    // first — a GUI-launched host inherits launchd's minimal PATH, where a
+    // bare `node` resolves to nothing — with PATH `node` as the fallback
+    // that survives a version-manager switch deleting the baked one. Hooks
+    // run through a shell (measured on the real host: an `x || y` command
+    // executed its fallback), which is what makes the chain legal. Windows
+    // keeps the single bare-node form: hooks there run under PowerShell,
+    // and 5.1 parse-errors on `||`.
+    if (isWindows) {
+      expect(entry.command.startsWith('node ')).toBe(true);
+      expect(entry.command).not.toContain('||');
+    } else {
+      expect(entry.command.startsWith(`"${SELF.command}" `)).toBe(true);
+      expect(entry.command).toContain(' || node "');
+    }
     expect(entry.command).toContain(SELF.args[0]); // absolute cli entry
     // Never the npm shim: Claude Code cannot exec a .cmd hook on Windows.
     expect(entry.command).not.toMatch(/^speculate\b/);
@@ -2822,7 +2829,12 @@ describe('auto-wrap on GUI-launched hosts', () => {
     expect(autowrapHookCommand(SELF, { platform: 'linux', claudeBin: null })).not.toContain('--claude-bin');
   });
 
-  it('resolveClaudeBin falls back to the usual POSIX install dirs when PATH misses', () => {
+  // Skipped on Windows: the scenario forces platform 'linux', whose PATH
+  // splitter is ':' — a Windows tmp path's drive colon splits there, so the
+  // fixture cannot express "a PATH entry containing claude" at all. The
+  // platform-crossed combination cannot occur in production (the platform
+  // comes from process.platform).
+  it.skipIf(isWindows)('resolveClaudeBin falls back to the usual POSIX install dirs when PATH misses', () => {
     const fallbackDir = join(home, '.claude', 'local');
     mkdirSync(fallbackDir, { recursive: true });
     writeFileSync(join(fallbackDir, 'claude'), '#!/bin/sh\n');
