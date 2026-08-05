@@ -72,11 +72,11 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 <details>
 <summary><b>How auto-wrapping behaves</b></summary>
 
-`on` installs a hook-only plugin at Claude Code's user scope, shared by every project. At each session start it wraps any newly added, already-approved servers.
+`on` installs a hook-only plugin at Claude Code's user scope, shared by every project. At session start — fresh, `--resume`, or `/clear` — it wraps any newly added, already-approved servers, plugin-declared ones included.
 
 - **One session behind.** Claude Code reads MCP config before session-start hooks run, so a server you add now gets wrapped from your *next* session. It works normally meanwhile, just without prefetching.
 - **Approval never widens.** A server pending approval in `.mcp.json` stays pending. Revoke it, or delete the server, and the next session start removes the wrapped copy.
-- **`--resume` and `--continue` do not trigger it.** The hook runs on fresh sessions only; `speculate on` always wraps on the spot.
+- **GUI-launched apps work too.** The hook bakes absolute paths for both `node` and `claude` with PATH fallbacks, so a desktop app opened from a dock icon — whose minimal OS PATH has neither — still auto-wraps. If the hook ever stops firing, `speculate status` says so instead of leaving it silent.
 - **Removing it everywhere:** `off` covers one project. To stop it globally, `claude plugin uninstall -s user speculate-autowrap`, then `claude plugin marketplace remove speculate-mcp`.
 
 </details>

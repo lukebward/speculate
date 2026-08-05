@@ -21,7 +21,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  AUTOWRAP_HEARTBEAT_FILE,
   PLUGIN_ORIGIN_ENV,
+  autowrapHookCommand,
   effectiveServerHash,
   execFileRunner,
   resolveClaudeBin,
@@ -72,7 +74,7 @@ let autowrapMarketplace: string;
  * A version or an installed hook command that no longer matches what this
  * Speculate would generate is what `on`'s repair path keys off.
  */
-let autowrapInstall: { version: string; installPath?: string };
+let autowrapInstall: { version: string; installPath?: string; installedAt?: string };
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'speculate-mhome-'));
@@ -134,6 +136,7 @@ const fakeRunner: CmdRunner = async (cmd, args) => {
           version: autowrapInstall.version,
           scope: 'user',
           ...(autowrapInstall.installPath ? { installPath: autowrapInstall.installPath } : {}),
+          ...(autowrapInstall.installedAt ? { installedAt: autowrapInstall.installedAt } : {}),
         });
       }
       return { code: 0, stdout: JSON.stringify(list), stderr: '' };
@@ -1640,7 +1643,9 @@ describe('the auto-wrap plugin', () => {
       execFile(
         process.execPath,
         [wrapper, ...args],
-        { env: { ...process.env, ...env } },
+        // XDG_STATE_HOME defaults into the fixture so the wrapper's
+        // heartbeat never lands in the developer's real state directory.
+        { env: { ...process.env, XDG_STATE_HOME: join(home, 'state'), ...env } },
         (err, stdout, stderr) => {
           const anyErr = err as (Error & { code?: number | string }) | null;
           res({ code: typeof anyErr?.code === 'number' ? anyErr.code : 0, stdout, stderr });
@@ -1799,17 +1804,20 @@ describe('the auto-wrap plugin', () => {
     expect(readClaudeJson().mcpServers.github.command).toBe(SELF.command);
   });
 
-  it('the generated hook command is absolute and never a bare speculate', async () => {
+  it('the generated hook command tries the baked interpreter, then PATH node, never a bare speculate', async () => {
     pluginSim = { installed: false, marketplace: false };
     writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
     await speculateOn(opts());
     const entry = hookEntry(stagedHooks());
     expect(entry.type).toBe('command');
-    // `node` by NAME, resolved on PATH: node/node.exe is a real executable
-    // (never a .cmd shim), and a baked interpreter path would break for good
-    // the first time an nvm/fnm/volta user switched Node versions.
-    expect(entry.command.startsWith('node ')).toBe(true);
-    expect(entry.command).not.toContain(SELF.command);
+    // POSIX (this suite): the ABSOLUTE interpreter this install ran under is
+    // tried first — a GUI-launched host inherits launchd's minimal PATH,
+    // where a bare `node` resolves to nothing — with PATH `node` as the
+    // fallback that survives a version-manager switch deleting the baked
+    // one. Hooks run through a shell (measured on the real host: an `x || y`
+    // command executed its fallback), which is what makes the chain legal.
+    expect(entry.command.startsWith(`"${SELF.command}" `)).toBe(true);
+    expect(entry.command).toContain(' || node "');
     expect(entry.command).toContain(SELF.args[0]); // absolute cli entry
     // Never the npm shim: Claude Code cannot exec a .cmd hook on Windows.
     expect(entry.command).not.toMatch(/^speculate\b/);
@@ -1820,7 +1828,10 @@ describe('the auto-wrap plugin', () => {
     // Must outlast sync's own last-resort 120s exit, or the host kills a wrap
     // mid-flight and reopens the window the cooperative deadline closed.
     expect(entry.timeout).toBeGreaterThan(120);
-    expect(stagedHooks().hooks.SessionStart[0].matcher).toBe('startup');
+    // resume/clear included so resume-only users (and desktop apps reopening
+    // conversations) still auto-wrap; measured: matcher alternation matches
+    // the event's `source` on the real host.
+    expect(stagedHooks().hooks.SessionStart[0].matcher).toBe('startup|resume|clear');
     // The staged tree is what the host was pointed at, and it carries the
     // wrapper (the package dir may be root-owned or read-only).
     expect(calls).toContainEqual(['claude', 'plugin', 'marketplace', 'add', stagedRoot()]);
@@ -2780,5 +2791,165 @@ describe('plugin server wrapping (the §13.23 fifth row)', () => {
     const out = logs.join('\n');
     expect(out).toContain(`${QUAL} (plugin): wrapped as 'probesrv'`);
     expect(out).toContain('plugin:testplug:helper (plugin): uses headersHelper');
+  });
+});
+
+describe('auto-wrap on GUI-launched hosts', () => {
+  it('the POSIX hook command chains the baked interpreter with a PATH-node fallback', () => {
+    const command = autowrapHookCommand(SELF, { platform: 'linux', claudeBin: '/usr/local/bin/claude' });
+    const wrapper = '"${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs"';
+    // Baked interpreter first (GUI PATH lacks nvm shims), PATH node second
+    // (survives a version-manager switch deleting the baked one).
+    expect(command.startsWith(`"${SELF.command}" ${wrapper}`)).toBe(true);
+    expect(command).toContain(` || node ${wrapper}`);
+    // The host CLI rides behind `--` so a GUI session can spawn the front
+    // door without PATH; both clauses carry it.
+    const clauses = command.split(' || ');
+    expect(clauses).toHaveLength(2);
+    for (const clause of clauses) {
+      expect(clause).toContain('-- --claude-bin "/usr/local/bin/claude"');
+    }
+  });
+
+  it('the Windows hook command stays a single bare-node form (PowerShell 5.1 cannot parse ||)', () => {
+    const command = autowrapHookCommand(SELF, { platform: 'win32', claudeBin: 'C:\\bin\\claude.cmd' });
+    expect(command.startsWith('node ')).toBe(true);
+    expect(command).not.toContain('||');
+    expect(command).toContain('-- --claude-bin "C:\\bin\\claude.cmd"');
+  });
+
+  it('bakes no --claude-bin when none can be proven', () => {
+    expect(autowrapHookCommand(SELF, { platform: 'linux', claudeBin: null })).not.toContain('--claude-bin');
+  });
+
+  it('resolveClaudeBin falls back to the usual POSIX install dirs when PATH misses', () => {
+    const fallbackDir = join(home, '.claude', 'local');
+    mkdirSync(fallbackDir, { recursive: true });
+    writeFileSync(join(fallbackDir, 'claude'), '#!/bin/sh\n');
+    // PATH miss, fallback hit: the absolute path comes back.
+    expect(
+      resolveClaudeBin('claude', { platform: 'linux', pathEnv: join(home, 'no-such'), home }),
+    ).toBe(join(fallbackDir, 'claude'));
+    // PATH hit: the bare name is returned untouched (spawn resolves it too).
+    const onPath = join(home, 'bin');
+    mkdirSync(onPath, { recursive: true });
+    writeFileSync(join(onPath, 'claude'), '#!/bin/sh\n');
+    expect(resolveClaudeBin('claude', { platform: 'linux', pathEnv: onPath, home })).toBe('claude');
+    // Total miss: unchanged, fail-soft.
+    expect(
+      resolveClaudeBin('claude', {
+        platform: 'linux',
+        pathEnv: join(home, 'no-such'),
+        home: join(home, 'empty-home'),
+      }),
+    ).toBe('claude');
+  });
+
+  it('the wrapper forwards everything after -- to sync, and stamps the heartbeat', async () => {
+    const fakeCli = join(home, 'fake-cli.cjs');
+    const argvOut = join(home, 'argv.json');
+    writeFileSync(
+      fakeCli,
+      `require('fs').writeFileSync(${JSON.stringify(argvOut)}, JSON.stringify(process.argv.slice(2)));`,
+    );
+    const wrapper = fileURLToPath(new URL('../plugin/hooks/autowrap.mjs', import.meta.url));
+    await new Promise<void>((res) => {
+      execFile(
+        process.execPath,
+        [wrapper, fakeCli, '--', '--claude-bin', '/somewhere/claude'],
+        { env: { ...process.env, XDG_STATE_HOME: join(home, 'state') } },
+        () => res(),
+      );
+    });
+    expect(JSON.parse(readFileSync(argvOut, 'utf8'))).toEqual([
+      'sync',
+      '--claude-bin',
+      '/somewhere/claude',
+    ]);
+    const beat = JSON.parse(
+      readFileSync(join(home, 'state', 'speculate', 'hook-heartbeat.json'), 'utf8'),
+    );
+    expect(typeof beat.at).toBe('number');
+  });
+
+  it('the heartbeat filename in the wrapper is pinned to AUTOWRAP_HEARTBEAT_FILE', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('../plugin/hooks/autowrap.mjs', import.meta.url)),
+      'utf8',
+    );
+    // The wrapper is dependency-free by design, so the name is duplicated
+    // there; this is the test the duplication leans on.
+    expect(source).toContain(`'${AUTOWRAP_HEARTBEAT_FILE}'`);
+  });
+
+  it('status warns when the hook has not run since an install more than a day old', async () => {
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    autowrapInstall = {
+      version: PLUGIN_MANIFEST.version!,
+      installedAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateStatus(opts())).toBe(0);
+    expect(logs.join('\n')).toContain('has NOT run since it was installed');
+  });
+
+  it('status stays quiet when the heartbeat postdates the install', async () => {
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    autowrapInstall = {
+      version: PLUGIN_MANIFEST.version!,
+      installedAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    };
+    // statePath lives directly in `home`, so the heartbeat sits beside it.
+    writeFileSync(join(home, 'hook-heartbeat.json'), JSON.stringify({ at: Date.now() }));
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateStatus(opts())).toBe(0);
+    expect(logs.join('\n')).not.toContain('has NOT run');
+  });
+
+  it('status stays quiet on a fresh install with no heartbeat yet', async () => {
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    autowrapInstall = {
+      version: PLUGIN_MANIFEST.version!,
+      installedAt: new Date().toISOString(),
+    };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateStatus(opts())).toBe(0);
+    expect(logs.join('\n')).not.toContain('has NOT run');
+  });
+
+  it('a stale matcher alone makes on refresh the installed copy', async () => {
+    const installPath = join(home, 'installed-autowrap');
+    mkdirSync(join(installPath, 'hooks'), { recursive: true });
+    // Pin the baked claude to an absolute path that exists, so the COMMAND in
+    // the installed copy matches what this run would generate byte for byte —
+    // only the matcher is the old startup-only form. That isolates the
+    // matcher comparison as the thing that must trigger the refresh.
+    const claudeBin = process.execPath;
+    writeFileSync(
+      join(installPath, 'hooks', 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              matcher: 'startup',
+              hooks: [
+                {
+                  type: 'command',
+                  command: autowrapHookCommand(SELF, { claudeBin }),
+                  timeout: 150,
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    );
+    pluginSim = { installed: false, marketplace: false, autowrap: true };
+    autowrapInstall = { version: PLUGIN_MANIFEST.version!, installPath };
+    writeClaudeJson({ mcpServers: { github: { command: 'gh-server' } } });
+    expect(await speculateOn({ ...opts(), claudeBin })).toBe(0);
+    // Refresh = uninstall + reinstall of OUR plugin.
+    expect(calls).toContainEqual([claudeBin, 'plugin', 'uninstall', '-s', 'user', 'speculate-autowrap']);
+    expect(pluginSim.autowrap).toBe(true);
   });
 });

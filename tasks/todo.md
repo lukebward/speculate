@@ -96,3 +96,21 @@ covers the CLI daemon).
 - [x] Adversarial review findings applied (6 reviewers, 32 findings, 20
       confirmed — marker-based adoption, measured enabledPlugins semantics,
       loud repair, mode-preserving refresh, redaction and robustness fixes)
+
+# Auto-wrap on GUI-launched hosts (2026-08-05)
+
+- [x] Measure: command hooks run through a shell (|| chain fired on the
+      real host); SessionStart matcher matches source, alternation works
+- [x] POSIX hook command = baked-interpreter || PATH-node chain; Windows
+      keeps single bare-node (PS 5.1 has no ||)
+- [x] Bake --claude-bin behind `--`; sync uses it only while it exists;
+      resolveClaudeBin POSIX fallbacks (~/.claude/local, brew, /usr/local,
+      ~/.local/bin)
+- [x] Matcher widened to startup|resume|clear (v0.12 choice reversed with
+      measurements); staleness check versions matcher + command
+- [x] Heartbeat in the wrapper + status warns when an install >1 day old
+      has no heartbeat since installedAt
+- [x] Live: refreshed hook fired in a real session, heartbeat stamped;
+      prior session's hook had auto-wrapped the plugin server unattended
+      and the adoption pass recovered its lost record in production
+- [x] DESIGN.md §13.27, README; full suite green

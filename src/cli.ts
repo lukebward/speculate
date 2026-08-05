@@ -12,6 +12,7 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { writeFileSync, existsSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 import { loadConfig } from './config.js';
 import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
 import { SpeculateProxy } from './proxy.js';
@@ -328,7 +329,22 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'sync') {
-    if (args.rest.length > 0) fail(`unknown sync argument '${args.rest[0]}'`);
+    // `--claude-bin <abs>` is baked into the auto-wrap hook command at
+    // install time: `on` runs in a terminal where `claude` is on PATH, and
+    // this carries that knowledge into GUI-launched sessions whose minimal
+    // OS PATH has neither node's version-manager shims nor the host CLI.
+    // Used only while the baked path still exists — a stale bake (the CLI
+    // moved or was uninstalled) silently falls back to normal resolution,
+    // because a hook argument must never turn into a session-start error.
+    const rest = [...args.rest];
+    let claudeBin: string | undefined;
+    const binIdx = rest.indexOf('--claude-bin');
+    if (binIdx !== -1) {
+      const value = rest[binIdx + 1];
+      rest.splice(binIdx, value !== undefined ? 2 : 1);
+      if (value !== undefined && isAbsolute(value) && existsSync(value)) claudeBin = value;
+    }
+    if (rest.length > 0) fail(`unknown sync argument '${rest[0]}'`);
     // The real budget is COOPERATIVE and lives in speculateSync, which stops
     // BETWEEN servers so a wrap is never cut in half. This timer is only the
     // last resort for a hang no layer below can end (every `claude mcp` call
@@ -350,7 +366,11 @@ async function main(): Promise<void> {
     // That is the right long-term fix; this timer is the interim.
     const timer = setTimeout(() => process.exit(0), 120_000).unref();
     try {
-      process.exitCode = await speculateSync({ self: selfCommand(), mode: null });
+      process.exitCode = await speculateSync({
+        self: selfCommand(),
+        mode: null,
+        ...(claudeBin !== undefined ? { claudeBin } : {}),
+      });
     } catch {
       // selfCommand() throws when the entrypoint can't be located (a
       // half-removed install with the plugin still there). The hook must

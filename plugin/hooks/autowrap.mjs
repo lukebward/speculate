@@ -34,9 +34,43 @@
  * and forwarding only the last silently swallowed the other.
  */
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 
-const argv = process.argv.slice(2).filter((a) => a.length > 0);
+// Heartbeat first, before anything can bail: `speculate status` reads this
+// to tell "the hook never fires" (a GUI-launched host with no usable PATH,
+// a dead matcher) apart from "no session has started" — the one failure mode
+// that is otherwise perfectly silent. Same XDG resolution as the CLI's
+// managedStatePath, duplicated because this file is deliberately
+// dependency-free (plugins install as checkouts; there is nothing to import
+// from). The filename is pinned to manage.ts's AUTOWRAP_HEARTBEAT_FILE by a
+// test. Best-effort in every direction: a heartbeat must never fail a
+// session start.
+try {
+  const xdg = process.env.XDG_STATE_HOME;
+  const stateHome =
+    xdg && xdg.length > 0 && isAbsolute(xdg)
+      ? xdg
+      : process.platform === 'win32' && process.env.LOCALAPPDATA
+        ? process.env.LOCALAPPDATA
+        : join(homedir(), '.local', 'state');
+  const dir = join(stateHome, 'speculate');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, 'hook-heartbeat.json'), `${JSON.stringify({ at: Date.now() })}\n`, {
+    mode: 0o600,
+  });
+} catch {
+  // never the session's problem
+}
+
+const raw = process.argv.slice(2).filter((a) => a.length > 0);
+// Everything before `--` is the baked CLI invocation (existence-checked);
+// everything after it is passed to `sync` verbatim — today, `--claude-bin`,
+// the absolute host CLI a GUI-launched session may not find on PATH.
+const sep = raw.indexOf('--');
+const argv = sep === -1 ? raw : raw.slice(0, sep);
+const extra = sep === -1 ? [] : raw.slice(sep + 1);
 const fromEnv = process.env.SPECULATE_CLI ?? '';
 const cli = argv.length > 0 ? argv : fromEnv.length > 0 ? [fromEnv] : [];
 
@@ -46,7 +80,7 @@ if (cli.length === 0 || !cli.every((p) => existsSync(p))) process.exit(0);
 
 let child;
 try {
-  child = spawn(process.execPath, [...cli, 'sync'], {
+  child = spawn(process.execPath, [...cli, 'sync', ...extra], {
     stdio: ['ignore', 'ignore', 'pipe'],
     windowsHide: true,
   });

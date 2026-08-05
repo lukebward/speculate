@@ -181,27 +181,60 @@ export const execFileRunner: CmdRunner = (cmd, args, opts) =>
  * execFile nor spawn does a PATHEXT search (libuv tries `.com`/`.exe` only) —
  * so a bare 'claude' fails with ENOENT even though it works in the user's
  * shell. Resolve a BARE name against PATH × the extensions Windows can
- * execute, most-native first. Fail-soft: anything already carrying a path,
- * any non-win32 platform, or no hit at all returns the input untouched.
+ * execute, most-native first.
+ *
+ * POSIX: a bare name found on PATH is returned untouched (spawn resolves it
+ * the same way). The interesting case is a GUI-LAUNCHED host — a desktop app
+ * opened from a dock icon inherits launchd's minimal PATH, where `claude`
+ * resolves to nothing even though it is installed — so a PATH miss falls
+ * back to probing the usual install locations, most claude-specific first:
+ * the host's own local-install directory, then Homebrew and the common
+ * npm-prefix bins. Fail-soft everywhere: anything already carrying a path,
+ * or no hit at all, returns the input untouched.
  */
 export function resolveClaudeBin(
   bin: string,
-  opts: { platform?: NodeJS.Platform; pathEnv?: string } = {},
+  opts: { platform?: NodeJS.Platform; pathEnv?: string; home?: string } = {},
 ): string {
   const platform = opts.platform ?? process.platform;
-  if (platform !== 'win32') return bin;
   if (bin.includes('/') || bin.includes('\\') || isAbsolute(bin)) return bin;
   const pathEnv = opts.pathEnv ?? process.env.PATH ?? '';
-  for (const dir of pathEnv.split(';')) {
-    const trimmed = dir.replace(/^"|"$/g, '').trim();
-    if (trimmed.length === 0) continue;
-    for (const ext of ['.exe', '.cmd', '.bat', '']) {
-      const candidate = join(trimmed, `${bin}${ext}`);
-      try {
-        if (existsSync(candidate)) return candidate;
-      } catch {
-        // unreadable PATH entry — keep looking
+  if (platform === 'win32') {
+    for (const dir of pathEnv.split(';')) {
+      const trimmed = dir.replace(/^"|"$/g, '').trim();
+      if (trimmed.length === 0) continue;
+      for (const ext of ['.exe', '.cmd', '.bat', '']) {
+        const candidate = join(trimmed, `${bin}${ext}`);
+        try {
+          if (existsSync(candidate)) return candidate;
+        } catch {
+          // unreadable PATH entry — keep looking
+        }
       }
+    }
+    return bin;
+  }
+  for (const dir of pathEnv.split(':')) {
+    if (dir.length === 0) continue;
+    try {
+      if (existsSync(join(dir, bin))) return bin; // spawn will find it too
+    } catch {
+      // unreadable PATH entry — keep looking
+    }
+  }
+  const home = opts.home ?? homedir();
+  const fallbacks = [
+    join(home, '.claude', 'local'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    join(home, '.local', 'bin'),
+  ];
+  for (const dir of fallbacks) {
+    const candidate = join(dir, bin);
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      // unreadable — keep looking
     }
   }
   return bin;
@@ -1645,10 +1678,12 @@ function isAutowrapRecord(item: unknown): boolean {
   return false;
 }
 
-/** What the host reports about an installed copy; both fields are optional. */
+/** What the host reports about an installed copy; every field is optional. */
 interface AutowrapInstall {
   version?: string;
   installPath?: string;
+  /** ISO timestamp of the install, when the host reports one (measured: it does). */
+  installedAt?: string;
 }
 
 /**
@@ -1663,6 +1698,7 @@ function autowrapRecord(parsed: unknown): AutowrapInstall | null {
     return {
       ...(typeof rec['version'] === 'string' ? { version: rec['version'] } : {}),
       ...(typeof rec['installPath'] === 'string' ? { installPath: rec['installPath'] } : {}),
+      ...(typeof rec['installedAt'] === 'string' ? { installedAt: rec['installedAt'] } : {}),
     };
   };
   if (Array.isArray(parsed)) {
@@ -1703,51 +1739,91 @@ function packageRoot(): string | null {
 }
 
 /**
- * The hook's command line, with both file paths baked at install time.
- *
- * Never a bare `speculate`: Claude Code cannot exec a `.cmd` shim as a hook on
- * Windows, and npm installs `speculate` as one. `node` by NAME is a different
- * case and is deliberate: node/node.exe is a real executable, so PATH
- * resolution works where a shim would not — and it self-heals the one thing a
- * baked `process.execPath` cannot survive, an nvm/fnm/volta version switch
- * that deletes the interpreter the hook was pinned to. `ctx.self.command` is
- * therefore intentionally unused here; only its ARGS are baked.
- *
- * This is a trade, not a strict improvement: a GUI-launched host (e.g. a
- * desktop app opened from a dock/Start Menu icon) inherits whatever PATH the
- * OS session set up, which may lack the nvm/fnm shim directory entirely, and
- * a bare `node` there resolves to nothing or the wrong interpreter, whereas
- * a baked `process.execPath` would have kept working. PATH resolution wins
- * the common case (a terminal-launched host, where version managers live)
- * at the cost of that less common one.
- *
- * `${CLAUDE_PLUGIN_ROOT}` is the host's own expansion for the INSTALLED plugin
- * directory and has to be used for the wrapper, because `claude plugin
- * install` COPIES the plugin: a path into the npm package is precisely the
- * path that disappears on `npm uninstall`, which is the case the wrapper
- * exists to survive. The CLI path after it may well disappear too — the
- * wrapper checks it and exits 0 silently.
+ * The SessionStart sources the hook fires on. Measured against the shipped
+ * host (2.1.222): the matcher is matched against the event's `source`
+ * (startup | resume | clear | compact | fork) and alternation works — a
+ * `startup|resume` matcher fired on a real `startup` session in this
+ * container. `resume` and `clear` are included so a user who lives in
+ * `--resume`/`--continue` (or a desktop app reopening conversations) still
+ * gets auto-wrap; the v0.12 startup-only choice predates plugin wrapping and
+ * is deliberately reversed here — the fast path the extra firings hit is a
+ * hash over a handful of file reads. `compact` and `fork` stay excluded:
+ * they fire mid-work, where a wrap that cannot take effect until the next
+ * session buys nothing.
  */
-function autowrapHookCommand(self: { command: string; args: string[] }): string {
+export const AUTOWRAP_HOOK_MATCHER = 'startup|resume|clear';
+
+/** The heartbeat the hook writes; `status` reads it to prove the hook fires. */
+export const AUTOWRAP_HEARTBEAT_FILE = 'hook-heartbeat.json';
+
+/**
+ * The hook's command line, with the interpreter, both file paths, and the
+ * host CLI baked at install time.
+ *
+ * Never a bare `speculate`: Claude Code cannot exec a `.cmd` shim as a hook
+ * on Windows, and npm installs `speculate` as one.
+ *
+ * The interpreter is belt and braces on POSIX. Command hooks run through a
+ * shell (measured: a `x || y` chain executed its fallback on the real host),
+ * so the command tries the ABSOLUTE interpreter this install ran under
+ * first — a GUI-launched host (desktop app opened from a dock icon) inherits
+ * a minimal OS PATH with no nvm/fnm shims, where a bare `node` resolves to
+ * nothing — and falls back to PATH `node`, which survives the one thing the
+ * baked path cannot: a version-manager switch that deletes the interpreter.
+ * Either clause failing to SPAWN (127) triggers the other; the wrapper
+ * itself always exits 0, so the fallback never runs it twice.
+ *
+ * Windows keeps the single bare-`node` form: hooks there run under
+ * PowerShell, and PowerShell 5.1 — stock Windows — parse-errors on `||`
+ * (the same reason `on`'s recovery recipes print two lines). GUI-launched
+ * apps on Windows read PATH from the registry, which node installers and
+ * nvm-windows write, so the POSIX problem does not arise there.
+ *
+ * `${CLAUDE_PLUGIN_ROOT}` is the host's own expansion for the INSTALLED
+ * plugin directory and has to be used for the wrapper, because `claude
+ * plugin install` COPIES the plugin: a path into the npm package is
+ * precisely the path that disappears on `npm uninstall`, which is the case
+ * the wrapper exists to survive. The CLI path after it may well disappear
+ * too — the wrapper checks it and exits 0 silently.
+ *
+ * `claudeBin`, when known, rides after a `--` separator as `--claude-bin`:
+ * the wrapper forwards everything past the `--` to `speculate sync`, which
+ * uses the baked absolute path only if it still exists. Same GUI rationale
+ * as the interpreter: sync's front door spawns `claude`, and a dock-launched
+ * host may not have it on PATH either.
+ */
+export function autowrapHookCommand(
+  self: { command: string; args: string[] },
+  opts: { claudeBin?: string | null; platform?: NodeJS.Platform } = {},
+): string {
+  const platform = opts.platform ?? process.platform;
   const quoted = (s: string): string => `"${s}"`;
-  return [
-    'node',
-    quoted('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs'),
+  const wrapper = quoted('${CLAUDE_PLUGIN_ROOT}/hooks/autowrap.mjs');
+  const args = [
     ...self.args.map(quoted),
-  ].join(' ');
+    ...(opts.claudeBin ? ['--', '--claude-bin', quoted(opts.claudeBin)] : []),
+  ];
+  if (platform === 'win32') {
+    return ['node', wrapper, ...args].join(' ');
+  }
+  const invocation = (interpreter: string): string => [interpreter, wrapper, ...args].join(' ');
+  return `${invocation(quoted(self.command))} || ${invocation('node')}`;
 }
 
-function autowrapHooksJson(self: { command: string; args: string[] }): string {
+function autowrapHooksJson(
+  self: { command: string; args: string[] },
+  opts: { claudeBin?: string | null } = {},
+): string {
   return `${JSON.stringify(
     {
       hooks: {
         SessionStart: [
           {
-            matcher: 'startup',
+            matcher: AUTOWRAP_HOOK_MATCHER,
             hooks: [
               {
                 type: 'command',
-                command: autowrapHookCommand(self),
+                command: autowrapHookCommand(self, opts),
                 timeout: AUTOWRAP_HOOK_TIMEOUT_S,
               },
             ],
@@ -1758,6 +1834,37 @@ function autowrapHooksJson(self: { command: string; args: string[] }): string {
     null,
     2,
   )}\n`;
+}
+
+/**
+ * An ABSOLUTE path to the host CLI, for baking into the hook command — or
+ * null when none can be proven, in which case nothing is baked and sync
+ * falls back to its ordinary resolution. Resolved at `on` time, which runs
+ * in a terminal where `claude` is on PATH (it was just invoked); the point
+ * is to carry that knowledge into GUI-launched sessions that lack it.
+ */
+function absoluteClaudeBin(ctx: Ctx): string | null {
+  const bin = ctx.claudeBin;
+  if (isAbsolute(bin)) return existsSync(bin) ? bin : null;
+  if (bin.includes('/') || bin.includes('\\')) {
+    const abs = resolve(ctx.cwd, bin);
+    return existsSync(abs) ? abs : null;
+  }
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
+  for (const dir of (process.env.PATH ?? '').split(sep)) {
+    const trimmed = dir.replace(/^"|"$/g, '').trim();
+    if (trimmed.length === 0) continue;
+    for (const ext of exts) {
+      const candidate = join(trimmed, `${bin}${ext}`);
+      try {
+        if (existsSync(candidate)) return candidate;
+      } catch {
+        // unreadable PATH entry — keep looking
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -1792,7 +1899,10 @@ function stageAutowrapPlugin(ctx: Ctx, root: string): string {
     join(root, 'plugin', 'hooks', 'autowrap.mjs'),
     join(dest, 'plugin', 'hooks', 'autowrap.mjs'),
   );
-  writeFileSync(join(dest, 'plugin', 'hooks', 'hooks.json'), autowrapHooksJson(ctx.self));
+  writeFileSync(
+    join(dest, 'plugin', 'hooks', 'hooks.json'),
+    autowrapHooksJson(ctx.self, { claudeBin: absoluteClaudeBin(ctx) }),
+  );
   return dest;
 }
 
@@ -1838,9 +1948,20 @@ function autowrapInstallIsCurrent(ctx: Ctx, root: string, installed: AutowrapIns
     try {
       const hooks = JSON.parse(
         readFileSync(join(installed.installPath, 'hooks', 'hooks.json'), 'utf8'),
-      ) as { hooks?: { SessionStart?: { hooks?: { command?: unknown }[] }[] } };
-      const command = hooks.hooks?.SessionStart?.[0]?.hooks?.[0]?.command;
-      if (typeof command === 'string' && command !== autowrapHookCommand(ctx.self)) return false;
+      ) as { hooks?: { SessionStart?: { matcher?: unknown; hooks?: { command?: unknown }[] }[] } };
+      const entry = hooks.hooks?.SessionStart?.[0];
+      const command = entry?.hooks?.[0]?.command;
+      if (
+        typeof command === 'string' &&
+        command !== autowrapHookCommand(ctx.self, { claudeBin: absoluteClaudeBin(ctx) })
+      ) {
+        return false;
+      }
+      // The matcher is versioned too: widening it (startup-only → also
+      // resume/clear) only reaches existing installs through a refresh.
+      if (typeof entry?.matcher === 'string' && entry.matcher !== AUTOWRAP_HOOK_MATCHER) {
+        return false;
+      }
     } catch {
       // Unreadable: no evidence either way, so nothing to act on.
     }
@@ -2515,7 +2636,8 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
       `[speculate] ${needAuth} server(s) need a login first: run 'speculate auth' (or say yes when 'speculate on' offers)`,
     );
   }
-  if (await detectAutowrapPlugin(ctx)) {
+  const autowrap = autowrapRecord(await fetchPluginList(ctx));
+  if (autowrap !== null) {
     // The plugin being installed is only half the answer: `off` records a
     // per-project opt-out that `sync` honors before anything else, so in an
     // opted-out project "new servers wrap at the next session start" is
@@ -2528,6 +2650,33 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
         ? "[speculate]   auto-wrap: installed, but this project is opted out ('speculate off' did that) — run 'speculate on' here to re-enable"
         : '[speculate]   auto-wrap: installed (new servers wrap at the next session start)',
     );
+    // The hook's one silent failure mode, made visible with evidence: the
+    // wrapper stamps a heartbeat on every firing, so an install that is a
+    // day old with no heartbeat since it means the hook is NOT running —
+    // classically a GUI-launched host whose minimal OS PATH resolves
+    // neither node nor claude (terminal-launched sessions are unaffected,
+    // and current installs bake absolute fallbacks for both). Only positive
+    // evidence warns: no installedAt from the host, or a young install, says
+    // nothing.
+    const installedAt = autowrap.installedAt ? Date.parse(autowrap.installedAt) : NaN;
+    if (Number.isFinite(installedAt) && Date.now() - installedAt > 24 * 60 * 60 * 1000) {
+      let beatAt = NaN;
+      try {
+        const beat = JSON.parse(
+          readFileSync(join(dirname(ctx.statePath), AUTOWRAP_HEARTBEAT_FILE), 'utf8'),
+        ) as { at?: unknown };
+        if (typeof beat.at === 'number') beatAt = beat.at;
+      } catch {
+        // no heartbeat yet — exactly the evidence the warning is about
+      }
+      if (!(Number.isFinite(beatAt) && beatAt >= installedAt)) {
+        ctx.log(
+          '[speculate]   auto-wrap: its session-start hook has NOT run since it was installed — ' +
+            "rerun 'speculate on' from a terminal to refresh the hook (older installs lack the " +
+            'PATH-independent fallbacks GUI-launched apps need)',
+        );
+      }
+    }
   }
   if (await detectLegacyPlugin(ctx)) {
     ctx.log(

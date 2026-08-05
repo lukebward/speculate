@@ -886,6 +886,72 @@ changed behavior:
   `on` never ran), and `off` treats an already-removed copy as the success
   it is.
 
+### 13.27 Auto-wrap reaches GUI-launched hosts (2026-08-05)
+
+Auto-wrap's weak link was never the wrap — it was getting the hook to RUN
+outside a terminal. A desktop app opened from a dock icon inherits the OS
+session's minimal PATH (launchd's `/usr/bin:/bin:/usr/sbin:/sbin` on
+macOS), where the hook command's bare `node` resolves to nothing and
+`speculate sync`'s front-door spawn of a bare `claude` fails the same way.
+Both failures were perfectly silent: the session started fine, nothing
+wrapped, and nothing said so. Four changes close this, each resting on a
+measurement against the real host (2.1.222) rather than on documentation.
+
+**The hook command is now a fallback chain, and a measurement made it
+legal.** Command hooks run through a shell — measured by giving a real
+session a `bogus-command || touch marker` hook and finding the marker — so
+on POSIX the generated command tries the ABSOLUTE interpreter this install
+ran under first (immune to PATH, the GUI case) and falls back to PATH
+`node` (immune to the version-manager switch that deletes the baked
+interpreter — the exact trade §13.12's bare-`node` choice made, now had
+both ways). Windows keeps the single bare-`node` form: hooks there run
+under PowerShell, 5.1 parse-errors on `||`, and Windows GUI apps read PATH
+from the registry, where node installers write — the POSIX problem does
+not exist there. The wrapper itself always exits 0, so the fallback fires
+only on a failure to spawn, never as a duplicate run.
+
+**The host CLI rides along.** `sync` spawns `claude` for every mutation,
+and a GUI session may not find that either. `on` runs in a terminal where
+`claude` just ran, so the resolved absolute path is baked into the hook
+command behind a `--` separator (`--claude-bin`), forwarded by the wrapper,
+and used by `sync` only while it still exists — a stale bake silently falls
+back to normal resolution, because a hook argument must never become a
+session-start error. Independently, `resolveClaudeBin` gained POSIX
+fallbacks (the host's own `~/.claude/local`, Homebrew, `/usr/local/bin`,
+`~/.local/bin`) for the GUI case with no bake to lean on.
+
+**The matcher widened from `startup` to `startup|resume|clear`** — v0.12
+made the narrow matcher "as a choice, not as an oversight", and this
+reverses it with its own measurements: the SessionStart matcher matches
+the event's `source` (the shipped bundle enumerates
+startup/resume/clear/compact/fork) and alternation works (a
+`startup|resume` matcher fired on a real `startup` session). A resume-only
+user — or a desktop app reopening conversations — previously never fired
+auto-wrap at all; the cost v0.12 weighed, running the check on more
+events, lands on a hash over a handful of file reads. `compact` and `fork`
+stay excluded: they fire mid-work, where a wrap that cannot take effect
+before the next session buys nothing. The staleness check now versions the
+matcher as well as the command, so existing installs pick all of this up
+through `on`'s ordinary refresh.
+
+**The one remaining silent mode is now visible with evidence.** The
+wrapper stamps a heartbeat (timestamp only, same XDG state dir as
+managed.json) before doing anything else, and `status` compares it with
+the install time the host itself reports (`installedAt` in `plugin list
+--json`): an install more than a day old with no heartbeat since means the
+hook is NOT firing, and status says so and names the fix. Only positive
+evidence warns — a young install, or a host that reports no install time,
+says nothing.
+
+Verified end to end on the real host: a session started with the refreshed
+hook stamped the heartbeat through the full chain, and — by accident, and
+worth recording — the PREVIOUS session-start hook had already auto-wrapped
+this container's plugin-declared test server unattended, with the managed
+record landing under a different state dir; the §13.26 adoption pass then
+recovered it from the copy's marker exactly as designed. The unattended
+pipeline (hook → sync → plugin wrap → state loss → adoption) has now run
+in production conditions, not just in the suite.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.
