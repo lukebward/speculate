@@ -114,3 +114,15 @@ covers the CLI daemon).
       prior session's hook had auto-wrapped the plugin server unattended
       and the adoption pass recovered its lost record in production
 - [x] DESIGN.md §13.27, README; full suite green
+
+# Upstream seam proposal (2026-08-05)
+
+- [x] Verified the shipped host (2.1.222) has no wrapper/middleware seam
+      under any plausible name; plugin capability surface is
+      commands/agents/hooks/mcpServers/skills only
+- [x] docs/upstream/mcp-wrapper-seam.md — fileable issue body for
+      anthropics/claude-code: field report of the six mechanisms the
+      missing seam forced, two API shapes (settings key / plugin
+      capability), safety story (sniffing pass-through, direct fallback,
+      consent unchanged), references into DESIGN.md measurements
+- [ ] File it (needs a human go — public issue under the repo owner's name)

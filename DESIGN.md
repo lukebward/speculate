@@ -952,6 +952,12 @@ recovered it from the copy's marker exactly as designed. The unattended
 pipeline (hook → sync → plugin wrap → state loss → adoption) has now run
 in production conditions, not just in the suite.
 
+The durable endgame §13.12 named — a host-provided wrapper seam that would
+delete every mechanism in §§13.12–13.27 — is now a fileable proposal
+rather than a sentence: docs/upstream/mcp-wrapper-seam.md, written after
+verifying the shipped host (2.1.222) has no such seam under any plausible
+name.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.
