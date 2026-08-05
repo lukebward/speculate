@@ -12,7 +12,7 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { writeFileSync, existsSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { loadConfig } from './config.js';
 import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
 import { SpeculateProxy } from './proxy.js';
@@ -21,7 +21,13 @@ import { buildWrapConfig, parseWrapArgs } from './wrap.js';
 import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
 import { nodeSignalNumber, parseTryArgs, runTry } from './tryRun.js';
-import { projectIsManaged, speculateOff, speculateOn, speculateStatus } from './manage.js';
+import {
+  projectIsManaged,
+  speculateOff,
+  speculateOn,
+  speculateStatus,
+  speculateStatusGlobal,
+} from './manage.js';
 import { speculateSync } from './sync.js';
 import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
@@ -38,7 +44,8 @@ install-and-it-works (no config files edited by hand):
                                            MCP server wrapped, this session only
   speculate on [--mode <mode>]             wrap this project's MCP servers via 'claude mcp'
   speculate off                            undo everything 'on' did (exact restore)
-  speculate status                         what's wrapped here, and what drifted since 'on'
+  speculate status [path]                  every project at a glance; give a path ('.') for
+                                           one project's detail, reachability included
   speculate sync                           wrap MCP servers added since the last run (run by the auto-wrap hook)
   speculate stats [--json]                 cumulative speculation usage
   speculate auth [server]                  authorize Speculate with remote servers that need a
@@ -383,6 +390,9 @@ async function main(): Promise<void> {
 
   if (args.command === 'on' || args.command === 'off' || args.command === 'status') {
     let mode: 'strict' | 'annotated' | 'off' | null = null;
+    // `status` alone is the machine-wide view; `status <path>` is the deep
+    // per-project view ('.' for the current one).
+    let statusPath: string | undefined;
     for (let i = 0; i < args.rest.length; i++) {
       if (args.rest[i] === '--mode' && args.command === 'on') {
         const m = args.rest[++i];
@@ -390,6 +400,12 @@ async function main(): Promise<void> {
           fail(`--mode must be strict|annotated|off (got '${m ?? ''}')`);
         }
         mode = m;
+      } else if (
+        args.command === 'status' &&
+        statusPath === undefined &&
+        !args.rest[i]!.startsWith('-')
+      ) {
+        statusPath = args.rest[i];
       } else {
         fail(`unknown ${args.command} argument '${args.rest[i]}'`);
       }
@@ -400,7 +416,9 @@ async function main(): Promise<void> {
         ? await speculateOn(manageOpts)
         : args.command === 'off'
           ? await speculateOff(manageOpts)
-          : await speculateStatus(manageOpts);
+          : statusPath !== undefined
+            ? await speculateStatus({ ...manageOpts, cwd: resolve(statusPath) })
+            : await speculateStatusGlobal(manageOpts);
     process.exitCode = code;
     return;
   }

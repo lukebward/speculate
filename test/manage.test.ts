@@ -30,6 +30,7 @@ import {
   speculateOff,
   speculateOn,
   speculateStatus,
+  speculateStatusGlobal,
   win32ShimInvocation,
   type CmdRunner,
   adoptLegacyProjectRecords,
@@ -2963,5 +2964,124 @@ describe('auto-wrap on GUI-launched hosts', () => {
     // Refresh = uninstall + reinstall of OUR plugin.
     expect(calls).toContainEqual([claudeBin, 'plugin', 'uninstall', '-s', 'user', 'speculate-autowrap']);
     expect(pluginSim.autowrap).toBe(true);
+  });
+});
+
+describe('speculate status, machine-wide', () => {
+  const QUAL = 'plugin:testplug:probesrv';
+  let savedConfigDir: string | undefined;
+  let otherProj: string;
+
+  beforeEach(() => {
+    savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    otherProj = mkdtempSync(join(tmpdir(), 'speculate-gproj-'));
+  });
+  afterEach(() => {
+    if (savedConfigDir !== undefined) process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+    rmSync(otherProj, { recursive: true, force: true });
+  });
+
+  it('reports every project once, host-wide facts once, and the rest not at all', async () => {
+    // Plugin fixture: probesrv (wrapped below) and helper (wrappable, not wrapped).
+    const root = join(home, '.claude', 'plugins', 'cache', 'mkt', 'testplug', '1.0.0');
+    mkdirSync(join(root, '.claude-plugin'), { recursive: true });
+    writeFileSync(
+      join(root, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'testplug', version: '1.0.0' }),
+    );
+    writeFileSync(
+      join(root, '.mcp.json'),
+      JSON.stringify({
+        probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] },
+        helper: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/helper.js'] },
+      }),
+    );
+    writeFileSync(
+      join(home, '.claude', 'plugins', 'installed_plugins.json'),
+      JSON.stringify({
+        version: 2,
+        plugins: { 'testplug@mkt': [{ scope: 'user', installPath: root, version: '1.0.0' }] },
+      }),
+    );
+    writeFileSync(
+      join(home, '.claude', 'settings.json'),
+      JSON.stringify({ enabledPlugins: { 'testplug@mkt': true } }),
+    );
+
+    // Another project with an approved-but-unwrapped .mcp.json server.
+    writeFileSync(join(otherProj, '.mcp.json'), JSON.stringify({ mcpServers: { team: { command: 't' } } }));
+
+    // A gone project that off opted out, and a serverless one to stay unlisted.
+    const goneProj = join(home, 'gone-project');
+    const dullProj = mkdtempSync(join(tmpdir(), 'speculate-dull-'));
+    try {
+      writeClaudeJson({
+        mcpServers: {
+          github: { command: SELF.command, args: [...SELF.args, 'wrap', '--', 'gh-server'] },
+          slack: { command: 'slack-server', args: [] },
+        },
+        projects: {
+          [cwd]: {
+            mcpServers: {
+              probesrv: {
+                command: SELF.command,
+                args: [...SELF.args, 'wrap', '--', 'node', `${root}/server.js`],
+                env: { CLAUDE_PLUGIN_ROOT: root, [PLUGIN_ORIGIN_ENV]: QUAL },
+              },
+            },
+            disabledMcpServers: [QUAL],
+          },
+          [otherProj]: { enableAllProjectMcpServers: true },
+          [dullProj]: {},
+        },
+      });
+      writeFileSync(
+        statePath,
+        JSON.stringify({
+          version: 1,
+          projects: {
+            [cwd]: {
+              entries: [
+                { name: 'probesrv', scope: 'local', action: 'pluginShadowed', pluginServer: QUAL },
+              ],
+              updatedAt: 1,
+            },
+          },
+          syncOptOut: { [goneProj]: true },
+        }),
+      );
+
+      expect(await speculateStatusGlobal(opts())).toBe(0);
+      const out = logs.join('\n');
+      // Host-wide facts, once.
+      expect(out).toContain('user scope (shared by every project): github wrapped; slack NOT wrapped');
+      expect(out).toContain("auto-wrap: not installed — 'speculate on' anywhere sets it up");
+      // This project: the wrapped plugin copy, plus the plugin's second
+      // (wrappable, unwrapped) server.
+      expect(out).toContain(`${cwd} (here): 1 wrapped (1 plugin), 1 NOT wrapped`);
+      // The other project: its approved .mcp.json server plus the two plugin
+      // servers nothing has wrapped there.
+      expect(out).toMatch(new RegExp(`${otherProj.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}: 3 NOT wrapped`));
+      expect(out).toContain("run 'speculate on' there");
+      // The opted-out project is listed even though its directory is gone.
+      expect(out).toContain('gone-project');
+      expect(out).toContain('(directory missing)');
+      expect(out).toContain('opted out');
+      // The serverless project is counted, not listed.
+      expect(out).toContain('not listed: 1 project(s)');
+      expect(out).not.toContain(dullProj);
+      // And the way into the deep view is named.
+      expect(out).toContain('speculate status <path>');
+    } finally {
+      rmSync(dullProj, { recursive: true, force: true });
+    }
+  });
+
+  it('spawns nothing but the one plugin-list probe: no mcp calls, no remote probes', async () => {
+    writeClaudeJson({ mcpServers: { slack: { command: 'slack-server', args: [] } } });
+    expect(await speculateStatusGlobal(opts())).toBe(0);
+    expect(calls.filter((c) => c[1] === 'mcp')).toEqual([]);
+    expect(probes).toEqual([]);
   });
 });

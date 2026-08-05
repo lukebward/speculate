@@ -958,6 +958,31 @@ rather than a sentence: docs/upstream/mcp-wrapper-seam.md, written after
 verifying the shipped host (2.1.222) has no such seam under any plausible
 name.
 
+### 13.28 status goes machine-wide (2026-08-05)
+
+`speculate status` with no argument now reports the whole machine, because
+the state it describes was never per-project: user-scope wraps are shared
+by every project, the auto-wrap plugin and its heartbeat are host-global,
+logins are per-server, and managed.json spans everything `on` ever
+touched. The global view prints host-wide facts once (auto-wrap health,
+logins, user-scope servers) and one line per project with anything
+wrapped, wrappable, or opted out — plugin copies counted by name, the
+current project marked, opted-out and directory-missing projects labeled
+— and a count of projects with nothing to show rather than a listing of
+them. The per-project deep view, reachability probes included, moved
+behind a path argument (`speculate status .`), unchanged.
+
+Two costs held down deliberately. The global view spawns no probes and
+sends nothing over the network — reachability questions belong to the
+detail view, so the overview stays file-reads fast. And full discovery
+runs only for projects passing a cheap pre-filter (a managed record, an
+opt-out, local-scope servers, or a `.mcp.json` on disk), so a host
+`projects` map with hundreds of serverless entries costs hundreds of
+existsSync calls, not hundreds of config parses. A project whose
+directory is gone is classified from its raw local entries alone —
+discovery rooted at a dead path would walk up to some OTHER repository's
+root and misattribute its servers.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.

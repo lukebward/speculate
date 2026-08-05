@@ -54,7 +54,7 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 |---|---|
 | `speculate on` | Wrap this project's MCP servers, and keep new ones wrapped |
 | `speculate off` | Restore this project exactly, and stop auto-wrapping it |
-| `speculate status` | What is wrapped here, what needs a login, and what changed since `on` |
+| `speculate status [path]` | Every project at a glance; give a path (`.`) for one project's detail |
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |

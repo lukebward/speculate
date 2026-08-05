@@ -126,3 +126,14 @@ covers the CLI daemon).
       capability), safety story (sniffing pass-through, direct fallback,
       consent unchanged), references into DESIGN.md measurements
 - [ ] File it (needs a human go — public issue under the repo owner's name)
+
+# status goes machine-wide (2026-08-05)
+
+- [x] `speculate status` = global view: auto-wrap health + heartbeat,
+      logins, user-scope servers once, one line per project (wrapped /
+      plugin copies / NOT wrapped / opted out / directory missing),
+      unlisted count, no network probes
+- [x] `speculate status <path>` = the per-project deep view, unchanged
+- [x] Cheap pre-filter so hundreds of serverless projects cost existsSync,
+      not config parses; dead-path projects classified from raw entries
+- [x] Verified live against the real host; suite green; DESIGN §13.28

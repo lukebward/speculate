@@ -38,7 +38,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { probeRemote, type RemoteProbe, type RemoteProber } from './remoteProbe.js';
-import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
+import { listAuthorizedServers, oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import {
   WORKSPACE_SERVER_NAME,
   claudeJsonPath,
@@ -2471,6 +2471,38 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
 
 // -- status -----------------------------------------------------------------------
 
+/**
+ * The hook's one silent failure mode, made visible with evidence: the
+ * wrapper stamps a heartbeat on every firing, so an install more than a day
+ * old with no heartbeat since means the hook is NOT running — classically a
+ * GUI-launched host whose minimal OS PATH resolves neither node nor claude
+ * (terminal-launched sessions are unaffected, and current installs bake
+ * absolute fallbacks for both). Only positive evidence warns: no
+ * installedAt from the host, or a young install, says nothing. Returns the
+ * warning line, or null when there is nothing to warn about.
+ */
+function autowrapHookWarning(ctx: Ctx, autowrap: AutowrapInstall): string | null {
+  const installedAt = autowrap.installedAt ? Date.parse(autowrap.installedAt) : NaN;
+  if (!Number.isFinite(installedAt) || Date.now() - installedAt <= 24 * 60 * 60 * 1000) {
+    return null;
+  }
+  let beatAt = NaN;
+  try {
+    const beat = JSON.parse(
+      readFileSync(join(dirname(ctx.statePath), AUTOWRAP_HEARTBEAT_FILE), 'utf8'),
+    ) as { at?: unknown };
+    if (typeof beat.at === 'number') beatAt = beat.at;
+  } catch {
+    // no heartbeat yet — exactly the evidence the warning is about
+  }
+  if (Number.isFinite(beatAt) && beatAt >= installedAt) return null;
+  return (
+    'auto-wrap: its session-start hook has NOT run since it was installed — ' +
+    "rerun 'speculate on' from a terminal to refresh the hook (older installs lack the " +
+    'PATH-independent fallbacks GUI-launched apps need)'
+  );
+}
+
 export async function speculateStatus(opts: ManageOptions): Promise<number> {
   const ctx = makeCtx(opts);
   const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
@@ -2650,33 +2682,8 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
         ? "[speculate]   auto-wrap: installed, but this project is opted out ('speculate off' did that) — run 'speculate on' here to re-enable"
         : '[speculate]   auto-wrap: installed (new servers wrap at the next session start)',
     );
-    // The hook's one silent failure mode, made visible with evidence: the
-    // wrapper stamps a heartbeat on every firing, so an install that is a
-    // day old with no heartbeat since it means the hook is NOT running —
-    // classically a GUI-launched host whose minimal OS PATH resolves
-    // neither node nor claude (terminal-launched sessions are unaffected,
-    // and current installs bake absolute fallbacks for both). Only positive
-    // evidence warns: no installedAt from the host, or a young install, says
-    // nothing.
-    const installedAt = autowrap.installedAt ? Date.parse(autowrap.installedAt) : NaN;
-    if (Number.isFinite(installedAt) && Date.now() - installedAt > 24 * 60 * 60 * 1000) {
-      let beatAt = NaN;
-      try {
-        const beat = JSON.parse(
-          readFileSync(join(dirname(ctx.statePath), AUTOWRAP_HEARTBEAT_FILE), 'utf8'),
-        ) as { at?: unknown };
-        if (typeof beat.at === 'number') beatAt = beat.at;
-      } catch {
-        // no heartbeat yet — exactly the evidence the warning is about
-      }
-      if (!(Number.isFinite(beatAt) && beatAt >= installedAt)) {
-        ctx.log(
-          '[speculate]   auto-wrap: its session-start hook has NOT run since it was installed — ' +
-            "rerun 'speculate on' from a terminal to refresh the hook (older installs lack the " +
-            'PATH-independent fallbacks GUI-launched apps need)',
-        );
-      }
-    }
+    const warning = autowrapHookWarning(ctx, autowrap);
+    if (warning) ctx.log(`[speculate]   ${warning}`);
   }
   if (await detectLegacyPlugin(ctx)) {
     ctx.log(
@@ -2692,5 +2699,222 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
       `[speculate] legacy marketplace 'speculate' registered (its source was removed in 0.11) — remove with: ${ctx.claudeBin} plugin marketplace remove speculate`,
     );
   }
+  return 0;
+}
+
+// -- status, machine-wide ---------------------------------------------------------
+
+/** What one project contributes to the global view. */
+interface ProjectStatusLine {
+  /** The key as the host spells it (display) — home-shortened when printed. */
+  path: string;
+  wrapped: number;
+  pluginCopies: number;
+  notWrapped: number;
+  optedOut: boolean;
+  missingDir: boolean;
+  isHere: boolean;
+}
+
+/**
+ * `speculate status` with no path: the whole machine at a glance.
+ *
+ * The state this command describes was never per-project — user-scope wraps
+ * are shared by every project, the auto-wrap plugin is host-global, logins
+ * are per-server not per-directory, and managed.json spans everything `on`
+ * ever touched — so the default view now matches the state's actual shape.
+ * One line per project that has anything wrapped, wrappable, or opted out;
+ * host-wide facts once at the top; the per-project deep view (reachability
+ * probes included) lives behind a path argument.
+ *
+ * Deliberately spawns no probes and reads no network: an overview must be
+ * file-reads fast however many projects it covers. Full discovery runs only
+ * for projects that pass a cheap pre-filter, so a `projects` map with
+ * hundreds of serverless entries costs hundreds of existsSync calls, not
+ * hundreds of config parses.
+ */
+export async function speculateStatusGlobal(opts: ManageOptions): Promise<number> {
+  const ctx = makeCtx(opts);
+  const state = loadManagedState(ctx.statePath);
+
+  const autowrap = autowrapRecord(await fetchPluginList(ctx));
+  ctx.log(
+    autowrap !== null
+      ? '[speculate] auto-wrap: installed (new servers wrap at each project’s next session start)'
+      : "[speculate] auto-wrap: not installed — 'speculate on' anywhere sets it up",
+  );
+  if (autowrap !== null) {
+    const warning = autowrapHookWarning(ctx, autowrap);
+    if (warning) ctx.log(`[speculate] ${warning}`);
+  }
+
+  const logins = listAuthorizedServers(ctx.oauthStorePath).filter(
+    (url) => readOAuthRecord(ctx.oauthStorePath, url)?.tokens !== undefined,
+  );
+  if (logins.length > 0) ctx.log(`[speculate] logged in: ${logins.join(', ')}`);
+
+  // One parse of ~/.claude.json serves the user-scope line and the cheap
+  // per-project pre-filter; full discovery is reserved for listed projects.
+  let claudeJson: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(readFileSync(claudeJsonPath(ctx.home), 'utf8')) as unknown;
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      claudeJson = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // no host config: the state file may still name projects worth listing
+  }
+  const isRecordValue = (v: unknown): v is Record<string, unknown> =>
+    v !== null && typeof v === 'object' && !Array.isArray(v);
+
+  const userServers = isRecordValue(claudeJson.mcpServers)
+    ? Object.entries(claudeJson.mcpServers as Record<string, unknown>).filter(
+        ([name, entry]) => name !== WORKSPACE_SERVER_NAME && isRecordValue(entry),
+      )
+    : [];
+  if (userServers.length > 0) {
+    const label = (name: string, entry: McpServerEntry): string =>
+      isWrappedEntry(entry) ? `${name} wrapped` : `${name} NOT wrapped`;
+    ctx.log(
+      `[speculate] user scope (shared by every project): ${userServers
+        .map(([name, entry]) => label(name, entry as McpServerEntry))
+        .join('; ')}`,
+    );
+  }
+
+  const projectsRaw = isRecordValue(claudeJson.projects)
+    ? (claudeJson.projects as Record<string, unknown>)
+    : {};
+  // Union of everything that can name a project, deduplicated the way the
+  // filesystem would compare the paths.
+  const candidates = new Map<string, string>(); // normalized -> display key
+  for (const key of [
+    ...Object.keys(projectsRaw),
+    ...Object.keys(state.projects),
+    ...Object.keys(state.syncOptOut ?? {}),
+  ]) {
+    const norm = normalizeProjectKey(key);
+    if (!candidates.has(norm)) candidates.set(norm, key);
+  }
+
+  const stateFor = (norm: string): { record?: { entries: ManagedEntry[] }; optedOut: boolean } => {
+    let record: { entries: ManagedEntry[] } | undefined;
+    for (const [key, value] of Object.entries(state.projects)) {
+      if (normalizeProjectKey(key) === norm) {
+        record = value;
+        break;
+      }
+    }
+    const optedOut = Object.keys(state.syncOptOut ?? {}).some(
+      (key) => normalizeProjectKey(key) === norm,
+    );
+    return { record, optedOut };
+  };
+
+  const here = normalizeProjectKey(ctx.cwd);
+  const lines: ProjectStatusLine[] = [];
+  let unlisted = 0;
+  for (const [norm, display] of candidates) {
+    const raw = isRecordValue(projectsRaw[display]) ? (projectsRaw[display] as Record<string, unknown>) : {};
+    const { record, optedOut } = stateFor(norm);
+    const hasLocal = isRecordValue(raw.mcpServers) && Object.keys(raw.mcpServers).length > 0;
+    const missingDir = !existsSync(display);
+    const hasMcpJson = !missingDir && existsSync(join(display, '.mcp.json'));
+    if (!hasLocal && !hasMcpJson && record === undefined && !optedOut) {
+      unlisted++;
+      continue;
+    }
+    const line: ProjectStatusLine = {
+      path: display,
+      wrapped: 0,
+      pluginCopies: 0,
+      notWrapped: 0,
+      optedOut,
+      missingDir,
+      isHere: norm === here,
+    };
+    if (missingDir) {
+      // The directory is gone, so discovery rooted there would walk to some
+      // OTHER repository's root and misattribute its servers. Classify from
+      // the raw local map alone.
+      for (const entry of Object.values(
+        isRecordValue(raw.mcpServers) ? (raw.mcpServers as Record<string, unknown>) : {},
+      )) {
+        if (!isRecordValue(entry)) continue;
+        if (isWrappedEntry(entry as McpServerEntry)) {
+          line.wrapped++;
+          if (pluginOriginOf(entry as McpServerEntry)) line.pluginCopies++;
+        }
+      }
+    } else {
+      const view = readClaudeServers({ home: ctx.home, cwd: display });
+      const disabled = new Set(view.disabledMcpServers);
+      const managedPluginQuals = new Set(
+        (record?.entries ?? [])
+          .filter((e) => e.action === 'pluginShadowed' && typeof e.pluginServer === 'string')
+          .map((e) => e.pluginServer!),
+      );
+      for (const [name, scoped] of effectiveServers(view.servers)) {
+        // User scope is reported once, above; a project line covers only
+        // what is specific to that project.
+        if (scoped.scope === 'user' || name === WORKSPACE_SERVER_NAME) continue;
+        if (isWrappedEntry(scoped.entry)) {
+          line.wrapped++;
+          if (pluginOriginOf(scoped.entry)) line.pluginCopies++;
+          continue;
+        }
+        if (scoped.scope === 'project' && !view.approvedProjectServers.has(name)) continue;
+        if (isStdioEntry(scoped.entry) || planRemoteWrap(scoped.entry)?.wrappable) {
+          line.notWrapped++;
+        }
+      }
+      for (const ps of view.pluginServers) {
+        if (ps.unwrappableReason !== null) continue;
+        // The user's own switches: their disable of the original, or of the
+        // copy name (the per-server opt-out), takes the server out of play.
+        if (disabled.has(ps.qualifiedName) && !managedPluginQuals.has(ps.qualifiedName)) continue;
+        if (disabled.has(ps.serverName)) continue;
+        // A wrapped copy already counted under `wrapped` covers this one.
+        const copy = view.servers.find(
+          (s) => s.scope === 'local' && s.name === ps.serverName && pluginOriginOf(s.entry) === ps.qualifiedName,
+        );
+        if (copy) continue;
+        line.notWrapped++;
+      }
+    }
+    lines.push(line);
+  }
+
+  lines.sort((a, b) => (a.isHere !== b.isHere ? (a.isHere ? -1 : 1) : a.path < b.path ? -1 : 1));
+  if (lines.length > 0) ctx.log('[speculate] projects:');
+  const tilde = (p: string): string => (p.startsWith(ctx.home) ? `~${p.slice(ctx.home.length)}` : p);
+  for (const line of lines) {
+    const counts: string[] = [];
+    if (line.wrapped > 0) {
+      counts.push(
+        `${line.wrapped} wrapped${line.pluginCopies > 0 ? ` (${line.pluginCopies} plugin)` : ''}`,
+      );
+    }
+    if (line.notWrapped > 0) counts.push(`${line.notWrapped} NOT wrapped`);
+    if (counts.length === 0) counts.push('nothing to wrap');
+    const tail = line.optedOut
+      ? " — opted out ('speculate on' there to re-enable)"
+      : line.notWrapped > 0
+        ? autowrap !== null
+          ? ' — wraps at its next session start'
+          : " — run 'speculate on' there"
+        : '';
+    ctx.log(
+      `[speculate]   ${tilde(line.path)}${line.isHere ? ' (here)' : ''}${line.missingDir ? ' (directory missing)' : ''}: ${counts.join(', ')}${tail}`,
+    );
+  }
+  if (unlisted > 0) {
+    ctx.log(
+      `[speculate] not listed: ${unlisted} project(s) Claude Code knows with no project-level MCP servers and no Speculate state`,
+    );
+  }
+  ctx.log(
+    "[speculate] detail for one project (with server-by-server reachability): speculate status <path>  ('.' for this one)",
+  );
   return 0;
 }
