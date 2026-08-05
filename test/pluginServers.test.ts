@@ -246,6 +246,80 @@ describe('plugin server discovery', () => {
       version: 2,
       plugins: { 'p@m': { scope: 'user', installPath: root, version: '1.0.0' } },
     });
+    writeJson(join(home, '.claude', 'settings.json'), { enabledPlugins: { 'p@m': true } });
     expect(discover().map((s) => s.qualifiedName)).toEqual(['plugin:p:s']);
+  });
+
+  // Measured on Claude Code 2.1.222: a plugin present in
+  // installed_plugins.json with NO enabledPlugins entry anywhere is NOT
+  // loaded by the host. Treating it as enabled would wrap (and run) a
+  // server the user never had running — consent widening.
+  it('requires an explicit enabledPlugins true: installed-but-unlisted contributes nothing', () => {
+    const root = join(home, '.claude', 'plugins', 'cache', 'mkt', 'testplug', '1.0.0');
+    mkdirSync(root, { recursive: true });
+    writeJson(join(root, '.mcp.json'), { probesrv: { command: 'node' } });
+    writeJson(join(home, '.claude', 'plugins', 'installed_plugins.json'), {
+      version: 2,
+      plugins: { 'testplug@mkt': [{ scope: 'user', installPath: root, version: '1.0.0' }] },
+    });
+    // No settings.json at all.
+    expect(discover()).toEqual([]);
+  });
+
+  // Measured on Claude Code 2.1.222: the merge is MOST SPECIFIC WINS —
+  // user-level false plus project-level true LOADS the plugin. Any-false-wins
+  // would diverge in both directions.
+  it('lets a project-level enabledPlugins:true override a user-level false', () => {
+    installPlugin({ mcpJson: { probesrv: { command: 'node' } }, enabled: false });
+    writeJson(join(cwd, '.claude', 'settings.json'), {
+      enabledPlugins: { 'testplug@probe-mkt': true },
+    });
+    expect(discover().map((s) => s.serverName)).toEqual(['probesrv']);
+  });
+
+  it('resolves a qualified-name collision across marketplaces deterministically, with a warning', () => {
+    installPlugin({ marketplace: 'a-mkt', mcpJson: { s: { command: 'from-a' } } });
+    const rootB = join(home, '.claude', 'plugins', 'cache', 'b-mkt', 'testplug', '1.0.0');
+    mkdirSync(join(rootB, '.claude-plugin'), { recursive: true });
+    writeJson(join(rootB, '.claude-plugin', 'plugin.json'), { name: 'testplug', version: '1.0.0' });
+    writeJson(join(rootB, '.mcp.json'), { s: { command: 'from-b' } });
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const installed = JSON.parse(readFileSync(installedPath, 'utf8'));
+    installed.plugins['testplug@b-mkt'] = [{ scope: 'user', installPath: rootB, version: '1.0.0' }];
+    writeJson(installedPath, installed);
+    writeJson(join(home, '.claude', 'settings.json'), {
+      enabledPlugins: { 'testplug@a-mkt': true, 'testplug@b-mkt': true },
+    });
+    const view = readClaudeServers({ home, cwd });
+    const dupes = view.pluginServers.filter((s) => s.qualifiedName === 'plugin:testplug:s');
+    expect(dupes).toHaveLength(1);
+    // Sorted key order: a-mkt wins, every run.
+    expect(dupes[0]!.entry.command).toBe('from-a');
+    expect(view.warnings.join('\n')).toContain('more than one installed plugin');
+  });
+
+  it('ignores an install record scoped to a different project', () => {
+    const root = join(home, '.claude', 'plugins', 'cache', 'mkt', 'testplug', '1.0.0');
+    mkdirSync(root, { recursive: true });
+    writeJson(join(root, '.mcp.json'), { probesrv: { command: 'node' } });
+    writeJson(join(home, '.claude', 'plugins', 'installed_plugins.json'), {
+      version: 2,
+      plugins: {
+        'testplug@mkt': [
+          { scope: 'project', projectPath: '/somewhere/else', installPath: root, version: '1.0.0' },
+        ],
+      },
+    });
+    writeJson(join(home, '.claude', 'settings.json'), { enabledPlugins: { 'testplug@mkt': true } });
+    expect(discover()).toEqual([]);
+  });
+
+  it('interpolates a root containing replacement metacharacters verbatim', () => {
+    const root = installPlugin({
+      version: 'v$$1',
+      mcpJson: { probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } },
+    });
+    expect(root).toContain('$$');
+    expect(discover()[0]!.entry.args).toEqual([`${root}/server.js`]);
   });
 });

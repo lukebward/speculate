@@ -76,3 +76,23 @@ covers the CLI daemon).
       ~60% hit / ~58% cut vs off; S12 rewritten against the landed stats CLI
       (accumulation via `speculate stats --json`; snapshots aggregate-only)
 - [x] DESIGN §13.15, README, version 0.10.0; full suite green
+
+# Plugin wrap — the §13.23 fifth row (2026-08-05)
+
+- [x] Verify the mechanism against the real CLI (Claude Code 2.1.222,
+      isolated CLAUDE_CONFIG_DIR): installed_plugins.json v2 layout,
+      enabledPlugins, cache root vs directory-source root, the
+      disabledMcpServers per-project switch gating every connect path
+- [x] Design spec: docs/superpowers/specs/2026-08-05-plugin-wrap-design.md
+- [x] Discovery: pluginServers + disabledMcpServers on ClaudeConfigView,
+      fail-closed interpolation (13 tests)
+- [x] Wrap/unwrap: copy-then-disable with rollback, teardown, drift
+      refresh, adoption, /mcp switches honored both directions, off with
+      and without state, sync + hash coverage, status, auth (14 tests)
+- [x] DESIGN.md §13.26 (the invariant amendment, named), README
+- [x] Full suite green (30 files, 716 passed), build green
+- [x] Live end-to-end round trip against the real host: on wraps and
+      disables, off restores exactly
+- [x] Adversarial review findings applied (6 reviewers, 32 findings, 20
+      confirmed — marker-based adoption, measured enabledPlugins semantics,
+      loud repair, mode-preserving refresh, redaction and robustness fixes)

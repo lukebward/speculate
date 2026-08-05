@@ -2608,7 +2608,92 @@ describe('plugin server wrapping (the §13.23 fifth row)', () => {
     const state = JSON.parse(readFileSync(statePath, 'utf8'));
     const rec = state.projects[cwd].entries.find((e: AnyRecord) => e.name === 'probesrv');
     expect(rec.action).toBe('pluginShadowed');
-    expect(logs.join('\n')).toContain('adopted a half-finished wrap');
+    // The pre-pass records the marked copy; the repair completes the disable.
+    expect(logs.join('\n')).toContain('adopted an unrecorded wrapped copy');
+    expect(logs.join('\n')).toContain('re-disabled the plugin original');
+  });
+
+  // The review's state-loss scenario: copy AND disable both live, but the
+  // record is gone (a kill between the disable write and the state save, or
+  // a lost managed.json). Without marker-based adoption, the disable entry
+  // reads as the USER's and — worse — when the plugin is later uninstalled,
+  // the licence-gone teardown (which audits only records) never fires, so
+  // the copy outlives its plugin.
+  it('adopts a fully-formed wrap whose record was lost, so teardown regains authority', async () => {
+    const root = join(home, '.claude', 'plugins', 'cache', 'mkt', 'testplug', '1.0.0');
+    // NO plugin fixture: the plugin was uninstalled while the record was lost.
+    writeClaudeJson({
+      projects: {
+        [cwd]: {
+          mcpServers: { probesrv: wrappedCopyFor(root) },
+          disabledMcpServers: [QUAL],
+        },
+      },
+    });
+    expect(await speculateOn(opts())).toBe(0);
+    const config = readClaudeJson();
+    expect(config.projects[cwd].mcpServers?.probesrv).toBeUndefined();
+    expect(config.projects[cwd].disabledMcpServers).toEqual([]);
+    expect(logs.join('\n')).toContain('adopted an unrecorded wrapped copy');
+  });
+
+  it('drift refresh preserves the --mode the copy was wrapped with', async () => {
+    const oldRoot = join(home, '.claude', 'plugins', 'cache', 'mkt', 'testplug', '1.0.0');
+    const newRoot = installPluginFixture(
+      { probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } },
+      { version: '2.0.0' },
+    );
+    seedManagedRecord();
+    const seeded = wrappedCopyFor(oldRoot);
+    // As `on --mode strict` would have registered it.
+    seeded.args = [
+      ...SELF.args,
+      'wrap',
+      '--mode',
+      'strict',
+      '--',
+      'node',
+      `${oldRoot}/server.js`,
+    ];
+    seeded.command = SELF.command;
+    writeClaudeJson({
+      projects: {
+        [cwd]: { mcpServers: { probesrv: seeded }, disabledMcpServers: [QUAL] },
+      },
+    });
+    // sync-shaped call: no mode of its own.
+    expect(await speculateOn(opts())).toBe(0);
+    const copy = readClaudeJson().projects[cwd].mcpServers.probesrv;
+    expect(copy.args).toContain('--mode');
+    expect(copy.args[copy.args.indexOf('--mode') + 1]).toBe('strict');
+    expect(copy.args.slice(-1)).toEqual([`${newRoot}/server.js`]);
+  });
+
+  it('sync says so out loud when it re-disables a user-re-enabled original', async () => {
+    const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    seedManagedRecord();
+    writeClaudeJson({
+      projects: { [cwd]: { mcpServers: { probesrv: wrappedCopyFor(root) }, disabledMcpServers: [] } },
+    });
+    const reports: string[] = [];
+    expect(
+      await speculateSync({
+        ...opts(),
+        log: (l: string) => reports.push(l),
+        lockPath: join(home, 'sync.lock'),
+      }),
+    ).toBe(0);
+    expect(readClaudeJson().projects[cwd].disabledMcpServers).toEqual([QUAL]);
+    const out = reports.join('\n');
+    expect(out).toContain('re-disabled');
+    expect(out).toContain(QUAL);
+  });
+
+  it('survives a plugin entry with a non-string element after a literal --header', async () => {
+    installPluginFixture({ probesrv: { command: 'node', args: ['--header', 42] } });
+    // Must not throw (entrySecrets guards the non-string element); the wrap
+    // itself proceeds — the args are the plugin's own business.
+    expect(await speculateOn(opts())).toBe(0);
   });
 
   it('refreshes the copy when a plugin update moves the versioned root', async () => {

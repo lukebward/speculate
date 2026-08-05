@@ -102,9 +102,16 @@ Mirrors `hostConfig.ts`'s stance: read the host's files, never write,
 fail soft with warnings. Reads, per project:
 
 - `settings.json` (user) + `<repoRoot>/.claude/settings.json` +
-  `settings.local.json`: `enabledPlugins`, merged with **any explicit
-  `false` winning** (the conservative direction).
-- `plugins/installed_plugins.json`: installs per plugin key.
+  `settings.local.json` + the platform's managed (admin) settings:
+  `enabledPlugins`, merged the way the host merges them — **most specific
+  wins** (measured: user-level `false` plus project-level `true` loads the
+  plugin), managed settings above everything. A plugin needs an **explicit
+  `true`** somewhere: installed-but-unlisted is NOT loaded by the host
+  (also measured), so treating it as enabled would wrap a server the user
+  never had running.
+- `plugins/installed_plugins.json`: installs per plugin key; a
+  project-scoped install record whose `projectPath` is a different project
+  is ignored.
 - `plugins/known_marketplaces.json` + the marketplace's
   `.claude-plugin/marketplace.json`: for a directory-sourced marketplace,
   the live source directory is the plugin root (measured behavior);

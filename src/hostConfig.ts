@@ -216,23 +216,45 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
 
 /**
- * `enabledPlugins` merged across the host's settings files, any explicit
- * `false` winning — `claude plugin disable` writes exactly that (measured),
- * and when the levels disagree the conservative reading is "disabled".
+ * Where the host's admin-managed settings live, per platform. Read-only,
+ * existsSync-guarded: on most machines the file does not exist, and this
+ * module must never require privileges to run.
+ */
+function managedSettingsPath(): string {
+  if (process.platform === 'win32') {
+    return join(process.env.ProgramData ?? 'C:\\ProgramData', 'ClaudeCode', 'managed-settings.json');
+  }
+  if (process.platform === 'darwin') {
+    return '/Library/Application Support/ClaudeCode/managed-settings.json';
+  }
+  return '/etc/claude-code/managed-settings.json';
+}
+
+/**
+ * `enabledPlugins` merged across the host's settings files the way the host
+ * merges them — MOST SPECIFIC WINS. Measured against the real CLI (2.1.222):
+ * user-level `false` plus project-level `true` LOADS the plugin, and
+ * project-level `false` plus local-level `true` loads it too, so
+ * any-false-wins would diverge in both directions. Managed (admin) settings
+ * sit above everything. A plugin with NO entry anywhere is NOT loaded by the
+ * host (also measured), which is why the caller requires an explicit `true`
+ * rather than treating installed-but-unlisted as enabled.
  */
 function readEnabledPlugins(home: string, projectDir: string, warnings: string[]): Map<string, boolean> {
   const out = new Map<string, boolean>();
+  // Ascending precedence: a later file's explicit value overrides an earlier
+  // one's. Managed settings are last, so an admin's decision always wins.
   const files = [
     join(claudeConfigDir(home), 'settings.json'),
     join(projectDir, '.claude', 'settings.json'),
     join(projectDir, '.claude', 'settings.local.json'),
+    managedSettingsPath(),
   ];
   for (const file of files) {
     const parsed = readJsonFile(file, warnings);
     if (!parsed || !isRecord(parsed.enabledPlugins)) continue;
     for (const [key, value] of Object.entries(parsed.enabledPlugins)) {
-      if (value === false) out.set(key, false);
-      else if (value === true && out.get(key) !== false) out.set(key, true);
+      if (value === true || value === false) out.set(key, value);
     }
   }
   return out;
@@ -295,7 +317,7 @@ function pluginServerMap(root: string, warnings: string[]): Record<string, McpSe
   if (isRecord(declared)) {
     Object.assign(out, serverMap(declared));
   } else if (typeof declared === 'string' && declared.length > 0) {
-    const file = resolve(root, declared.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, root));
+    const file = resolve(root, declared.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => root));
     const referenced = readJsonFile(file, warnings);
     if (referenced) {
       Object.assign(out, serverMap(isRecord(referenced.mcpServers) ? referenced.mcpServers : referenced));
@@ -332,10 +354,13 @@ function interpolatePluginEntry(
   root: string,
   projectDir: string,
 ): { entry: McpServerEntry; unwrappableReason: string | null } {
+  // Replacement FUNCTIONS, not strings: a plugin root containing `$$` or
+  // `$&` would otherwise trip GetSubstitution's metacharacters and corrupt
+  // the path (the host substitutes "as plain strings" — its own words).
   const sub = (s: string): string =>
     s
-      .replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, root)
-      .replace(/\$\{CLAUDE_PROJECT_DIR\}/g, projectDir);
+      .replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => root)
+      .replace(/\$\{CLAUDE_PROJECT_DIR\}/g, () => projectDir);
   const entry: McpServerEntry = { ...raw };
   if (typeof entry.command === 'string') entry.command = sub(entry.command);
   if (Array.isArray(entry.args)) entry.args = entry.args.map((a) => (typeof a === 'string' ? sub(a) : a));
@@ -396,21 +421,45 @@ function readPluginServers(home: string, projectDir: string, warnings: string[])
   if (!plugins) return [];
   const enabled = readEnabledPlugins(home, projectDir, warnings);
   const out: PluginScopedServer[] = [];
-  for (const [pluginKey, rawInstalls] of Object.entries(plugins)) {
-    if (enabled.get(pluginKey) === false) continue;
-    const installs = Array.isArray(rawInstalls) ? rawInstalls : [rawInstalls];
-    const installPath = installs
-      .filter(isRecord)
-      .map((i) => (typeof i.installPath === 'string' ? i.installPath : null))
-      .find((p): p is string => p !== null) ?? null;
+  const seen = new Set<string>();
+  // Sorted keys so two plugins colliding on a qualified name resolve the
+  // same way every run, not in installed_plugins.json's insertion order.
+  for (const pluginKey of Object.keys(plugins).sort()) {
+    // The host loads a plugin only on an explicit enabledPlugins `true`
+    // (measured — installed-but-unlisted is NOT loaded), so anything less
+    // contributes no servers here either.
+    if (enabled.get(pluginKey) !== true) continue;
+    const rawInstalls = plugins[pluginKey];
+    const installs = (Array.isArray(rawInstalls) ? rawInstalls : [rawInstalls]).filter(isRecord);
+    // A project-scoped install carries the project it belongs to; one for a
+    // DIFFERENT project must not supply this project's root.
+    const usable = installs.filter(
+      (i) =>
+        typeof i.projectPath !== 'string' ||
+        normalizeProjectKey(i.projectPath) === normalizeProjectKey(projectDir),
+    );
+    const installPath =
+      usable
+        .map((i) => (typeof i.installPath === 'string' ? i.installPath : null))
+        .find((p): p is string => p !== null) ?? null;
     const root = pluginRootFor(configDir, pluginKey, installPath, warnings);
     if (!root) continue;
     const at = pluginKey.lastIndexOf('@');
     const pluginName = at > 0 ? pluginKey.slice(0, at) : pluginKey;
     for (const [serverName, raw] of Object.entries(pluginServerMap(root, warnings))) {
+      const qualifiedName = `plugin:${pluginName}:${serverName}`;
+      if (seen.has(qualifiedName)) {
+        // Two marketplaces shipping same-named plugins collide on the
+        // qualified name; first (in sorted-key order) wins, said out loud.
+        warnings.push(
+          `${qualifiedName}: declared by more than one installed plugin — ignoring ${pluginKey}'s copy`,
+        );
+        continue;
+      }
+      seen.add(qualifiedName);
       const { entry, unwrappableReason } = interpolatePluginEntry(raw, root, projectDir);
       out.push({
-        qualifiedName: `plugin:${pluginName}:${serverName}`,
+        qualifiedName,
         pluginKey,
         serverName,
         entry,

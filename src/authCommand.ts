@@ -36,6 +36,7 @@ import {
   unwrapEntry,
 } from './hostConfig.js';
 import { probeRemote, type RemoteProber } from './remoteProbe.js';
+import { loadManagedState, managedStatePath, saveManagedState } from './manage.js';
 import { VERSION } from './version.js';
 
 /**
@@ -59,6 +60,8 @@ export interface AuthOptions {
   home?: string;
   cwd?: string;
   storePath?: string;
+  /** Managed-state file override (tests); defaults to managedStatePath(). */
+  managedStatePath?: string;
   log?: (line: string) => void;
   /** Injectable for tests; the real one spawns the OS browser opener. */
   openBrowser?: (url: URL) => Promise<void> | void;
@@ -302,10 +305,17 @@ async function findServersNeedingAuth(
     ...[...effectiveServers(view.servers)].map(([name, scoped]) => ({ name, entry: scoped.entry })),
     // Plugin-declared servers (the §13.23 fifth row) are authorization
     // candidates too — the hosted OAuth ones are the whole point of wrapping
-    // them — except where the user disabled the server or the entry is one
-    // Speculate could never wrap anyway.
+    // them — except where the user disabled the server, opted its wrap out
+    // (a disabled copy name), or the entry is one Speculate could never wrap
+    // anyway: a login for a server nothing will wrap is a browser round trip
+    // for nothing.
     ...view.pluginServers
-      .filter((ps) => ps.unwrappableReason === null && !view.disabledMcpServers.includes(ps.qualifiedName))
+      .filter(
+        (ps) =>
+          ps.unwrappableReason === null &&
+          !view.disabledMcpServers.includes(ps.qualifiedName) &&
+          !view.disabledMcpServers.includes(ps.serverName),
+      )
       .map((ps) => ({ name: ps.qualifiedName, entry: ps.entry })),
   ];
   for (const { name, entry } of candidates) {
@@ -443,6 +453,23 @@ export async function speculateAuth(opts: AuthOptions = {}): Promise<number> {
     }
   }
   if (failed > 0) return 1;
+  // A fresh login changes what the unattended path can wrap, but it changes
+  // no config file — so sync's per-project hash gate would fast-path forever,
+  // and in a project where `on` never ran (the CLI's own re-wrap only covers
+  // managed ones) the server this login unlocked would never be picked up.
+  // Clearing the stored hashes makes every project's next session start take
+  // the slow path once; a login is rare enough that this costs nothing.
+  try {
+    const statePath = opts.managedStatePath ?? managedStatePath();
+    const state = loadManagedState(statePath);
+    if (state.syncHashes && Object.keys(state.syncHashes).length > 0) {
+      delete state.syncHashes;
+      saveManagedState(statePath, state);
+    }
+  } catch {
+    // Fail-soft: the login itself succeeded; auto-wrap just stays one
+    // manual `speculate on` behind in unmanaged projects.
+  }
   // Deliberately says nothing about WHEN wrapping happens: the CLI wraps
   // straight after this returns when the project is already managed by `on`,
   // and this function is also called from inside `on` itself.

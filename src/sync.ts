@@ -168,7 +168,12 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
       // possible. Nothing wrapped and nothing removed means nothing to
       // record: writing an empty entry list would make `status` report drift
       // "since 'speculate on'" in a project where `on` has never run.
-      if (wrapped.length > 0 || outcome.shadowsRemoved > 0 || outcome.pluginShadowsRemoved > 0) {
+      if (
+        wrapped.length > 0 ||
+        outcome.shadowsRemoved > 0 ||
+        outcome.pluginShadowsRemoved > 0 ||
+        outcome.adopted.length > 0
+      ) {
         const entries = [...managed.values()];
         if (entries.length > 0) merged.projects[ctx.cwd] = { entries, updatedAt: Date.now() };
         else delete merged.projects[ctx.cwd];
@@ -211,6 +216,16 @@ export async function speculateSync(opts: SyncOptions): Promise<number> {
             `[speculate] removed ${outcome.pluginShadowsRemoved} wrapped plugin ` +
               `${outcome.pluginShadowsRemoved > 1 ? 'copies' : 'copy'} ` +
               '(plugin gone or disabled, or the wrap was opted out in Claude Code)',
+          );
+        }
+        // The repair OVERRIDES something the user did in the host's own UI
+        // (re-enabling a wrapped plugin original), so it must never happen
+        // silently — this line is the only place the unattended path can say
+        // so, and it names the two real opt-outs.
+        if (outcome.repaired.length > 0) {
+          report(
+            `[speculate] re-disabled ${outcome.repaired.join(', ')}: a wrapped copy is standing in for ` +
+              "it — to unwrap, disable the copy in /mcp or run 'speculate off'",
           );
         }
         // The one thing the automatic path cannot do for you. Worth a line

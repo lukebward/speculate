@@ -154,6 +154,9 @@ const run = (extra: Parameters<typeof speculateAuth>[0] = {}) =>
   speculateAuth({
     target: `${base}/mcp`,
     storePath,
+    // Never the real state file: a successful auth clears stored sync hashes
+    // there, and a test must not touch the developer's.
+    managedStatePath: join(dir, 'managed.json'),
     log: (l) => logs.push(l),
     openBrowser: browser,
     ...extra,

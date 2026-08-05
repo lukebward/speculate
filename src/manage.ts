@@ -31,6 +31,7 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -508,8 +509,30 @@ function entrySecrets(entry: McpServerEntry): string[] {
   const args = entry.args ?? [];
   for (let i = 0; i < args.length - 1; i++) {
     if (args[i] !== '--header') continue;
-    const split = args[i + 1]!.indexOf(':');
-    if (split > 0) push(args[i + 1]!.slice(split + 1).trim());
+    const next = args[i + 1];
+    // Plugin manifests are third-party input, so a non-string element after
+    // a literal '--header' is reachable — a guard, not dead code.
+    if (typeof next !== 'string') continue;
+    const split = next.indexOf(':');
+    if (split > 0) push(next.slice(split + 1).trim());
+  }
+  return out;
+}
+
+/**
+ * The secrets a PLUGIN-declared entry can carry: its headers (entrySecrets),
+ * plus its env values — a plugin's stdio server routinely holds its token in
+ * `env`, and the host CLI may quote the whole add-json payload (env
+ * included) back in an error. The same length floor applies; over-scrubbing
+ * a path from a failure line is the cheap side of this trade.
+ */
+function pluginEntrySecrets(entry: McpServerEntry): string[] {
+  const out = entrySecrets(entry);
+  const env = entry.env;
+  if (env !== null && typeof env === 'object' && !Array.isArray(env)) {
+    for (const value of Object.values(env as Record<string, unknown>)) {
+      if (typeof value === 'string' && value.length >= MIN_REDACTABLE_LENGTH) out.push(value);
+    }
   }
   return out;
 }
@@ -885,6 +908,22 @@ export interface WrapOutcome {
    */
   pluginShadowsRemoved: number;
   /**
+   * Plugin originals whose disable entry was re-added under a live wrap
+   * (the /mcp re-enable repair). Carried out of the pass because the repair
+   * OVERRIDES something the user did in the host's own UI: `sync` silences
+   * per-server logging, so without this the override would be invisible —
+   * re-applied at every session start with zero output.
+   */
+  repaired: string[];
+  /**
+   * Marked plugin copies whose managed record was synthesized this pass (a
+   * record lost to a crash or a corrupt state file). The host is unchanged,
+   * but the STATE is not: `sync` must persist the recovered records, or
+   * `status` keeps mislabeling the wrap until some other change forces a
+   * write.
+   */
+  adopted: string[];
+  /**
    * True when the pass stopped early because `opts.deadline` had passed, so
    * servers were left unvisited. The pass is INCOMPLETE: callers must not
    * record anything that claims the whole set was handled (`sync`'s hash).
@@ -958,6 +997,25 @@ function pluginOriginOf(entry: McpServerEntry): string | null {
  *     servers whose code reads it.)
  *   - the SPECULATE_PLUGIN_ORIGIN marker, last, so nothing overrides it.
  */
+/**
+ * The `--mode` a wrapped invocation carries, if any. The registered args are
+ * the ONLY place a user's `on --mode strict` choice lives (the managed
+ * record stores no mode), so a drift refresh must read it back from the copy
+ * it is replacing — `sync` runs with no mode of its own, and rebuilding the
+ * copy without this would silently strip the user's safety setting.
+ */
+function wrappedModeOf(entry: McpServerEntry): SpeculationMode | undefined {
+  const args = entry.args ?? [];
+  const wrapIdx = args.indexOf('wrap');
+  if (wrapIdx === -1) return undefined;
+  const scan = args.slice(wrapIdx + 1);
+  const stop = scan.indexOf('--');
+  const flags = stop === -1 ? scan : scan.slice(0, stop);
+  const i = flags.indexOf('--mode');
+  const value = i !== -1 ? flags[i + 1] : undefined;
+  return value === 'strict' || value === 'annotated' || value === 'off' ? value : undefined;
+}
+
 function wrapPluginCopy(
   ps: PluginScopedServer,
   self: { command: string; args: string[] },
@@ -1003,9 +1061,13 @@ function setPluginServerDisabled(
     }
     config = parsed as Record<string, unknown>;
   } catch (err) {
-    // Unreadable file: nothing can have been disabled in it, so a removal is
-    // already complete; an add has nowhere safe to land.
-    return disabled ? { ok: false, reason: `cannot read ${path}: ${(err as Error).message}` } : { ok: true };
+    // A MISSING file cannot hold a disable, so a removal against it is
+    // already complete. A file that EXISTS but cannot be read or parsed is
+    // different: the disable may well be in it, and reporting the removal
+    // done would let a caller delete the copy while the original stays off —
+    // the one end state every ordering rule here exists to prevent.
+    if (!disabled && !existsSync(path)) return { ok: true };
+    return { ok: false, reason: `cannot read ${path}: ${(err as Error).message}` };
   }
   const projects =
     config.projects !== null && typeof config.projects === 'object' && !Array.isArray(config.projects)
@@ -1042,8 +1104,12 @@ function setPluginServerDisabled(
   record.disabledMcpServers = disabled
     ? [...current, qualifiedName]
     : current.filter((v) => v !== qualifiedName);
+  // Per-process tmp name: two speculate processes sharing one tmp path could
+  // interleave writes (writeFileSync is not one syscall for a large file) and
+  // rename a TORN ~/.claude.json into place — host-config corruption, the
+  // one outcome strictly worse than a lost update.
+  const tmp = `${path}.speculate-tmp-${process.pid}`;
   try {
-    const tmp = `${path}.speculate-tmp`;
     let mode = 0o600;
     try {
       mode = statSync(path).mode & 0o777;
@@ -1054,6 +1120,11 @@ function setPluginServerDisabled(
     renameSync(tmp, path);
     return { ok: true };
   } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // never written, or already renamed — nothing to clean
+    }
     return { ok: false, reason: `cannot write ${path}: ${(err as Error).message}` };
   }
 }
@@ -1084,13 +1155,25 @@ export async function wrapEffectiveServers(
   let failed = 0;
   let shadowsRemoved = 0;
   let pluginShadowsRemoved = 0;
+  const repaired: string[] = [];
+  const adopted: string[] = [];
   const needsAuth: { name: string; url: string }[] = [];
   const projectScopeNames = new Set(
     view.servers.filter((s) => s.scope === 'project').map((s) => s.name),
   );
+  const outcome = (timedOut: boolean): WrapOutcome => ({
+    changed,
+    failed,
+    shadowsRemoved,
+    pluginShadowsRemoved,
+    repaired,
+    adopted,
+    timedOut,
+    needsAuth,
+  });
   const outOfTime = (name: string): WrapOutcome => {
     ctx.log(`[speculate] out of time before ${name} — the next run picks it up`);
-    return { changed, failed, shadowsRemoved, pluginShadowsRemoved, timedOut: true, needsAuth };
+    return outcome(true);
   };
 
   for (const [name, scoped] of effectiveServers(view.servers)) {
@@ -1263,6 +1346,27 @@ export async function wrapEffectiveServers(
   const pluginByQual = new Map(view.pluginServers.map((p) => [p.qualifiedName, p]));
   const disabledSet = new Set(view.disabledMcpServers);
 
+  // ADOPTION comes before the licence audit: a local Speculate wrap whose
+  // SPECULATE_PLUGIN_ORIGIN marker names a plugin server, with no managed
+  // record claiming that name, is OURS with the record lost — a kill between
+  // the disable write and the state save, or a lost/corrupt managed.json.
+  // Without the synthesized record, the disable entry it stands on would
+  // read as the USER's own (skipped forever) and the teardown pass — which
+  // only audits records — would never fire, so the copy would outlive its
+  // plugin. The marker is the same proof of ownership `off`'s stateless net
+  // already accepts.
+  for (const s of view.servers) {
+    if (s.scope !== 'local') continue;
+    const origin = pluginOriginOf(s.entry);
+    if (!origin) continue;
+    const key = managedKey('local', s.name);
+    // A record of any kind already owning this name is not ours to rewrite.
+    if (managed.has(key)) continue;
+    managed.set(key, { name: s.name, scope: 'local', action: 'pluginShadowed', pluginServer: origin });
+    adopted.push(origin);
+    ctx.log(`[speculate] ${origin}: adopted an unrecorded wrapped copy '${s.name}' (state restored)`);
+  }
+
   for (const rec of [...managed.values()]) {
     if (rec.action !== 'pluginShadowed') continue;
     if (opts.deadline !== undefined && performance.now() >= opts.deadline) {
@@ -1299,16 +1403,17 @@ export async function wrapEffectiveServers(
       copyIsOurs &&
       !disabledSet.has(qual)
     ) {
-      const repaired = setPluginServerDisabled(ctx, qual, true);
-      if (repaired.ok) {
+      const redisabled = setPluginServerDisabled(ctx, qual, true);
+      if (redisabled.ok) {
         disabledSet.add(qual);
+        repaired.push(qual);
         ctx.log(
           `[speculate] ${qual}: re-disabled the plugin original (its wrapped copy '${rec.name}' is live; ` +
             `to unwrap it, disable '${rec.name}' in /mcp or run 'speculate off')`,
         );
         changed++;
       } else {
-        ctx.log(`[speculate] ${qual}: could not re-disable the plugin original: ${repaired.reason}`);
+        ctx.log(`[speculate] ${qual}: could not re-disable the plugin original: ${redisabled.reason}`);
         failed++;
       }
       continue;
@@ -1328,7 +1433,7 @@ export async function wrapEffectiveServers(
       const res = await mcpRemove(ctx, rec.name, 'local');
       if (res.code !== 0) {
         ctx.log(
-          `[speculate] ${rec.name}: plugin copy removal failed: ${redactSecrets((res.stderr || res.stdout).trim(), entrySecrets(local!.entry))}`,
+          `[speculate] ${rec.name}: plugin copy removal failed: ${redactSecrets((res.stderr || res.stdout).trim(), pluginEntrySecrets(local!.entry))}`,
         );
         failed++;
         continue; // record kept: the disable is already lifted, so retrying is safe
@@ -1373,13 +1478,13 @@ export async function wrapEffectiveServers(
       // (a plugin update moves the versioned root, changing baked paths).
       const local = localByName.get(copyName);
       if (!local) continue;
-      const expected = wrapPluginCopy(ps, ctx.self, opts.mode);
+      const expected = wrapPluginCopy(ps, ctx.self, opts.mode ?? wrappedModeOf(local.entry));
       const canon = (e: McpServerEntry): string => JSON.stringify(canonicalizeForHash(e));
       if (canon(local.entry) === canon(expected)) {
         ctx.log(`[speculate] ${qual}: already wrapped as '${copyName}' — skipping`);
         continue;
       }
-      const secrets = [...entrySecrets(local.entry), ...entrySecrets(ps.entry)];
+      const secrets = [...pluginEntrySecrets(local.entry), ...pluginEntrySecrets(ps.entry)];
       const removed = await mcpRemove(ctx, copyName, 'local');
       if (removed.code !== 0) {
         ctx.log(
@@ -1413,34 +1518,9 @@ export async function wrapEffectiveServers(
     }
     const existing = anyScopeNames.get(copyName);
     if (existing) {
-      // Crash recovery: a marked copy with no record means a previous pass
-      // died between `add-json` and the disable. Adopt it — complete the
-      // disable and the record — instead of skipping a half-made wrap.
-      if (
-        existing.scope === 'local' &&
-        isWrappedEntry(existing.entry) &&
-        pluginOriginOf(existing.entry) === qual
-      ) {
-        if (!disabledSet.has(qual)) {
-          const dis = setPluginServerDisabled(ctx, qual, true);
-          if (!dis.ok) {
-            ctx.log(`[speculate] ${qual}: could not disable the plugin original: ${dis.reason}`);
-            failed++;
-            continue;
-          }
-          disabledSet.add(qual);
-        }
-        managed.set(managedKey('local', copyName), {
-          name: copyName,
-          scope: 'local',
-          action: 'pluginShadowed',
-          pluginServer: qual,
-        });
-        ctx.log(`[speculate] ${qual}: adopted a half-finished wrap as '${copyName}' (disable completed)`);
-        opts.onWrapped?.(qual);
-        changed++;
-        continue;
-      }
+      // A marked copy with no record was already adopted by the pre-pass
+      // above (and completed by the repair branch), so anything left here is
+      // genuinely someone else's server.
       ctx.log(
         `[speculate] ${qual}: copy name '${copyName}' is taken by an existing ${existing.scope} server — skipping`,
       );
@@ -1465,7 +1545,7 @@ export async function wrapEffectiveServers(
     // (duplicated tools for one session, adopted and completed by the next
     // pass via the marker) — disable-first would leave the server gone.
     const wrapped = wrapPluginCopy(ps, ctx.self, opts.mode);
-    const secrets = entrySecrets(ps.entry);
+    const secrets = pluginEntrySecrets(ps.entry);
     const added = await mcpAddJson(ctx, copyName, wrapped, 'local');
     if (added.code !== 0) {
       ctx.log(
@@ -1501,7 +1581,7 @@ export async function wrapEffectiveServers(
     changed++;
   }
 
-  return { changed, failed, shadowsRemoved, pluginShadowsRemoved, timedOut: false, needsAuth };
+  return outcome(false);
 }
 
 // -- the auto-wrap plugin -------------------------------------------------------
@@ -2065,9 +2145,18 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
         }
       }
       const res = await mcpRemove(ctx, entry.name, 'local');
-      if (res.code !== 0) {
+      // "No such server" is a restore that already happened (a previous run,
+      // or the copy removed by hand) — success, not a failure to retry
+      // forever against a clean host.
+      if (res.code !== 0 && !/no\s+(mcp\s+)?server/i.test(res.stderr || res.stdout)) {
+        // The record holds no entry, but the HOST's copy may carry secrets
+        // (a remote copy's --header args, a plugin's env) that a failing
+        // front door can quote back — scrub with what the pre-off view saw.
+        const hostEntry = preView.servers.find(
+          (s) => s.scope === 'local' && s.name === entry.name,
+        )?.entry;
         ctx.log(
-          `[speculate] ${entry.name}: plugin copy removal failed: ${(res.stderr || res.stdout).trim()}`,
+          `[speculate] ${entry.name}: plugin copy removal failed: ${redactSecrets((res.stderr || res.stdout).trim(), pluginEntrySecrets(hostEntry ?? {}))}`,
         );
         failed++;
         unfinished.push(entry);
@@ -2165,9 +2254,10 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
         continue; // keep the copy while the original stays disabled
       }
     }
-    // A wrapped remote entry carries its credential in `--header` args, so
-    // this net needs the same scrub the recorded path gets.
-    const secrets = entrySecrets(scoped.entry);
+    // A wrapped remote entry carries its credential in `--header` args — and
+    // a plugin copy may carry one in env — so this net needs the same scrub
+    // the recorded path gets.
+    const secrets = pluginOrigin ? pluginEntrySecrets(scoped.entry) : entrySecrets(scoped.entry);
     const removed = await mcpRemove(ctx, scoped.name, scoped.scope);
     if (removed.code !== 0) {
       ctx.log(
@@ -2363,14 +2453,18 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
   // each original to its copy, or say why it was left alone.
   for (const ps of view.pluginServers) {
     const rec = managedPluginByQual.get(ps.qualifiedName);
-    const copy = rec ? effective.get(rec.name) : undefined;
+    // The record names the copy when it survives; the marker identifies it
+    // even when the record is lost, so an orphaned wrap never reads as "the
+    // user disabled this" (the next on/sync pass re-adopts the record).
+    const copyName = rec?.name ?? ps.serverName;
+    const copy = effective.get(copyName);
     const copyIsOurs =
       copy !== undefined &&
       isWrappedEntry(copy.entry) &&
       pluginOriginOf(copy.entry) === ps.qualifiedName;
     let stateLabel: string;
     if (copyIsOurs) {
-      stateLabel = `wrapped as '${rec!.name}' (local copy; the plugin original is disabled)`;
+      stateLabel = `wrapped as '${copyName}' (local copy; the plugin original is disabled)`;
     } else if (disabledSet.has(ps.qualifiedName)) {
       stateLabel = 'disabled in Claude Code — left alone';
     } else if (disabledSet.has(ps.serverName)) {

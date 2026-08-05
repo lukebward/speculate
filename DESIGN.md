@@ -840,6 +840,52 @@ list. And a stdio plugin server whose *code* reads `CLAUDE_PLUGIN_DATA`
 loses that env var under the wrap: derivation unknown, documented rather
 than approximated.
 
+**Adversarial review — hardening pass.** Six reviewers (consent, restore
+ordering, secrets, sync/hash, platform, discovery fidelity) over the diff,
+every finding adversarially verified; twenty survived. The ones that
+changed behavior:
+
+- **The marker is now consulted everywhere ownership matters.** A local
+  wrap whose `SPECULATE_PLUGIN_ORIGIN` names a plugin server, with no
+  managed record claiming the name, is ADOPTED (record synthesized) before
+  the licence audit. Without this, a record lost to a crash or a corrupt
+  state file made Speculate's own disable entry read as the *user's* —
+  skipped forever — and the licence-gone teardown, which audits only
+  records, never fired: the copy would have outlived its plugin,
+  credentials and all. `status` applies the same marker fallback rather
+  than mislabeling an orphan as a user disable, and sync persists
+  synthesized records.
+- **`enabledPlugins` semantics were measured wrong the first time.** The
+  merge is most-specific-wins (user `false` + project `true` LOADS the
+  plugin — measured), managed settings above all, and a plugin with no
+  entry anywhere is NOT loaded, so discovery now requires an explicit
+  `true`. The original any-false-wins reading would have wrapped a server
+  the host never runs — consent widening by way of a wrong model.
+- **The repair is no longer silent where it loops.** Re-disabling a
+  user-re-enabled original is carried out of the pass
+  (`WrapOutcome.repaired`) and `sync` reports it by name, with the two real
+  opt-outs — the only unattended path that overrides a host-UI action now
+  says so every time it does.
+- **A drift refresh reads `--mode` back from the copy it replaces** — the
+  registered args are the only place `on --mode strict` lives, and sync
+  runs modeless, so the refresh used to silently strip the user's safety
+  setting.
+- Robustness and hygiene: per-process tmp names for the `~/.claude.json`
+  write (two unsynchronized writers shared one tmp path — a torn host
+  config was possible), tmp cleanup on a failed rename, exists-but-
+  unreadable distinguished from missing on the tolerant removal path,
+  plugin env values joined headers in every redaction scrub (a plugin's
+  stdio token lives in `env`), `--header` followed by a non-string element
+  no longer throws, interpolation is immune to `$`-metacharacters in
+  roots, qualified-name collisions across marketplaces resolve
+  deterministically with a warning, project-scoped install records for
+  other projects are ignored, `speculate auth` skips opted-out plugin
+  servers and clears stored sync hashes after a login (a token changes
+  what sync can wrap but no config file, so the hash gate would have
+  fast-pathed past the newly authorized server forever in projects where
+  `on` never ran), and `off` treats an already-removed copy as the success
+  it is.
+
 ## v0.11 (2026-08-01): MCP-only focus
 
 CLI speculation (exec daemon, Bash hook, workspace shell server) is removed.
