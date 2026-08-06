@@ -3062,7 +3062,10 @@ describe('speculate status, machine-wide', () => {
       expect(out).toContain(`${cwd} (here): 1 wrapped (1 plugin), 1 NOT wrapped`);
       // The other project: its approved .mcp.json server plus the two plugin
       // servers nothing has wrapped there.
-      expect(out).toMatch(new RegExp(`${otherProj.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}: 3 NOT wrapped`));
+      // A literal substring, not a regex: a Windows path is full of
+      // backslashes, which are regex metacharacters, and hand-escaping them
+      // is a portability bug waiting to happen (it was one).
+      expect(out).toContain(`${otherProj}: 3 NOT wrapped`);
       expect(out).toContain("run 'speculate on' there");
       // The opted-out project is listed even though its directory is gone.
       expect(out).toContain('gone-project');
