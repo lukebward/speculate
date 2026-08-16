@@ -60,4 +60,5 @@ npm run demo:gif
 | `mock/`, `bench/`, `eval/`, `demo/` | instruments and fixtures |
 
 Architecture, measured results, threat model, and the design history
-(including the changes that measurement killed): [DESIGN.md](DESIGN.md).
+(including the changes that measurement killed): [`docs/design/`](docs/design/),
+published at <https://lukebward.github.io/speculate/design/>.

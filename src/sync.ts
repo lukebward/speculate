@@ -1,6 +1,6 @@
 /**
  * `speculate sync` — the unattended wrap (see
- * docs/superpowers/specs/2026-08-02-auto-wrap-design.md).
+ * .superpowers/specs/2026-08-02-auto-wrap-design.md).
  *
  * Same wrap as `speculate on`, through the same front door, with the same
  * consent gates — but run by the auto-wrap plugin's SessionStart hook rather

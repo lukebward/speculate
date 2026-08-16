@@ -1,6 +1,6 @@
 /**
  * `speculate sync` — the unattended wrap the auto-wrap session-start hook
- * runs (docs/superpowers/specs/2026-08-02-auto-wrap-design.md).
+ * runs (.superpowers/specs/2026-08-02-auto-wrap-design.md).
  *
  * Same fake-runner harness as manage.test.ts (just enough `claude mcp` to
  * mutate the fixture config), because sync's whole point is that it goes

@@ -2,6 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/speculate-mcp)](https://www.npmjs.com/package/speculate-mcp)
 [![CI](https://github.com/lukebward/speculate/actions/workflows/ci.yml/badge.svg)](https://github.com/lukebward/speculate/actions/workflows/ci.yml)
+[![docs](https://img.shields.io/badge/docs-lukebward.github.io%2Fspeculate-teal)](https://lukebward.github.io/speculate/)
 [![license](https://img.shields.io/npm/l/speculate-mcp)](LICENSE)
 
 **Speculative prefetching for coding agents.** Speculate sits between your MCP client and its servers. It predicts the next read-only tool call, runs it early, and has the answer waiting. Gmail preloads your inbox; this preloads your tool calls.
@@ -31,7 +32,7 @@ Zero wasted calls on any of them. The saving tracks how slow the server is, whic
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
 ```
 
-[DESIGN.md](DESIGN.md) has every run, including the ones that went the wrong way.
+The [design document](https://lukebward.github.io/speculate/design/releases/) has every run, including the ones that went the wrong way.
 
 ## Install
 
@@ -124,7 +125,7 @@ Rules are the only hand-written prediction source, and you need them for one thi
 
 ## More
 
-Architecture, measured results, and threat model: [DESIGN.md](DESIGN.md). Building and testing: [CONTRIBUTING.md](CONTRIBUTING.md).
+Full docs: <https://lukebward.github.io/speculate/>. Architecture, measured results, and threat model: [design document](https://lukebward.github.io/speculate/design/). Building and testing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

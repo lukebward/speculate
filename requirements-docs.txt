@@ -1,0 +1,3 @@
+# Docs toolchain. Kept out of docs/ so it isn't published with the site.
+#   pip install -r requirements-docs.txt && mkdocs serve
+mkdocs-material>=9.5

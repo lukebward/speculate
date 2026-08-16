@@ -1,0 +1,120 @@
+site_name: Speculate
+site_url: https://lukebward.github.io/speculate/
+site_description: >-
+  Speculative prefetching for coding agents. A transparent MCP proxy that
+  predicts the next read-only tool call and has the answer waiting.
+site_author: Luke Ward
+copyright: MIT © 2026 Luke Ward
+
+repo_url: https://github.com/lukebward/speculate
+repo_name: lukebward/speculate
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  icon:
+    logo: material/lightning-bolt
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.tooltips
+    - content.action.edit
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Commands: commands.md
+  - Safety: safety.md
+  - Configuration: configuration.md
+  - Design document:
+      - Design spec: design/index.md
+      - Implementation notes: design/implementation-notes.md
+      - Release notes: design/releases.md
+      - Prior art: design/prior-art.md
+  - Proposals:
+      - Host-provided wrapper seam: upstream/mcp-wrapper-seam.md
+  - Contributing: https://github.com/lukebward/speculate/blob/main/CONTRIBUTING.md
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+# Fail the build on a bad cross-reference, not just a bad file path.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/lukebward/speculate
+      name: Speculate on GitHub
+    - icon: fontawesome/brands/npm
+      link: https://www.npmjs.com/package/speculate-mcp
+      name: speculate-mcp on npm
