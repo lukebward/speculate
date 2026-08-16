@@ -5,6 +5,8 @@
 [![docs](https://img.shields.io/badge/docs-lukebward.github.io%2Fspeculate-teal)](https://lukebward.github.io/speculate/)
 [![license](https://img.shields.io/npm/l/speculate-mcp)](LICENSE)
 
+📖 **[Documentation](https://lukebward.github.io/speculate/)** · [Getting started](https://lukebward.github.io/speculate/getting-started/) · [Commands](https://lukebward.github.io/speculate/commands/) · [Safety](https://lukebward.github.io/speculate/safety/) · [Design document](https://lukebward.github.io/speculate/design/)
+
 **Speculative prefetching for coding agents.** Speculate sits between your MCP client and its servers. It predicts the next read-only tool call, runs it early, and has the answer waiting. Gmail preloads your inbox; this preloads your tool calls.
 
 > Built with heavy use of AI coding agents. Everything here is reviewed and tested, and the suite runs on Linux, macOS, and Windows, but weigh that as you would any other statement about how software was made.
@@ -125,7 +127,7 @@ Rules are the only hand-written prediction source, and you need them for one thi
 
 ## More
 
-Full docs: <https://lukebward.github.io/speculate/>. Architecture, measured results, and threat model: [design document](https://lukebward.github.io/speculate/design/). Building and testing: [CONTRIBUTING.md](CONTRIBUTING.md).
+Architecture, measured results, and threat model: [design document](https://lukebward.github.io/speculate/design/). Building and testing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
