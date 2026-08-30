@@ -393,3 +393,49 @@ adversarial floor remained unwritten, so no measured lower bound existed;
 that is no longer true, and the floor is the 0.087 row. The v0.12 note said
 the `speculate exec` compatibility pass-through would be removed in 0.13.
 That did not happen either, and 0.13 still ships it.
+
+## v0.18 (2026-08-30): day-to-day utility
+
+Speculation now learns the latency of eligible tools across sessions and uses
+a conservative latency estimate when deciding whether a candidate is worth
+issuing. The model is time-decayed, numerically stable, bounded, and merged
+across concurrent state writers. Existing learned transition latency remains
+as a migration fallback, and a v0.17 state file without the optional latency
+field still loads normally.
+
+Candidate correctness is evaluated before admission, including candidates
+suppressed for being too cheap. Those observations feed a bounded,
+confidence-informed calibration model. Calibrated next-call probabilities now
+rank candidates while operational feedback remains a separate suppression
+signal. Live statistics expose calibration Brier scores and reliability
+buckets without persisting arguments, result data, or cache keys.
+
+The underlying predictor also becomes more useful on varied workflows:
+learned state is isolated by workspace, upstream, and credential/account
+scope; bounded recent context can specialize a durable transition; argument
+sources can use conservative deterministic transforms; alternative argument
+sets retain separate feedback; and compatible list/detail schemas can yield a
+cold prediction without a server-specific rule. Mutations and session resets
+clear pending shadow batches without manufacturing negative observations.
+
+Durable statistics now report conservative added wait and net saving,
+predictor recall, argument near misses, and optional server/tool breakdowns.
+They support time and workspace filters plus crash-safe monthly compaction.
+Terminal accounting includes abandoned outstanding work instead of allowing a
+final speculative batch to disappear from the waste total.
+
+Validation covered 796 passing tests with 7 opt-in skips, a clean TypeScript
+build, and an unchanged offline workflow score (recall@3 0.8463, waste/hit
+2.00). Default admission stayed quiet on approximately 5 ms Git reads; an
+unconstrained Git control retained an 80% hit/join rate; the 120 ms filesystem
+workflow produced 30 useful results from 44 opportunities and about 3.16 s of
+estimated net saving; and calibrated Brier score beat static confidence on
+the Git, filesystem, and Hugging Face runs. Hosted latency remains noisy and
+is reported as per-run spread rather than a release gate.
+
+The deterministic daily-workflow generator and comparison core ship with the
+release. The common executable daily runner, marginal per-candidate admission
+controller, durable per-tool latency explanation, and bounded unknown-latency
+discovery remain follow-up work. Cold discovery stays disabled until a
+negative-control workflow proves that it becomes quiet on unpredictable
+traffic.
