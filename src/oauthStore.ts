@@ -34,6 +34,11 @@ export interface StoredOAuth {
   expiresAt?: number;
   /** Lives only between `authorize` and the code exchange. */
   codeVerifier?: string;
+  /**
+   * Stable across refreshes, replaced after a fresh consent grant. Used only
+   * to isolate learned argument state when the authorized account changes.
+   */
+  authEpoch?: string;
 }
 
 interface StoreFile {

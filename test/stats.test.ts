@@ -46,8 +46,18 @@ const totals = (overrides: Partial<UsageTotals> = {}): UsageTotals => ({
   speculativeCalls: 0,
   wasted: 0,
   estimatedSavedMs: 0,
+  estimatedAddedWaitMs: 0,
+  predictionOpportunities: 0,
+  predictionOffered: 0,
+  predictionHitsAt1: 0,
+  predictionHitsAt3: 0,
+  nearMisses: 0,
+  nearMissDistanceOne: 0,
   hitRate: null,
   wastePerHit: null,
+  predictionRecallAt1: null,
+  predictionRecallAt3: null,
+  predictionPrecisionAt3: null,
   ...overrides,
 });
 
@@ -78,6 +88,8 @@ const report: UsageReport = {
       ...totals({ sessions: 2, estimatedSavedMs: 90_000 }),
     },
   ],
+  servers: [],
+  tools: [],
 };
 
 const emptyReport: UsageReport = {
@@ -87,6 +99,8 @@ const emptyReport: UsageReport = {
   totals: totals(),
   bySource: { mcp: totals(), cli: totals() },
   workspaces: [],
+  servers: [],
+  tools: [],
 };
 
 describe('parseStatsArgs', () => {
@@ -96,6 +110,19 @@ describe('parseStatsArgs', () => {
 
   it('accepts JSON output', () => {
     expect(parseStatsArgs(['--json'])).toEqual({ json: true });
+  });
+
+  it('accepts time, workspace, and dimension filters', () => {
+    expect(parseStatsArgs([
+      '--since', '7d', '--workspace', '/work/a', '--by-server', '--by-tool', '--compact',
+    ])).toEqual({
+      json: false,
+      since: '7d',
+      workspace: '/work/a',
+      byServer: true,
+      byTool: true,
+      compact: true,
+    });
   });
 
   it('rejects unknown arguments', () => {
@@ -109,7 +136,7 @@ describe('formatUsageReport', () => {
   it('formats cumulative totals, sources, and workspaces', () => {
     const output = formatUsageReport(report);
 
-    expect(output).toContain('Speculate stats (all time since 2026-07-14)');
+    expect(output).toContain('Speculate stats (since 2026-07-14)');
     expect(output).toContain('Estimated time saved: 1m 30s');
     expect(output).toContain('Prefetch hits: 4 (3 ready, 1 joined)');
     expect(output).toContain('Hit rate: 66.7%');
@@ -188,6 +215,38 @@ describe('formatUsageReport', () => {
 });
 
 describe('runStats', () => {
+  it('passes resolved filters to the usage reader', () => {
+    let filters: { sinceMs?: number; workspace?: string } | undefined;
+    runStats(
+      { json: true, since: '24h', workspace: '/workspace/a' },
+      {
+        now: () => 100_000_000,
+        read: (_directory, received) => {
+          filters = received;
+          return emptyReport;
+        },
+        write: () => {},
+      },
+    );
+    expect(filters).toEqual({ sinceMs: 13_600_000, workspace: '/workspace/a' });
+  });
+
+  it('compacts only when explicitly requested', () => {
+    let compacted = false;
+    runStats(
+      { json: true, compact: true },
+      {
+        now: () => 40 * 24 * 60 * 60_000,
+        compact: (_directory, beforeMs) => {
+          compacted = beforeMs === 10 * 24 * 60 * 60_000;
+        },
+        read: () => emptyReport,
+        write: () => {},
+      },
+    );
+    expect(compacted).toBe(true);
+  });
+
   it('exposes stats through the real CLI', async () => {
     const stateHome = mkdtempSync(join(tmpdir(), 'speculate-stats-cli-'));
     try {
@@ -206,6 +265,13 @@ describe('runStats', () => {
         speculativeCalls: 1,
         wasted: 0,
         estimatedSavedMs: 1500,
+        estimatedAddedWaitMs: 0,
+        predictionOpportunities: 0,
+        predictionOffered: 0,
+        predictionHitsAt1: 0,
+        predictionHitsAt3: 0,
+        nearMisses: 0,
+        nearMissDistanceOne: 0,
       });
       recorder.close();
 

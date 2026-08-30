@@ -5,6 +5,8 @@
 import { describe, expect, it } from 'vitest';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { parseResult, Predictor } from '../src/predictor.js';
+import { LatencyModel } from '../src/latency.js';
+import { CandidateCalibrator } from '../src/calibration.js';
 import type {
   DecisionEvent,
   Prediction,
@@ -522,5 +524,279 @@ describe('parseResult', () => {
     // Previously a tool with no vetted parser fell to a generic path; now
     // there is only the generic path, so every tool behaves identically.
     expect(parseResult(textResult('{"a":1}'))).toEqual({ a: 1 });
+  });
+
+  it('continues past prose blocks and understands fenced JSON', () => {
+    const result = {
+      content: [
+        { type: 'text', text: 'Here are the results:' },
+        { type: 'text', text: '```json\n{"items":[{"id":7}]}\n```' },
+      ],
+    } as CallToolResult;
+    expect(parseResult(result)).toEqual({ items: [{ id: 7 }] });
+  });
+});
+
+describe('prediction telemetry and adaptive admission', () => {
+  it('records the exact rank of the next eligible real call', () => {
+    const metrics = makeMetrics();
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      extraRules: {
+        [SERVER]: [{
+          id: 'next',
+          trigger: 'list',
+          predict: () => [pred('get', { id: 7 }, 0.9, 'next')],
+        }],
+      },
+    });
+    predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 20,
+      timestamp: 1,
+    });
+    predictor.observe({
+      server: SERVER,
+      tool: 'get',
+      args: { id: 7 },
+      result: jsonResult({}),
+      latencyMs: 20,
+      timestamp: 2,
+      eligibleTarget: true,
+    });
+    expect(metrics.events).toContainEqual(expect.objectContaining({
+      type: 'prediction_evaluated',
+      rank: 1,
+      candidateCount: 1,
+    }));
+  });
+
+  it('suppresses low-value fast calls while retaining slow valuable ones', () => {
+    const metrics = makeMetrics();
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      admission: { [SERVER]: { enabled: true, minExpectedSavedMs: 20 } },
+      extraRules: {
+        [SERVER]: [{
+          id: 'utility',
+          trigger: 'list',
+          predict: () => [
+            { ...pred('fast', {}, 0.8, 'utility'), expectedLatencyMs: 10 },
+            { ...pred('slow', {}, 0.8, 'utility'), expectedLatencyMs: 200 },
+          ],
+        }],
+      },
+    });
+    const out = predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 20,
+      timestamp: 1,
+    });
+    expect(out.map((prediction) => prediction.tool)).toEqual(['slow']);
+    expect(metrics.events).toContainEqual(expect.objectContaining({
+      type: 'suppressed',
+      tool: 'fast',
+      reason: 'low-utility',
+    }));
+    predictor.observe({
+      server: SERVER,
+      tool: 'fast',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 10,
+      timestamp: 2,
+      eligibleTarget: true,
+    });
+    expect(metrics.events).toContainEqual(expect.objectContaining({
+      type: 'prediction_evaluated',
+      rank: 2,
+      candidateCount: 2,
+    }));
+  });
+
+  it('uses persisted tool latency ahead of a legacy prediction hint', () => {
+    const metrics = makeMetrics();
+    const latency = new LatencyModel({ now: () => 1 });
+    latency.observe(SERVER, 'detail', 200);
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      latency,
+      admission: { [SERVER]: { enabled: true, minExpectedSavedMs: 20 } },
+      extraRules: {
+        [SERVER]: [{
+          id: 'persisted-latency',
+          trigger: 'list',
+          predict: () => [{
+            ...pred('detail', {}, 0.5, 'persisted-latency'),
+            expectedLatencyMs: 5,
+          }],
+        }],
+      },
+    });
+    const out = predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 1,
+      eligibleTarget: true,
+    });
+    expect(out.map((prediction) => prediction.tool)).toEqual(['detail']);
+  });
+
+  it('does not let ineligible mutation latency contaminate the server fallback', () => {
+    const metrics = makeMetrics();
+    const latency = new LatencyModel({ now: () => 1 });
+    const predictor = new Predictor({ maxPerTrigger: 3, metrics, latency });
+    predictor.observe({
+      server: SERVER,
+      tool: 'mutate',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 500,
+      timestamp: 1,
+      eligibleTarget: false,
+    });
+    expect(latency.revision).toBe(0);
+    expect(latency.estimate(SERVER, 'read').source).toBe('unknown');
+  });
+
+  it('credits a correct candidate even when latency admission suppresses it', () => {
+    const metrics = makeMetrics();
+    const latency = new LatencyModel({ now: () => 1 });
+    latency.observe(SERVER, 'detail', 5);
+    const calibration = new CandidateCalibrator({ now: () => 1 });
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      latency,
+      calibration,
+      admission: { [SERVER]: { enabled: true, minExpectedSavedMs: 20 } },
+      extraRules: {
+        [SERVER]: [{
+          id: 'shadow',
+          trigger: 'list',
+          predict: () => [pred('detail', { id: 7 }, 0.8, 'shadow')],
+        }],
+      },
+    });
+    expect(predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 1,
+      eligibleTarget: true,
+    })).toEqual([]);
+    predictor.observe({
+      server: SERVER,
+      tool: 'detail',
+      args: { id: 7 },
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 2,
+      eligibleTarget: true,
+    });
+    expect(calibration.probability('shadow', 0.8).probability).toBeCloseTo(0.84);
+    expect(metrics.events).toContainEqual(expect.objectContaining({
+      type: 'candidate_evaluated',
+      candidateId: 'shadow',
+      correct: true,
+      admitted: false,
+    }));
+  });
+
+  it('clears shadow candidates across a mutation without inventing negatives', () => {
+    const metrics = makeMetrics();
+    const calibration = new CandidateCalibrator({ now: () => 1 });
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      calibration,
+      extraRules: {
+        [SERVER]: [{
+          id: 'shadow',
+          trigger: 'list',
+          predict: () => [pred('detail', { id: 7 }, 0.8, 'shadow')],
+        }],
+      },
+    });
+    predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 1,
+      eligibleTarget: true,
+    });
+    predictor.observe({
+      server: SERVER,
+      tool: 'mutate',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 2,
+      eligibleTarget: false,
+    });
+    predictor.observe({
+      server: SERVER,
+      tool: 'detail',
+      args: { id: 7 },
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 3,
+      eligibleTarget: true,
+    });
+    expect(calibration.revision).toBe(0);
+    expect(metrics.events.filter((event) => event.type === 'candidate_evaluated')).toEqual([]);
+  });
+
+  it('ranks alternatives by calibrated next-call probability', () => {
+    const metrics = makeMetrics();
+    const calibration = new CandidateCalibrator({ now: () => 1 });
+    for (let i = 0; i < 12; i++) {
+      calibration.observe('ranked', false);
+      calibration.observe('ranked#2', true);
+    }
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      calibration,
+      extraRules: {
+        [SERVER]: [{
+          id: 'ranked',
+          trigger: 'list',
+          predict: () => [
+            pred('detail', { id: 'historically-wrong' }, 0.5, 'ranked'),
+            pred('detail', { id: 'historically-right' }, 0.5, 'ranked'),
+          ],
+        }],
+      },
+    });
+    const out = predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 100,
+      timestamp: 1,
+      eligibleTarget: true,
+    });
+    expect(out.map((prediction) => prediction.args['id'])).toEqual([
+      'historically-right',
+      'historically-wrong',
+    ]);
   });
 });

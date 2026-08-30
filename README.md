@@ -26,7 +26,12 @@ Measured against real hosted MCP servers, not mocks. Three alternating off/on ru
 | Microsoft Learn | none | 2.3 s to 1.1 s | -54% |
 | Hugging Face Hub | none | 259 ms to 139 ms | -46% |
 
-Zero wasted calls on any of them. The saving tracks how slow the server is, which is the point: a local stdio server answering in single-digit milliseconds has nothing worth hiding.
+Those historical snapshots reported zero completed waste, but they predated
+terminal accounting for the final outstanding batch. The current harness
+prints outstanding entries separately and shutdown counts them as abandoned,
+so new runs expose that cost rather than letting it disappear. The saving
+still tracks how slow the server is, which is the point: a local stdio server
+answering in single-digit milliseconds has nothing worth hiding.
 
 **Warm** is the median of runs 2 and 3. Expect little from the first pass: Speculate cannot predict a call it has never seen, and warming up takes two or three runs. The benchmark repeats an identical session, so treat it as the best case for a workflow you genuinely repeat. Three of the four need no credential. Check them yourself:
 
@@ -59,7 +64,7 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 | `speculate off` | Restore this project exactly, and stop auto-wrapping it |
 | `speculate status [path]` | Every project at a glance; give a path (`.`) for one project's detail |
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
-| `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
+| `speculate stats` | Saved time, conservative net, predictor recall, near misses, and per-server/tool views |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
@@ -110,7 +115,7 @@ Prefix the server command already in your client's config:
 
 Speculate resolves `${VAR}` in a header value from the environment at startup, so your token stays out of the file. An unset variable fails at startup and names itself; Speculate never sends a literal `${GITHUB_TOKEN}` upstream.
 
-Your client sees standard MCP: same tools, same results. Predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for the live hit rate, time saved, and how stale the served prefetches were.
+Your client sees standard MCP: same tools, same results. Predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for live cache outcomes, predictor recall, time saved versus possible stdio wait, per-tool near misses, and how stale served prefetches were.
 
 `speculate shims install` is auto-wrapping for these clients: opt-in `npx`/`uvx` shims that wrap any MCP server any client launches. It edits one marked block in your shell rc file. POSIX only.
 

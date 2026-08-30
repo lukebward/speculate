@@ -167,9 +167,12 @@ export function decayedScore(
 // missing score defaults to count, missing lastUpdated to now().
 
 export interface SerializedSource {
-  kind: 'arg' | 'parsed' | 'const';
+  kind: 'arg' | 'parsed' | 'transform' | 'const';
   key?: string;
   path?: string[];
+  transform?: TransformName;
+  prefix?: string;
+  suffix?: string;
   /** For 'const': the stableStringify repr; the value is rebuilt from it. */
   repr?: string;
   /**
@@ -200,6 +203,7 @@ export interface SerializedTransition {
   score?: number;
   /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
   lastUpdated?: number;
+  latencyMs?: number;
   templates: Array<{
     name: string;
     /**
@@ -215,6 +219,13 @@ export interface SerializedTransition {
     missed?: number;
     sources: SerializedSource[];
   }>;
+  /** Optional variable-order context evidence (added after v0.13). */
+  contexts?: Array<{
+    key: string;
+    count: number;
+    score: number;
+    lastUpdated: number;
+  }>;
 }
 
 export interface SerializedOpener {
@@ -227,6 +238,8 @@ export interface SerializedOpener {
   score?: number;
   /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
   lastUpdated?: number;
+  /** EWMA of the opener tool's real upstream latency. Absent in legacy state. */
+  latencyMs?: number;
 }
 
 export interface SerializedLearner {
@@ -244,7 +257,16 @@ export interface SerializedLearner {
 type Source =
   | { kind: 'arg'; key: string }
   | { kind: 'parsed'; path: string[] }
+  | {
+      kind: 'transform';
+      base: { kind: 'arg'; key: string } | { kind: 'parsed'; path: string[] };
+      transform: TransformName;
+      prefix?: string;
+      suffix?: string;
+    }
   | { kind: 'const'; value: unknown; repr: string };
+
+export type TransformName = 'string' | 'number' | 'lower' | 'upper' | 'basename' | 'affix';
 
 /**
  * One competing hypothesis about where an argument's value comes from, with
@@ -312,8 +334,17 @@ interface TransitionState {
   score: number;
   /** Injected-clock time `score` was taken at (also recency for eviction). */
   lastUpdated: number;
+  /** EWMA of the target tool's observed upstream latency. */
+  latencyMs: number;
   /** Per-argument templates for the next call's args, keyed by arg name. */
   templates: Map<string, ArgTemplate>;
+  contexts: Map<string, ContextEvidence>;
+}
+
+interface ContextEvidence {
+  count: number;
+  score: number;
+  lastUpdated: number;
 }
 
 /** The slice of the previous call the learner retains per server. */
@@ -322,6 +353,7 @@ interface PrevCall {
   args: Record<string, unknown>;
   parsed: unknown;
   timestamp: number;
+  priorTool?: string;
 }
 
 interface OpenerState {
@@ -334,6 +366,15 @@ interface OpenerState {
   score: number;
   /** Injected-clock time of the last sighting (eviction tie-break). */
   lastUpdated: number;
+  /** Persisted so a new session does not assume every opener costs 100 ms. */
+  latencyMs?: number;
+}
+
+interface SchemaPrior {
+  server: string;
+  prevTool: string;
+  nextTool: string;
+  inputSchema: unknown;
 }
 
 /** A parsed-result path candidate: segments plus the value found there. */
@@ -362,6 +403,8 @@ export class TransitionLearner {
    * ones. Never persisted itself (recomputed per session from tool lists).
    */
   private readonly primed = new Set<string>();
+  /** Tool-schema-backed lister→getter priors for first-observation predictions. */
+  private readonly schemaPriors = new Map<string, SchemaPrior>();
   /** Bumped on every transition create/update/import (dirty tracking). */
   private mutations = 0;
   /**
@@ -412,14 +455,18 @@ export class TransitionLearner {
   }
 
   /**
-   * Pre-load a transition prior: the first observed instance of
-   * (prevTool → nextTool) on `server` becomes immediately predictable,
-   * with argument templates taken from that instance. No-op if the
+   * Pre-load a transition prior. A supplied getter schema may enable a
+   * fail-closed prediction from the first real trigger result; otherwise the
+   * first observed pair arms normal argument templates. No-op if the
    * transition is already tracked (real evidence wins over priors).
    */
-  prime(server: string, prevTool: string, nextTool: string): void {
+  prime(server: string, prevTool: string, nextTool: string, inputSchema?: unknown): void {
     if (server.includes(' ') || prevTool.includes(' ') || nextTool.includes(' ')) return;
-    this.primed.add(`${server} ${prevTool} ${nextTool}`);
+    const key = `${server} ${prevTool} ${nextTool}`;
+    this.primed.add(key);
+    if (inputSchema !== undefined) {
+      this.schemaPriors.set(key, { server, prevTool, nextTool, inputSchema });
+    }
   }
 
   /** Number of primed (not yet observed) transition priors. */
@@ -432,7 +479,12 @@ export class TransitionLearner {
    * for the first few read-eligible asks per server per session. Never
    * throws; oversized or unrepresentable args are skipped (fail closed).
    */
-  recordOpener(server: string, tool: string, args: Record<string, unknown>): void {
+  recordOpener(
+    server: string,
+    tool: string,
+    args: Record<string, unknown>,
+    latencyMs?: number,
+  ): void {
     try {
       if (server.includes(' ') || tool.includes(' ') || tool.length === 0) return;
       const repr = safeStringify(args);
@@ -444,6 +496,11 @@ export class TransitionLearner {
         existing.count = Math.min(existing.count + 1, MAX_IMPORTED_OPENER_COUNT);
         existing.score = decayedScore(existing.score, existing.lastUpdated, now) + 1;
         existing.lastUpdated = now;
+        if (Number.isFinite(latencyMs) && latencyMs! >= 0) {
+          existing.latencyMs = existing.latencyMs === undefined
+            ? latencyMs!
+            : existing.latencyMs * 0.8 + latencyMs! * 0.2;
+        }
       } else {
         this.openers.set(key, {
           server,
@@ -452,6 +509,7 @@ export class TransitionLearner {
           count: 1,
           score: 1,
           lastUpdated: now,
+          ...(Number.isFinite(latencyMs) && latencyMs! >= 0 ? { latencyMs } : {}),
         });
         // Evict the weakest opener (lowest decayed score, then stalest),
         // never the one just recorded.
@@ -483,6 +541,7 @@ export class TransitionLearner {
           (a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0),
       );
       const out: Prediction[] = [];
+      const toolRanks = new Map<string, number>();
       for (const o of mine.slice(0, this.maxPredictionsPerTrigger)) {
         let args: unknown;
         try {
@@ -491,12 +550,15 @@ export class TransitionLearner {
           continue;
         }
         if (!isPlainObject(args)) continue;
+        const rank = (toolRanks.get(o.tool) ?? 0) + 1;
+        toolRanks.set(o.tool, rank);
         out.push({
           server,
           tool: o.tool,
           args: jsonCopyRecord(args),
           confidence: Math.min(0.5, 0.2 + 0.1 * o.count),
-          ruleId: `opener:${server}:${o.tool}`,
+          ...(o.latencyMs !== undefined ? { expectedLatencyMs: o.latencyMs } : {}),
+          ruleId: `opener:${server}:${o.tool}${rank === 1 ? '' : `#${rank}`}`,
           // The longest horizon there is (§6.2): fired before the agent has
           // made a single call, so nothing at all derives it and the wait to
           // the claiming call is the whole session start.
@@ -528,12 +590,19 @@ export class TransitionLearner {
         // process was down.
         score: state.score,
         lastUpdated: state.lastUpdated,
+        latencyMs: state.latencyMs,
         templates: [...state.templates.entries()].map(([name, tpl]) => ({
           name,
           underivable: isUnderivable(tpl),
           derived: tpl.derived,
           missed: tpl.missed,
           sources: tpl.sources.map(serializeSource),
+        })),
+        contexts: [...state.contexts.entries()].map(([key, evidence]) => ({
+          key,
+          count: evidence.count,
+          score: evidence.score,
+          lastUpdated: evidence.lastUpdated,
         })),
       });
     }
@@ -544,6 +613,7 @@ export class TransitionLearner {
       count: o.count,
       score: o.score,
       lastUpdated: o.lastUpdated,
+      ...(o.latencyMs !== undefined ? { latencyMs: o.latencyMs } : {}),
     }));
     return openers.length > 0 ? { transitions, openers } : { transitions };
   }
@@ -590,21 +660,21 @@ export class TransitionLearner {
 
   private observeInner(call: ObservedCall): void {
     const prev = this.lastCallByServer.get(call.server);
+    const gap = prev ? call.timestamp - prev.timestamp : Number.POSITIVE_INFINITY;
+    const linked = prev !== undefined && gap >= 0 && gap <= this.maxGapMs ? prev : undefined;
     this.lastCallByServer.set(call.server, {
       tool: call.tool,
       args: call.args,
       parsed: call.parsed,
       timestamp: call.timestamp,
+      priorTool: linked?.tool,
     });
-    if (!prev) return;
+    if (!linked) return;
 
     // Gap math uses call timestamps, not the injected clock: observations
     // carry their own time. Out-of-order or too-far-apart timestamps just
     // reset the chain (the new call is already stored as the head).
-    const gap = call.timestamp - prev.timestamp;
-    if (gap < 0 || gap > this.maxGapMs) return;
-
-    const key = `${call.server} ${prev.tool} ${call.tool}`;
+    const key = `${call.server} ${linked.tool} ${call.tool}`;
     const now = this.now();
     this.mutations++;
     let state = this.transitions.get(key);
@@ -615,19 +685,25 @@ export class TransitionLearner {
       // weight: recent evidence is worth more than the same volume of old.
       state.score = decayedScore(state.score, state.lastUpdated, now) + 1;
       state.lastUpdated = now;
-      updateTemplates(state, prev, call.args, now);
+      if (Number.isFinite(call.latencyMs) && call.latencyMs >= 0) {
+        state.latencyMs = state.latencyMs * 0.8 + call.latencyMs * 0.2;
+      }
+      updateTemplates(state, linked, call.args, now);
+      updateContexts(state, linked, now);
     } else {
       // A primed pair arms on first sight (§13.9); templates still come
       // from real traffic, so a prior can never invent arguments.
       const initial = this.primed.has(key) ? this.minObservations : 1;
       state = {
         server: call.server,
-        prevTool: prev.tool,
+        prevTool: linked.tool,
         nextTool: call.tool,
         count: initial,
         score: initial,
         lastUpdated: now,
-        templates: initialTemplates(prev, call.args, now),
+        latencyMs: Number.isFinite(call.latencyMs) && call.latencyMs >= 0 ? call.latencyMs : 0,
+        templates: initialTemplates(linked, call.args, now),
+        contexts: initialContexts(linked, now),
       };
     }
     this.transitions.set(key, state);
@@ -718,21 +794,92 @@ export class TransitionLearner {
       args: Record<string, unknown>;
       memorized: boolean;
     }> = [];
-    for (const state of this.transitions.values()) {
-      if (state.server !== call.server || state.prevTool !== call.tool) continue;
-      if (state.count < this.minObservations) continue;
+    const matching = [...this.transitions.values()].filter(
+      (state) =>
+        state.server === call.server &&
+        state.prevTool === call.tool &&
+        state.count >= this.minObservations,
+    );
+    const baseScores = new Map(
+      matching.map((state) => [state, decayedScore(state.score, state.lastUpdated, now)]),
+    );
+    const baseTotal = [...baseScores.values()].reduce((sum, score) => sum + score, 0);
+    const head = this.lastCallByServer.get(call.server);
+    // Session-start has no real preceding context. Treating '<start>' as one
+    // makes opener frequency overpower the decayed bigram prior and erases
+    // regime changes; context is reserved for genuine three-call histories.
+    const availableContexts = head?.priorTool ? contextKeys(head).reverse() : [];
+    const chosenContext = availableContexts.find((key) =>
+      matching.reduce((sum, state) => sum + (state.contexts.get(key)?.count ?? 0), 0) >= 3,
+    );
+    const contextTotal = chosenContext
+      ? matching.reduce((sum, state) => {
+          const evidence = state.contexts.get(chosenContext);
+          return sum + (evidence ? decayedScore(evidence.score, evidence.lastUpdated, now) : 0);
+        }, 0)
+      : 0;
+    for (const state of matching) {
       // Server label is part of the id: feedback must never bleed between
       // servers that happen to share tool names (review finding, §13.7).
-      const ruleId = `learned:${state.server}:${state.prevTool}→${state.nextTool}`;
-      const score = decayedScore(state.score, state.lastUpdated, now);
-      for (const c of materializeCombos(state, call, now, this.maxPredictionsPerTrigger)) {
+      const baseRuleId = `learned:${state.server}:${state.prevTool}→${state.nextTool}`;
+      const baseProbability = baseTotal > 0 ? (baseScores.get(state) ?? 0) / baseTotal : 0;
+      const evidence = chosenContext ? state.contexts.get(chosenContext) : undefined;
+      const contextProbability =
+        evidence && contextTotal > 0
+          ? decayedScore(evidence.score, evidence.lastUpdated, now) / contextTotal
+          : 0;
+      // Interpolated backoff: context can sharpen a branch, never erase the
+      // durable bigram prior when its bucket is still sparse.
+      const score = chosenContext
+        ? 0.65 * baseProbability + 0.35 * contextProbability
+        : baseProbability;
+      const combos = materializeCombos(state, call, now, this.maxPredictionsPerTrigger);
+      for (let comboRank = 0; comboRank < combos.length; comboRank++) {
+        const c = combos[comboRank]!;
         candidates.push({
           state,
-          ruleId,
+          // Keep rank 1's historic id so existing feedback survives upgrade;
+          // alternatives get their own calibration instead of hiding behind
+          // the primary candidate's hits.
+          ruleId: comboRank === 0 ? baseRuleId : `${baseRuleId}#${comboRank + 1}`,
           score: score * c.weight,
           weight: c.weight,
           args: c.args,
           memorized: c.memorized,
+        });
+      }
+    }
+    // Cold start: morphology already tells us likely lister→getter pairs. Tool
+    // schemas plus the current result can sometimes materialize the getter's
+    // required arguments before the user has ever performed the transition.
+    // Once real transition evidence exists, it takes over completely.
+    for (const [key, prior] of this.schemaPriors) {
+      if (prior.server !== call.server || prior.prevTool !== call.tool) continue;
+      if (this.transitions.has(key)) continue;
+      const cold = schemaColdStartPredictions(
+        prior,
+        call,
+        this.maxPredictionsPerTrigger,
+      );
+      for (let i = 0; i < cold.length; i++) {
+        const prediction = cold[i]!;
+        candidates.push({
+          state: {
+            server: prior.server,
+            prevTool: prior.prevTool,
+            nextTool: prior.nextTool,
+            count: 2,
+            score: 1,
+            lastUpdated: now,
+            latencyMs: call.latencyMs,
+            templates: new Map(),
+            contexts: new Map(),
+          },
+          ruleId: prediction.ruleId,
+          score: prediction.confidence,
+          weight: prediction.confidence / 0.45,
+          args: prediction.args,
+          memorized: false,
         });
       }
     }
@@ -771,6 +918,7 @@ export class TransitionLearner {
         // arrive indistinguishable from its first. The best combo weighs
         // exactly 1, so a single-candidate transition is unchanged.
         confidence: Math.min(0.55, 0.25 + 0.1 * c.state.count) * c.weight,
+        expectedLatencyMs: c.state.latencyMs,
         ruleId: c.ruleId,
         // §6.2: a call carrying a remembered literal is a bet on "at some
         // point", not on "next", so the executor fetches it with a shorter
@@ -784,6 +932,17 @@ export class TransitionLearner {
 }
 
 // -- (de)serialization ----------------------------------------------------------
+
+function isTransformName(value: unknown): value is TransformName {
+  return (
+    value === 'string' ||
+    value === 'number' ||
+    value === 'lower' ||
+    value === 'upper' ||
+    value === 'basename' ||
+    value === 'affix'
+  );
+}
 
 function serializeSource(src: ScoredSource): SerializedSource {
   // (score, lastUpdated) travel together and undecayed, exactly as they do
@@ -799,6 +958,17 @@ function serializeSource(src: ScoredSource): SerializedSource {
       return { kind: 'arg', key: src.s.key, ...evidence };
     case 'parsed':
       return { kind: 'parsed', path: [...src.s.path], ...evidence };
+    case 'transform':
+      return {
+        kind: 'transform',
+        ...(src.s.base.kind === 'arg'
+          ? { key: src.s.base.key }
+          : { path: [...src.s.base.path] }),
+        transform: src.s.transform,
+        ...(src.s.prefix !== undefined ? { prefix: src.s.prefix } : {}),
+        ...(src.s.suffix !== undefined ? { suffix: src.s.suffix } : {}),
+        ...evidence,
+      };
     case 'const':
       return { kind: 'const', repr: src.s.repr, ...evidence };
   }
@@ -817,6 +987,26 @@ function deserializeSource(raw: unknown, now: number): ScoredSource | null {
       s.path.every((seg) => typeof seg === 'string')
     ) {
       return { kind: 'parsed', path: [...s.path] };
+    }
+    if (
+      s.kind === 'transform' &&
+      isTransformName(s.transform) &&
+      (typeof s.key === 'string' ||
+        (Array.isArray(s.path) && s.path.every((seg) => typeof seg === 'string'))) &&
+      (s.prefix === undefined || (typeof s.prefix === 'string' && s.prefix.length <= 64)) &&
+      (s.suffix === undefined || (typeof s.suffix === 'string' && s.suffix.length <= 64))
+    ) {
+      const base: { kind: 'arg'; key: string } | { kind: 'parsed'; path: string[] } =
+        typeof s.key === 'string'
+          ? { kind: 'arg', key: s.key }
+          : { kind: 'parsed', path: [...s.path!] };
+      return {
+        kind: 'transform',
+        base,
+        transform: s.transform,
+        ...(s.prefix !== undefined ? { prefix: s.prefix } : {}),
+        ...(s.suffix !== undefined ? { suffix: s.suffix } : {}),
+      };
     }
     if (s.kind === 'const' && typeof s.repr === 'string') {
       try {
@@ -877,6 +1067,9 @@ function deserializeOpener(raw: unknown, now: number): OpenerState | null {
     count,
     score: importedScore(o.score, count, MAX_IMPORTED_OPENER_COUNT),
     lastUpdated: importedStamp(o.lastUpdated, now),
+    ...(typeof o.latencyMs === 'number' && Number.isFinite(o.latencyMs) && o.latencyMs >= 0
+      ? { latencyMs: Math.min(o.latencyMs, 600_000) }
+      : {}),
   };
 }
 
@@ -982,6 +1175,19 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
     });
   }
   const count = Math.min(Math.floor(t.count), MAX_IMPORTED_COUNT);
+  const contexts = new Map<string, ContextEvidence>();
+  if (Array.isArray(t.contexts)) {
+    for (const rawContext of t.contexts.slice(0, 32)) {
+      if (!isPlainObject(rawContext) || typeof rawContext.key !== 'string') continue;
+      const contextCount = importedCount(rawContext.count);
+      if (contextCount === undefined) continue;
+      contexts.set(rawContext.key, {
+        count: contextCount,
+        score: importedScore(rawContext.score, contextCount, MAX_IMPORTED_COUNT),
+        lastUpdated: importedStamp(rawContext.lastUpdated, now),
+      });
+    }
+  }
   return {
     server: t.server,
     prevTool: t.prevTool,
@@ -989,11 +1195,268 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
     count,
     score: importedScore(t.score, count, MAX_IMPORTED_COUNT),
     lastUpdated: importedStamp(t.lastUpdated, now),
+    latencyMs:
+      typeof t.latencyMs === 'number' && Number.isFinite(t.latencyMs) && t.latencyMs >= 0
+        ? Math.min(t.latencyMs, 600_000)
+        : 0,
     templates,
+    contexts,
   };
 }
 
+// -- schema-backed cold start -------------------------------------------------
+
+interface SchemaShape {
+  properties: Record<string, unknown>;
+  required: string[];
+}
+
+function readSchemaShape(raw: unknown): SchemaShape | null {
+  if (!isPlainObject(raw) || !isPlainObject(raw.properties)) return null;
+  const properties = raw.properties as Record<string, unknown>;
+  const required = Array.isArray(raw.required)
+    ? raw.required.filter((name): name is string => typeof name === 'string')
+    : [];
+  // A schema with optional properties gives no evidence about which spelling
+  // the agent will choose. Zero-property calls are safe; otherwise require an
+  // explicit required set and abstain rather than inventing partial args.
+  if (required.length === 0 && Object.keys(properties).length > 0) return null;
+  if (required.some((name) => !Object.hasOwn(properties, name))) return null;
+  return { properties, required };
+}
+
+function normalizedField(name: string): string {
+  return name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function fieldTokens(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+const IDENTITY_FIELD_TAILS = new Set([
+  'id',
+  'number',
+  'name',
+  'key',
+  'slug',
+  'ref',
+  'url',
+  'path',
+]);
+
+function fieldMatch(target: string, source: string, allowIdentityTail: boolean): boolean {
+  if (normalizedField(target) === normalizedField(source)) return true;
+  if (!allowIdentityTail) return false;
+  const targetTokens = fieldTokens(target);
+  const sourceTokens = fieldTokens(source);
+  const tail = targetTokens.at(-1);
+  return (
+    (targetTokens.length > 1 &&
+      sourceTokens.length === 1 &&
+      tail !== undefined &&
+      IDENTITY_FIELD_TAILS.has(tail) &&
+      sourceTokens[0] === tail) ||
+    (targetTokens.length === 1 &&
+      sourceTokens.length > 1 &&
+      IDENTITY_FIELD_TAILS.has(targetTokens[0]!) &&
+      sourceTokens.at(-1) === targetTokens[0])
+  );
+}
+
+function schemaAccepts(schema: unknown, value: unknown): boolean {
+  if (!isPlainObject(schema) || typeof schema.type !== 'string') return true;
+  switch (schema.type) {
+    case 'string':
+      return typeof value === 'string';
+    case 'number':
+    case 'integer':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'array':
+      return Array.isArray(value);
+    case 'object':
+      return isPlainObject(value);
+    default:
+      return true;
+  }
+}
+
+/** Array elements, in result order, through common JSON envelope depth. */
+function collectResultItems(root: unknown): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  let visited = 0;
+  const walk = (value: unknown, depth: number, fromArray: boolean): void => {
+    if (depth > 6 || visited++ >= 512 || out.length >= 32) return;
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1, true);
+      return;
+    }
+    if (!isPlainObject(value)) return;
+    if (fromArray) out.push(value);
+    for (const child of Object.values(value)) walk(child, depth + 1, false);
+  };
+  walk(root, 0, false);
+  return out;
+}
+
+function itemValue(
+  item: Record<string, unknown>,
+  target: string,
+  schema: unknown,
+): Resolution {
+  const exact: unknown[] = [];
+  const tail: unknown[] = [];
+  let visited = 0;
+  const walk = (value: Record<string, unknown>, depth: number): void => {
+    if (depth > 2 || visited++ >= 64) return;
+    for (const [key, candidate] of Object.entries(value)) {
+      if (schemaAccepts(schema, candidate)) {
+        if (fieldMatch(target, key, false)) exact.push(candidate);
+        else if (fieldMatch(target, key, true)) tail.push(candidate);
+      }
+      if (isPlainObject(candidate)) walk(candidate, depth + 1);
+    }
+  };
+  walk(item, 0);
+  const candidates = exact.length > 0 ? exact : tail;
+  const unique = new Map<string, unknown>();
+  for (const value of candidates) {
+    const repr = safeStringify(value);
+    if (repr !== undefined) unique.set(repr, value);
+  }
+  return unique.size === 1 ? { ok: true, value: unique.values().next().value } : { ok: false };
+}
+
+function schemaColdStartPredictions(
+  prior: SchemaPrior,
+  call: ObservedCall,
+  limit: number,
+): Prediction[] {
+  const shape = readSchemaShape(prior.inputSchema);
+  if (shape === null) return [];
+  if (shape.required.length === 0) {
+    return [{
+      server: prior.server,
+      tool: prior.nextTool,
+      args: {},
+      confidence: 0.45,
+      ruleId: `schema:${prior.server}:${prior.prevTool}→${prior.nextTool}`,
+      horizon: 'next',
+    }];
+  }
+
+  const base: Record<string, unknown> = {};
+  const missing: string[] = [];
+  for (const target of shape.required) {
+    const matches = Object.entries(call.args).filter(
+      ([name, value]) =>
+        fieldMatch(target, name, false) && schemaAccepts(shape.properties[target], value),
+    );
+    if (matches.length === 1) base[target] = matches[0]![1];
+    else missing.push(target);
+  }
+  if (missing.length === 0) {
+    return [{
+      server: prior.server,
+      tool: prior.nextTool,
+      args: jsonCopyRecord(base),
+      confidence: 0.45,
+      ruleId: `schema:${prior.server}:${prior.prevTool}→${prior.nextTool}`,
+      horizon: 'next',
+    }];
+  }
+
+  const out: Prediction[] = [];
+  const emitted = new Set<string>();
+  for (const item of collectResultItems(call.parsed)) {
+    const args = { ...base };
+    let complete = true;
+    for (const target of missing) {
+      const found = itemValue(item, target, shape.properties[target]);
+      if (!found.ok) {
+        complete = false;
+        break;
+      }
+      args[target] = found.value;
+    }
+    if (!complete) continue;
+    const repr = safeStringify(args);
+    if (repr === undefined || emitted.has(repr)) continue;
+    emitted.add(repr);
+    const rank = out.length + 1;
+    out.push({
+      server: prior.server,
+      tool: prior.nextTool,
+      args: jsonCopyRecord(args),
+      confidence: rank === 1 ? 0.45 : rank === 2 ? 0.32 : 0.24,
+      ruleId: `schema:${prior.server}:${prior.prevTool}→${prior.nextTool}${rank === 1 ? '' : `#${rank}`}`,
+      horizon: 'next',
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 // -- argument templates -------------------------------------------------------
+
+function resultShape(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `array:${value.length === 0 ? '0' : value.length === 1 ? '1' : value.length <= 3 ? '2-3' : '4+'}`;
+  }
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort().slice(0, 8).join(',');
+    const array = Object.values(value).find(Array.isArray);
+    const cardinality = Array.isArray(array)
+      ? array.length === 0
+        ? '0'
+        : array.length === 1
+          ? '1'
+          : array.length <= 3
+            ? '2-3'
+            : '4+'
+      : '-';
+    return `object:${keys}:list=${cardinality}`;
+  }
+  return value === null ? 'null' : typeof value;
+}
+
+/** Coarse then rich: prediction backs off in exactly this order. */
+function contextKeys(call: PrevCall): string[] {
+  const prior = call.priorTool ?? '<start>';
+  const coarse = `tool:${prior}`;
+  const args = Object.keys(call.args).sort().join(',');
+  return [coarse, `${coarse}|args:${args}|result:${resultShape(call.parsed)}`];
+}
+
+function initialContexts(prev: PrevCall, now: number): Map<string, ContextEvidence> {
+  return new Map(contextKeys(prev).map((key) => [key, { count: 1, score: 1, lastUpdated: now }]));
+}
+
+function updateContexts(state: TransitionState, prev: PrevCall, now: number): void {
+  for (const key of contextKeys(prev)) {
+    const evidence = state.contexts.get(key);
+    if (evidence) {
+      evidence.count = Math.min(MAX_IMPORTED_COUNT, evidence.count + 1);
+      evidence.score = decayedScore(evidence.score, evidence.lastUpdated, now) + 1;
+      evidence.lastUpdated = now;
+    } else {
+      state.contexts.set(key, { count: 1, score: 1, lastUpdated: now });
+    }
+  }
+  if (state.contexts.size <= 32) return;
+  const weakest = [...state.contexts.entries()].sort(
+    (a, b) =>
+      decayedScore(a[1].score, a[1].lastUpdated, now) -
+        decayedScore(b[1].score, b[1].lastUpdated, now) ||
+      a[1].lastUpdated - b[1].lastUpdated,
+  );
+  while (state.contexts.size > 32) state.contexts.delete(weakest.shift()![0]);
+}
 
 /** First instance of a transition: store every candidate source per arg. */
 function initialTemplates(
@@ -1141,6 +1604,8 @@ function sourceId(s: Source): string {
       return `a\x00${s.key}`;
     case 'parsed':
       return `p\x00${s.path.join('\x00')}`;
+    case 'transform':
+      return `t\x00${sourceId(s.base)}\x00${s.transform}\x00${s.prefix ?? ''}\x00${s.suffix ?? ''}`;
     case 'const':
       return `c\x00${s.repr}`;
   }
@@ -1201,18 +1666,61 @@ function isUnderivable(tpl: ArgTemplate): boolean {
  * once instead of once per argument.
  */
 interface PrevIndex {
-  args: Array<{ key: string; repr: string | undefined }>;
-  paths: Array<{ segs: string[]; repr: string | undefined }>;
+  args: Array<{ key: string; value: unknown; repr: string | undefined }>;
+  paths: Array<{ segs: string[]; value: unknown; repr: string | undefined }>;
+  parsed: unknown;
 }
 
 function indexPrevCall(prev: PrevCall): PrevIndex {
   return {
-    args: Object.entries(prev.args).map(([key, v]) => ({ key, repr: safeStringify(v) })),
+    args: Object.entries(prev.args).map(([key, value]) => ({
+      key,
+      value,
+      repr: safeStringify(value),
+    })),
     paths: enumerateParsedPaths(prev.parsed).map((p) => ({
       segs: p.segs,
+      value: p.value,
       repr: safeStringify(p.value),
     })),
+    parsed: prev.parsed,
   };
+}
+
+/**
+ * Search specifically for the value we are trying to explain. Unlike the
+ * cheap general index, this can cross deep server envelopes and arbitrary
+ * list positions without retaining every value it walks. Bounds make a huge
+ * or hostile result degrade to fewer hypotheses rather than CPU/state blowup.
+ */
+function matchingParsedPaths(parsed: unknown, repr: string): ParsedPath[] {
+  const out: ParsedPath[] = [];
+  let visited = 0;
+  const walk = (value: unknown, path: string[], depth: number): void => {
+    if (depth > 8 || visited++ >= 1_024 || out.length >= MAX_SOURCES_PER_ARG) return;
+    if (path.length > 0 && safeStringify(value) === repr) out.push({ segs: path, value });
+    if (Array.isArray(value)) {
+      // Keep learned positional hypotheses to the first few rows. Schema
+      // cold-start extraction below can materialize arbitrary list items from
+      // their fields without turning every observed row index into a standing
+      // alternative that crowds the shipped three-call batch.
+      for (let i = 0; i < Math.min(value.length, 3); i++) {
+        walk(value[i], [...path, String(i)], depth + 1);
+      }
+    } else if (isPlainObject(value)) {
+      let keys = 0;
+      for (const [key, child] of Object.entries(value)) {
+        if (++keys > MAX_PARSED_KEYS_PER_LEVEL) break;
+        walk(child, [...path, key], depth + 1);
+      }
+    }
+  };
+  try {
+    walk(parsed, [], 0);
+  } catch {
+    // Keep matches collected before an exotic getter threw.
+  }
+  return out;
 }
 
 /**
@@ -1243,8 +1751,105 @@ function candidateSources(
     if (sources.length >= room) break;
     if (p.repr === repr) sources.push({ kind: 'parsed', path: p.segs });
   }
+  // The targeted deep walk fills a blind spot, it does not multiply aliases
+  // for a value the cheap bounded index already found. That distinction keeps
+  // repeated envelope fields from crowding the prediction batch while still
+  // learning row 17 (or a deeply nested id) when it is the only derivation.
+  if (sources.length === 0) {
+    const knownPaths = new Set<string>();
+    for (const p of matchingParsedPaths(index.parsed, repr)) {
+      if (sources.length >= room) break;
+      const id = p.segs.join('\x00');
+      if (knownPaths.has(id)) continue;
+      knownPaths.add(id);
+      sources.push({ kind: 'parsed', path: p.segs });
+    }
+  }
+  const transformed: Source[] = [
+    ...index.args.flatMap((entry) =>
+      inferTransforms({ kind: 'arg', key: entry.key }, entry.value, value),
+    ),
+    ...index.paths.flatMap((entry) =>
+      inferTransforms({ kind: 'parsed', path: entry.segs }, entry.value, value),
+    ),
+  ];
+  const known = new Set(sources.map(sourceId));
+  for (const source of transformed) {
+    if (sources.length >= room) break;
+    const id = sourceId(source);
+    if (known.has(id)) continue;
+    known.add(id);
+    sources.push(source);
+  }
   if (withConst) sources.push({ kind: 'const', value, repr });
   return sources;
+}
+
+function inferTransforms(
+  base: { kind: 'arg'; key: string } | { kind: 'parsed'; path: string[] },
+  input: unknown,
+  target: unknown,
+): Source[] {
+  const out: Source[] = [];
+  const add = (transform: TransformName, extra: { prefix?: string; suffix?: string } = {}) =>
+    out.push({ kind: 'transform', base, transform, ...extra });
+  if (typeof target === 'string') {
+    if (typeof input === 'number' || typeof input === 'boolean') {
+      if (String(input) === target) add('string');
+    }
+    if (typeof input === 'string') {
+      if (input.toLowerCase() === target && input !== target) add('lower');
+      if (input.toUpperCase() === target && input !== target) add('upper');
+      const basename = input.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1);
+      if (basename === target && input !== target) add('basename');
+      const at = input.length >= 2 ? target.indexOf(input) : -1;
+      if (at >= 0 && target !== input) {
+        const prefix = target.slice(0, at);
+        const suffix = target.slice(at + input.length);
+        if (prefix.length + suffix.length <= 64) add('affix', { prefix, suffix });
+      }
+    }
+  }
+  if (
+    typeof target === 'number' &&
+    Number.isFinite(target) &&
+    typeof input === 'string' &&
+    input.trim() !== '' &&
+    Number(input) === target
+  ) {
+    add('number');
+  }
+  return out;
+}
+
+function applyTransform(
+  source: Extract<Source, { kind: 'transform' }>,
+  input: unknown,
+): Resolution {
+  switch (source.transform) {
+    case 'string':
+      return typeof input === 'number' || typeof input === 'boolean'
+        ? { ok: true, value: String(input) }
+        : { ok: false };
+    case 'number':
+      if (typeof input !== 'string' || input.trim() === '') return { ok: false };
+      {
+        const value = Number(input);
+        return Number.isFinite(value) ? { ok: true, value } : { ok: false };
+      }
+    case 'lower':
+      return typeof input === 'string' ? { ok: true, value: input.toLowerCase() } : { ok: false };
+    case 'upper':
+      return typeof input === 'string' ? { ok: true, value: input.toUpperCase() } : { ok: false };
+    case 'basename':
+      return typeof input === 'string'
+        ? { ok: true, value: input.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) ?? '' }
+        : { ok: false };
+    case 'affix':
+      return typeof input === 'string'
+        ? { ok: true, value: `${source.prefix ?? ''}${input}${source.suffix ?? ''}` }
+        : { ok: false };
+  }
 }
 
 /** Would `source`, applied to this instance's previous call, yield `repr`? */
@@ -1259,6 +1864,20 @@ function sourceProduces(source: Source, prev: PrevCall, repr: string): boolean {
     case 'parsed': {
       const res = resolvePath(prev.parsed, source.path);
       return res.ok && safeStringify(res.value) === repr;
+    }
+    case 'transform': {
+      const base = resolveSource(source.base, {
+        server: '',
+        tool: prev.tool,
+        args: prev.args,
+        result: { content: [] },
+        parsed: prev.parsed,
+        timestamp: prev.timestamp,
+        latencyMs: 0,
+      });
+      if (!base.ok) return false;
+      const transformed = applyTransform(source, base.value);
+      return transformed.ok && safeStringify(transformed.value) === repr;
     }
     case 'const':
       // A const survives only if the literal is identical.
@@ -1311,7 +1930,11 @@ interface ArgOption {
 function argOptions(tpl: ArgTemplate, call: ObservedCall, now: number): ArgOption[] | null {
   if (isUnderivable(tpl)) return null;
   const ranked = tpl.sources
-    .map((src, i) => ({ src, i, score: decayedScore(src.score, src.lastUpdated, now) }))
+    .map((src, i) => ({
+      src,
+      i,
+      score: decayedScore(src.score, src.lastUpdated, now),
+    }))
     .sort((a, b) => b.score - a.score || kindRank(a.src.s) - kindRank(b.src.s) || a.i - b.i);
 
   const byRepr = new Map<string, ArgOption>();
@@ -1370,7 +1993,7 @@ function argWeights(options: ArgOption[]): void {
 
 /** Seed priority, the tie-break among equally evidenced sources. */
 function kindRank(s: Source): number {
-  return s.kind === 'arg' ? 0 : s.kind === 'parsed' ? 1 : 2;
+  return s.kind === 'arg' ? 0 : s.kind === 'parsed' ? 1 : s.kind === 'transform' ? 2 : 3;
 }
 
 /** This source's value on the current call. `const` always resolves. */
@@ -1382,6 +2005,10 @@ function resolveSource(s: Source, call: ObservedCall): Resolution {
         : { ok: false };
     case 'parsed':
       return resolvePath(call.parsed, s.path);
+    case 'transform': {
+      const base = resolveSource(s.base, call);
+      return base.ok ? applyTransform(s, base.value) : { ok: false };
+    }
     case 'const':
       return { ok: true, value: s.value };
   }

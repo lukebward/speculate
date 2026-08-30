@@ -23,7 +23,9 @@ The file is JSON with comments (JSONC).
       "speculation": {
         "defaultTtlMs": 30000,
         "maxPerMinute": 30,
-        "maxConcurrent": 2
+        "maxConcurrent": 2,
+        "adaptiveAdmission": true,
+        "minExpectedSavedMs": 15
       }
     }
   }
@@ -97,6 +99,13 @@ The file is JSON with comments (JSONC).
 | `longHorizonTtlFactor` | number in (0,1] | TTL multiplier for long-horizon ("standing") predictions |
 | `maxPerMinute` | number | Speculative-call rate budget |
 | `maxConcurrent` | number | Speculative-call concurrency budget |
+| `adaptiveAdmission` | boolean | Rank by confidence × learned upstream latency and suppress low-utility calls (default `true`) |
+| `minExpectedSavedMs` | number | Minimum expected latency saving to issue a prediction (default `15`) |
+
+Adaptive admission is most useful for mixed servers: a 400 ms network read can
+justify a moderate-confidence prefetch while a 5 ms local metadata call often
+cannot. Set `adaptiveAdmission: false` to retain confidence-only admission, or
+raise `minExpectedSavedMs` when upstream quota matters more than latency.
 
 !!! warning "Read before lowering `longHorizonTtlFactor`"
 

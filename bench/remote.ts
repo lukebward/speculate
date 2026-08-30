@@ -28,7 +28,7 @@
  */
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -39,6 +39,9 @@ import type { SpeculationMode, StatsReport } from '../src/types.js';
 import { SCENARIOS, type Scenario, type ScenarioContext, type ScriptStep } from './scenarios.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TARGET_ROOT = process.env['SPECULATE_E2E_TARGET_ROOT']
+  ? resolve(process.env['SPECULATE_E2E_TARGET_ROOT'])
+  : ROOT;
 const NODE = process.execPath;
 const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
@@ -218,7 +221,8 @@ async function runSession(
   const client = new Client({ name: 'speculate-bench', version: '0.1.0' }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: NODE,
-    args: [TSX_CLI, join(ROOT, 'src', 'cli.ts'), '--config', configPath],
+    args: [TSX_CLI, join(TARGET_ROOT, 'src', 'cli.ts'), '--config', configPath],
+    cwd: TARGET_ROOT,
     env: { ...process.env } as Record<string, string>,
     stderr: 'ignore',
   });
@@ -359,6 +363,36 @@ async function main(): Promise<void> {
     console.log(`  median tool-wait change, warm only  ${pct(warmReduction)}   ${dim('(run 1 excluded)')}`);
   }
 
+  console.log();
+  console.log(bold('  speculation quality by run'));
+  console.log(
+    dim(
+      `  ${'run'.padEnd(6)}${'hit/join'.padStart(11)}${'eligible'.padStart(10)}` +
+        `${'hit rate'.padStart(11)}${'recall@3'.padStart(12)}${'outstanding'.padStart(13)}`,
+    ),
+  );
+  for (let r = 0; r < onRuns.length; r++) {
+    const stats = onRuns[r]!.stats;
+    if (!stats) continue;
+    const eligible = stats.hits + stats.joins + stats.misses;
+    const useful = stats.hits + stats.joins;
+    const quality = (stats as Partial<StatsReport>).predictionQuality;
+    const cache = (stats as StatsReport & {
+      cache?: { ready?: number; inFlight?: number };
+    }).cache;
+    const outstanding = (cache?.ready ?? 0) + (cache?.inFlight ?? 0);
+    console.log(
+      `  ${String(r + 1).padEnd(6)}` +
+        `${`${stats.hits}/${stats.joins}`.padStart(11)}` +
+        `${String(eligible).padStart(10)}` +
+        `${(eligible ? `${((useful / eligible) * 100).toFixed(0)}%` : '—').padStart(11)}` +
+        `${(quality?.recallAt3 === null || quality?.recallAt3 === undefined
+          ? '—'
+          : `${(quality.recallAt3 * 100).toFixed(0)}%`).padStart(12)}` +
+        `${String(outstanding).padStart(13)}`,
+    );
+  }
+
   // --- per call, warmest run ----------------------------------------------
   const lastOn = onRuns.at(-1)!;
   const offPerCall = lastOn.perCall.map((_, i) => median(offRuns.map((r) => r.perCall[i]?.ms ?? 0)));
@@ -401,6 +435,23 @@ async function main(): Promise<void> {
       `    wasted              ${s.wasted}  ${dim(`(${(s.wastePerHit ?? 0).toFixed(2)} per hit)`)}`,
     );
     console.log(`    est. time saved     ${fmtMs(s.estimatedSavedMs)}`);
+    if (s.calibration.evaluations > 0) {
+      console.log(
+        `    calibrated Brier    ${s.calibration.brierScore?.toFixed(4)}  ` +
+          dim(`(static ${s.calibration.staticBrierScore?.toFixed(4)}, ${s.calibration.evaluations} candidates)`),
+      );
+    }
+    const cache = (s as StatsReport & {
+      cache?: { ready?: number; inFlight?: number };
+    }).cache;
+    const outstanding = (cache?.ready ?? 0) + (cache?.inFlight ?? 0);
+    if (outstanding > 0) {
+      console.log(
+        dim(
+          `    outstanding         ${outstanding} at snapshot; counted as abandoned on close`,
+        ),
+      );
+    }
     const suppressed = Object.entries(s.suppressed).filter(([, n]) => n > 0);
     if (suppressed.length > 0) {
       console.log(
@@ -408,6 +459,33 @@ async function main(): Promise<void> {
       );
     }
   }
+  console.log(
+    `REMOTE_E2E ${JSON.stringify({
+      target: TARGET_ROOT,
+      scenario: opts.scenario.key,
+      runs: onRuns.map((run, index) => {
+        const stats = run.stats;
+        const eligible = stats ? stats.hits + stats.joins + stats.misses : 0;
+        const quality = stats ? (stats as Partial<StatsReport>).predictionQuality : undefined;
+        const cache = stats
+          ? (stats as StatsReport & { cache?: { ready?: number; inFlight?: number } }).cache
+          : undefined;
+        return {
+          run: index + 1,
+          offMs: offRuns[index]?.toolWaitMs ?? null,
+          onMs: run.toolWaitMs,
+          hits: stats?.hits ?? 0,
+          joins: stats?.joins ?? 0,
+          misses: stats?.misses ?? 0,
+          hitRate: eligible > 0 && stats ? (stats.hits + stats.joins) / eligible : 0,
+          wasted: stats?.wasted ?? 0,
+          outstanding: (cache?.ready ?? 0) + (cache?.inFlight ?? 0),
+          recallAt3: quality?.recallAt3 ?? null,
+          calibration: stats?.calibration ?? null,
+        };
+      }),
+    })}`,
+  );
   console.log();
 }
 

@@ -402,6 +402,25 @@ describe('flushAll', () => {
   });
 });
 
+describe('abandonAll', () => {
+  it('terminalizes ready and in-flight entries exactly once at session end', async () => {
+    const { cache, events } = makeCache();
+    const pending = deferred<CallToolResult>();
+    cache.putInFlight(K1, meta(), Promise.resolve(res('ready')), 1000);
+    cache.putInFlight(K2, meta(), pending.promise, 1000);
+    await tick();
+
+    expect(cache.abandonAll()).toBe(2);
+    expect(cache.size()).toEqual({ ready: 0, inFlight: 0 });
+    expect(events.map((event) => event.type)).toEqual(['abandoned', 'abandoned']);
+
+    pending.resolve(res('late'));
+    await tick();
+    expect(events.map((event) => event.type)).toEqual(['abandoned', 'abandoned']);
+    expect(cache.abandonAll()).toBe(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // ttlMs <= 0
 // ---------------------------------------------------------------------------

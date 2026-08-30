@@ -79,8 +79,8 @@ describe('learner openers', () => {
 
   it('openers survive an export/import round trip', () => {
     const first = learnerAt();
-    first.recordOpener('gh', 'get_issue', ARGS);
-    first.recordOpener('gh', 'get_issue', ARGS);
+    first.recordOpener('gh', 'get_issue', ARGS, 8);
+    first.recordOpener('gh', 'get_issue', ARGS, 12);
     const state = JSON.parse(JSON.stringify(first.exportState())) as unknown;
 
     const second = learnerAt();
@@ -88,6 +88,14 @@ describe('learner openers', () => {
     const preds = second.openerPredictions('gh');
     expect(preds).toHaveLength(1);
     expect(preds[0]!.args).toEqual(ARGS);
+    expect(preds[0]!.expectedLatencyMs).toBeCloseTo(8.8);
+  });
+
+  it('retains measured zero-latency openers instead of treating them as unknown', () => {
+    const l = learnerAt();
+    l.recordOpener('gh', 'list_issues', {}, 0);
+    l.recordOpener('gh', 'list_issues', {}, 0);
+    expect(l.openerPredictions('gh')[0]!.expectedLatencyMs).toBe(0);
   });
 
   it('export omits the openers key when none are tracked', () => {

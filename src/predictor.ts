@@ -8,6 +8,8 @@
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { canonicalKey } from './keys.js';
+import type { LatencyEstimator } from './latency.js';
+import type { CandidateCalibration } from './calibration.js';
 import type {
   DecisionEvent,
   ObservedCall,
@@ -49,6 +51,11 @@ export interface PredictorOptions {
     /** Session-opening reads worth prefetching at proxy start (§13.15). */
     openerPredictions?(server: string): Prediction[];
   };
+  /** Shared persisted latency source used by adaptive admission. */
+  latency?: LatencyEstimator;
+  /** Shadow correctness learner; does not alter ranking in this release. */
+  calibration?: CandidateCalibration;
+  admission?: Record<string, { enabled: boolean; minExpectedSavedMs: number }>;
 }
 
 /** A completed real call, as reported by the proxy core. */
@@ -59,16 +66,22 @@ export interface CompletedCall {
   result: CallToolResult;
   latencyMs: number;
   timestamp: number;
+  /** Whether this real call was eligible to have been prefetched. */
+  eligibleTarget?: boolean;
 }
 
 /** A rule must have speculated at least this often before feedback can mute it. */
 const FEEDBACK_MIN_SPECULATED = 8;
 /** Below this Laplace-smoothed hit rate a well-sampled rule is suppressed. */
 const FEEDBACK_EFFECTIVENESS_FLOOR = 0.15;
+const DEFAULT_MIN_EXPECTED_SAVED_MS = 15;
+const UNKNOWN_UPSTREAM_LATENCY_MS = 100;
 
 interface ScoredPrediction {
   prediction: Prediction;
-  /** confidence × rule effectiveness (§5.6). */
+  /** Stable rule/alternative identity without argument material. */
+  candidateId: string;
+  /** Calibrated next-call probability, or legacy feedback-weighted score. */
   score: number;
   /** Emission order, used as the stable tie-break when ranking. */
   order: number;
@@ -79,6 +92,11 @@ export class Predictor {
   private readonly learner: PredictorOptions['learner'];
   private readonly maxPerTrigger: number;
   private readonly metrics: PredictorMetrics;
+  private readonly admission: Record<string, { enabled: boolean; minExpectedSavedMs: number }>;
+  private readonly latency: LatencyEstimator | undefined;
+  private readonly calibration: CandidateCalibration | undefined;
+  /** Last ranked batch emitted on each server, for real recall@K telemetry. */
+  private readonly pendingEvaluation = new Map<string, PendingCandidateEvaluation[]>();
 
   constructor(opts: PredictorOptions) {
     // A Map avoids Object.prototype lookups for hostile server labels.
@@ -86,9 +104,14 @@ export class Predictor {
     this.learner = opts.learner;
     this.maxPerTrigger = opts.maxPerTrigger;
     this.metrics = opts.metrics;
+    this.admission = opts.admission ?? {};
+    this.latency = opts.latency;
+    this.calibration = opts.calibration;
   }
 
   observe(call: CompletedCall): Prediction[] {
+    this.evaluatePreviousBatch(call);
+    if (call.eligibleTarget !== false) this.latency?.observe(call.server, call.tool, call.latencyMs);
     // §5.1 result access: structuredContent first, then generic JSON-in-text
     // sniffing (most servers serialize JSON into a text block), fail closed
     // to null. A parse failure costs a prefetch, never correctness.
@@ -160,8 +183,14 @@ export class Predictor {
         }
         continue;
       }
-      for (const p of valid) {
-        candidates.push({ prediction: p, score: p.confidence * eff, order: order++ });
+      for (const [index, p] of valid.entries()) {
+        const candidateId = index === 0 ? rule.id : `${rule.id}#${index + 1}`;
+        candidates.push({
+          prediction: p,
+          candidateId,
+          score: this.candidateScore(candidateId, p.confidence, eff),
+          order: order++,
+        });
       }
     }
 
@@ -192,14 +221,19 @@ export class Predictor {
             });
             continue;
           }
-          candidates.push({ prediction: p, score: p.confidence * eff, order: order++ });
+          candidates.push({
+            prediction: p,
+            candidateId: p.ruleId,
+            score: this.candidateScore(p.ruleId, p.confidence, eff),
+            order: order++,
+          });
         }
       } catch {
         // Learner errors are contained; rule-based prediction continues.
       }
     }
 
-    return this.selectBatch(candidates, call.timestamp);
+    return this.selectBatch(candidates, call.server, call.timestamp);
   }
 
   /**
@@ -233,12 +267,17 @@ export class Predictor {
           });
           continue;
         }
-        candidates.push({ prediction: p, score: p.confidence * eff, order: order++ });
+        candidates.push({
+          prediction: p,
+          candidateId: p.ruleId,
+          score: this.candidateScore(p.ruleId, p.confidence, eff),
+          order: order++,
+        });
       }
     } catch {
       return [];
     }
-    return this.selectBatch(candidates);
+    return this.selectBatch(candidates, server);
   }
 
   /**
@@ -248,6 +287,7 @@ export class Predictor {
    */
   private selectBatch(
     candidates: ScoredPrediction[],
+    server: string,
     timestamp?: number,
   ): Prediction[] {
     const byKey = new Map<string, ScoredPrediction>();
@@ -259,10 +299,37 @@ export class Predictor {
     }
 
     const ranked = [...byKey.values()].sort(
-      (a, b) => b.score - a.score || a.order - b.order,
+      (a, b) => this.utility(b) - this.utility(a) || b.score - a.score || a.order - b.order,
     );
-    const kept = ranked.slice(0, this.maxPerTrigger);
-    for (const cut of ranked.slice(kept.length)) {
+    // Quality telemetry measures the predictor at the shipped rank cap before
+    // latency admission. Otherwise a deliberately suppressed 5 ms Git call
+    // appears as a model miss, making it impossible to distinguish "wrong"
+    // from "right but not worth issuing" in day-to-day diagnostics.
+    const evaluated = ranked.slice(0, this.maxPerTrigger);
+    const admission = this.admission[server] ?? {
+      // Embedders that do not opt into an admission policy retain the
+      // predictor's historical behavior. The proxy supplies an explicit
+      // enabled policy for every configured server.
+      enabled: false,
+      minExpectedSavedMs: DEFAULT_MIN_EXPECTED_SAVED_MS,
+    };
+    const useful = admission.enabled
+      ? ranked.filter((candidate) => {
+          if (this.utility(candidate) >= admission.minExpectedSavedMs) return true;
+          this.metrics.record({
+            type: 'suppressed',
+            server: candidate.prediction.server,
+            tool: candidate.prediction.tool,
+            ruleId: candidate.prediction.ruleId,
+            reason: 'low-utility',
+            confidence: candidate.prediction.confidence,
+            timestamp,
+          });
+          return false;
+        })
+      : ranked;
+    const kept = useful.slice(0, this.maxPerTrigger);
+    for (const cut of useful.slice(kept.length)) {
       this.metrics.record({
         type: 'suppressed',
         server: cut.prediction.server,
@@ -284,8 +351,101 @@ export class Predictor {
         timestamp,
       });
     }
+    const admitted = new Set(kept);
+    this.pendingEvaluation.set(server, evaluated.map((candidate, index) => {
+      const { prediction } = candidate;
+      return {
+        key: dedupeKey(prediction, index),
+        tool: prediction.tool,
+        ruleId: prediction.ruleId,
+        candidateId: candidate.candidateId,
+        rank: index + 1,
+        probability:
+          this.calibration ? candidate.score : prediction.confidence,
+        baseConfidence: prediction.confidence,
+        admitted: admitted.has(candidate),
+      };
+    }));
     return kept.map((c) => c.prediction);
   }
+
+  /**
+   * Compare the exact next eligible real call with the batch produced after
+   * the prior call on this server. This measures predictor recall separately
+   * from policy, budget, upstream latency, and TTL timing—the cache hit rate
+   * deliberately combines all of those and cannot diagnose model quality.
+   */
+  private evaluatePreviousBatch(call: CompletedCall): void {
+    const prior = this.pendingEvaluation.get(call.server);
+    if (prior === undefined) return; // first call: no preceding opportunity
+    this.pendingEvaluation.delete(call.server);
+    if (call.eligibleTarget === false) return;
+    let rank: number | undefined;
+    try {
+      const actual = canonicalKey(call.server, call.tool, call.args);
+      const at = prior.findIndex((candidate) => candidate.key === actual);
+      if (at >= 0) rank = at + 1;
+      for (const candidate of prior) {
+        const correct = candidate.key === actual;
+        this.calibration?.observe(candidate.candidateId, correct, call.timestamp);
+        this.metrics.record({
+          type: 'candidate_evaluated',
+          server: call.server,
+          tool: candidate.tool,
+          ruleId: candidate.ruleId,
+          candidateId: candidate.candidateId,
+          rank: candidate.rank,
+          probability: candidate.probability,
+          baseConfidence: candidate.baseConfidence,
+          admitted: candidate.admitted,
+          correct,
+          timestamp: call.timestamp,
+        });
+      }
+    } catch {
+      // Unkeyable real args are not a measurable cache opportunity.
+      return;
+    }
+    this.metrics.record({
+      type: 'prediction_evaluated',
+      server: call.server,
+      tool: call.tool,
+      rank,
+      candidateCount: prior.length,
+      timestamp: call.timestamp,
+    });
+  }
+
+  private utility(candidate: ScoredPrediction): number {
+    const prediction = candidate.prediction;
+    const latency = this.latency
+      ? this.latency.estimate(
+          prediction.server,
+          prediction.tool,
+          prediction.expectedLatencyMs,
+        ).conservativeMs
+      : (prediction.expectedLatencyMs !== undefined && prediction.expectedLatencyMs >= 0
+          ? prediction.expectedLatencyMs
+          : UNKNOWN_UPSTREAM_LATENCY_MS);
+    return candidate.score * latency;
+  }
+
+  private candidateScore(candidateId: string, confidence: number, operational: number): number {
+    return this.calibration
+      ? this.calibration.probability(candidateId, confidence).probability
+      : confidence * operational;
+  }
+}
+
+interface PendingCandidateEvaluation {
+  key: string;
+  tool: string;
+  ruleId: string;
+  candidateId: string;
+  rank: number;
+  probability: number;
+  baseConfidence: number;
+  admitted: boolean;
 }
 
 /**
@@ -317,22 +477,47 @@ function parseResultDetail(result: CallToolResult): {
   return { parsed: genericJsonText(result), parserMiss: false };
 }
 
-/** Best-effort JSON extraction from the first text block; null otherwise. */
+/** Best-effort JSON extraction from text/resource blocks; null otherwise. */
 function genericJsonText(result: CallToolResult): unknown | null {
   if (result.isError) return null;
   for (const block of result.content ?? []) {
-    if (block.type !== 'text') continue;
-    if (typeof block.text !== 'string') return null;
-    const t = block.text.trimStart();
-    // Cheap sniff: only attempt JSON.parse on something JSON-shaped.
-    if (!t.startsWith('{') && !t.startsWith('[')) return null;
-    try {
-      return JSON.parse(t) as unknown;
-    } catch {
-      return null;
-    }
+    const text =
+      block.type === 'text' && typeof block.text === 'string'
+        ? block.text
+        : block.type === 'resource' &&
+            'resource' in block &&
+            typeof (block.resource as { text?: unknown }).text === 'string'
+          ? ((block.resource as { text: string }).text)
+          : null;
+    if (text === null) continue;
+    const parsed = parseJsonTextCandidate(text);
+    if (parsed.ok) return parsed.value;
   }
   return null;
+}
+
+function parseJsonTextCandidate(text: string): { ok: true; value: unknown } | { ok: false } {
+  const parse = (candidate: string): { ok: true; value: unknown } | { ok: false } => {
+    const trimmed = candidate.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return { ok: false };
+    try {
+      return { ok: true, value: JSON.parse(trimmed) as unknown };
+    } catch {
+      return { ok: false };
+    }
+  };
+
+  const direct = parse(text);
+  if (direct.ok) return direct;
+  // Exact fenced blocks are common in MCP text results and unambiguous.
+  for (const match of text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    const fenced = parse(match[1] ?? '');
+    if (fenced.ok) return fenced;
+  }
+  // Prose prefix followed by a JSON value occupying the remainder.
+  const starts = [text.indexOf('{'), text.indexOf('[')].filter((at) => at >= 0);
+  if (starts.length > 0) return parse(text.slice(Math.min(...starts)));
+  return { ok: false };
 }
 
 /** Laplace-smoothed per-rule hit rate (§5.6): (hits + 1) / (hits + wasted + 2). */
@@ -354,6 +539,7 @@ function validatePrediction(raw: unknown, server: string, ruleId: string): Predi
     args?: unknown;
     confidence?: unknown;
     horizon?: unknown;
+    expectedLatencyMs?: unknown;
   };
   if (typeof p.tool !== 'string' || p.tool.length === 0) return null;
   if (typeof p.args !== 'object' || p.args === null || Array.isArray(p.args)) return null;
@@ -363,6 +549,11 @@ function validatePrediction(raw: unknown, server: string, ruleId: string): Predi
     tool: p.tool,
     args: p.args as Record<string, unknown>,
     confidence: Math.min(1, Math.max(0, p.confidence)),
+    ...(typeof p.expectedLatencyMs === 'number' &&
+    Number.isFinite(p.expectedLatencyMs) &&
+    p.expectedLatencyMs >= 0
+      ? { expectedLatencyMs: p.expectedLatencyMs }
+      : {}),
     ruleId,
     // §6.2: only the two known classes survive validation. Anything else —
     // including nothing, which is what every hand-written rule emits — is

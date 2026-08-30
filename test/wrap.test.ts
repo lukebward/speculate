@@ -153,6 +153,29 @@ describe('buildWrapConfig', () => {
     expect(a1).not.toBe(b);
   });
 
+  it('isolates state by workspace and preserves argv boundaries', () => {
+    const args = mkArgs({ command: ['srv', 'a b'] });
+    const projectA = buildWrapConfig(args, '/project/a').stateKey;
+    const projectB = buildWrapConfig(args, '/project/b').stateKey;
+    const differentArgv = buildWrapConfig(mkArgs({ command: ['srv', 'a', 'b'] }), '/project/a').stateKey;
+    expect(projectA).not.toBe(projectB);
+    expect(projectA).not.toBe(differentArgv);
+  });
+
+  it('changes account scope without putting header secrets in the state key', () => {
+    const a = buildWrapConfig(
+      mkArgs({ url: 'https://api.example.test/mcp', headers: { Authorization: 'Bearer secret-a' } }),
+      '/project',
+    ).stateKey;
+    const b = buildWrapConfig(
+      mkArgs({ url: 'https://api.example.test/mcp', headers: { Authorization: 'Bearer secret-b' } }),
+      '/project',
+    ).stateKey;
+    expect(a).not.toBe(b);
+    expect(a).not.toContain('secret-a');
+    expect(b).not.toContain('secret-b');
+  });
+
   it('defaults to annotated mode end to end (parse → build)', () => {
     const { config } = buildWrapConfig(ok(parseWrapArgs(['--', 'srv'])));
     expect(config.mode).toBe('annotated');

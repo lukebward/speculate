@@ -23,12 +23,27 @@ read-only aborts before a single call is made.
 # these need no credential, so anyone can reproduce them
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario mslearn
+SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario mslearn-cold
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario huggingface
 
 # needs a token, which is never written to disk (the config carries the
 # ${VAR} placeholder and the child proxy resolves it from its environment)
 SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
 ```
+
+The two opt-in local E2Es use actual filesystem operations and a disposable
+Git repository through SDK-backed stdio MCP servers. They are intentionally
+outside the default suite because each starts many full proxy sessions:
+
+```bash
+SPECULATE_REAL_E2E=1 npx vitest run test/filesystem-real-e2e.test.ts
+SPECULATE_REAL_E2E=1 npx vitest run test/git-real-e2e.test.ts
+```
+
+Every real harness accepts `SPECULATE_E2E_TARGET_ROOT=/path/to/checkout`, so
+the current driver and workflow can measure an archived revision with exactly
+the same fixture and reporting. Remote output includes one machine-readable
+`REMOTE_E2E` line; local tests emit `FILESYSTEM_REAL_E2E` or `GIT_REAL_E2E`.
 
 Scenarios live in `bench/scenarios.ts`; adding one is a URL, the tools the
 session calls, and how to find real arguments for them. The bar for adding a

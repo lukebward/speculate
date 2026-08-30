@@ -34,6 +34,7 @@ import {
   type StoredOAuth,
 } from './oauthStore.js';
 import { VERSION } from './version.js';
+import { randomUUID } from 'node:crypto';
 
 /**
  * Refresh this long before the token actually expires.
@@ -63,7 +64,12 @@ const ASSUMED_LIFETIME_MS = 3_600_000;
  * 401 from a token that is perfectly valid and never sent.
  */
 export function attachStoredOAuth(
-  servers: Record<string, { url?: string; headers?: Record<string, string>; oauthStorePath?: string }>,
+  servers: Record<string, {
+    url?: string;
+    headers?: Record<string, string>;
+    oauthStorePath?: string;
+    oauthAuthEpoch?: string;
+  }>,
   storePath: string,
 ): string[] {
   const errors: string[] = [];
@@ -87,6 +93,7 @@ export function attachStoredOAuth(
       continue;
     }
     server.oauthStorePath = storePath;
+    server.oauthAuthEpoch = record.authEpoch ?? 'legacy';
   }
   return errors;
 }
@@ -283,6 +290,7 @@ export class SpeculateOAuthProvider implements OAuthClientProvider {
         tokens,
         expiresAt: expiryOf(tokens, Date.now()),
         codeVerifier: undefined,
+        authEpoch: randomUUID(),
       });
     });
   }

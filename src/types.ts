@@ -46,6 +46,8 @@ export interface Prediction {
   args: Record<string, unknown>;
   /** Static prior confidence in [0,1] assigned by the rule. */
   confidence: number;
+  /** Optional upstream-latency estimate used by adaptive admission. */
+  expectedLatencyMs?: number;
   ruleId: string;
   /**
    * Canonical cache key, stamped by the predictor so the executor never
@@ -154,9 +156,12 @@ export type DecisionEventType =
   | 'miss' // real call had no matching entry
   | 'expired' // entry aged out unused
   | 'invalidated' // entry dropped by mutation/flush
+  | 'abandoned' // entry was still unused when the proxy session ended
   | 'spec_error' // speculative call failed upstream (incl. a failed join)
   | 'parser_miss' // profile parser failed on a result (§5.1)
   | 'stdio_delay' // a real call waited behind an in-flight speculative call
+  | 'prediction_evaluated' // ranked candidates compared with the next real read
+  | 'candidate_evaluated' // one shadow candidate received a binary next-call outcome
   | 'real_call'; // a tools/call actually forwarded upstream (bookkeeping)
 
 export interface DecisionEvent {
@@ -175,6 +180,20 @@ export interface DecisionEvent {
   /** For hit: `ageMs` as a fraction of that entry's TTL, in [0,1). */
   ttlFraction?: number;
   latencyMs?: number;
+  /** For prediction_evaluated: 1-based rank of the exact next call. */
+  rank?: number;
+  /** For prediction_evaluated: candidates the predictor offered. */
+  candidateCount?: number;
+  /** Stable rule/alternative identity; never contains arguments. */
+  candidateId?: string;
+  /** For candidate_evaluated: whether this candidate exactly matched. */
+  correct?: boolean;
+  /** For candidate_evaluated: probability recorded before seeing the outcome. */
+  probability?: number;
+  /** For candidate_evaluated: original rule confidence used as calibration prior. */
+  baseConfidence?: number;
+  /** For candidate_evaluated: whether admission returned this candidate. */
+  admitted?: boolean;
   timestamp?: number;
 }
 
@@ -229,21 +248,72 @@ export interface StatsReport {
   misses: number;
   expired: number;
   invalidated: number;
+  abandoned: number;
   wasted: number;
   parserMisses: number;
   /** Real calls that may have queued behind speculation on a serial upstream (§3.1). */
   stdioDelays: number;
+  /** Conservative upper bound: full latency of delayed stdio real calls. */
+  estimatedAddedWaitMs: number;
+  /** estimatedSavedMs minus the conservative added-wait upper bound. */
+  netEstimatedSavedMs: number;
+  nearMisses: { sameTool: number; distanceOne: number };
   /** Prediction suppressions by reason (policy:/budget:/dedup/feedback/…). */
   suppressed: Record<string, number>;
   estimatedSavedMs: number;
   wastePerHit: number | null;
+  predictionQuality: PredictionQualityReport;
+  calibration: CalibrationReport;
   /** Freshness of what was actually served (§6.2/§9). */
   ageAtHit: AgeAtHitReport;
   perServer: Record<
     string,
-    { speculativeCalls: number; hits: number; wasted: number; specErrors: number }
+    {
+      speculativeCalls: number;
+      hits: number;
+      joins: number;
+      misses: number;
+      wasted: number;
+      specErrors: number;
+      estimatedSavedMs: number;
+      estimatedAddedWaitMs: number;
+      predictionOpportunities: number;
+      predictionOffered: number;
+      predictionHitsAt1: number;
+      predictionHitsAt3: number;
+      nearMisses: number;
+      nearMissDistanceOne: number;
+    }
   >;
+  perTool: Record<string, Record<string, StatsReport['perServer'][string]>>;
   perRule: RuleStats[];
+}
+
+export interface PredictionQualityReport {
+  opportunities: number;
+  offered: number;
+  hitsAt1: number;
+  hitsAt3: number;
+  recallAt1: number | null;
+  recallAt3: number | null;
+  /** Among opportunities where at least one candidate was offered. */
+  precisionAt3: number | null;
+}
+
+export interface CalibrationReport {
+  evaluations: number;
+  correct: number;
+  brierScore: number | null;
+  staticBrierScore: number | null;
+  correctButSuppressed: number;
+  admittedButWrong: number;
+  buckets: Array<{
+    lower: number;
+    upper: number;
+    count: number;
+    correct: number;
+    meanProbability: number | null;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +350,8 @@ export interface ServerConfig {
    * silently shadow a valid token and present as an inexplicable 401.
    */
   oauthStorePath?: string;
+  /** Stable authorization identity; changes on fresh consent, not refresh. */
+  oauthAuthEpoch?: string;
   /**
    * Accepted and ignored. Vetted per-server profiles were removed; the field
    * stays in the type so an older config still LOADS (config.ts warns and
@@ -309,6 +381,10 @@ export interface ServerConfig {
     longHorizonTtlFactor?: number;
     maxPerMinute?: number;
     maxConcurrent?: number;
+    /** Minimum probability-weighted latency benefit required to issue. */
+    minExpectedSavedMs?: number;
+    /** Set false to retain fixed-cap admission regardless of latency. */
+    adaptiveAdmission?: boolean;
   };
 }
 

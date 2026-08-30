@@ -15,7 +15,7 @@ import type {
   SpeculationMode,
   StatsReport,
 } from './types.js';
-import type { UsageCounters } from './usage.js';
+import type { UsageBreakdown, UsageCounters } from './usage.js';
 
 /**
  * Age-at-hit histogram resolution and reach (§9). 100 ms bins out to 60 s is
@@ -39,8 +39,55 @@ const AGE_BANDS: ReadonlyArray<readonly [string, number]> = [
 interface PerServerCounters {
   speculativeCalls: number;
   hits: number;
+  joins: number;
+  misses: number;
   wasted: number;
   specErrors: number;
+  estimatedSavedMs: number;
+  estimatedAddedWaitMs: number;
+  predictionOpportunities: number;
+  predictionOffered: number;
+  predictionHitsAt1: number;
+  predictionHitsAt3: number;
+  nearMisses: number;
+  nearMissDistanceOne: number;
+}
+
+function emptyDimension(): PerServerCounters {
+  return {
+    speculativeCalls: 0,
+    hits: 0,
+    joins: 0,
+    misses: 0,
+    wasted: 0,
+    specErrors: 0,
+    estimatedSavedMs: 0,
+    estimatedAddedWaitMs: 0,
+    predictionOpportunities: 0,
+    predictionOffered: 0,
+    predictionHitsAt1: 0,
+    predictionHitsAt3: 0,
+    nearMisses: 0,
+    nearMissDistanceOne: 0,
+  };
+}
+
+function usageFromDimension(c: PerServerCounters): UsageCounters {
+  return {
+    hits: c.hits,
+    joins: c.joins,
+    misses: c.misses,
+    speculativeCalls: c.speculativeCalls,
+    wasted: c.wasted,
+    estimatedSavedMs: c.estimatedSavedMs,
+    estimatedAddedWaitMs: c.estimatedAddedWaitMs,
+    predictionOpportunities: c.predictionOpportunities,
+    predictionOffered: c.predictionOffered,
+    predictionHitsAt1: c.predictionHitsAt1,
+    predictionHitsAt3: c.predictionHitsAt3,
+    nearMisses: c.nearMisses,
+    nearMissDistanceOne: c.nearMissDistanceOne,
+  };
 }
 
 interface PerRuleCounters {
@@ -51,11 +98,29 @@ interface PerRuleCounters {
   suppressedByFeedback: number;
 }
 
+/** Same topical horizon as learned transition evidence (about a 9.7-day half-life). */
+const FEEDBACK_TAU_MS = 14 * 24 * 60 * 60_000;
+const MAX_PRIOR_FEEDBACK = 500;
+
+interface PriorRuleFeedback {
+  hits: number;
+  wasted: number;
+  speculated: number;
+  lastUpdated: number;
+}
+
+function feedbackDecayFactor(from: number, to: number): number {
+  const elapsed = Math.max(0, to - from);
+  return Math.exp(-elapsed / FEEDBACK_TAU_MS);
+}
+
 export class Metrics {
   private readonly mode: SpeculationMode;
   private readonly log: 'stderr' | 'off';
   private readonly now: () => number;
-  private readonly onUsage: ((counters: UsageCounters) => void) | undefined;
+  private readonly onUsage:
+    | ((counters: UsageCounters, breakdown: UsageBreakdown) => void)
+    | undefined;
   private readonly startedAt: number;
 
   private realCalls = 0;
@@ -65,10 +130,29 @@ export class Metrics {
   private misses = 0;
   private expired = 0;
   private invalidated = 0;
+  private abandoned = 0;
   private wasted = 0;
   private parserMisses = 0;
   private stdioDelays = 0;
   private estimatedSavedMs = 0;
+  private estimatedAddedWaitMs = 0;
+  private predictionOpportunities = 0;
+  private predictionOffered = 0;
+  private predictionHitsAt1 = 0;
+  private predictionHitsAt3 = 0;
+  private candidateEvaluations = 0;
+  private candidateCorrect = 0;
+  private candidateBrierSum = 0;
+  private staticCandidateBrierSum = 0;
+  private correctButSuppressed = 0;
+  private admittedButWrong = 0;
+  private readonly calibrationBuckets = Array.from({ length: 5 }, () => ({
+    count: 0,
+    correct: 0,
+    probabilitySum: 0,
+  }));
+  private nearMisses = 0;
+  private nearMissDistanceOne = 0;
   private readonly suppressedByReason = new Map<string, number>();
 
   /**
@@ -83,16 +167,14 @@ export class Metrics {
   private readonly ttlQuarters: [number, number, number, number] = [0, 0, 0, 0];
 
   private readonly perServer = new Map<string, PerServerCounters>();
+  private readonly perTool = new Map<string, PerServerCounters>();
   private readonly perRule = new Map<string, PerRuleCounters>();
   /**
    * Prior-session feedback (§13.6): folded into ruleFeedback() so the
    * suppression loop remembers across restarts, but kept out of
    * statsSnapshot(), which reports this session only.
    */
-  private readonly priorFeedback = new Map<
-    string,
-    { hits: number; wasted: number; speculated: number }
-  >();
+  private readonly priorFeedback = new Map<string, PriorRuleFeedback>();
   /** Bumped whenever a counter feeding ruleFeedback() changes (§13.6 dirty gate). */
   private feedbackMutations = 0;
 
@@ -104,7 +186,7 @@ export class Metrics {
     mode: SpeculationMode;
     log: 'stderr' | 'off';
     now?: () => number;
-    onUsage?: (counters: UsageCounters) => void;
+    onUsage?: (counters: UsageCounters, breakdown: UsageBreakdown) => void;
   }) {
     this.mode = opts.mode;
     this.log = opts.log;
@@ -114,26 +196,37 @@ export class Metrics {
   }
 
   /**
-   * Load prior-session feedback. Counts are HALVED on import (floor) and
-   * capped: decay lets evidence age out across restarts, so a rule
-   * suppressed by ancient waste eventually earns a retrial instead of
-   * being muted forever (suppressed rules never speculate, so they could
-   * otherwise never redeem themselves). Malformed entries are skipped.
+   * Load prior-session feedback. Current snapshots decay by elapsed time,
+   * rather than by restart count: opening ten short sessions in one day must
+   * not forget evidence faster than leaving one session open. Legacy entries
+   * have no timestamp, so they retain the old one-time halving behaviour and
+   * are stamped on the next export. Malformed entries are skipped.
    */
   importRuleFeedback(priors: unknown): void {
     if (priors === null || typeof priors !== 'object') return;
-    const CAP = 500;
+    const now = this.now();
     for (const [ruleId, raw] of Object.entries(priors as Record<string, unknown>)) {
       if (raw === null || typeof raw !== 'object') continue;
-      const r = raw as { hits?: unknown; wasted?: unknown; speculated?: unknown };
+      const r = raw as {
+        hits?: unknown;
+        wasted?: unknown;
+        speculated?: unknown;
+        lastUpdated?: unknown;
+      };
       const clean = (v: unknown): number =>
         typeof v === 'number' && Number.isFinite(v) && v > 0
-          ? Math.min(Math.floor(v / 2), CAP)
+          ? Math.min(v, MAX_PRIOR_FEEDBACK)
           : 0;
+      const stamp =
+        typeof r.lastUpdated === 'number' && Number.isFinite(r.lastUpdated)
+          ? Math.min(r.lastUpdated, now)
+          : null;
+      const factor = stamp === null ? 0.5 : feedbackDecayFactor(stamp, now);
       const entry = {
-        hits: clean(r.hits),
-        wasted: clean(r.wasted),
-        speculated: clean(r.speculated),
+        hits: clean(r.hits) * factor,
+        wasted: clean(r.wasted) * factor,
+        speculated: clean(r.speculated) * factor,
+        lastUpdated: now,
       };
       if (entry.hits + entry.wasted + entry.speculated > 0) {
         this.priorFeedback.set(ruleId, entry);
@@ -142,12 +235,19 @@ export class Metrics {
   }
 
   /** Combined (prior + session) feedback for persistence. */
-  exportRuleFeedback(): Record<string, { hits: number; wasted: number; speculated: number }> {
-    const out: Record<string, { hits: number; wasted: number; speculated: number }> = {};
+  exportRuleFeedback(): Record<
+    string,
+    { hits: number; wasted: number; speculated: number; lastUpdated: number }
+  > {
+    const out: Record<
+      string,
+      { hits: number; wasted: number; speculated: number; lastUpdated: number }
+    > = {};
+    const now = this.now();
     const ids = new Set([...this.priorFeedback.keys(), ...this.perRule.keys()]);
     for (const id of ids) {
       const fb = this.ruleFeedback(id);
-      if (fb.hits + fb.wasted + fb.speculated > 0) out[id] = fb;
+      if (fb.hits + fb.wasted + fb.speculated > 0) out[id] = { ...fb, lastUpdated: now };
     }
     return out;
   }
@@ -169,6 +269,7 @@ export class Metrics {
         this.speculativeCalls++;
         usageChanged = true;
         this.server(event.server).speculativeCalls++;
+        this.tool(event.server, event.tool).speculativeCalls++;
         if (event.ruleId !== undefined) {
           this.rule(event.ruleId).speculated++;
           this.feedbackMutations++;
@@ -188,6 +289,18 @@ export class Metrics {
       case 'miss':
         this.misses++;
         usageChanged = true;
+        this.server(event.server).misses++;
+        this.tool(event.server, event.tool).misses++;
+        if (event.nearMissDistance !== undefined) {
+          this.nearMisses++;
+          this.server(event.server).nearMisses++;
+          this.tool(event.server, event.tool).nearMisses++;
+          if (event.nearMissDistance === 1) {
+            this.nearMissDistanceOne++;
+            this.server(event.server).nearMissDistanceOne++;
+            this.tool(event.server, event.tool).nearMissDistanceOne++;
+          }
+        }
         break;
       case 'expired':
         this.expired++;
@@ -199,9 +312,15 @@ export class Metrics {
         usageChanged = true;
         this.recordWaste(event);
         break;
+      case 'abandoned':
+        this.abandoned++;
+        usageChanged = true;
+        this.recordWaste(event);
+        break;
       case 'spec_error':
         usageChanged = true;
         this.server(event.server).specErrors++;
+        this.tool(event.server, event.tool).specErrors++;
         this.recordWaste(event);
         break;
       case 'parser_miss':
@@ -209,10 +328,53 @@ export class Metrics {
         break;
       case 'stdio_delay':
         this.stdioDelays++;
+        this.estimatedAddedWaitMs += Math.max(0, event.latencyMs ?? 0);
+        this.server(event.server).estimatedAddedWaitMs += Math.max(0, event.latencyMs ?? 0);
+        this.tool(event.server, event.tool).estimatedAddedWaitMs += Math.max(
+          0,
+          event.latencyMs ?? 0,
+        );
+        usageChanged = true;
         break;
       case 'predicted':
         if (event.ruleId !== undefined) this.rule(event.ruleId).predicted++;
         break;
+      case 'prediction_evaluated': {
+        this.predictionOpportunities++;
+        const offered = Math.max(0, Math.floor(event.candidateCount ?? 0));
+        if (offered > 0) this.predictionOffered++;
+        if (event.rank === 1) this.predictionHitsAt1++;
+        if (event.rank !== undefined && event.rank <= 3) this.predictionHitsAt3++;
+        for (const counters of [this.server(event.server), this.tool(event.server, event.tool)]) {
+          counters.predictionOpportunities++;
+          if (offered > 0) counters.predictionOffered++;
+          if (event.rank === 1) counters.predictionHitsAt1++;
+          if (event.rank !== undefined && event.rank <= 3) counters.predictionHitsAt3++;
+        }
+        usageChanged = true;
+        break;
+      }
+      case 'candidate_evaluated': {
+        if (typeof event.correct !== 'boolean') break;
+        if (typeof event.probability !== 'number' || !Number.isFinite(event.probability)) break;
+        const probability = Math.max(0, Math.min(1, event.probability));
+        const baseConfidence =
+          typeof event.baseConfidence === 'number' && Number.isFinite(event.baseConfidence)
+            ? Math.max(0, Math.min(1, event.baseConfidence))
+            : probability;
+        const outcome = event.correct ? 1 : 0;
+        this.candidateEvaluations++;
+        this.candidateCorrect += outcome;
+        this.candidateBrierSum += (probability - outcome) ** 2;
+        this.staticCandidateBrierSum += (baseConfidence - outcome) ** 2;
+        if (event.correct && event.admitted === false) this.correctButSuppressed++;
+        if (!event.correct && event.admitted === true) this.admittedButWrong++;
+        const bucket = this.calibrationBuckets[Math.min(4, Math.floor(probability * 5))]!;
+        bucket.count++;
+        bucket.correct += outcome;
+        bucket.probabilitySum += probability;
+        break;
+      }
       case 'suppressed': {
         if (event.reason === 'feedback' && event.ruleId !== undefined) {
           this.rule(event.ruleId).suppressedByFeedback++;
@@ -227,14 +389,7 @@ export class Metrics {
         break;
     }
     if (usageChanged) {
-      this.onUsage?.({
-        hits: this.hits,
-        joins: this.joins,
-        misses: this.misses,
-        speculativeCalls: this.speculativeCalls,
-        wasted: this.wasted,
-        estimatedSavedMs: this.estimatedSavedMs,
-      });
+      this.onUsage?.(this.usageCounters(), this.usageBreakdown());
     }
   }
 
@@ -249,10 +404,11 @@ export class Metrics {
   } {
     const r = this.perRule.get(ruleId);
     const p = this.priorFeedback.get(ruleId);
+    const factor = p ? feedbackDecayFactor(p.lastUpdated, this.now()) : 0;
     return {
-      hits: (r?.hits ?? 0) + (p?.hits ?? 0),
-      wasted: (r?.wasted ?? 0) + (p?.wasted ?? 0),
-      speculated: (r?.speculated ?? 0) + (p?.speculated ?? 0),
+      hits: (r?.hits ?? 0) + (p?.hits ?? 0) * factor,
+      wasted: (r?.wasted ?? 0) + (p?.wasted ?? 0) * factor,
+      speculated: (r?.speculated ?? 0) + (p?.speculated ?? 0) * factor,
     };
   }
 
@@ -261,6 +417,13 @@ export class Metrics {
     const perServer: StatsReport['perServer'] = {};
     for (const [server, c] of this.perServer) {
       perServer[server] = { ...c };
+    }
+    const perTool: StatsReport['perTool'] = {};
+    for (const [key, c] of this.perTool) {
+      const split = key.indexOf('\x00');
+      const server = key.slice(0, split);
+      const tool = key.slice(split + 1);
+      (perTool[server] ??= {})[tool] = { ...c };
     }
     const perRule: RuleStats[] = [...this.perRule.entries()]
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -275,6 +438,7 @@ export class Metrics {
       misses: this.misses,
       expired: this.expired,
       invalidated: this.invalidated,
+      abandoned: this.abandoned,
       wasted: this.wasted,
       parserMisses: this.parserMisses,
       stdioDelays: this.stdioDelays,
@@ -282,10 +446,52 @@ export class Metrics {
         [...this.suppressedByReason.entries()].sort((a, b) => b[1] - a[1]),
       ),
       estimatedSavedMs: this.estimatedSavedMs,
+      estimatedAddedWaitMs: this.estimatedAddedWaitMs,
+      netEstimatedSavedMs: this.estimatedSavedMs - this.estimatedAddedWaitMs,
+      nearMisses: { sameTool: this.nearMisses, distanceOne: this.nearMissDistanceOne },
       wastePerHit: used === 0 ? null : this.wasted / used,
+      predictionQuality: this.predictionQuality(),
+      calibration: this.calibrationReport(),
       ageAtHit: this.ageAtHit(),
       perServer,
+      perTool,
       perRule,
+    };
+  }
+
+  private predictionQuality(): import('./types.js').PredictionQualityReport {
+    const opportunities = this.predictionOpportunities;
+    return {
+      opportunities,
+      offered: this.predictionOffered,
+      hitsAt1: this.predictionHitsAt1,
+      hitsAt3: this.predictionHitsAt3,
+      recallAt1: opportunities === 0 ? null : this.predictionHitsAt1 / opportunities,
+      recallAt3: opportunities === 0 ? null : this.predictionHitsAt3 / opportunities,
+      precisionAt3:
+        this.predictionOffered === 0 ? null : this.predictionHitsAt3 / this.predictionOffered,
+    };
+  }
+
+  private calibrationReport(): import('./types.js').CalibrationReport {
+    return {
+      evaluations: this.candidateEvaluations,
+      correct: this.candidateCorrect,
+      brierScore:
+        this.candidateEvaluations === 0 ? null : this.candidateBrierSum / this.candidateEvaluations,
+      staticBrierScore:
+        this.candidateEvaluations === 0
+          ? null
+          : this.staticCandidateBrierSum / this.candidateEvaluations,
+      correctButSuppressed: this.correctButSuppressed,
+      admittedButWrong: this.admittedButWrong,
+      buckets: this.calibrationBuckets.map((bucket, index) => ({
+        lower: index / 5,
+        upper: (index + 1) / 5,
+        count: bucket.count,
+        correct: bucket.correct,
+        meanProbability: bucket.count === 0 ? null : bucket.probabilitySum / bucket.count,
+      })),
     };
   }
 
@@ -365,8 +571,13 @@ export class Metrics {
 
   /** Shared bookkeeping for 'hit' and 'joined'. */
   private recordUse(event: DecisionEvent): void {
-    this.estimatedSavedMs += event.savedMs ?? 0;
-    this.server(event.server).hits++;
+    const saved = event.savedMs ?? 0;
+    this.estimatedSavedMs += saved;
+    for (const counters of [this.server(event.server), this.tool(event.server, event.tool)]) {
+      if (event.type === 'joined') counters.joins++;
+      else counters.hits++;
+      counters.estimatedSavedMs += saved;
+    }
     if (event.ruleId !== undefined) {
       this.rule(event.ruleId).hits++;
       this.feedbackMutations++;
@@ -377,6 +588,7 @@ export class Metrics {
   private recordWaste(event: DecisionEvent): void {
     this.wasted++;
     this.server(event.server).wasted++;
+    this.tool(event.server, event.tool).wasted++;
     if (event.ruleId !== undefined) {
       this.rule(event.ruleId).wasted++;
       this.feedbackMutations++;
@@ -386,10 +598,51 @@ export class Metrics {
   private server(name: string): PerServerCounters {
     let c = this.perServer.get(name);
     if (c === undefined) {
-      c = { speculativeCalls: 0, hits: 0, wasted: 0, specErrors: 0 };
+      c = emptyDimension();
       this.perServer.set(name, c);
     }
     return c;
+  }
+
+  private tool(server: string, tool: string): PerServerCounters {
+    const key = `${server}\x00${tool}`;
+    let c = this.perTool.get(key);
+    if (c === undefined) {
+      c = emptyDimension();
+      this.perTool.set(key, c);
+    }
+    return c;
+  }
+
+  private usageCounters(): UsageCounters {
+    return {
+      hits: this.hits,
+      joins: this.joins,
+      misses: this.misses,
+      speculativeCalls: this.speculativeCalls,
+      wasted: this.wasted,
+      estimatedSavedMs: this.estimatedSavedMs,
+      estimatedAddedWaitMs: this.estimatedAddedWaitMs,
+      predictionOpportunities: this.predictionOpportunities,
+      predictionOffered: this.predictionOffered,
+      predictionHitsAt1: this.predictionHitsAt1,
+      predictionHitsAt3: this.predictionHitsAt3,
+      nearMisses: this.nearMisses,
+      nearMissDistanceOne: this.nearMissDistanceOne,
+    };
+  }
+
+  private usageBreakdown(): UsageBreakdown {
+    const servers: Record<string, UsageCounters> = {};
+    for (const [name, counters] of this.perServer) servers[name] = usageFromDimension(counters);
+    const tools: Record<string, Record<string, UsageCounters>> = {};
+    for (const [key, counters] of this.perTool) {
+      const split = key.indexOf('\x00');
+      const server = key.slice(0, split);
+      const tool = key.slice(split + 1);
+      (tools[server] ??= {})[tool] = usageFromDimension(counters);
+    }
+    return { servers, tools };
   }
 
   private rule(ruleId: string): PerRuleCounters {

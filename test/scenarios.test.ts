@@ -771,15 +771,14 @@ describe('scenario metrics (mock upstream, no credentials)', () => {
     ).toBeGreaterThanOrEqual(2);
     expect(report.totals.estimatedSavedMs).toBeGreaterThan(0);
 
-    // Usage snapshots are aggregate-only: no tool or server names, no
-    // arguments, and never fetched result content.
+    // Usage snapshots contain aggregate server/tool dimensions, but never
+    // arguments, cache keys, or fetched result content.
     const usageDir = join(xdgStateHome, 'speculate', 'usage');
     const snapshotFiles = readdirSync(usageDir).filter((f) => f.endsWith('.json'));
     expect(snapshotFiles.length).toBe(2);
     for (const file of snapshotFiles) {
       const text = readFileSync(join(usageDir, file), 'utf8');
       for (const leaked of [
-        'get_issue',
         '"args"',
         'Rate limiter drops burst',
         'Token bucket refill',

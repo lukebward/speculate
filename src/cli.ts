@@ -10,6 +10,7 @@
  * go to stderr. `doctor` and `validate` are human-facing and use stdout.
  */
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { writeFileSync, existsSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
@@ -33,7 +34,7 @@ import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shi
 import { parseStatsArgs, runStats } from './stats.js';
 import { speculateAuth } from './authCommand.js';
 import { attachStoredOAuth } from './oauthProvider.js';
-import { oauthStorePath } from './oauthStore.js';
+import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import { createUsageRecorder } from './usage.js';
 import { VERSION } from './version.js';
 
@@ -47,7 +48,9 @@ install-and-it-works (no config files edited by hand):
   speculate status [path]                  every project at a glance; give a path ('.') for
                                            one project's detail, reachability included
   speculate sync                           wrap MCP servers added since the last run (run by the auto-wrap hook)
-  speculate stats [--json]                 cumulative speculation usage
+  speculate stats [--json] [--since 7d] [--workspace PATH]
+                   [--by-server] [--by-tool] [--compact]
+                                           cumulative usage and prediction quality
   speculate auth [server]                  authorize Speculate with remote servers that need a
                                            login (no argument: every one that does)
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
@@ -462,16 +465,42 @@ async function main(): Promise<void> {
       // Re-inject the sniffed bytes so the proxy's transport sees the
       // stream from its true beginning (initialize included).
       if (decision.buffered.length > 0) process.stdin.unshift(decision.buffered);
-      const { config: wrapConfig, stateKey } = buildWrapConfig(wrapArgs);
-      await runProxy(wrapConfig, defaultStatePathForKey(stateKey), '(wrap)');
+      const oauthScope = wrapArgs.url
+        ? (readOAuthRecord(oauthStorePath(), wrapArgs.url)?.authEpoch ?? 'legacy-or-none')
+        : 'none';
+      const { config: wrapConfig, stateKey } = buildWrapConfig(
+        wrapArgs,
+        process.cwd(),
+        oauthScope,
+      );
+      await runProxy(
+        wrapConfig,
+        defaultStatePathForKey(stateKey),
+        '(wrap)',
+        // The legacy key was global across projects/accounts and can contain
+        // memorized entity ids. Starting cold is safer than importing it.
+        [],
+      );
       // Sniffing left stdin explicitly paused; an explicit pause is not
       // undone by the transport attaching its 'data' listener. Resume only
       // now that the listener exists, so no byte can flow into the void.
       process.stdin.resume();
       return;
     }
-    const { config: wrapConfig, stateKey } = buildWrapConfig(wrapArgs);
-    await runProxy(wrapConfig, defaultStatePathForKey(stateKey), '(wrap)');
+    const oauthScope = wrapArgs.url
+      ? (readOAuthRecord(oauthStorePath(), wrapArgs.url)?.authEpoch ?? 'legacy-or-none')
+      : 'none';
+    const { config: wrapConfig, stateKey } = buildWrapConfig(
+      wrapArgs,
+      process.cwd(),
+      oauthScope,
+    );
+    await runProxy(
+      wrapConfig,
+      defaultStatePathForKey(stateKey),
+      '(wrap)',
+      [],
+    );
     return;
   }
 
@@ -554,15 +583,23 @@ async function runProxy(
   config: import('./types.js').SpeculateConfig,
   statePath: string | null,
   configLabel: string,
+  stateFallbackPaths: string[] = [],
 ): Promise<void> {
   applyStoredOAuth(config);
+  const stateScope = createStateScope(config, process.cwd());
   const usageRecorder = createUsageRecorder({
     source: 'mcp',
     workspace: process.cwd(),
   });
-  const proxy = new SpeculateProxy(config, { statePath, usageRecorder });
+  const proxy = new SpeculateProxy(config, {
+    statePath,
+    stateFallbackPaths,
+    stateScope,
+    usageRecorder,
+  });
   const shutdown = async (): Promise<void> => {
     try {
+      await proxy.close();
       const s = proxy.metrics.statsSnapshot();
       // §9 freshness: only shown once something was actually served from the
       // buffer, so a session with no hits keeps the one-line summary short.
@@ -579,7 +616,6 @@ async function runProxy(
           `${s.wasted} wasted speculative call(s), ${s.realCalls} upstream call(s)` +
           `${freshness}\n`,
       );
-      await proxy.close();
     } finally {
       exitWhenFlushed(0);
     }
@@ -617,6 +653,33 @@ async function runProxy(
   process.stderr.write(
     `[speculate] v${VERSION} proxying ${Object.keys(config.servers).join(', ')} (mode: ${config.mode}${statePath ? `, state: ${statePath}` : ', persistence off'})\n`,
   );
+}
+
+/** One-way discriminator only: neither state files nor logs receive secrets. */
+function createStateScope(
+  config: import('./types.js').SpeculateConfig,
+  workspace: string,
+): string {
+  const credentialEnv = (env: Record<string, string> | undefined): Array<[string, string]> =>
+    Object.entries(env ?? {})
+      .filter(([name]) => /token|api_?key|secret|credential|account|tenant/i.test(name))
+      .sort(([a], [b]) => a.localeCompare(b));
+  const servers = Object.entries(config.servers)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, server]) => ({
+      name,
+      upstream: server.url
+        ? { url: server.url }
+        : { command: server.command, args: server.args ?? [] },
+      identity: {
+        oauth: server.oauthAuthEpoch ?? 'none',
+        headers: Object.entries(server.headers ?? {}).sort(([a], [b]) => a.localeCompare(b)),
+        env: credentialEnv(server.env),
+      },
+    }));
+  return createHash('sha256')
+    .update(JSON.stringify({ workspace: resolve(workspace), servers }))
+    .digest('hex');
 }
 
 main().catch((err) => {

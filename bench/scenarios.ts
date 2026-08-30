@@ -305,9 +305,40 @@ const mslearn: Scenario = {
   },
 };
 
+/**
+ * A deliberately minimal Microsoft Learn workflow used to isolate true cold
+ * schema prediction. With only one search→fetch pair, a run-1 hit cannot have
+ * come from a transition learned earlier in the same session.
+ */
+const mslearnCold: Scenario = {
+  key: 'mslearn-cold',
+  label: 'Microsoft Learn (single cold transition)',
+  url: 'https://learn.microsoft.com/api/mcp',
+  tokenEnv: null,
+  needTools: ['microsoft_docs_search', 'microsoft_docs_fetch'],
+  describe: (ctx) => `single query "${String(ctx['query'])}"`,
+  async plan(call) {
+    const query = 'typescript node streams';
+    const urls = extractContentUrls(resultText(await call('microsoft_docs_search', { query })));
+    if (urls.length === 0) {
+      throw new Error(`microsoft_docs_search("${query}") returned no urls`);
+    }
+    return { query, url: urls[0]! };
+  },
+  script(ctx) {
+    return [
+      { kind: 'turn', label: `user: "docs on ${String(ctx['query'])}"` },
+      { kind: 'call', tool: 'microsoft_docs_search', args: { query: ctx['query'] } },
+      { kind: 'think', ms: 1000 },
+      { kind: 'call', tool: 'microsoft_docs_fetch', args: { url: ctx['url'] } },
+    ];
+  },
+};
+
 export const SCENARIOS: Record<string, Scenario> = {
   github,
   huggingface,
   context7,
   mslearn,
+  'mslearn-cold': mslearnCold,
 };

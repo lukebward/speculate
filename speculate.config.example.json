@@ -15,7 +15,9 @@
       "speculation": {
         "defaultTtlMs": 30000,
         "maxPerMinute": 30,
-        "maxConcurrent": 2
+        "maxConcurrent": 2,
+        "adaptiveAdmission": true,
+        "minExpectedSavedMs": 15
       }
     }
   }

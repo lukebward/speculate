@@ -30,6 +30,8 @@ import { SpeculationExecutor } from './executor.js';
 import { compileConfigRules } from './configRules.js';
 import { morphologicalPairs } from './priming.js';
 import { StateStore } from './persistence.js';
+import { LatencyModel } from './latency.js';
+import { CandidateCalibrator } from './calibration.js';
 import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
@@ -66,6 +68,8 @@ export class SpeculateProxy {
   private initialized = false;
   private closing = false;
   private readonly learner: TransitionLearner;
+  private readonly latency: LatencyModel;
+  private readonly calibration: CandidateCalibrator;
   private readonly store: StateStore | null;
   private readonly usageRecorder: UsageRecorder | null;
   private saveTimer: NodeJS.Timeout | null = null;
@@ -78,6 +82,8 @@ export class SpeculateProxy {
     opts: {
       now?: () => number;
       statePath?: string | null;
+      stateFallbackPaths?: string[];
+      stateScope?: string;
       usageRecorder?: UsageRecorder | null;
     } = {},
   ) {
@@ -90,7 +96,7 @@ export class SpeculateProxy {
       mode: config.mode,
       log: config.log,
       now,
-      onUsage: (counters) => this.usageRecorder?.update(counters),
+      onUsage: (counters, breakdown) => this.usageRecorder?.update(counters, breakdown),
     });
     this.cache = new SpeculationCache({
       now,
@@ -148,12 +154,18 @@ export class SpeculateProxy {
       now,
       maxPredictionsPerTrigger: config.maxPredictionsPerTrigger,
     });
-    this.store = opts.statePath ? new StateStore(opts.statePath, now) : null;
+    this.latency = new LatencyModel({ now });
+    this.calibration = new CandidateCalibrator({ now });
+    this.store = opts.statePath
+      ? new StateStore(opts.statePath, now, opts.stateFallbackPaths ?? [], opts.stateScope)
+      : null;
     if (this.store) {
       const state = this.store.load();
       if (state) {
         this.learner.importState(state.learner);
         this.metrics.importRuleFeedback(state.ruleFeedback);
+        this.latency.importState(state.latency);
+        this.calibration.importState(state.candidateFeedback);
       }
       this.savedStamp = this.dirtyStamp();
     }
@@ -162,9 +174,20 @@ export class SpeculateProxy {
       maxPerTrigger: config.maxPredictionsPerTrigger,
       metrics: this.metrics,
       extraRules,
+      admission: Object.fromEntries(
+        Object.entries(config.servers).map(([name, server]) => [
+          name,
+          {
+            enabled: server.speculation?.adaptiveAdmission !== false,
+            minExpectedSavedMs: server.speculation?.minExpectedSavedMs ?? 15,
+          },
+        ]),
+      ),
       // §5.3 Tier 2 (server-agnostic): learns tool-call transitions from the
       // session itself, so unprofiled servers gain speculation over time.
       learner: this.learner,
+      latency: this.latency,
+      calibration: this.calibration,
     });
     this.executor = new SpeculationExecutor({
       upstreams: this.upstreams,
@@ -317,7 +340,12 @@ export class SpeculateProxy {
     this.closing = true;
     if (this.sweeper) clearInterval(this.sweeper);
     if (this.saveTimer) clearTimeout(this.saveTimer);
-    this.saveState(); // best-effort final flush
+    // Reconcile the prediction funnel before persisting feedback. A session's
+    // last real call commonly emits a batch that can never be claimed; letting
+    // those entries vanish here makes poor rules look artificially effective.
+    this.executor.abandonPending();
+    this.cache.abandonAll();
+    this.saveState(); // best-effort final flush, including abandonment feedback
     try {
       await Promise.all([...this.upstreams.values()].map((u) => u.close()));
       await this.server.close();
@@ -326,9 +354,9 @@ export class SpeculateProxy {
     }
   }
 
-  /** Learner + feedback state fingerprint for the dirty gate (§13.6). */
+  /** Learner + feedback + latency fingerprint for the dirty gate (§13.6). */
   private dirtyStamp(): string {
-    return `${this.learner.revision}:${this.metrics.feedbackRevision}`;
+    return `${this.learner.revision}:${this.metrics.feedbackRevision}:${this.latency.revision}:${this.calibration.revision}`;
   }
 
   /** Debounced dirty-flag save: fires ~1s after the FIRST unsaved change. */
@@ -351,6 +379,8 @@ export class SpeculateProxy {
       this.store.save({
         learner: this.learner.exportState(),
         ruleFeedback: this.metrics.exportRuleFeedback(),
+        latency: this.latency.exportState(),
+        candidateFeedback: this.calibration.exportState(),
       })
     ) {
       this.savedStamp = stamp;
@@ -393,7 +423,7 @@ export class SpeculateProxy {
     out.push({
       name: STATS_TOOL,
       description:
-        'Speculate proxy statistics: hit rate, wasted speculative calls, estimated time saved, how stale served prefetches were (age at hit), suppression reasons, cache occupancy, per-rule effectiveness.',
+        'Speculate proxy statistics: cache outcomes, predictor recall, wasted/abandoned calls, saved time versus conservative stdio wait, argument near misses, freshness, and server/tool/rule breakdowns.',
       inputSchema: { type: 'object', properties: {} },
       outputSchema: {
         type: 'object',
@@ -407,12 +437,42 @@ export class SpeculateProxy {
           misses: { type: 'number' },
           expired: { type: 'number' },
           invalidated: { type: 'number' },
+          abandoned: { type: 'number' },
           wasted: { type: 'number' },
           parserMisses: { type: 'number' },
           stdioDelays: { type: 'number' },
+          estimatedAddedWaitMs: { type: 'number' },
+          netEstimatedSavedMs: { type: 'number' },
+          nearMisses: { type: 'object' },
           suppressed: { type: 'object', additionalProperties: { type: 'number' } },
           estimatedSavedMs: { type: 'number' },
           wastePerHit: { type: ['number', 'null'] },
+          predictionQuality: {
+            type: 'object',
+            description: 'predictor recall measured before policy, budget, latency, and TTL',
+            properties: {
+              opportunities: { type: 'number' },
+              offered: { type: 'number' },
+              hitsAt1: { type: 'number' },
+              hitsAt3: { type: 'number' },
+              recallAt1: { type: ['number', 'null'] },
+              recallAt3: { type: ['number', 'null'] },
+              precisionAt3: { type: ['number', 'null'] },
+            },
+          },
+          calibration: {
+            type: 'object',
+            description: 'shadow next-call probability quality before execution outcomes',
+            properties: {
+              evaluations: { type: 'number' },
+              correct: { type: 'number' },
+              brierScore: { type: ['number', 'null'] },
+              staticBrierScore: { type: ['number', 'null'] },
+              correctButSuppressed: { type: 'number' },
+              admittedButWrong: { type: 'number' },
+              buckets: { type: 'array', items: { type: 'object' } },
+            },
+          },
           ageAtHit: {
             type: 'object',
             description:
@@ -428,6 +488,7 @@ export class SpeculateProxy {
             },
           },
           perServer: { type: 'object' },
+          perTool: { type: 'object' },
           perRule: { type: 'array' },
           cache: {
             type: 'object',
@@ -459,7 +520,6 @@ export class SpeculateProxy {
    */
   private primeLearner(up: Upstream): void {
     const names = up.tools.map((t) => t.name);
-    const present = new Set(names);
     const eligibleTarget = (tool: string): boolean =>
       this.policy.eligibility(up.name, tool).eligible;
     // Name morphology only. Hand-written per-server primes lived here too;
@@ -468,7 +528,9 @@ export class SpeculateProxy {
     // `list_issues -> issue_read` on GitHub's hosted server, which no
     // hand-written list had).
     for (const [prev, next] of morphologicalPairs(names)) {
-      if (eligibleTarget(next)) this.learner.prime(up.name, prev, next);
+      if (!eligibleTarget(next)) continue;
+      const target = up.tools.find((tool) => tool.name === next);
+      this.learner.prime(up.name, prev, next, target?.inputSchema);
     }
   }
 
@@ -589,9 +651,8 @@ export class SpeculateProxy {
 
     // stdio contention visibility (§3.1/§9): a real call arriving while a
     // speculative call is in flight on a serial transport may queue.
-    if (upstream.transport === 'stdio' && this.budget.specInFlight(server) > 0) {
-      this.metrics.record({ type: 'stdio_delay', server, tool });
-    }
+    const mayWaitBehindStdioSpeculation =
+      upstream.transport === 'stdio' && this.budget.specInFlight(server) > 0;
 
     let result: CallToolResult | null = null;
     let latencyMs = 0;
@@ -624,7 +685,7 @@ export class SpeculateProxy {
         try {
           result = await found.promise;
           const saved = Math.max(0, tJoin - found.meta.issuedAt);
-          latencyMs = this.now() - tJoin;
+          latencyMs = found.meta.upstreamLatencyMs ?? this.now() - tJoin;
           this.metrics.record({
             type: 'joined',
             server,
@@ -675,6 +736,12 @@ export class SpeculateProxy {
         this.executor.drainServer(server);
       }
       latencyMs = this.now() - t0;
+      if (mayWaitBehindStdioSpeculation) {
+        // Conservative upper bound: the transport exposes no split between
+        // queueing and the real tool's own work, so charge the full wait rather
+        // than claim unverifiable net savings.
+        this.metrics.record({ type: 'stdio_delay', server, tool, latencyMs });
+      }
       this.metrics.record({ type: 'real_call', server, tool, latencyMs });
       if (!result.isError && this.policy.isSuspended(server, tool)) {
         // §4: a successful real call resets the auth breaker.
@@ -696,7 +763,7 @@ export class SpeculateProxy {
             const slots = this.openerSlots.get(server) ?? OPENER_RECORD_LIMIT;
             if (slots > 0) {
               this.openerSlots.set(server, slots - 1);
-              this.learner.recordOpener(server, tool, args);
+              this.learner.recordOpener(server, tool, args, latencyMs);
             }
           }
           const predictions = this.predictor.observe({
@@ -706,6 +773,7 @@ export class SpeculateProxy {
             result: finalResult,
             latencyMs,
             timestamp: this.now(),
+            eligibleTarget: isReadOnly,
           });
           if (predictions.length > 0) {
             this.executor.submit(predictions);

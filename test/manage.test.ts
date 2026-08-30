@@ -2239,7 +2239,7 @@ describe('resolveClaudeBin', () => {
     const binDir = join(home, 'bin2');
     mkdirSync(binDir, { recursive: true });
     writeFileSync(join(binDir, 'claude.cmd'), '@echo off\r\n');
-    expect(resolveClaudeBin('claude', { platform: 'darwin', pathEnv: binDir })).toBe('claude');
+    expect(resolveClaudeBin('claude', { platform: 'darwin', pathEnv: binDir, home })).toBe('claude');
     expect(resolveClaudeBin('claude', { platform: 'win32', pathEnv: join(home, 'nope') })).toBe(
       'claude',
     );

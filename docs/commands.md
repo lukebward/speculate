@@ -39,11 +39,24 @@ that applied.
 
 ## `stats`
 
-Cumulative time saved, hit rate, and waste. `--json` for scripts.
+Cumulative time saved, conservative stdio wait, net estimate, hit/waste rate,
+predictor recall, and argument near misses. `--json` emits the full structured
+report.
+
+```bash
+speculate stats --since 7d
+speculate stats --workspace . --by-server --by-tool
+speculate stats --compact
+```
+
+`--since` accepts durations (`30m`, `24h`, `7d`, `4w`) or a date.
+`--compact` packs completed records older than 30 days into monthly archives;
+it preserves each snapshot and every filter, while avoiding thousands of tiny
+files.
 
 The same numbers are available to the agent mid-session as the
-`speculate__stats` tool, which also reports how stale the served prefetches
-were.
+`speculate__stats` tool, which also reports how stale served prefetches were and
+breaks outcomes down by server and tool.
 
 ## `wrap`
 

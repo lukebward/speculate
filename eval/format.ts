@@ -134,6 +134,16 @@ export function table(run: EvalRun, opts: TableOptions = {}): string[] {
   return lines;
 }
 
+/** Cold-start view: no hidden warm-up, grouped by session age. */
+export function learningCurveTable(run: EvalRun): string[] {
+  return [
+    'cold-start learning curve (workflow only; no warm-up excluded)',
+    head(),
+    rule(),
+    ...run.learningCurve.map((report) => row(report)),
+  ];
+}
+
 const AGE_COLUMNS: readonly Column[] = [
   { head: 'class', width: 22 },
   { head: 'hits', width: 7 },

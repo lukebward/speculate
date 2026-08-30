@@ -69,6 +69,24 @@ export class SpeculationExecutor {
   }
 
   /**
+   * Drop predictions that never acquired an upstream slot before shutdown.
+   * They are suppression, not waste: no speculative call was issued. Keeping
+   * the event makes the end-of-session funnel reconcile without penalizing a
+   * rule for work the budget deliberately prevented.
+   */
+  abandonPending(): number {
+    let dropped = 0;
+    for (const queue of this.pending.values()) {
+      for (const { p } of queue) {
+        this.suppress(p, 'session-end');
+        dropped++;
+      }
+    }
+    this.pending.clear();
+    return dropped;
+  }
+
+  /**
    * Drain hook: called when a budget slot may have freed (a speculative call
    * settled, or a real call finished on a serial upstream).
    */

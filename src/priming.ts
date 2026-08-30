@@ -8,11 +8,11 @@
  *    "search_users" → "get_user", "notion-search" → "notion-fetch"-style
  *    stems). Any eligible lister/getter pair sharing a stem is primed.
  *
- * A prime is a THRESHOLD change, not knowledge: the transition still only
- * predicts after the user's own traffic exhibits it once (arguments are
- * always learned from real calls), and from then on it grows, decays, and
- * persists exactly like any learned transition. Cost of a wrong prior: one
- * Set entry; the feedback loop suppresses primes that never pay.
+ * A prime names a plausible transition, not invented arguments. When the
+ * getter schema and the lister's real JSON result identify one unambiguous
+ * complete argument set, schema-backed cold start may predict immediately.
+ * Otherwise the transition still waits for the user's own traffic to exhibit
+ * it once, then grows, decays, and persists like any learned transition.
  */
 
 const LISTER_PREFIX = /^(list|search|find|query|browse|enumerate)[_-]?(.*)$/;

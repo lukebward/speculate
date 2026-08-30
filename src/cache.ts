@@ -48,7 +48,7 @@ export const LONG_HORIZON_TTL_FACTOR = 1;
  * countable (DESIGN.md §9): an entry emits at most one of these, ever.
  */
 export interface SpeculationCacheEvent {
-  type: 'expired' | 'invalidated' | 'spec_error';
+  type: 'expired' | 'invalidated' | 'abandoned' | 'spec_error';
   key: CacheKey;
   meta: CacheEntryMeta;
   /** For 'spec_error': the upstream error message. */
@@ -211,6 +211,25 @@ export class SpeculationCache {
   /** Remove everything (restart/re-auth flush). Returns entries affected. */
   flushAll(): number {
     return this.evict(() => true);
+  }
+
+  /**
+   * End-of-session terminalization. Unlike mutation invalidation, this emits
+   * synchronously for BOTH ready and in-flight entries: the process is about
+   * to stop, so waiting for an in-flight promise to settle would lose the
+   * feedback entirely. Marking an in-flight entry claimed makes its existing
+   * settlement handlers consume the eventual resolution/rejection silently,
+   * so every speculative call still has exactly one terminal outcome.
+   */
+  abandonAll(): number {
+    let removed = 0;
+    for (const [key, entry] of this.entries) {
+      this.entries.delete(key);
+      entry.claimed = true;
+      this.emit({ type: 'abandoned', key, meta: entry.meta });
+      removed++;
+    }
+    return removed;
   }
 
   /** Drop expired ready entries, emitting 'expired' per entry. */

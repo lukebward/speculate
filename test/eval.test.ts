@@ -200,6 +200,23 @@ describe('sensitivity', () => {
   });
 });
 
+describe('cold-start learning curve', () => {
+  it('scores session one instead of hiding it behind the headline warm-up', () => {
+    const run = runEvalDetailed(DEFAULT_SEEDS);
+    expect(run.learningCurve.map((point) => point.archetype)).toEqual([
+      'session 1',
+      'session 2',
+      'session 3',
+      'sessions 4-5',
+      'sessions 6-10',
+      'sessions 11+',
+    ]);
+    expect(run.learningCurve[0]!.pairs).toBeGreaterThan(0);
+    expect(run.learningCurve[0]!.recallAt3).toBe(0);
+    expect(run.learningCurve[1]!.recallAt3).toBeGreaterThan(0);
+  });
+});
+
 // --- staleness ----------------------------------------------------------------
 
 describe('regime-shift', () => {

@@ -15,6 +15,8 @@
  */
 import { RETIRED_PROFILES, resolveHeaderValue } from './config.js';
 import type { SpeculateConfig, SpeculationMode } from './types.js';
+import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 
 export interface WrapArgs {
   mode: SpeculationMode;
@@ -136,8 +138,27 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
 }
 
 /** Build the in-memory SpeculateConfig for a wrap invocation. */
-export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stateKey: string } {
+export function buildWrapConfig(
+  args: WrapArgs,
+  workspace: string = process.cwd(),
+  oauthScope: string = 'none',
+): { config: SpeculateConfig; stateKey: string; legacyStateKey: string } {
   const commandLine = args.command.join(' ');
+  const ambientCredentialEnv = Object.entries(process.env)
+    .filter(
+      (entry): entry is [string, string] =>
+        typeof entry[1] === 'string' && /token|api_?key|secret|credential|account|tenant/i.test(entry[0]),
+    )
+    .sort(([a], [b]) => a.localeCompare(b));
+  const credentialScope =
+    Object.keys(args.headers).length === 0 && ambientCredentialEnv.length === 0
+      ? 'none'
+      : createHash('sha256')
+          .update(JSON.stringify({
+            headers: Object.entries(args.headers).sort(([a], [b]) => a.localeCompare(b)),
+            env: ambientCredentialEnv,
+          }))
+          .digest('hex');
   // The state key must NEVER carry the headers: it names the on-disk state
   // file. The URL alone identifies the upstream.
   const upstream = args.url
@@ -158,6 +179,18 @@ export function buildWrapConfig(args: WrapArgs): { config: SpeculateConfig; stat
         },
       },
     },
-    stateKey: args.url ? `wrap:url:${args.url}` : `wrap:${commandLine}`,
+    // v1 keyed only by URL or a space-joined argv. Besides argv collisions,
+    // that mixed memorized entity ids and session openers across unrelated
+    // projects using the same server. v2 is structured and workspace-local.
+    stateKey: `wrap:v2:${JSON.stringify({
+      workspace: resolve(workspace),
+      upstream: args.url ? { url: args.url } : { command: args.command },
+      // Only a one-way scope discriminator is retained. A changed account or
+      // API token starts clean without ever putting a credential in a path.
+      credentialScope,
+      oauthScope,
+    })}`,
+    // Read once as a migration fallback; every save goes to the scoped path.
+    legacyStateKey: args.url ? `wrap:url:${args.url}` : `wrap:${commandLine}`,
   };
 }

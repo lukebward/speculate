@@ -112,6 +112,8 @@ const serverSchema = z
         longHorizonTtlFactor: z.number().positive().max(1).optional(),
         maxPerMinute: z.number().int().positive().optional(),
         maxConcurrent: z.number().int().positive().optional(),
+        minExpectedSavedMs: z.number().nonnegative().max(60_000).optional(),
+        adaptiveAdmission: z.boolean().optional(),
       })
       .optional(),
   })

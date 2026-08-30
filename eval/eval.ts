@@ -26,7 +26,7 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { SESSIONS_PER_ARCHETYPE, WARMUP_SESSIONS } from './corpus.js';
-import { ageTable, baselineLine, detail, notes, table } from './format.js';
+import { ageTable, baselineLine, detail, learningCurveTable, notes, table } from './format.js';
 import { DEFAULT_SEEDS, MAX_K, PRODUCTION_K, runEvalDetailed } from './replay.js';
 import type { EvalRun } from './replay.js';
 
@@ -106,6 +106,8 @@ function main(): void {
   );
   console.log();
   for (const line of table(run, { compare: comparison() })) console.log(indent(line));
+  console.log();
+  for (const line of learningCurveTable(run)) console.log(indent(line));
   console.log();
   for (const line of ageTable(run)) console.log(indent(line));
   console.log();

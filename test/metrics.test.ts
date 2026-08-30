@@ -63,6 +63,13 @@ describe('Metrics — counter accumulation', () => {
       speculativeCalls: 1,
       wasted: 0,
       estimatedSavedMs: 250,
+      estimatedAddedWaitMs: 0,
+      predictionOpportunities: 0,
+      predictionOffered: 0,
+      predictionHitsAt1: 0,
+      predictionHitsAt3: 0,
+      nearMisses: 0,
+      nearMissDistanceOne: 0,
     });
   });
 
@@ -95,15 +102,21 @@ describe('Metrics — counter accumulation', () => {
   });
 
   it('keys perServer by event server', () => {
-    expect(snap.perServer['gh']).toEqual({
+    expect(snap.perServer['gh']).toMatchObject({
       speculativeCalls: 3,
-      hits: 2, // hit + joined
+      hits: 1,
+      joins: 1,
+      misses: 1,
       wasted: 1, // the expired entry
       specErrors: 0,
+      estimatedSavedMs: 570,
+      nearMisses: 1,
+      nearMissDistanceOne: 1,
     });
-    expect(snap.perServer['slack']).toEqual({
+    expect(snap.perServer['slack']).toMatchObject({
       speculativeCalls: 1,
       hits: 0,
+      joins: 0,
       wasted: 2, // invalidated + spec_error
       specErrors: 1,
     });
@@ -145,13 +158,71 @@ describe('Metrics — counter accumulation', () => {
     });
   });
 
-  it('stdio_delay events increment the stdioDelays counter and nothing else', () => {
+  it('stdio_delay events expose their conservative added-wait estimate', () => {
     const before = recorded().statsSnapshot();
     const m = recorded();
     m.record({ type: 'stdio_delay', server: 'fs', tool: 'read_file', latencyMs: 90 });
     const after = m.statsSnapshot();
     expect(after.stdioDelays).toBe(before.stdioDelays + 1);
-    expect(after).toEqual({ ...before, stdioDelays: before.stdioDelays + 1, uptimeMs: after.uptimeMs });
+    expect(after.estimatedAddedWaitMs).toBe(before.estimatedAddedWaitMs + 90);
+    expect(after.netEstimatedSavedMs).toBe(before.netEstimatedSavedMs - 90);
+    expect(after.perTool['fs']!['read_file']!.estimatedAddedWaitMs).toBe(90);
+  });
+
+  it('separates model recall from cache-policy hit rate', () => {
+    const m = recorded([]);
+    m.record({ type: 'prediction_evaluated', server: 's', tool: 'a', rank: 1, candidateCount: 3 });
+    m.record({ type: 'prediction_evaluated', server: 's', tool: 'b', rank: 3, candidateCount: 3 });
+    m.record({ type: 'prediction_evaluated', server: 's', tool: 'c', candidateCount: 0 });
+    expect(m.statsSnapshot().predictionQuality).toEqual({
+      opportunities: 3,
+      offered: 2,
+      hitsAt1: 1,
+      hitsAt3: 2,
+      recallAt1: 1 / 3,
+      recallAt3: 2 / 3,
+      precisionAt3: 1,
+    });
+  });
+
+  it('reports shadow calibration independently from cache outcomes', () => {
+    const m = recorded([]);
+    m.record({
+      type: 'candidate_evaluated',
+      server: 's',
+      tool: 'a',
+      candidateId: 'r',
+      probability: 0.8,
+      baseConfidence: 0.6,
+      correct: true,
+      admitted: false,
+    });
+    m.record({
+      type: 'candidate_evaluated',
+      server: 's',
+      tool: 'b',
+      candidateId: 'r#2',
+      probability: 0.2,
+      baseConfidence: 0.4,
+      correct: false,
+      admitted: true,
+    });
+    const calibration = m.statsSnapshot().calibration;
+    expect(calibration).toMatchObject({
+      evaluations: 2,
+      correct: 1,
+      correctButSuppressed: 1,
+      admittedButWrong: 1,
+    });
+    expect(calibration.brierScore).toBeCloseTo(0.04);
+    expect(calibration.staticBrierScore).toBeCloseTo(0.16);
+    expect(calibration.buckets.reduce((sum, bucket) => sum + bucket.count, 0)).toBe(2);
+  });
+
+  it('counts abandoned issued work as terminal waste', () => {
+    const m = recorded([{ type: 'abandoned', server: 's', tool: 't', ruleId: 'r' }]);
+    expect(m.statsSnapshot()).toMatchObject({ abandoned: 1, wasted: 1 });
+    expect(m.ruleFeedback('r').wasted).toBe(1);
   });
 });
 
@@ -398,14 +469,21 @@ describe('Metrics — statsSnapshot shape', () => {
         'misses',
         'expired',
         'invalidated',
+        'abandoned',
         'wasted',
         'parserMisses',
         'stdioDelays',
         'suppressed',
         'estimatedSavedMs',
+        'estimatedAddedWaitMs',
+        'netEstimatedSavedMs',
+        'nearMisses',
         'wastePerHit',
+        'predictionQuality',
+        'calibration',
         'ageAtHit',
         'perServer',
+        'perTool',
         'perRule',
       ].sort(),
     );
@@ -433,7 +511,8 @@ describe('Metrics — statsSnapshot shape', () => {
     a.perServer['gh']!.hits = 999;
     a.perRule[0]!.speculated = 999;
     const b = m.statsSnapshot();
-    expect(b.perServer['gh']!.hits).toBe(2);
+    expect(b.perServer['gh']!.hits).toBe(1);
+    expect(b.perServer['gh']!.joins).toBe(1);
     expect(b.perRule[0]!.speculated).toBe(2);
   });
 });

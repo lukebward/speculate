@@ -165,6 +165,8 @@ export interface ArchetypeResult {
   sessions: number;
   /** Sessions observed but not scored, per seed. */
   warmupSessions: number;
+  /** All sessions, including warm-up, kept separately for cold-start curves. */
+  bySession: ReplayTotals[];
 }
 
 export interface EvalRun {
@@ -196,6 +198,8 @@ export interface EvalRun {
   standingTtlFactor: number;
   /** Spacing between calls, which on this corpus sets the ages outright. */
   callSpacingMs: number;
+  /** Workflow-only learning curve; unlike the headline, starts at session 1. */
+  learningCurve: RecallReport[];
 }
 
 export interface ReplayOptions {
@@ -355,6 +359,7 @@ export function replayArchetype(
   });
 
   const totals = emptyTotals();
+  const bySession = sessions.map(() => emptyTotals());
   const byTransition = new Map<string, TransitionStat>();
   const age = emptyAgeBreakdown();
   const buffer = new SimBuffer(
@@ -377,6 +382,10 @@ export function replayArchetype(
       if (prev) {
         const predictions = learner.predict(prev);
         const rank = rankOf(predictions, call);
+        const cold = bySession[s]!;
+        cold.pairs++;
+        const coldHit = scoreRank(cold, rank);
+        bill(cold, predictions.length, coldHit);
         if (scored) {
           totals.pairs++;
           const hit = scoreRank(totals, rank);
@@ -412,6 +421,10 @@ export function replayArchetype(
       bill(totals, trailing.length, false);
       buffer.issue(trailing, session.calls.length - 1, prev.timestamp);
     }
+    if (prev) {
+      const trailing = learner.predict(prev);
+      bill(bySession[s]!, trailing.length, false);
+    }
     buffer.endSession();
   }
 
@@ -424,6 +437,7 @@ export function replayArchetype(
     ),
     sessions: sessions.length,
     warmupSessions: warmup,
+    bySession,
   };
 }
 
@@ -437,11 +451,16 @@ export function replayArchetypeSeeds(
   const age = emptyAgeBreakdown();
   const merged = new Map<string, TransitionStat>();
   let shape = { sessions: 0, warmupSessions: 0 };
+  const bySession: ReplayTotals[] = [];
   for (const seed of seeds) {
     const result = replayArchetype(archetype, seed, opts);
     shape = { sessions: result.sessions, warmupSessions: result.warmupSessions };
     addTotals(totals, result.totals);
     addAge(age, result.age);
+    for (let i = 0; i < result.bySession.length; i++) {
+      bySession[i] ??= emptyTotals();
+      addTotals(bySession[i]!, result.bySession[i]!);
+    }
     for (const stat of result.byTransition) {
       const into = merged.get(stat.transition) ?? blankStat(stat.transition);
       into.pairs += stat.pairs;
@@ -459,6 +478,7 @@ export function replayArchetypeSeeds(
       (a, b) => b.pairs - a.pairs || (a.transition < b.transition ? -1 : 1),
     ),
     ...shape,
+    bySession,
   };
 }
 
@@ -487,6 +507,7 @@ export function runEvalDetailed(
   const overall = emptyTotals();
   const age = emptyAgeBreakdown();
   const floorAge = emptyAgeBreakdown();
+  const workflowBySession: ReplayTotals[] = [];
   for (const archetype of ARCHETYPES) {
     const result = replayArchetypeSeeds(archetype, list, opts);
     byArchetype.push(result);
@@ -498,6 +519,12 @@ export function runEvalDetailed(
     // kept on its own, because it is the only place any lead depth exists.
     addAge(age, result.age);
     if (FLOOR_ARCHETYPES.has(archetype.name)) addAge(floorAge, result.age);
+    else {
+      for (let i = 0; i < result.bySession.length; i++) {
+        workflowBySession[i] ??= emptyTotals();
+        addTotals(workflowBySession[i]!, result.bySession[i]!);
+      }
+    }
   }
   return {
     seeds: list,
@@ -511,7 +538,24 @@ export function runEvalDetailed(
     ttlMs: opts.ttlMs ?? DEFAULT_TTL_MS,
     standingTtlFactor: opts.standingTtlFactor ?? LONG_HORIZON_TTL_FACTOR,
     callSpacingMs: opts.callSpacingMs ?? CALL_SPACING_MS,
+    learningCurve: learningCurveReports(workflowBySession),
   };
+}
+
+function learningCurveReports(bySession: ReplayTotals[]): RecallReport[] {
+  const ranges: Array<{ label: string; from: number; to: number }> = [
+    { label: 'session 1', from: 0, to: 1 },
+    { label: 'session 2', from: 1, to: 2 },
+    { label: 'session 3', from: 2, to: 3 },
+    { label: 'sessions 4-5', from: 3, to: 5 },
+    { label: 'sessions 6-10', from: 5, to: 10 },
+    { label: 'sessions 11+', from: 10, to: bySession.length },
+  ];
+  return ranges.map(({ label, from, to }) => {
+    const totals = emptyTotals();
+    for (const session of bySession.slice(from, to)) addTotals(totals, session);
+    return toReport(label, totals);
+  });
 }
 
 function emptyAge(): AgeTotals {

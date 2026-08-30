@@ -673,9 +673,9 @@ describe('per-source scoring', () => {
     expect(preds.map((p) => p.args)).toEqual([{ id: 'p' }, { id: 'q' }, { id: 'r' }]);
     expect(preds[0]!.confidence).toBeGreaterThan(preds[1]!.confidence);
     expect(preds[1]!.confidence).toBeGreaterThan(preds[2]!.confidence);
-    // Same ruleId: they are the same learned transition, so §5.6 feedback
-    // scores the transition as a whole.
-    expect(new Set(preds.map((p) => p.ruleId)).size).toBe(1);
+    // Alternatives calibrate independently: a bad row-2 hypothesis must not
+    // inherit the primary candidate's feedback.
+    expect(new Set(preds.map((p) => p.ruleId)).size).toBe(3);
   });
 
   it('never exceeds maxPredictionsPerTrigger when a transition offers variants', () => {
@@ -1356,9 +1356,9 @@ describe('robustness', () => {
     });
   }
 
-  it('deep nesting degrades to no candidates (no partial prediction)', () => {
+  it('extracts a bounded deeply nested result path', () => {
     const learner = new TransitionLearner({ now });
-    // The only source of the value is 4 levels deep — beyond the search.
+    // The only source of the value is 4 levels deep.
     observePair(
       learner,
       'srv',
@@ -1373,7 +1373,96 @@ describe('robustness', () => {
     );
     expect(
       learner.predict(mkCall('srv', 'list', {}, { a: { b: { c: { d: 3 } } } })),
-    ).toEqual([]);
+    ).toMatchObject([{ tool: 'get', args: { id: 3 } }]);
+  });
+});
+
+describe('cold-start schemas, transforms, and context', () => {
+  it('uses a getter schema on the first list result, including a later list row', () => {
+    const learner = new TransitionLearner({ now });
+    learner.prime('srv', 'list_items', 'get_item', {
+      type: 'object',
+      properties: { itemId: { type: 'string' } },
+      required: ['itemId'],
+    });
+    const trigger = mkCall('srv', 'list_items', {}, {
+      data: { items: [{ label: 'a' }, { label: 'b' }, { label: 'c' }, { id: 'row-4' }] },
+    });
+    learner.observe(trigger);
+    expect(learner.predict(trigger)).toMatchObject([
+      { tool: 'get_item', args: { itemId: 'row-4' }, ruleId: 'schema:srv:list_items→get_item' },
+    ]);
+  });
+
+  it('maps an unambiguous qualified identity field to a short schema field', () => {
+    const learner = new TransitionLearner({ now });
+    learner.prime('srv', 'docs_search', 'docs_fetch', {
+      type: 'object',
+      properties: { url: { type: 'string' } },
+      required: ['url'],
+    });
+    const trigger = mkCall('srv', 'docs_search', {}, {
+      results: [{ title: 'Streams', contentUrl: 'https://docs.test/streams' }],
+    });
+    learner.observe(trigger);
+    expect(learner.predict(trigger)).toMatchObject([
+      { tool: 'docs_fetch', args: { url: 'https://docs.test/streams' } },
+    ]);
+  });
+
+  it('abstains when qualified identity fields are ambiguous', () => {
+    const learner = new TransitionLearner({ now });
+    learner.prime('srv', 'docs_search', 'docs_fetch', {
+      type: 'object',
+      properties: { url: { type: 'string' } },
+      required: ['url'],
+    });
+    const trigger = mkCall('srv', 'docs_search', {}, {
+      results: [{ contentUrl: 'https://docs.test/a', apiUrl: 'https://docs.test/api/a' }],
+    });
+    learner.observe(trigger);
+    expect(learner.predict(trigger)).toEqual([]);
+  });
+
+  it('learns common deterministic argument transforms', () => {
+    const learner = new TransitionLearner({ now });
+    observePair(
+      learner,
+      'srv',
+      { tool: 'list', parsed: { path: '/tmp/one.txt' } },
+      { tool: 'read', args: { name: 'one.txt' } },
+    );
+    observePair(
+      learner,
+      'srv',
+      { tool: 'list', parsed: { path: '/tmp/two.txt' } },
+      { tool: 'read', args: { name: 'two.txt' } },
+    );
+    expect(learner.predict(mkCall('srv', 'list', {}, { path: '/tmp/three.txt' }))).toMatchObject([
+      { tool: 'read', args: { name: 'three.txt' } },
+    ]);
+  });
+
+  it('uses real three-call context and backs off outside that context', () => {
+    const learner = new TransitionLearner({ now });
+    let timestamp = 0;
+    const train = (context: string, target: string): void => {
+      timestamp += 1_000_000;
+      learner.observe(mkCall('srv', context, {}, null, timestamp));
+      learner.observe(mkCall('srv', 'select', {}, null, timestamp + 10));
+      learner.observe(mkCall('srv', target, {}, null, timestamp + 20));
+    };
+    for (let i = 0; i < 4; i++) train('from_a', 'detail_a');
+    for (let i = 0; i < 4; i++) train('from_b', 'detail_b');
+
+    timestamp += 1_000_000;
+    learner.observe(mkCall('srv', 'from_b', {}, null, timestamp));
+    const trigger = mkCall('srv', 'select', {}, null, timestamp + 10);
+    learner.observe(trigger);
+    expect(learner.predict(trigger).map((prediction) => prediction.tool).slice(0, 2)).toEqual([
+      'detail_b',
+      'detail_a',
+    ]);
   });
 });
 

@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   UsageRecorder,
+  compactUsageRecords,
   createUsageRecorder,
   readUsageReport,
   type UsageCounters,
@@ -27,6 +28,13 @@ const counters = (overrides: Partial<UsageCounters> = {}): UsageCounters => ({
   speculativeCalls: 0,
   wasted: 0,
   estimatedSavedMs: 0,
+  estimatedAddedWaitMs: 0,
+  predictionOpportunities: 0,
+  predictionOffered: 0,
+  predictionHitsAt1: 0,
+  predictionHitsAt3: 0,
+  nearMisses: 0,
+  nearMissDistanceOne: 0,
   ...overrides,
 });
 
@@ -272,6 +280,50 @@ describe('readUsageReport', () => {
       resolve('/workspace/a'),
       resolve('/workspace/b'),
     ]);
+  });
+
+  it('filters by time/workspace and rolls up server/tool dimensions', () => {
+    const directory = dir();
+    writeSnapshot(directory, 'old.json', snapshot({
+      sessionId: 'old',
+      workspace: resolve('/workspace/old'),
+      updatedAt: 1_000,
+      counters: counters({ hits: 9 }),
+    }));
+    writeSnapshot(directory, 'new.json', snapshot({
+      sessionId: 'new',
+      workspace: resolve('/workspace/a'),
+      startedAt: 2_000,
+      updatedAt: 3_000,
+      counters: counters({ hits: 1, misses: 1, estimatedSavedMs: 250 }),
+      breakdown: {
+        servers: { github: counters({ hits: 1, misses: 1, estimatedSavedMs: 250 }) },
+        tools: { github: { get_issue: counters({ hits: 1, misses: 1, estimatedSavedMs: 250 }) } },
+      },
+    }));
+
+    const report = readUsageReport(directory, { sinceMs: 2_000, workspace: '/workspace/a' });
+    expect(report.totals).toMatchObject({ sessions: 1, hits: 1, misses: 1 });
+    expect(report.servers).toMatchObject([{ server: 'github', hits: 1, misses: 1 }]);
+    expect(report.tools).toMatchObject([{ server: 'github', tool: 'get_issue', hits: 1 }]);
+  });
+
+  it('compacts old completed sessions without changing the report', () => {
+    const directory = dir();
+    for (const [name, hits] of [['a', 1], ['b', 2]] as const) {
+      writeSnapshot(directory, `${name}.json`, snapshot({
+        sessionId: name,
+        endedAt: 2_000,
+        counters: counters({ hits }),
+      }));
+    }
+    const before = readUsageReport(directory);
+    expect(compactUsageRecords(directory, 10_000)).toEqual({
+      archivedSessions: 2,
+      removedFiles: 2,
+    });
+    expect(readdirSync(directory).filter((entry) => entry.endsWith('.json'))).toHaveLength(1);
+    expect(readUsageReport(directory)).toEqual(before);
   });
 
   it('rejects malformed and invalid records', () => {

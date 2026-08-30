@@ -226,6 +226,18 @@ describe('executor drain queue', () => {
     expect(calls.map((c) => c.tool)).toEqual(['a']);
   });
 
+  it('drops never-issued queued work cleanly at session end', () => {
+    const { executor, calls, budget, metrics } = makeHarness('stdio');
+    budget.realStarted('github');
+    executor.submit([pred('a', 0.9)]);
+    expect(calls).toHaveLength(0);
+    expect(executor.abandonPending()).toBe(1);
+    expect(metrics.statsSnapshot().suppressed['session-end']).toBe(1);
+    budget.realFinished('github');
+    executor.drainServer('github');
+    expect(calls).toHaveLength(0);
+  });
+
   it('re-checks eligibility at drain time (suspension between queue and fire)', async () => {
     const h = makeHarness('stdio');
     h.executor.submit([pred('a', 0.9), pred('b', 0.8)]);

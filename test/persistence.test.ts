@@ -11,8 +11,10 @@ import {
   StateStore,
   defaultStateDirectory,
   defaultStatePath,
+  mergePersistedState,
 } from '../src/persistence.js';
 import { TransitionLearner } from '../src/learner.js';
+import { LatencyModel } from '../src/latency.js';
 import { Metrics } from '../src/metrics.js';
 import type { ObservedCall } from '../src/types.js';
 
@@ -69,6 +71,116 @@ describe('StateStore', () => {
     writeFileSync(blocker, 'occupied');
     const bad = new StateStore(join(blocker, 'child.json'));
     expect(bad.save({ learner: {}, ruleFeedback: {} })).toBe(false);
+  });
+
+  it('refuses current state from a different workspace/account scope', () => {
+    const path = join(dir(), 'state.json');
+    const a = new StateStore(path, () => 1, [], 'scope-a');
+    expect(a.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
+    expect(a.load()?.scope).toBe('scope-a');
+    expect(new StateStore(path, () => 2, [], 'scope-b').load()).toBeNull();
+  });
+
+  it('merges disjoint concurrent learner entities instead of last-writer loss', () => {
+    const transition = (nextTool: string) => ({
+      server: 's',
+      prevTool: 'list',
+      nextTool,
+      count: 2,
+      templates: [],
+    });
+    const merged = mergePersistedState(
+      {
+        version: 1,
+        savedAt: 1,
+        learner: { transitions: [transition('get_a')] },
+        ruleFeedback: { a: { hits: 1, wasted: 0, speculated: 1 } },
+      },
+      {
+        version: 1,
+        savedAt: 2,
+        learner: { transitions: [transition('get_b')] },
+        ruleFeedback: { b: { hits: 0, wasted: 1, speculated: 1 } },
+      },
+    );
+    expect((merged.learner as { transitions: Array<{ nextTool: string }> }).transitions
+      .map((item) => item.nextTool)
+      .sort()).toEqual(['get_a', 'get_b']);
+    expect(Object.keys(merged.ruleFeedback).sort()).toEqual(['a', 'b']);
+  });
+
+  it('adds same-rule feedback deltas without double-counting the shared baseline', () => {
+    const state = (hits: number, savedAt: number) => ({
+      version: 1 as const,
+      savedAt,
+      learner: { transitions: [] },
+      ruleFeedback: {
+        r: { hits, wasted: 0, speculated: hits, lastUpdated: savedAt },
+      },
+    });
+    const merged = mergePersistedState(state(12, 0), state(11, 0), state(10, 0));
+    expect(merged.ruleFeedback['r']).toMatchObject({ hits: 13, speculated: 13 });
+  });
+
+  it('round-trips optional latency state without breaking legacy files', () => {
+    const path = join(dir(), 'state.json');
+    const latency = new LatencyModel({ now: () => 1_000 });
+    latency.observe('s', 'slow', 180);
+    const store = new StateStore(path, () => 1_000);
+    expect(store.save({
+      learner: { transitions: [] },
+      ruleFeedback: {},
+      latency: latency.exportState(),
+    })).toBe(true);
+    const loaded = store.load();
+    const restored = new LatencyModel({ now: () => 1_000 });
+    restored.importState(loaded?.latency);
+    expect(restored.estimate('s', 'slow')).toMatchObject({ source: 'tool', expectedMs: 180 });
+
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      savedAt: 2_000,
+      learner: { transitions: [] },
+      ruleFeedback: {},
+    }));
+    expect(new StateStore(path, () => 2_000).load()?.latency).toBeUndefined();
+  });
+
+  it('merges concurrent latency deltas without counting the baseline twice', () => {
+    const model = (values: number[]) => {
+      const latency = new LatencyModel({ now: () => 0 });
+      for (const value of values) latency.observe('s', 't', value);
+      return latency.exportState();
+    };
+    const state = (latency: ReturnType<LatencyModel['exportState']>, savedAt: number) => ({
+      version: 1 as const,
+      savedAt,
+      learner: { transitions: [] },
+      ruleFeedback: {},
+      latency,
+    });
+    const baseline = state(model([100]), 0);
+    const merged = mergePersistedState(
+      state(model([100, 200]), 0),
+      state(model([100, 300]), 0),
+      baseline,
+    );
+    const restored = new LatencyModel({ now: () => 0 });
+    restored.importState(merged.latency);
+    expect(restored.estimate('s', 't').expectedMs).toBeCloseTo(200);
+    expect(merged.latency?.tools[0]?.observations).toBe(3);
+  });
+
+  it('merges concurrent shadow-candidate feedback deltas', () => {
+    const state = (correct: number, evaluated: number) => ({
+      version: 1 as const,
+      savedAt: 0,
+      learner: { transitions: [] },
+      ruleFeedback: {},
+      candidateFeedback: { r: { correct, evaluated, lastUpdated: 0 } },
+    });
+    const merged = mergePersistedState(state(4, 6), state(3, 7), state(3, 5));
+    expect(merged.candidateFeedback?.['r']).toMatchObject({ correct: 4, evaluated: 8 });
   });
 });
 
@@ -323,9 +435,33 @@ describe('Metrics feedback priors', () => {
     m.record({ type: 'speculated', server: 's', tool: 't', ruleId: 'r1' });
     m.record({ type: 'hit', server: 's', tool: 't', ruleId: 'r1', savedMs: 100 });
     const out = m.exportRuleFeedback();
-    expect(out['r1']).toEqual({ hits: 3, wasted: 0, speculated: 5 }); // 2+1, 4+1
+    expect(out['r1']).toEqual({ hits: 3, wasted: 0, speculated: 5, lastUpdated: 0 }); // 2+1, 4+1
     expect(out['bad']).toBeUndefined();
     expect(out['alsoBad']).toBeUndefined();
+  });
+
+  it('decays by elapsed time instead of restart count', () => {
+    const first = new Metrics({ mode: 'strict', log: 'off', now: () => 0 });
+    first.importRuleFeedback({
+      r1: { hits: 10, wasted: 4, speculated: 20, lastUpdated: 0 },
+    });
+    const persisted = first.exportRuleFeedback();
+
+    const immediateRestart = new Metrics({ mode: 'strict', log: 'off', now: () => 0 });
+    immediateRestart.importRuleFeedback(persisted);
+    expect(immediateRestart.ruleFeedback('r1')).toEqual({
+      hits: 10,
+      wasted: 4,
+      speculated: 20,
+    });
+
+    const later = new Metrics({
+      mode: 'strict',
+      log: 'off',
+      now: () => 14 * 24 * 60 * 60_000,
+    });
+    later.importRuleFeedback(persisted);
+    expect(later.ruleFeedback('r1').hits).toBeCloseTo(10 / Math.E, 5);
   });
 });
 
