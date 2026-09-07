@@ -137,8 +137,10 @@ const configSchema = z.object({
       /** Override the state-file location (default: XDG state dir, per
        * config file). Relative paths resolve against the proxy's cwd. */
       path: z.string().min(1).optional(),
+      retentionDays: z.number().int().min(1).max(3650).default(30),
+      maxBytes: z.number().int().min(65_536).max(67_108_864).default(8_388_608),
     })
-    .optional(),
+    .default({ enabled: true, retentionDays: 30, maxBytes: 8_388_608 }),
 });
 
 /**

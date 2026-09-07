@@ -1,4 +1,49 @@
-import { compactUsageRecords, readUsageReport, type UsageReport } from './usage.js';
+import { compactUsageRecords, readUsageReport, type UsageReport, type UsageTotals } from './usage.js';
+
+export interface LearningSummary {
+  /** Recorded ready hits, successful joins, and read misses; excludes writes. */
+  recordedReadOutcomes: number;
+  opportunities: number;
+  offered: number;
+  coverage: number | null;
+  matched: number;
+  withoutCandidate: number;
+  unmatched: number;
+  usefulPrefetches: number;
+  estimatedNetSavedMs: number;
+  benefit: 'no-prediction-data' | 'no-useful-prefetches' | 'positive-estimate' | 'negative-estimate' | 'neutral-estimate';
+}
+
+/** Summarizes recorded evidence, not whether a proxy is currently running. */
+export function summarizeLearning(totals: UsageTotals): LearningSummary {
+  const opportunities = totals.predictionOpportunities;
+  const offered = totals.predictionOffered;
+  const matched = totals.predictionHitsAt3;
+  const usefulPrefetches = totals.hits + totals.joins;
+  const estimatedNetSavedMs = totals.estimatedSavedMs - totals.estimatedAddedWaitMs;
+  return {
+    recordedReadOutcomes: usefulPrefetches + totals.misses,
+    opportunities,
+    offered,
+    coverage: opportunities > 0 ? offered / opportunities : null,
+    matched,
+    withoutCandidate: Math.max(0, opportunities - offered),
+    unmatched: Math.max(0, offered - matched),
+    usefulPrefetches,
+    estimatedNetSavedMs,
+    benefit: estimatedNetSavedMs < 0 ? 'negative-estimate'
+      : usefulPrefetches > 0 ? (estimatedNetSavedMs > 0 ? 'positive-estimate' : 'neutral-estimate')
+      : opportunities === 0 ? 'no-prediction-data' : 'no-useful-prefetches',
+  };
+}
+
+const BENEFIT_LABEL: Record<LearningSummary['benefit'], string> = {
+  'no-prediction-data': 'no prediction-quality observations recorded',
+  'no-useful-prefetches': 'no useful prefetches recorded',
+  'positive-estimate': 'positive tool-wait estimate',
+  'negative-estimate': 'estimated added wait exceeds estimated saved wait',
+  'neutral-estimate': 'useful prefetches recorded; no positive net estimate',
+};
 
 export interface StatsArgs {
   json: boolean;
@@ -89,6 +134,7 @@ export function formatUsageReport(
     ? 'Speculate stats (all time)'
     : `Speculate stats (since ${report.since.slice(0, 10)})`;
   const used = report.totals.hits + report.totals.joins;
+  const learning = summarizeLearning(report.totals);
   const wastePerHit = report.totals.wastePerHit === null
     ? '—'
     : report.totals.wastePerHit.toFixed(2);
@@ -103,6 +149,9 @@ export function formatUsageReport(
     `Wasted calls: ${report.totals.wasted} (${wastePerHit} per hit)`,
     `Predictor recall: @1 ${formatPercentage(report.totals.predictionRecallAt1)}, @3 ${formatPercentage(report.totals.predictionRecallAt3)}`,
     `Prediction precision when offered: ${formatPercentage(report.totals.predictionPrecisionAt3)}`,
+    `Prediction coverage: ${learning.offered}/${learning.opportunities} opportunities (${formatPercentage(learning.coverage)})`,
+    `Without a ranked candidate: ${learning.withoutCandidate}; offered but unmatched: ${learning.unmatched}`,
+    `Recorded benefit: ${BENEFIT_LABEL[learning.benefit]}`,
     `Argument near misses: ${report.totals.nearMisses} (${report.totals.nearMissDistanceOne} one-key away)`,
     `Sessions: ${report.totals.sessions}`,
     `MCP: ${formatDuration(report.bySource.mcp.estimatedSavedMs)} saved`,
@@ -128,6 +177,8 @@ export function formatUsageReport(
         )
       : []),
     `Ignored records: ${report.ignoredRecords}`,
+    `Last recorded activity: ${report.updatedAt ?? 'unknown'}`,
+    "Activation: speculate status; retained learning: speculate memory",
   ];
   return `${lines.join('\n')}\n`;
 }
@@ -159,7 +210,7 @@ export function runStats(
     workspace: args.workspace,
   });
   const output = args.json
-    ? `${JSON.stringify(report, null, 2)}\n`
+    ? `${JSON.stringify({ ...report, learning: summarizeLearning(report.totals) }, null, 2)}\n`
     : formatUsageReport(report, args);
   (options.write ?? ((text) => process.stdout.write(text)))(output);
   return 0;

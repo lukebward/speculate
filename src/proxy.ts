@@ -30,6 +30,7 @@ import { SpeculationExecutor } from './executor.js';
 import { compileConfigRules } from './configRules.js';
 import { morphologicalPairs } from './priming.js';
 import { StateStore } from './persistence.js';
+import { collectRuntimeSecrets } from './privacy.js';
 import { LatencyModel } from './latency.js';
 import { CandidateCalibrator } from './calibration.js';
 import { VERSION } from './version.js';
@@ -157,7 +158,11 @@ export class SpeculateProxy {
     this.latency = new LatencyModel({ now });
     this.calibration = new CandidateCalibrator({ now });
     this.store = opts.statePath
-      ? new StateStore(opts.statePath, now, opts.stateFallbackPaths ?? [], opts.stateScope)
+      ? new StateStore(opts.statePath, now, opts.stateFallbackPaths ?? [], opts.stateScope, {
+          retentionDays: config.persistence?.retentionDays,
+          maxBytes: config.persistence?.maxBytes,
+          secretValues: () => collectRuntimeSecrets(config),
+        })
       : null;
     if (this.store) {
       const state = this.store.load();
@@ -350,7 +355,7 @@ export class SpeculateProxy {
       await Promise.all([...this.upstreams.values()].map((u) => u.close()));
       await this.server.close();
     } finally {
-      this.usageRecorder?.close();
+      await this.usageRecorder?.close();
     }
   }
 
@@ -576,7 +581,9 @@ export class SpeculateProxy {
         const payload = {
           ...this.metrics.statsSnapshot(),
           cache: this.cache.size(),
-          persistence: this.store ? { path: this.store.path } : { enabled: false },
+          persistence: this.store
+            ? { enabled: true, path: this.store.path, diagnostics: { ...this.store.diagnostics } }
+            : { enabled: false },
         };
         return {
           content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
@@ -642,6 +649,7 @@ export class SpeculateProxy {
     if (!upstream?.connected) {
       throw new McpError(ErrorCode.InternalError, `upstream '${server}' is not connected`);
     }
+    this.executor.supersedePendingNext(server);
     const isReadOnly = this.policy.isAffirmativelyReadOnly(server, tool);
 
     // §6.2 conservative invalidation: unknown/mutating tools invalidate on

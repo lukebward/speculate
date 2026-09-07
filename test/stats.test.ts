@@ -133,6 +133,45 @@ describe('parseStatsArgs', () => {
 });
 
 describe('formatUsageReport', () => {
+  it('separates missing candidates from offered predictions that missed', () => {
+    const fixture: UsageReport = {
+      ...report,
+      totals: totals({
+        sessions: 4, hits: 4, joins: 2, misses: 14,
+        predictionOpportunities: 16, predictionOffered: 10,
+        predictionHitsAt1: 5, predictionHitsAt3: 7,
+        estimatedSavedMs: 800, estimatedAddedWaitMs: 200,
+      }),
+    };
+    const output = formatUsageReport(fixture);
+    expect(output).toContain('Prediction coverage: 10/16 opportunities (62.5%)');
+    expect(output).toContain('Without a ranked candidate: 6; offered but unmatched: 3');
+    expect(output).toContain('Recorded benefit: positive tool-wait estimate');
+    let json = '';
+    runStats({ json: true }, { read: () => fixture, write: (value) => { json = value; } });
+    expect(JSON.parse(json).learning).toEqual({
+      recordedReadOutcomes: 20, opportunities: 16, offered: 10, coverage: 0.625,
+      matched: 7, withoutCandidate: 6, unmatched: 3, usefulPrefetches: 6,
+      estimatedNetSavedMs: 600, benefit: 'positive-estimate',
+    });
+  });
+
+  it('does not call absent predictions or a negative net estimate a benefit', () => {
+    for (const [counters, expected] of [
+      [totals({ sessions: 2, misses: 5 }), 'no-prediction-data'],
+      [totals({ sessions: 2, misses: 5, predictionOpportunities: 4 }), 'no-useful-prefetches'],
+      [totals({ sessions: 2, hits: 1, estimatedSavedMs: 20, estimatedAddedWaitMs: 50 }), 'negative-estimate'],
+    ] as const) {
+      let json = '';
+      runStats({ json: true }, {
+        read: () => ({ ...report, totals: counters }),
+        write: (value) => { json = value; },
+      });
+      expect(JSON.parse(json).learning.benefit).toBe(expected);
+      expect(JSON.parse(json).learning.coverage).toBe(counters.predictionOpportunities ? 0 : null);
+    }
+  });
+
   it('formats cumulative totals, sources, and workspaces', () => {
     const output = formatUsageReport(report);
 
@@ -407,7 +446,7 @@ describe('runStats', () => {
     );
   });
 
-  it('prints the exact report as JSON', () => {
+  it('prints the report with additive learning diagnostics as JSON', () => {
     let stdout = '';
 
     const exitCode = runStats(
@@ -416,7 +455,8 @@ describe('runStats', () => {
     );
 
     expect(exitCode).toBe(0);
-    expect(JSON.parse(stdout)).toEqual(report);
-    expect(stdout).toBe(`${JSON.stringify(report, null, 2)}\n`);
+    expect(JSON.parse(stdout)).toMatchObject(report);
+    expect(JSON.parse(stdout).learning).toHaveProperty('withoutCandidate');
+    expect(stdout.endsWith('\n')).toBe(true);
   });
 });

@@ -7,6 +7,7 @@
 | `speculate status` | What is wrapped here, what needs a login, and what changed since `on` |
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
+| `speculate memory` | Retained learning inventory; `clear --all` removes managed learning and usage records |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
@@ -43,6 +44,12 @@ Cumulative time saved, conservative stdio wait, net estimate, hit/waste rate,
 predictor recall, and argument near misses. `--json` emits the full structured
 report.
 
+Prediction coverage distinguishes opportunities with no ranked candidate from
+candidates that were offered but did not match. The benefit summary uses
+recorded hits, joins, and estimated wait; waste is displayed separately. It does not measure total task
+time or prove a proxy is currently active. Use `speculate status` for activation.
+JSON preserves existing fields and adds a `learning` summary.
+
 ```bash
 speculate stats --since 7d
 speculate stats --workspace . --by-server --by-tool
@@ -54,9 +61,34 @@ speculate stats --compact
 it preserves each snapshot and every filter, while avoiding thousands of tiny
 files.
 
-The same numbers are available to the agent mid-session as the
+The agent can inspect current-session equivalents through the
 `speculate__stats` tool, which also reports how stale served prefetches were and
-breaks outcomes down by server and tool.
+breaks outcomes down by server and tool. CLI stats aggregate retained sessions.
+
+## `memory`
+
+Learning persists automatically. Inspect aggregate inventory without printing
+argument values:
+
+```bash
+speculate memory
+speculate memory --json
+speculate memory --config speculate.config.json
+speculate memory clear --config speculate.config.json
+speculate memory clear --all
+```
+
+`--config` selects an explicit configured state path. `clear --all` removes
+recognized learning and usage records from the managed state directory; custom
+paths must be cleared using their config. Authentication, host registrations,
+and wrapping settings are preserved. Active sessions can continue using their
+in-memory learning, but stop saving into cleared generations. Start a new
+session to resume persistent learning from cleared state.
+
+The inventory shows file size, last-save time, and counts with repeated evidence.
+Those counts do not prove a call can be predicted now: fresh history, eligibility,
+and admission still matter. The bare command displays default limits; use
+`--config PATH` to inspect custom limits.
 
 ## `wrap`
 

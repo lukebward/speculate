@@ -14,6 +14,7 @@
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.gif)
 
 - **No configuration, nothing per-server.** Speculate learns from your own traffic, so it works the same on a server nobody has heard of.
+- **Memory across sessions.** It writes compact learning to your disk automatically. Recent call payloads stay in bounded session memory; argument bindings can reach across intervening calls. `speculate memory` shows what is retained and `speculate stats` shows whether it helps.
 - **Read-only, always.** It runs tools the server marks read-only, and nothing else.
 - **Nothing taken away.** Every change is recorded, and `off` reverses it exactly.
 
@@ -33,13 +34,20 @@ so new runs expose that cost rather than letting it disappear. The saving
 still tracks how slow the server is, which is the point: a local stdio server
 answering in single-digit milliseconds has nothing worth hiding.
 
-**Warm** is the median of runs 2 and 3. Expect little from the first pass: Speculate cannot predict a call it has never seen, and warming up takes two or three runs. The benchmark repeats an identical session, so treat it as the best case for a workflow you genuinely repeat. Three of the four need no credential. Check them yourself:
+**Warm** is the median of runs 2 and 3. Repeated traffic usually helps: the learner can make some schema-backed predictions on a first pass, while learned transitions need evidence. These benchmarks warmed over two or three runs and repeat an identical session, so treat them as a best case for a workflow you repeat. Three of the four need no credential. Check them yourself:
 
 ```bash
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
 ```
 
 The [design document](https://lukebward.github.io/speculate/design/releases/) has every run, including the ones that went the wrong way.
+
+The [v0.19 qualification](docs/design/local-learning-benchmark.md) compares
+changing repeated workflows against v0.18: useful prefetches rose from 68.5%
+to 83.75% and mean tool wait fell 12.87% across four controlled fixtures with
+120 ms injected latency. Most additional useful results were in-flight joins;
+ready hits and tail latency did not improve. See the report for cold starts,
+waste, negative controls, and the limited gains in live-server checks.
 
 ## Install
 
@@ -65,13 +73,15 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 | `speculate status [path]` | Every project at a glance; give a path (`.`) for one project's detail |
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Saved time, conservative net, predictor recall, near misses, and per-server/tool views |
+| `speculate memory [--json]` | Inspect retained learning, size, last-save time, and default limits; `clear --all` removes managed learning and usage records |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
 ## Safety
 
 - Speculate only ever executes tools the server marks read-only (`readOnlyHint` plus your own `allowTools` in `strict` mode; annotations alone in `annotated`, the zero-config default). It never speculates on an unknown tool. It forwards every real call verbatim, writes included, and flushes the cache on any mutation.
-- Cached results are byte-identical, single-use, short-lived, and never hit the disk. What Speculate persists is tool names and argument templates, never results.
+- Cached results are byte-identical, single-use, short-lived, and remain in memory. Disk learning contains tool names, argument source descriptors, filtered constants, and aggregate evidence. Learner observations have a 30-day retention window; state is capped at 8 MiB per workspace/account by default. There is no raw call/result archive.
+- Known credentials and recognizable secret literals are removed before learned state is written or imported. This reduces exposure; arbitrary private strings cannot always be recognized. Local files inherit your account's access controls. See [disk contents and secret handling](docs/safety.md#local-learning-and-secrets).
 - `speculate on` changes config through the host's own CLIs and records everything it did, so `off` can undo it exactly. One scoped exception: wrapping a plugin's server also adds that server's name to `disabledMcpServers` in your own `~/.claude.json` — the key the `/mcp` screen writes and no CLI does — and `off` removes exactly that entry.
 - Speculate registers as its own OAuth client and never reads another application's credential store, so refreshing its token cannot disturb Claude Code's. It never logs a header value: `doctor` shows names and expiry, never the token.
 
@@ -126,7 +136,7 @@ Your client sees standard MCP: same tools, same results. Predicted reads come ba
 
 A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json); `speculate init` writes a starter.
 
-Rules are the only hand-written prediction source, and you need them for one thing: skipping the warm-up. A rule fires on the first call, where the learner must watch a transition happen before predicting it. Rules select values out of the trigger's arguments or its parsed result (`$args.owner`, `$item.number`, `forEach: "$parsed"`). A server that answers in non-JSON text can therefore be learned but not ruled.
+Rules provide explicit predictions from the first matching call. The learner normally builds evidence from repeated transitions, although compatible tool schemas can also support a prediction before a transition has been observed. Rules select values out of the trigger's arguments or its parsed result (`$args.owner`, `$item.number`, `forEach: "$parsed"`). A server that answers in non-JSON text can therefore be learned but not ruled.
 
 </details>
 

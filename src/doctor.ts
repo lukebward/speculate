@@ -15,6 +15,7 @@ import { StateStore } from './persistence.js';
 import { VERSION } from './version.js';
 import type { Rule, SpeculateConfig } from './types.js';
 import { readOAuthRecord } from './oauthStore.js';
+import { collectRuntimeSecrets } from './privacy.js';
 
 const CONNECT_TIMEOUT_MS = 15_000;
 
@@ -26,6 +27,7 @@ export async function runDoctor(
   config: SpeculateConfig,
   statePath: string | null,
   out: (line: string) => void = (line) => process.stdout.write(line + '\n'),
+  options: { stateScope?: string } = {},
 ): Promise<boolean> {
   out(`speculate doctor (v${VERSION}) — mode: ${config.mode}`);
   let healthy = true;
@@ -131,7 +133,11 @@ export async function runDoctor(
 
   out('');
   if (statePath) {
-    const state = new StateStore(statePath).load();
+    const state = new StateStore(statePath, Date.now, [], options.stateScope, {
+      retentionDays: config.persistence?.retentionDays,
+      maxBytes: config.persistence?.maxBytes,
+      secretValues: () => collectRuntimeSecrets(config),
+    }).load();
     if (state) {
       const transitions = Array.isArray((state.learner as { transitions?: unknown[] })?.transitions)
         ? (state.learner as { transitions: unknown[] }).transitions.length

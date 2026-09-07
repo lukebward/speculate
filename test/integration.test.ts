@@ -33,7 +33,7 @@ const harnesses: Harness[] = [];
 
 async function startProxy(
   mode: 'strict' | 'annotated' | 'off',
-  opts: { predict?: boolean; rules?: unknown[]; statePath?: string } = {},
+  opts: { predict?: boolean; rules?: unknown[]; statePath?: string; runtimeSecret?: string } = {},
 ): Promise<Harness> {
   const dir = mkdtempSync(join(tmpdir(), 'speculate-itest-'));
   const callLogPath = join(dir, 'calls.jsonl');
@@ -52,6 +52,7 @@ async function startProxy(
           env: {
             SPECULATE_MOCK_LATENCY_MS: String(LATENCY_MS),
             SPECULATE_MOCK_CALL_LOG: callLogPath,
+            ...(opts.runtimeSecret ? { SERVICE_TOKEN: opts.runtimeSecret } : {}),
           },
           // `predict: false` leaves the server with no hand-written rules at
           // all, so only the learner can produce predictions.
@@ -357,6 +358,31 @@ describe('speculate end-to-end', () => {
     // the wiring: stats still work and nothing crashed with the store off.
     const stats = await readStats(client);
     expect(stats.realCalls).toBeGreaterThanOrEqual(2);
+  }, 30_000);
+
+  it('filters runtime credential literals before proxy persistence and diagnostics', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'speculate-secret-state-'));
+    const statePath = join(stateDir, 'state.json');
+    const secret = 'opaque-canary-value-7162';
+    const harness = await startProxy('annotated', { predict: false, statePath, runtimeSecret: secret });
+    try {
+      for (const n of [41, 42, 43]) {
+        await timedCall(harness.client, 'get_issue', { ...REPO, correlation: secret, issue_number: n });
+        await timedCall(harness.client, 'get_issue_comments', { ...REPO, correlation: secret, issue_number: n });
+      }
+      await sleep(1500);
+      const stats = await readStats(harness.client);
+      expect(JSON.stringify(stats)).not.toContain(secret);
+      expect(stats).toMatchObject({ persistence: { enabled: true, diagnostics: { removedSensitive: expect.any(Number) } } });
+      await harness.client.close();
+      expect(existsSync(statePath)).toBe(true);
+      const retained = readFileSync(statePath, 'utf8');
+      expect(retained).not.toContain(secret);
+      expect(JSON.parse(retained).memory.removedSensitive).toBeGreaterThan(0);
+    } finally {
+      await harness.client.close().catch(() => {});
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   }, 30_000);
 
   // The fingerprinting test that lived here asserted a server was recognized

@@ -53,9 +53,40 @@ A tool is eligible only if both hold:
 
 ## What the cache holds
 
-Cached results are byte-identical, single-use, short-lived, and never hit the
-disk. What Speculate persists is tool names and argument templates — never
-results.
+Cached results are byte-identical, single-use, short-lived, and remain in
+memory. There is no raw call/result archive.
+
+## Local learning and secrets
+
+Speculate writes compact learning to your disk by default: tool names, argument
+source descriptors, filtered literal constants, and aggregate feedback/latency
+evidence. Earlier-call history stays in bounded session memory (eight calls and
+an estimated 1 MiB per server, separate from the current call and cache).
+Persistence uses a 30-day retention window and
+an 8 MiB limit per workspace/account state by default.
+
+The persistence boundary filters known runtime credentials, sensitive literal
+fields, and recognizable secret formats. The same filtering applies to legacy
+imports, concurrent merges, and atomic temporary files. Structural bindings
+can still obtain values from current calls without keeping those values on
+disk. Unusable literal sources are discarded; redaction text is never used as
+a predicted argument.
+
+Loading an old file sanitizes the model in memory. The original file is replaced
+on the next successful save; merely inspecting it with `doctor` does not rewrite
+it. Use `memory clear` to remove retained learning immediately.
+
+Filtering cannot recognize every arbitrary secret or private string. Ordinary
+identifiers and paths can remain as useful learned constants. The state is not
+encrypted; local open-source software does not make stored data secret-proof.
+POSIX files request owner-only permissions. On Windows, protection comes from
+the containing folder's ACL, not POSIX mode bits.
+
+`speculate memory` reports aggregate inventory without dumping values.
+`speculate memory clear --all` removes managed learning and usage records;
+`clear --config PATH` handles an explicitly configured state file. These
+commands preserve OAuth credentials and host configuration. See
+[configuration](configuration.md#top-level) for locations and limits.
 
 ## Credentials
 
@@ -71,8 +102,8 @@ Code's.
     commits to anything — what the user is *probably* about to do. "Read-only"
     bounds state mutation, not information disclosure.
 
-    Speculate's position: speculation only targets servers the session is
-    already sending real traffic to, never a server the agent hasn't touched.
+    Speculation targets configured, connected upstreams. Learned opening reads
+    can run at startup before the agent's first real call to that server.
     Privacy-sensitive deployments should use per-server denylists or `off`.
     Documented, not solved.
 

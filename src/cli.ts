@@ -37,6 +37,7 @@ import { attachStoredOAuth } from './oauthProvider.js';
 import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import { createUsageRecorder } from './usage.js';
 import { VERSION } from './version.js';
+import { parseMemoryArgs, runMemory } from './memory.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
@@ -51,6 +52,10 @@ install-and-it-works (no config files edited by hand):
   speculate stats [--json] [--since 7d] [--workspace PATH]
                    [--by-server] [--by-tool] [--compact]
                                            cumulative usage and prediction quality
+  speculate memory [--json] [--config PATH]
+                                           inventory bounded learned/usage memory
+  speculate memory clear (--all | --config PATH) [--json]
+                                           clear only the explicitly scoped memory records
   speculate auth [server]                  authorize Speculate with remote servers that need a
                                            login (no argument: every one that does)
   speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
@@ -112,6 +117,7 @@ interface Args {
     | 'status'
     | 'sync'
     | 'stats'
+    | 'memory'
     | 'shims'
     | 'auth'
     | 'exec';
@@ -129,6 +135,7 @@ const REST_COMMANDS = new Set([
   'status',
   'sync',
   'stats',
+  'memory',
   'shims',
   'auth',
   'exec',
@@ -321,6 +328,13 @@ async function main(): Promise<void> {
     const statsArgs = parseStatsArgs(args.rest);
     if ('error' in statsArgs) fail(`stats: ${statsArgs.error}`);
     process.exitCode = runStats(statsArgs);
+    return;
+  }
+
+  if (args.command === 'memory') {
+    const memoryArgs = parseMemoryArgs(args.rest);
+    if ('error' in memoryArgs) fail(`memory: ${memoryArgs.error}`);
+    process.exitCode = runMemory(memoryArgs);
     return;
   }
 
@@ -525,7 +539,9 @@ async function main(): Promise<void> {
     applyStoredOAuth(config);
     // Doctor's report can exceed the pipe buffer, and probed upstreams may
     // leave handles alive — flush-gated exit covers both.
-    const ok = await runDoctor(config, statePath);
+    const ok = await runDoctor(config, statePath, undefined, {
+      stateScope: createStateScope(config, process.cwd()),
+    });
     exitWhenFlushed(ok ? 0 : 1);
     return;
   }

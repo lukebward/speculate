@@ -25,6 +25,38 @@ afterEach(() => {
 });
 
 describe('loadConfig', () => {
+  it('loads bounded persistence defaults and explicit overrides', () => {
+    const defaults = loadConfig(writeConfig({ servers: { s: { command: 'server' } } }));
+    expect(defaults.persistence).toEqual({
+      enabled: true,
+      retentionDays: 30,
+      maxBytes: 8_388_608,
+    });
+
+    const configured = loadConfig(writeConfig({
+      persistence: { retentionDays: 7, maxBytes: 131_072, path: 'memory.json' },
+      servers: { s: { command: 'server' } },
+    }));
+    expect(configured.persistence).toMatchObject({
+      enabled: true,
+      retentionDays: 7,
+      maxBytes: 131_072,
+      path: 'memory.json',
+    });
+  });
+
+  it('rejects unsafe persistence bounds', () => {
+    for (const persistence of [
+      { retentionDays: 0 },
+      { retentionDays: 3651 },
+      { maxBytes: 65_535 },
+      { maxBytes: 67_108_865 },
+    ]) {
+      expect(() => loadConfig(writeConfig({ persistence, servers: { s: { command: 'server' } } })))
+        .toThrow(/persistence/);
+    }
+  });
+
   it('ignores a profile from an older config instead of failing the whole file', () => {
     // Vetted profiles were removed. A config still naming one must LOAD --
     // taking a working setup down over a dead field would be the worse

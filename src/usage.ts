@@ -1,5 +1,4 @@
 import {
-  mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -9,6 +8,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join, resolve } from 'node:path';
 import { defaultStateDirectory } from './persistence.js';
+import { readUsageGeneration, withUsageMemoryLock } from './memory.js';
 
 export type UsageSource = 'mcp' | 'cli'; // 'cli' survives only to read <=0.10 stats files
 
@@ -107,9 +107,13 @@ export class UsageRecorder {
   private readonly snapshot: UsageSnapshot;
   private timer: NodeJS.Timeout | null = null;
   private warnedFailure = false;
+  private readonly generation: string;
+  private cleared = false;
+  private closed = false;
 
   constructor(options: UsageRecorderOptions) {
     this.directory = options.directory ?? join(defaultStateDirectory(), 'usage');
+    this.generation = readUsageGeneration(this.directory);
     this.now = options.now ?? Date.now;
     this.flushDelayMs = options.flushDelayMs ?? 1000;
     this.log = options.log ?? ((line) => process.stderr.write(`${line}\n`));
@@ -125,10 +129,11 @@ export class UsageRecorder {
       updatedAt: startedAt,
       counters: { ...ZERO_COUNTERS },
     };
-    this.flush();
+    if (!this.flush()) this.scheduleFlush(100);
   }
 
   update(counters: UsageCounters, breakdown?: UsageBreakdown): void {
+    if (this.closed) return;
     this.snapshot.counters = {
       hits: counters.hits,
       joins: counters.joins,
@@ -147,39 +152,68 @@ export class UsageRecorder {
     this.snapshot.breakdown = breakdown;
     this.snapshot.updatedAt = this.now();
     if (this.flushDelayMs === 0) {
-      this.flush();
+      if (!this.flush()) this.scheduleFlush(100);
       return;
     }
+    this.scheduleFlush(this.flushDelayMs);
+  }
+
+  private scheduleFlush(delayMs: number): void {
+    if (this.closed || this.cleared) return;
     if (this.timer !== null) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.flush();
-    }, this.flushDelayMs);
+      if (!this.flush()) this.scheduleFlush(100);
+    }, delayMs);
     this.timer.unref();
   }
 
-  close(): void {
+  async close(): Promise<void> {
+    this.closed = true;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     this.snapshot.endedAt = this.now();
-    this.flush();
+    const deadline = Date.now() + 1000;
+    while (!this.flush()) {
+      if (Date.now() >= deadline) {
+        this.warnSaveFailure();
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   }
 
-  private flush(): void {
+  private flush(): boolean {
+    if (this.cleared) return true;
     const tmp = `${this.path}.tmp`;
     try {
-      mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-      writeFileSync(tmp, JSON.stringify(this.snapshot), { mode: 0o600 });
-      renameSync(tmp, this.path);
-    } catch (error) {
-      if (this.warnedFailure) return;
-      this.warnedFailure = true;
-      try {
-        this.log(`[speculate] usage save failed (will keep retrying silently): ${(error as Error).message}`);
-      } catch {}
+      const locked = withUsageMemoryLock(this.directory, () => {
+        if (readUsageGeneration(this.directory) !== this.generation) {
+          this.cleared = true;
+          return;
+        }
+        writeFileSync(tmp, JSON.stringify(this.snapshot), { mode: 0o600 });
+        renameSync(tmp, this.path);
+      }, 0);
+      if (!locked.acquired && locked.error !== undefined && locked.error !== 'busy') {
+        this.warnSaveFailure();
+        return true;
+      }
+      return locked.acquired;
+    } catch {
+      this.warnSaveFailure();
+      return true; // An I/O failure retries on the next update, without a busy loop.
+    } finally {
+      try { unlinkSync(tmp); } catch {}
     }
+  }
+
+  private warnSaveFailure(): void {
+    if (this.warnedFailure) return;
+    this.warnedFailure = true;
+    try { this.log('[speculate] usage save failed; usage stats may be incomplete'); } catch {}
   }
 }
 
@@ -446,6 +480,20 @@ export function readUsageReport(
 export function compactUsageRecords(
   directory: string = join(defaultStateDirectory(), 'usage'),
   beforeMs: number = Date.now() - 30 * 24 * 60 * 60_000,
+): { archivedSessions: number; removedFiles: number } {
+  // Clearing and compaction must serialize: a stale compactor must never
+  // restore snapshots after a clear command has returned.
+  try {
+    const locked = withUsageMemoryLock(directory, () => compactUsageRecordsLocked(directory, beforeMs));
+    return locked.acquired ? locked.value : { archivedSessions: 0, removedFiles: 0 };
+  } catch {
+    return { archivedSessions: 0, removedFiles: 0 };
+  }
+}
+
+function compactUsageRecordsLocked(
+  directory: string,
+  beforeMs: number,
 ): { archivedSessions: number; removedFiles: number } {
   const result = { archivedSessions: 0, removedFiles: 0 };
   let entries: string[];

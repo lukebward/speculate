@@ -1,10 +1,10 @@
 /**
  * Tier 2 — learned transition model (DESIGN.md §5.3).
  *
- * A session-scoped, in-memory, server-agnostic model of tool-call
+ * A local, server-agnostic model of tool-call
  * transitions: it watches the stream of served real calls, learns which
  * tool tends to follow which (per server), and learns how the next call's
- * arguments derive from the previous call (argument templates). Works on
+ * arguments derive from recent calls (argument templates). Works on
  * any MCP server with zero configuration; cold-start is simply "no
  * predictions yet".
  *
@@ -43,7 +43,7 @@ const DEFAULT_MAX_TRANSITIONS = 500;
  * half-life is TAU*ln2 ≈ 9.7 days. Tune from those two numbers, not from
  * "14 days is the half-life", which is off by ~1.44x.
  *
- * 14 days is long enough that a workflow paused over a holiday still ranks,
+ * 14 days is long enough that a sequence paused over a holiday still ranks,
  * short enough that a project finished last quarter stops outranking this
  * week's. Ranking and eviction only — `count` never decays, so the
  * minObservations gate keeps its meaning.
@@ -56,6 +56,11 @@ const MAX_PARSED_KEYS_PER_LEVEL = 32;
 const MAX_PARSED_PATHS = 256;
 /** Per-arg candidate-source cap (arg-copies + parsed-paths; const always kept). */
 const MAX_SOURCES_PER_ARG = 12;
+/** Session-local prior calls: bounded by count, retained size, and copy work. */
+const MAX_HISTORY_CALLS = 8;
+const MAX_HISTORY_BYTES = 1_048_576;
+const MAX_HISTORY_NODES = 8_192;
+const MAX_HISTORY_TOOL_LENGTH = 512;
 /**
  * Observations a competing hypothesis must have explained ON ITS OWN before
  * it may be offered as an ALTERNATIVE candidate (§13.18). The best-scoring
@@ -168,6 +173,8 @@ export function decayedScore(
 
 export interface SerializedSource {
   kind: 'arg' | 'parsed' | 'transform' | 'const';
+  /** Latest earlier call of this observed tool; absent means the trigger. */
+  sourceTool?: string;
   key?: string;
   path?: string[];
   transform?: TransformName;
@@ -249,17 +256,20 @@ export interface SerializedLearner {
 }
 
 /**
- * Where a next-call argument value came from, relative to the previous
+ * Where a next-call argument value came from: the trigger or an earlier
  * call. Seeded in priority order within a template — arg-copy sources
  * first, then parsed-path sources, then the const fallback — which is now
  * only the tie-break: evidence decides (§13.18).
  */
+type ValueSource =
+  | { kind: 'arg'; key: string; sourceTool?: string }
+  | { kind: 'parsed'; path: string[]; sourceTool?: string };
+
 type Source =
-  | { kind: 'arg'; key: string }
-  | { kind: 'parsed'; path: string[] }
+  | ValueSource
   | {
       kind: 'transform';
-      base: { kind: 'arg'; key: string } | { kind: 'parsed'; path: string[] };
+      base: ValueSource;
       transform: TransformName;
       prefix?: string;
       suffix?: string;
@@ -354,6 +364,19 @@ interface PrevCall {
   parsed: unknown;
   timestamp: number;
   priorTool?: string;
+  /** Newest first, excludes this call, and never exported. */
+  history?: HistoryCall[];
+}
+
+interface HistoryCall {
+  tool: string;
+  args: Record<string, unknown>;
+  parsed: unknown;
+  timestamp: number;
+  /** False for a latest occurrence whose payload exceeded the copy budget. */
+  available: boolean;
+  /** Conservative retained-size estimate, including keys and node overhead. */
+  bytes: number;
 }
 
 interface OpenerState {
@@ -392,7 +415,7 @@ export class TransitionLearner {
   private readonly maxPredictionsPerTrigger: number;
   private readonly maxTransitions: number;
 
-  /** Most recent observed call per server — the head of that server's chain. */
+  /** Most recent observed call and bounded prior snapshots per server. */
   private readonly lastCallByServer = new Map<string, PrevCall>();
   /**
    * Primed transitions (§13.9): (server, prev, next) pairs shipped as
@@ -668,6 +691,7 @@ export class TransitionLearner {
       parsed: call.parsed,
       timestamp: call.timestamp,
       priorTool: linked?.tool,
+      history: linked ? recentHistory(linked, call.timestamp, this.maxGapMs) : [],
     });
     if (!linked) return;
 
@@ -805,6 +829,12 @@ export class TransitionLearner {
     );
     const baseTotal = [...baseScores.values()].reduce((sum, score) => sum + score, 0);
     const head = this.lastCallByServer.get(call.server);
+    // Only the observed trigger owns this history. An arbitrary predict()
+    // call must not borrow the latest head's preceding values.
+    const sourceCall: PrevCall = head?.tool === call.tool &&
+      head.timestamp === call.timestamp && head.args === call.args && head.parsed === call.parsed
+      ? head
+      : call;
     // Session-start has no real preceding context. Treating '<start>' as one
     // makes opener frequency overpower the decayed bigram prior and erases
     // regime changes; context is reserved for genuine three-call histories.
@@ -833,7 +863,7 @@ export class TransitionLearner {
       const score = chosenContext
         ? 0.65 * baseProbability + 0.35 * contextProbability
         : baseProbability;
-      const combos = materializeCombos(state, call, now, this.maxPredictionsPerTrigger);
+      const combos = materializeCombos(state, sourceCall, now, this.maxPredictionsPerTrigger);
       for (let comboRank = 0; comboRank < combos.length; comboRank++) {
         const c = combos[comboRank]!;
         candidates.push({
@@ -931,6 +961,83 @@ export class TransitionLearner {
   }
 }
 
+/** Copy a prior call under a work/size budget, without serializing the full result. */
+function historySnapshot(call: PrevCall): HistoryCall | null {
+  if (call.tool.length === 0 || call.tool.length > MAX_HISTORY_TOOL_LENGTH) return null;
+  const marker: HistoryCall = {
+    tool: call.tool,
+    args: {},
+    parsed: null,
+    timestamp: call.timestamp,
+    available: false,
+    bytes: 256 + call.tool.length * 2,
+  };
+  let bytes = marker.bytes;
+  let nodes = 0;
+  const charge = (amount: number): void => {
+    bytes += amount;
+    if (bytes > MAX_HISTORY_BYTES) throw new Error('history-size');
+  };
+  const copy = (value: unknown, depth: number): unknown => {
+    if (++nodes > MAX_HISTORY_NODES || depth > 16) throw new Error('history-work');
+    charge(64);
+    if (typeof value === 'string') {
+      charge(value.length * 2);
+      return value;
+    }
+    if (value === null || typeof value === 'boolean' || typeof value === 'number' ||
+      value === undefined) return value;
+    if (Array.isArray(value)) {
+      if (value.length > MAX_HISTORY_NODES - nodes) throw new Error('history-work');
+      const out: unknown[] = [];
+      for (let i = 0; i < value.length; i++) {
+        const entry = Object.getOwnPropertyDescriptor(value, String(i));
+        if (entry && !('value' in entry)) throw new Error('history-accessor');
+        out.push(copy(entry?.value, depth + 1));
+      }
+      return out;
+    }
+    if (!isPlainObject(value)) throw new Error('history-value');
+    const out: Record<string, unknown> = Object.create(null);
+    for (const key in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      charge(64 + key.length * 2);
+      const entry = Object.getOwnPropertyDescriptor(value, key);
+      if (!entry || !('value' in entry)) throw new Error('history-accessor');
+      out[key] = copy(entry.value, depth + 1);
+    }
+    return out;
+  };
+  try {
+    const args = copy(call.args, 0) as Record<string, unknown>;
+    const parsed = copy(call.parsed, 0);
+    return { ...marker, args, parsed, bytes, available: true };
+  } catch {
+    // Keep an empty latest-occurrence marker. Dropping it entirely would
+    // let an older value from the same tool silently become current again.
+    return marker;
+  }
+}
+
+function recentHistory(prev: PrevCall, timestamp: number, maxGapMs: number): HistoryCall[] {
+  const latest = historySnapshot(prev);
+  if (!latest) return [];
+  const history: HistoryCall[] = [];
+  let bytes = 0;
+  for (const candidate of [latest, ...(prev.history ?? [])]) {
+    if (history.length >= MAX_HISTORY_CALLS || bytes + candidate.bytes > MAX_HISTORY_BYTES) break;
+    const age = timestamp - candidate.timestamp;
+    if (age < 0 || age > maxGapMs) break;
+    bytes += candidate.bytes;
+    history.push(candidate);
+  }
+  return history;
+}
+
+function sourceOrigin(source: { sourceTool?: string }): { sourceTool?: string } {
+  return source.sourceTool === undefined ? {} : { sourceTool: source.sourceTool };
+}
+
 // -- (de)serialization ----------------------------------------------------------
 
 function isTransformName(value: unknown): value is TransformName {
@@ -955,9 +1062,9 @@ function serializeSource(src: ScoredSource): SerializedSource {
   };
   switch (src.s.kind) {
     case 'arg':
-      return { kind: 'arg', key: src.s.key, ...evidence };
+      return { kind: 'arg', key: src.s.key, ...sourceOrigin(src.s), ...evidence };
     case 'parsed':
-      return { kind: 'parsed', path: [...src.s.path], ...evidence };
+      return { kind: 'parsed', path: [...src.s.path], ...sourceOrigin(src.s), ...evidence };
     case 'transform':
       return {
         kind: 'transform',
@@ -965,6 +1072,7 @@ function serializeSource(src: ScoredSource): SerializedSource {
           ? { key: src.s.base.key }
           : { path: [...src.s.base.path] }),
         transform: src.s.transform,
+        ...sourceOrigin(src.s.base),
         ...(src.s.prefix !== undefined ? { prefix: src.s.prefix } : {}),
         ...(src.s.suffix !== undefined ? { suffix: src.s.suffix } : {}),
         ...evidence,
@@ -977,16 +1085,20 @@ function serializeSource(src: ScoredSource): SerializedSource {
 function deserializeSource(raw: unknown, now: number): ScoredSource | null {
   if (raw === null || typeof raw !== 'object') return null;
   const s = raw as SerializedSource;
+  if (s.sourceTool !== undefined &&
+    (typeof s.sourceTool !== 'string' || s.sourceTool.length === 0 ||
+      s.sourceTool.length > MAX_HISTORY_TOOL_LENGTH || s.kind === 'const')) return null;
+  const origin = sourceOrigin(s);
   const source = ((): Source | null => {
     if (s.kind === 'arg' && typeof s.key === 'string') {
-      return { kind: 'arg', key: s.key };
+      return { kind: 'arg', key: s.key, ...origin };
     }
     if (
       s.kind === 'parsed' &&
       Array.isArray(s.path) &&
       s.path.every((seg) => typeof seg === 'string')
     ) {
-      return { kind: 'parsed', path: [...s.path] };
+      return { kind: 'parsed', path: [...s.path], ...origin };
     }
     if (
       s.kind === 'transform' &&
@@ -996,10 +1108,10 @@ function deserializeSource(raw: unknown, now: number): ScoredSource | null {
       (s.prefix === undefined || (typeof s.prefix === 'string' && s.prefix.length <= 64)) &&
       (s.suffix === undefined || (typeof s.suffix === 'string' && s.suffix.length <= 64))
     ) {
-      const base: { kind: 'arg'; key: string } | { kind: 'parsed'; path: string[] } =
+      const base: ValueSource =
         typeof s.key === 'string'
-          ? { kind: 'arg', key: s.key }
-          : { kind: 'parsed', path: [...s.path!] };
+          ? { kind: 'arg', key: s.key, ...origin }
+          : { kind: 'parsed', path: [...s.path!], ...origin };
       return {
         kind: 'transform',
         base,
@@ -1164,6 +1276,10 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
     const sources: ScoredSource[] = [];
     for (const rawSrc of tpl.sources) {
       const s = deserializeSource(rawSrc, now);
+      // A malformed historical binding must not promote a once-seen literal
+      // into the missing binding's place on import.
+      if (!s && rawSrc !== null && typeof rawSrc === 'object' &&
+        Object.prototype.hasOwnProperty.call(rawSrc, 'sourceTool')) return null;
       if (s) sources.push(s); // malformed sources are dropped, not fatal
     }
     // A template that lost all its sources can never derive anything again,
@@ -1599,11 +1715,15 @@ function newSource(s: Source, now: number): ScoredSource {
 
 /** Identity of a hypothesis, for "does the template already hold this?". */
 function sourceId(s: Source): string {
+  // Keep immediate-source identities byte-for-byte compatible with old state.
+  const origin = (s.kind === 'arg' || s.kind === 'parsed') && s.sourceTool !== undefined
+    ? `h\x00${JSON.stringify(s.sourceTool)}\x00`
+    : '';
   switch (s.kind) {
     case 'arg':
-      return `a\x00${s.key}`;
+      return `${origin}a\x00${s.key}`;
     case 'parsed':
-      return `p\x00${s.path.join('\x00')}`;
+      return `${origin}p\x00${s.path.join('\x00')}`;
     case 'transform':
       return `t\x00${sourceId(s.base)}\x00${s.transform}\x00${s.prefix ?? ''}\x00${s.suffix ?? ''}`;
     case 'const':
@@ -1669,6 +1789,7 @@ interface PrevIndex {
   args: Array<{ key: string; value: unknown; repr: string | undefined }>;
   paths: Array<{ segs: string[]; value: unknown; repr: string | undefined }>;
   parsed: unknown;
+  history?: HistoryCall[];
 }
 
 function indexPrevCall(prev: PrevCall): PrevIndex {
@@ -1684,6 +1805,7 @@ function indexPrevCall(prev: PrevCall): PrevIndex {
       repr: safeStringify(p.value),
     })),
     parsed: prev.parsed,
+    history: prev.history,
   };
 }
 
@@ -1781,12 +1903,31 @@ function candidateSources(
     known.add(id);
     sources.push(source);
   }
+  // Earlier values fill an otherwise unexplained argument. Established
+  // trigger derivations keep their source budget and ranking unchanged.
+  if (sources.length === 0 && index.history) {
+    const visited = new Set<string>();
+    for (const prior of index.history) {
+      if (sources.length >= room) break;
+      if (visited.has(prior.tool)) continue;
+      visited.add(prior.tool);
+      if (!prior.available) continue;
+      for (const source of candidateSources(indexPrevCall(prior), value, repr, false)) {
+        if (sources.length >= room) break;
+        if (source.kind === 'arg' || source.kind === 'parsed') {
+          sources.push({ ...source, sourceTool: prior.tool });
+        } else if (source.kind === 'transform') {
+          sources.push({ ...source, base: { ...source.base, sourceTool: prior.tool } });
+        }
+      }
+    }
+  }
   if (withConst) sources.push({ kind: 'const', value, repr });
   return sources;
 }
 
 function inferTransforms(
-  base: { kind: 'arg'; key: string } | { kind: 'parsed'; path: string[] },
+  base: ValueSource,
   input: unknown,
   target: unknown,
 ): Source[] {
@@ -1854,35 +1995,9 @@ function applyTransform(
 
 /** Would `source`, applied to this instance's previous call, yield `repr`? */
 function sourceProduces(source: Source, prev: PrevCall, repr: string): boolean {
-  switch (source.kind) {
-    case 'arg': {
-      if (!Object.prototype.hasOwnProperty.call(prev.args, source.key)) {
-        return false;
-      }
-      return safeStringify(prev.args[source.key]) === repr;
-    }
-    case 'parsed': {
-      const res = resolvePath(prev.parsed, source.path);
-      return res.ok && safeStringify(res.value) === repr;
-    }
-    case 'transform': {
-      const base = resolveSource(source.base, {
-        server: '',
-        tool: prev.tool,
-        args: prev.args,
-        result: { content: [] },
-        parsed: prev.parsed,
-        timestamp: prev.timestamp,
-        latencyMs: 0,
-      });
-      if (!base.ok) return false;
-      const transformed = applyTransform(source, base.value);
-      return transformed.ok && safeStringify(transformed.value) === repr;
-    }
-    case 'const':
-      // A const survives only if the literal is identical.
-      return source.repr === repr;
-  }
+  if (source.kind === 'const') return source.repr === repr;
+  const resolved = resolveSource(source, prev);
+  return resolved.ok && safeStringify(resolved.value) === repr;
 }
 
 /** One distinct value an argument could take on the current call. */
@@ -1927,7 +2042,7 @@ interface ArgOption {
  * with the id it saw once, months ago, and "the derivation did not resolve,
  * so predict nothing" would quietly stop being true.
  */
-function argOptions(tpl: ArgTemplate, call: ObservedCall, now: number): ArgOption[] | null {
+function argOptions(tpl: ArgTemplate, call: PrevCall, now: number): ArgOption[] | null {
   if (isUnderivable(tpl)) return null;
   const ranked = tpl.sources
     .map((src, i) => ({
@@ -1997,14 +2112,18 @@ function kindRank(s: Source): number {
 }
 
 /** This source's value on the current call. `const` always resolves. */
-function resolveSource(s: Source, call: ObservedCall): Resolution {
+function resolveSource(s: Source, call: PrevCall): Resolution {
+  const from = (s.kind === 'arg' || s.kind === 'parsed') && s.sourceTool !== undefined
+    ? call.history?.find((prior) => prior.tool === s.sourceTool)
+    : call;
+  if (from && 'available' in from && !from.available) return { ok: false };
   switch (s.kind) {
     case 'arg':
-      return Object.prototype.hasOwnProperty.call(call.args, s.key)
-        ? { ok: true, value: call.args[s.key] }
+      return from && Object.prototype.hasOwnProperty.call(from.args, s.key)
+        ? { ok: true, value: from.args[s.key] }
         : { ok: false };
     case 'parsed':
-      return resolvePath(call.parsed, s.path);
+      return from ? resolvePath(from.parsed, s.path) : { ok: false };
     case 'transform': {
       const base = resolveSource(s.base, call);
       return base.ok ? applyTransform(s, base.value) : { ok: false };
@@ -2026,10 +2145,9 @@ interface ArgCombo {
    *
    * The test is `every`, not `some`, and the difference is the whole point.
    * Horizon is about whether the TARGET was derived from the trigger, not
-   * whether every argument was: `get_issue {repo, number: <from the trigger's
-   * result>, per_page: 100}` is a next-call prediction that happens to carry
-   * a constant, and real profiles are full of constant `per_page` /
-   * `state: 'open'` / `format` arguments. `some` classified the modal
+   * whether every argument was: `read_item {id: <derived>, format: 'json'}`
+   * is a next-call prediction that happens to carry a constant. `some`
+   * classified the modal
    * next-call prediction as a standing bet.
    *
    * KNOWN INCONSISTENCY, recorded in §13.19 rather than repaired here: by the
@@ -2065,7 +2183,7 @@ interface ArgCombo {
  */
 function materializeCombos(
   state: TransitionState,
-  call: ObservedCall,
+  call: PrevCall,
   now: number,
   limit: number,
 ): ArgCombo[] {

@@ -5,6 +5,7 @@ npm install     # builds dist/ via the prepare hook
 npm test        # unit and end-to-end suite
 npm run bench   # speculation off vs on, bundled mock upstream
 npm run eval    # offline prediction recall, headline and floor
+npm run bench:repeated -- --baseline ../speculate-baseline --candidate . --json repeated.json
 npm run demo    # the README demo, against the bundled mock
 ```
 
@@ -13,6 +14,19 @@ from: `eval` measures **prediction quality** (offline recall against a fixed
 corpus, with an adversarial floor as the control), `bench` measures
 **mechanics** (proxy overhead and cache hits against a mock with injected
 latency). Neither is a claim about a real server.
+
+`bench:repeated` compares speculation off, a built baseline checkout, and a
+built candidate with the same chronological fixtures and independent state.
+Train on earlier sessions and score held-out sessions with changed identifiers,
+optional intervening calls, distractors, and negative controls. The workflow
+examples live entirely under `bench/` and `test/`; production learning must stay
+generic, including comments. Never tune on the held-out answers.
+
+The default injected upstream latency is 120 ms. Results measure actual tool
+wait through the full MCP proxy and report ready hits, in-flight joins, misses,
+terminal waste, upstream calls, output equality, and cold/warm splits. They are
+controlled latency fixtures, not measurements of GitHub or Linear service
+latency. A fuller run uses `--seeds 1,2,3,4,5 --train 8 --holdout 8`.
 
 For that there is a live benchmark against real hosted servers. Opt-in, and
 read-only by construction: every tool it calls is checked against the server's
