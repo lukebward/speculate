@@ -133,7 +133,7 @@ export async function runDoctor(
 
   out('');
   if (statePath) {
-    const state = new StateStore(statePath, Date.now, [], options.stateScope, {
+    const state = new StateStore(statePath, Date.now, options.stateScope, {
       retentionDays: config.persistence?.retentionDays,
       maxBytes: config.persistence?.maxBytes,
       secretValues: () => collectRuntimeSecrets(config),

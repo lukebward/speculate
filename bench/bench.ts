@@ -1,11 +1,14 @@
 /**
- * Benchmark harness (DESIGN.md §10 item 8).
+ * Mock mechanics benchmark (historical DESIGN.md §10 item 8).
  *
  * Replays a scripted GitHub-flavoured agent session through the proxy twice —
  * speculation off, then on — against the bundled mock server with injected
  * upstream latency, and reports per-call wall clock, hit outcomes, and waste.
  *
- * Usage: npm run bench [-- --latency 400]
+ * Uses explicit GitHub rules and disables persistence; this does not measure
+ * the general learner. See docs/design/local-learning-benchmark.md.
+ *
+ * Usage: npm run bench:mock [-- --latency 400]
  */
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

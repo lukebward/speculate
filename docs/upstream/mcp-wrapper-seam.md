@@ -1,8 +1,9 @@
 # Feature request: a host-provided MCP server wrapper seam
 
-**Status:** drafted 2026-08-05, ready to file against `anthropics/claude-code`.
-Verified against Claude Code 2.1.222: no wrapper/middleware seam exists in the
-shipped host (`mcpCommandWrapper`, `commandWrapper`, `mcpMiddleware`,
+**Status:** historical proposal drafted 2026-08-05; wrapper examples updated
+for v0.20. Host capability findings below were checked against Claude Code
+2.1.222 on that date and have not been reverified against a newer host.
+No wrapper/middleware seam existed in that checked version (`mcpCommandWrapper`, `commandWrapper`, `mcpMiddleware`,
 `serverWrapper`, `mcpProxy` — zero hits in the bundle; the plugin manifest's
 capability surface is `commands` / `agents` / `hooks` / `mcpServers` /
 `skills`).
@@ -91,7 +92,7 @@ users who don't opt in.
 // settings.json (user / project / local / managed — normal precedence)
 {
   "mcpServerWrapper": {
-    "command": ["speculate", "wrap", "--sniff", "--"],
+    "command": ["speculate", "wrap", "--"],
     "servers": "*",            // or an allowlist / denylist of server names
     "fallback": "direct"       // wrapper missing or failing to spawn → launch the server directly
   }
@@ -114,7 +115,7 @@ detail.
 {
   "name": "speculate",
   "mcpMiddleware": {
-    "command": "${CLAUDE_PLUGIN_ROOT}/bin/wrap --sniff --",
+    "command": "${CLAUDE_PLUGIN_ROOT}/bin/wrap --",
     "servers": "*"
   }
 }
@@ -126,14 +127,10 @@ in plugin-load order if the host ever wants that.
 
 ### Why this is safe to offer
 
-- **Over-wrapping is harmless by construction.** Our wrapper's entry point
-  is a protocol sniffer: the first line of stdin decides MCP (run the
-  proxy) versus anything else (become a byte-transparent pipe, exit codes
-  and signals forwarded). A wrapper applied too broadly degrades to a pipe;
-  MCP clients send `initialize` immediately, so real sessions decide on the
-  first line, not a timeout. Any wrapper can adopt the same contract, and
-  the host could require it ("must forward a non-MCP byte stream
-  unchanged").
+- **The host applies the wrapper only to configured MCP servers.** Explicit
+  transport selection avoids interposing on unrelated shell commands. The host
+  already knows whether a server uses stdio or a remote transport; it can supply
+  that definition directly without waiting to sniff protocol bytes.
 - **`fallback: "direct"` keeps sessions alive** when the wrapper is
   uninstalled or broken — the failure mode is "no middleware", never "no
   servers".
@@ -148,9 +145,9 @@ in plugin-load order if the host ever wants that.
 
 ### What it unlocks
 
-Speculative prefetching is our use case (measured 46–85 % tool-wait
-reductions against hosted MCP servers once warm — numbers and methodology in
-the repo), but the seam is generic: org-wide security/policy gateways,
+Speculative prefetching is our use case (historical warm-session tool-wait
+reductions and their limits are recorded in the
+[benchmark guide](../design/local-learning-benchmark.md)), but the seam is generic: org-wide security/policy gateways,
 tracing and cost observability, response caching, failover — the middleware
 layer every mature protocol grows. Today each of those tools must reinvent
 the config-rewriting machinery above, and each copy of it carries the same
@@ -164,5 +161,4 @@ category.
   unreachability, measured), §13.23/§13.26 (plugin servers and the
   `disabledMcpServers` write), §13.27 (hook fragilities on GUI-launched
   hosts), v0.12 notes (the measured one-session lag).
-- The sniffing pass-through that makes over-wrapping safe:
-  `src/wrap.ts` / DESIGN.md §13.12 mechanism 1.
+- Explicit wrapper interface: [Commands](../commands.md#wrap).

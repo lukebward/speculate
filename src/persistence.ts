@@ -106,7 +106,6 @@ export class StateStore {
   constructor(
     readonly path: string,
     private readonly now: () => number = Date.now,
-    private readonly fallbackPaths: readonly string[] = [],
     private readonly expectedScope?: string,
     policy: PersistencePolicy = {},
   ) {
@@ -121,17 +120,16 @@ export class StateStore {
   load(): PersistedState | null {
     this.generation = readStateGeneration(this.path);
     this.directoryGeneration = readStateDirectoryGeneration(dirname(this.path));
-    for (const candidate of [this.path, ...this.fallbackPaths]) {
-      const state = this.loadPath(candidate);
-      if (state !== null) {
-        this.baseline = state;
-        return state;
-      }
-    }
-    return null;
+    this.baseline = this.loadPath(this.path);
+    return this.baseline;
   }
 
-  private loadPath(path: string): PersistedState | null {
+  /** Read sanitized memory for inventory without adopting another scope's model. */
+  static inspect(path: string, policy: PersistencePolicy = {}): PersistedState | null {
+    return new StateStore(path, Date.now, undefined, policy).loadPath(path, false);
+  }
+
+  private loadPath(path: string, checkScope = true): PersistedState | null {
     let text: string;
     try {
       if (statSync(path).size > this.maxBytes) {
@@ -147,14 +145,18 @@ export class StateStore {
       if (
         data === null ||
         typeof data !== 'object' ||
+        Array.isArray(data) ||
         data.version !== STATE_VERSION ||
-        typeof data.ruleFeedback !== 'object'
+        data.ruleFeedback === null ||
+        typeof data.ruleFeedback !== 'object' ||
+        Array.isArray(data.ruleFeedback) ||
+        (data.scope !== undefined && typeof data.scope !== 'string')
       ) {
         return null;
       }
       // Missing means a legacy file: allow one migration load. A current
       // file from another workspace/account is a cold start, never imported.
-      if (data.scope !== undefined && data.scope !== this.expectedScope) return null;
+      if (checkScope && data.scope !== undefined && data.scope !== this.expectedScope) return null;
       return this.sanitize(data);
     } catch {
       return null;

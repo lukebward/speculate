@@ -119,7 +119,7 @@ See [secret handling](safety.md#local-learning-and-secrets) and
 |---|---|---|
 | `defaultTtlMs` | number | Cache TTL for this server's entries |
 | `ttlMsByTool` | object | Per-tool TTL overrides; `0` disables |
-| `longHorizonTtlFactor` | number in (0,1] | TTL multiplier for long-horizon ("standing") predictions |
+| `longHorizonTtlFactor` | number in (0,1] | TTL multiplier for startup ("standing") predictions; learned transitions always target the next call |
 | `maxPerMinute` | number | Speculative-call rate budget |
 | `maxConcurrent` | number | Speculative-call concurrency budget |
 | `adaptiveAdmission` | boolean | Rank by confidence × learned upstream latency and suppress low-utility calls (default `true`) |

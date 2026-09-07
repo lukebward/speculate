@@ -58,12 +58,10 @@ export interface Prediction {
   /**
    * How far ahead this prediction is betting (§6.2 freshness). The default,
    * `'next'`, is derived from the call that just happened: "given what you
-   * just saw, this is the next call." `'standing'` is a memorized bet — at
-   * least one argument comes from a remembered literal rather than from the
-   * trigger, or the prediction has no trigger at all (session openers) — and
-   * so claims only "you will ask for this at some point." Standing bets wait
-   * longer in the buffer before anything claims them, so the executor fetches
-   * them with a shortened TTL (§6.2, LONG_HORIZON_TTL_FACTOR).
+   * just saw, this is the next call." This includes constant arguments.
+   * `'standing'` is reserved for session openers, which have no trigger.
+   * Standing bets can wait longer in the buffer before anything claims them, so the executor fetches
+   * them with a configurable TTL factor (§6.2, LONG_HORIZON_TTL_FACTOR).
    */
   horizon?: 'next' | 'standing';
 }
@@ -86,15 +84,6 @@ export interface Rule {
  * Return null on any parse failure (fail closed, §5.1). Must not throw.
  */
 export type ResultParser = (result: CallToolResult) => unknown | null;
-
-/**
- * Canonicalizes tool arguments for cache keying (§6.1): materialize
- * server-side defaults, fold case for case-insensitive enums. Returns a
- * NEW object; must not mutate the input.
- */
-export type ArgsCanonicalizer = (
-  args: Record<string, unknown>,
-) => Record<string, unknown>;
 
 // ---------------------------------------------------------------------------
 // Cache (DESIGN.md §6)

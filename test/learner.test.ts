@@ -231,9 +231,8 @@ describe('prediction horizon', () => {
     expect(preds[0]!.horizon).toBe('next');
   });
 
-  it('marks a prediction that reads NOTHING off the trigger as a standing bet', () => {
-    // No argument is in the trigger at all — the learner is betting the agent
-    // will ask for this at some point, not that the trigger implies it.
+  it('classifies a constant-argument transition as a next-call prediction', () => {
+    // Argument sources do not change the transition's learned timing.
     const learner = new TransitionLearner({ now });
     for (const q of ['foo', 'bar']) {
       observePair(
@@ -246,15 +245,10 @@ describe('prediction horizon', () => {
     const preds = learner.predict(mkCall('srv', 'search', { q: 'baz' }));
     expect(preds).toHaveLength(1);
     expect(preds[0]!.args).toEqual({ state: 'open' });
-    expect(preds[0]!.horizon).toBe('standing');
+    expect(preds[0]!.horizon).toBe('next');
   });
 
   it('a constant beside a derived argument is still a next-call prediction', () => {
-    // THE regression this pins. Horizon is about whether the TARGET was
-    // derived from the trigger, not whether every argument was. Classifying
-    // on "any argument is memorized" caught the modal real prediction —
-    // profiles are full of constant per_page / state / format arguments —
-    // and would have shortened the TTL of nearly every prediction there is.
     const learner = new TransitionLearner({ now });
     const seen = (id: number): void =>
       observePair(
@@ -290,6 +284,29 @@ describe('prediction horizon', () => {
     const openers = learner.openerPredictions('srv');
     expect(openers).toHaveLength(1);
     expect(openers[0]!.horizon).toBe('standing');
+  });
+});
+
+describe('legacy learner state', () => {
+  it('loads transition evidence while discarding duplicate latency estimates', () => {
+    const first = new TransitionLearner({ now });
+    for (let i = 0; i < 2; i++) {
+      observePair(first, 'srv', { tool: 'search', args: { q: String(i) } },
+        { tool: 'list_prs', args: { state: 'open' } });
+    }
+    const legacy = first.exportState();
+    const second = new TransitionLearner({ now });
+    second.importState({
+      ...legacy,
+      transitions: legacy.transitions.map((transition) => ({ ...transition, latencyMs: 450 })),
+    });
+
+    const prediction = second.predict(mkCall('srv', 'search', { q: 'new' }));
+    expect(prediction).toEqual([
+      expect.objectContaining({ tool: 'list_prs', args: { state: 'open' }, horizon: 'next' }),
+    ]);
+    expect(prediction[0]).not.toHaveProperty('expectedLatencyMs');
+    expect(second.exportState()).toEqual(legacy);
   });
 });
 

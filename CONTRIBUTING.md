@@ -3,67 +3,23 @@
 ```bash
 npm install     # builds dist/ via the prepare hook
 npm test        # unit and end-to-end suite
-npm run bench   # speculation off vs on, bundled mock upstream
+npm run build   # rebuild before benchmarking source changes
+npm run bench   # paired off/on repeated workflows, with persisted learning
 npm run eval    # offline prediction recall, headline and floor
-npm run bench:repeated -- --baseline ../speculate-baseline --candidate . --json repeated.json
 npm run demo    # the README demo, against the bundled mock
 ```
 
-Two instruments, and every performance claim has to name which one it came
-from: `eval` measures **prediction quality** (offline recall against a fixed
-corpus, with an adversarial floor as the control), `bench` measures
-**mechanics** (proxy overhead and cache hits against a mock with injected
-latency). Neither is a claim about a real server.
+The [benchmark methodology](docs/design/local-learning-benchmark.md) is the
+authoritative reference for commands, accounting, interpretation, and historical
+results. Use `bench` (also available as `bench:repeated`) for the general learner;
+pass `--baseline /path/to/built/checkout` to compare releases. `bench:mock` keeps
+the older GitHub-rule mechanics demonstration. `eval`, `bench:remote`, and the
+opt-in real filesystem/Git E2Es remain separate instruments with distinct claims.
 
-`bench:repeated` compares speculation off, a built baseline checkout, and a
-built candidate with the same chronological fixtures and independent state.
-Train on earlier sessions and score held-out sessions with changed identifiers,
-optional intervening calls, distractors, and negative controls. The workflow
-examples live entirely under `bench/` and `test/`; production learning must stay
-generic, including comments. Never tune on the held-out answers.
-
-The default injected upstream latency is 120 ms. Results measure actual tool
-wait through the full MCP proxy and report ready hits, in-flight joins, misses,
-terminal waste, upstream calls, output equality, and cold/warm splits. They are
-controlled latency fixtures, not measurements of GitHub or Linear service
-latency. A fuller run uses `--seeds 1,2,3,4,5 --train 8 --holdout 8`.
-
-For that there is a live benchmark against real hosted servers. Opt-in, and
-read-only by construction: every tool it calls is checked against the server's
-own `readOnlyHint` annotation at run time, and anything not affirmatively
-read-only aborts before a single call is made.
-
-```bash
-# these need no credential, so anyone can reproduce them
-SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
-SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario mslearn
-SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario mslearn-cold
-SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario huggingface
-
-# needs a token, which is never written to disk (the config carries the
-# ${VAR} placeholder and the child proxy resolves it from its environment)
-SPECULATE_E2E_LIVE=1 GITHUB_TOKEN=$(gh auth token) npm run bench:remote
-```
-
-The two opt-in local E2Es use actual filesystem operations and a disposable
-Git repository through SDK-backed stdio MCP servers. They are intentionally
-outside the default suite because each starts many full proxy sessions:
-
-```bash
-SPECULATE_REAL_E2E=1 npx vitest run test/filesystem-real-e2e.test.ts
-SPECULATE_REAL_E2E=1 npx vitest run test/git-real-e2e.test.ts
-```
-
-Every real harness accepts `SPECULATE_E2E_TARGET_ROOT=/path/to/checkout`, so
-the current driver and workflow can measure an archived revision with exactly
-the same fixture and reporting. Remote output includes one machine-readable
-`REMOTE_E2E` line; local tests emit `FILESYSTEM_REAL_E2E` or `GIT_REAL_E2E`.
-
-Scenarios live in `bench/scenarios.ts`; adding one is a URL, the tools the
-session calls, and how to find real arguments for them. The bar for adding a
-server: it annotates those tools read-only, the workflow is a genuine
-list-then-detail shape (which is what speculation can act on), and the calls
-are few, because these hit somebody else's service.
+Fixtures belong in `bench/` and `test/`; production learning must stay generic,
+including comments. Never tune on held-out answers. Hosted scenarios live in
+`bench/scenarios.ts`. Add only short list/detail workflows whose tools the
+server annotates read-only, because these run against somebody else's service.
 
 The test suite needs Node >= 20.19 (vitest's native rolldown binding; npm
 silently skips it on older Node). The floor for *using* Speculate is
@@ -84,7 +40,7 @@ npm run demo:gif
 | `src/predictor.ts`, `learner.ts`, `priming.ts` | prediction |
 | `src/cache.ts` | the single-use, short-TTL buffer |
 | `src/policy.ts`, `budget.ts` | safety and limits |
-| `src/manage.ts`, `sync.ts`, `tryRun.ts` | `on` / `off` / `sync` / `try` |
+| `src/manage.ts`, `sync.ts`, `wrap.ts` | `on` / `off` / `sync` / explicit `wrap` |
 | `src/oauthProvider.ts`, `oauthStore.ts`, `authCommand.ts` | `speculate auth` |
 | `mock/`, `bench/`, `eval/`, `demo/` | instruments and fixtures |
 

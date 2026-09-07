@@ -11,9 +11,9 @@
  * Defaults chosen for the zero-config path: mode `annotated` (there is no
  * allowlist to consult, so `readOnlyHint` is the only signal — documented
  * trade-off, overridable with --mode/--allow), persistence on (keyed by
- * the wrapped command line), known servers auto-matched to vetted profiles.
+ * the workspace, upstream, and account scope).
  */
-import { RETIRED_PROFILES, resolveHeaderValue } from './config.js';
+import { resolveHeaderValue } from './config.js';
 import type { SpeculateConfig, SpeculationMode } from './types.js';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -23,11 +23,10 @@ export interface WrapArgs {
   profile: string | null;
   allow: string[];
   /**
-   * §13.12 protocol sniffing: engage the proxy only if the first client
-   * line is an MCP initialize; otherwise degrade to a transparent pipe.
-   * This is what makes blind wrapping (launcher shims) safe.
+   * Retired --sniff compatibility: old installed PATH shims still invoke
+   * this flag. Launch their command directly, without speculation.
    */
-  sniff: boolean;
+  legacyPassthrough: boolean;
   command: string[];
   /**
    * A remote (streamable-HTTP) upstream instead of a wrapped child process.
@@ -46,7 +45,7 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
     mode: 'annotated',
     profile: null,
     allow: [],
-    sniff: false,
+    legacyPassthrough: false,
     command: [],
     url: null,
     headers: {},
@@ -76,7 +75,7 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       if (!list) return { error: '--allow requires a comma-separated tool list' };
       out.allow.push(...list.split(',').map((s) => s.trim()).filter(Boolean));
     } else if (a === '--sniff') {
-      out.sniff = true;
+      out.legacyPassthrough = true;
     } else if (a === '--url') {
       const u = argv[++i];
       if (!u) return { error: '--url requires a URL' };
@@ -118,10 +117,9 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
   if (!out.url && out.command.length === 0) {
     return { error: "wrap needs a server command after '--', or --url <url> for a remote server" };
   }
-  if (out.url && out.sniff) {
-    // Sniffing degrades to piping the WRAPPED COMMAND's bytes; with no child
-    // to pipe to, "non-MCP client" has no safe fallback to offer.
-    return { error: '--sniff applies to a wrapped command, not to --url' };
+  if (out.url && out.legacyPassthrough) {
+    // The compatibility path must have a command to run.
+    return { error: '--sniff is retired and only passes through a legacy wrapped command; remove it for --url' };
   }
   if (!out.url && Object.keys(out.headers).length > 0) {
     return { error: '--header applies to --url servers only (a stdio server takes env vars)' };
@@ -142,8 +140,7 @@ export function buildWrapConfig(
   args: WrapArgs,
   workspace: string = process.cwd(),
   oauthScope: string = 'none',
-): { config: SpeculateConfig; stateKey: string; legacyStateKey: string } {
-  const commandLine = args.command.join(' ');
+): { config: SpeculateConfig; stateKey: string } {
   const ambientCredentialEnv = Object.entries(process.env)
     .filter(
       (entry): entry is [string, string] =>
@@ -190,7 +187,5 @@ export function buildWrapConfig(
       credentialScope,
       oauthScope,
     })}`,
-    // Read once as a migration fallback; every save goes to the scoped path.
-    legacyStateKey: args.url ? `wrap:url:${args.url}` : `wrap:${commandLine}`,
   };
 }

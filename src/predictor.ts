@@ -53,7 +53,7 @@ export interface PredictorOptions {
   };
   /** Shared persisted latency source used by adaptive admission. */
   latency?: LatencyEstimator;
-  /** Shadow correctness learner; does not alter ranking in this release. */
+  /** Correctness calibration used for ranking and adaptive admission. */
   calibration?: CandidateCalibration;
   admission?: Record<string, { enabled: boolean; minExpectedSavedMs: number }>;
 }
@@ -161,36 +161,15 @@ export class Predictor {
 
       const valid: Prediction[] = [];
       for (const raw of emitted) {
-        const p = validatePrediction(raw, call.server, rule.id);
+        const p = validatePrediction(raw, call.server, rule.id, 'next');
         if (p) valid.push(p); // malformed predictions are dropped silently
       }
       if (valid.length === 0) continue;
 
-      const fb = this.metrics.ruleFeedback(rule.id);
-      const eff = effectiveness(fb);
-      if (fb.speculated >= FEEDBACK_MIN_SPECULATED && eff < FEEDBACK_EFFECTIVENESS_FLOOR) {
-        // §5.6: a rule that never hits gets suppressed entirely this round.
-        for (const p of valid) {
-          this.metrics.record({
-            type: 'suppressed',
-            server: p.server,
-            tool: p.tool,
-            ruleId: p.ruleId,
-            reason: 'feedback',
-            confidence: p.confidence,
-            timestamp: call.timestamp,
-          });
-        }
-        continue;
-      }
       for (const [index, p] of valid.entries()) {
         const candidateId = index === 0 ? rule.id : `${rule.id}#${index + 1}`;
-        candidates.push({
-          prediction: p,
-          candidateId,
-          score: this.candidateScore(candidateId, p.confidence, eff),
-          order: order++,
-        });
+        const candidate = this.scoreCandidate(p, candidateId, order++, call.timestamp);
+        if (candidate) candidates.push(candidate);
       }
     }
 
@@ -205,28 +184,10 @@ export class Predictor {
             typeof (raw as { ruleId?: unknown }).ruleId === 'string'
               ? (raw as { ruleId: string }).ruleId
               : 'learned:unknown';
-          const p = validatePrediction(raw, call.server, learnedId);
+          const p = validatePrediction(raw, call.server, learnedId, 'next');
           if (!p) continue;
-          const fb = this.metrics.ruleFeedback(p.ruleId);
-          const eff = effectiveness(fb);
-          if (fb.speculated >= FEEDBACK_MIN_SPECULATED && eff < FEEDBACK_EFFECTIVENESS_FLOOR) {
-            this.metrics.record({
-              type: 'suppressed',
-              server: call.server,
-              tool: p.tool,
-              ruleId: p.ruleId,
-              reason: 'feedback',
-              confidence: p.confidence,
-              timestamp: call.timestamp,
-            });
-            continue;
-          }
-          candidates.push({
-            prediction: p,
-            candidateId: p.ruleId,
-            score: this.candidateScore(p.ruleId, p.confidence, eff),
-            order: order++,
-          });
+          const candidate = this.scoreCandidate(p, p.ruleId, order++, call.timestamp);
+          if (candidate) candidates.push(candidate);
         }
       } catch {
         // Learner errors are contained; rule-based prediction continues.
@@ -252,27 +213,10 @@ export class Predictor {
           typeof (raw as { ruleId?: unknown }).ruleId === 'string'
             ? (raw as { ruleId: string }).ruleId
             : 'opener:unknown';
-        const p = validatePrediction(raw, server, openerId);
+        const p = validatePrediction(raw, server, openerId, 'standing');
         if (!p) continue;
-        const fb = this.metrics.ruleFeedback(p.ruleId);
-        const eff = effectiveness(fb);
-        if (fb.speculated >= FEEDBACK_MIN_SPECULATED && eff < FEEDBACK_EFFECTIVENESS_FLOOR) {
-          this.metrics.record({
-            type: 'suppressed',
-            server,
-            tool: p.tool,
-            ruleId: p.ruleId,
-            reason: 'feedback',
-            confidence: p.confidence,
-          });
-          continue;
-        }
-        candidates.push({
-          prediction: p,
-          candidateId: p.ruleId,
-          score: this.candidateScore(p.ruleId, p.confidence, eff),
-          order: order++,
-        });
+        const candidate = this.scoreCandidate(p, p.ruleId, order++);
+        if (candidate) candidates.push(candidate);
       }
     } catch {
       return [];
@@ -430,10 +374,40 @@ export class Predictor {
     return candidate.score * latency;
   }
 
-  private candidateScore(candidateId: string, confidence: number, operational: number): number {
-    return this.calibration
-      ? this.calibration.probability(candidateId, confidence).probability
-      : confidence * operational;
+  /** Apply the same operational cutoff and correctness score to every source. */
+  private scoreCandidate(
+    prediction: Prediction,
+    candidateId: string,
+    order: number,
+    timestamp?: number,
+  ): ScoredPrediction | null {
+    const feedback = this.metrics.ruleFeedback(prediction.ruleId);
+    const operational = effectiveness(feedback);
+    // A correct next-call prediction may still expire before use. Retain
+    // operational waste protection alongside next-call calibration.
+    if (
+      feedback.speculated >= FEEDBACK_MIN_SPECULATED &&
+      operational < FEEDBACK_EFFECTIVENESS_FLOOR
+    ) {
+      this.metrics.record({
+        type: 'suppressed',
+        server: prediction.server,
+        tool: prediction.tool,
+        ruleId: prediction.ruleId,
+        reason: 'feedback',
+        confidence: prediction.confidence,
+        timestamp,
+      });
+      return null;
+    }
+    return {
+      prediction,
+      candidateId,
+      score: this.calibration
+        ? this.calibration.probability(candidateId, prediction.confidence).probability
+        : prediction.confidence * operational,
+      order,
+    };
   }
 }
 
@@ -532,13 +506,17 @@ function effectiveness(fb: RuleFeedback): number {
  * - tool must be a non-empty string, args a plain object;
  * - confidence must be a number (clamped into [0,1]).
  */
-function validatePrediction(raw: unknown, server: string, ruleId: string): Prediction | null {
+function validatePrediction(
+  raw: unknown,
+  server: string,
+  ruleId: string,
+  horizon: 'next' | 'standing',
+): Prediction | null {
   if (raw === null || typeof raw !== 'object') return null;
   const p = raw as {
     tool?: unknown;
     args?: unknown;
     confidence?: unknown;
-    horizon?: unknown;
     expectedLatencyMs?: unknown;
   };
   if (typeof p.tool !== 'string' || p.tool.length === 0) return null;
@@ -555,13 +533,9 @@ function validatePrediction(raw: unknown, server: string, ruleId: string): Predi
       ? { expectedLatencyMs: p.expectedLatencyMs }
       : {}),
     ruleId,
-    // §6.2: only the two known classes survive validation. Anything else —
-    // including nothing, which is what every hand-written rule emits — is
-    // left unset, which the executor reads as a trigger-derived next-call
-    // prediction on the normal TTL.
-    ...(p.horizon === 'standing' || p.horizon === 'next'
-      ? { horizon: p.horizon }
-      : {}),
+    // Timing follows the entrypoint: trigger batches predict the next
+    // call; only session-start predictions may outlive the next real call.
+    horizon,
   };
 }
 

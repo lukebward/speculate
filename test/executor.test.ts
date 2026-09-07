@@ -11,7 +11,7 @@ import { canonicalKey } from '../src/keys.js';
 import { SafetyPolicy } from '../src/policy.js';
 import { BudgetManager } from '../src/budget.js';
 import { Metrics } from '../src/metrics.js';
-import type { Prediction, ServerProfile } from '../src/types.js';
+import type { Prediction } from '../src/types.js';
 import type { Upstream } from '../src/upstream.js';
 
 const RESULT: CallToolResult = { content: [{ type: 'text', text: '{}' }] };
@@ -27,19 +27,6 @@ function deferred(): Deferred {
     resolve = () => r(RESULT);
   });
   return { promise, resolve };
-}
-
-function profile(): ServerProfile {
-  return {
-    name: 'github',
-    validatedAgainst: 'test',
-    readOnlyAllowlist: ['a', 'b', 'c', 'd'],
-    defaultTtlMs: 30_000,
-    ttlMsByTool: {},
-    parsers: {},
-    canonicalizers: {},
-    rules: [],
-  };
 }
 
 function makeHarness(
@@ -83,7 +70,6 @@ function makeHarness(
     policy,
     budget,
     metrics,
-    profiles: { github: profile() },
     config: {
       mode: 'strict',
       maxPredictionsPerTrigger: 3,
@@ -129,10 +115,8 @@ describe('long-horizon TTL', () => {
   }
 
   it('ships as the identity: no class gets a shortened TTL by default', async () => {
-    // The default is 1 on evidence, not by omission (see cache.ts): the eval
-    // measures standing bets consumed at a lead of exactly 1.000 calls, so
-    // shortening them buys no measured freshness while measurably costing
-    // hits once an agent's inter-call gap passes half the TTL.
+    // Startup openers retain the default TTL unless an operator opts in.
+    // The transition corpus does not measure opener consumption timing.
     expect(LONG_HORIZON_TTL_FACTOR).toBe(1);
     expect(await lifetime('next')).toBe(30_000);
     expect(await lifetime('standing')).toBe(30_000);

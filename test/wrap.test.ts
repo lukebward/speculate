@@ -24,7 +24,7 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
     mode: over.mode ?? 'annotated',
     profile: over.profile ?? null,
     allow: over.allow ?? [],
-    sniff: over.sniff ?? false,
+    legacyPassthrough: over.legacyPassthrough ?? false,
     command: over.command ?? [],
     url: over.url ?? null,
     headers: over.headers ?? {},
@@ -42,15 +42,15 @@ describe('parseWrapArgs', () => {
       mode: 'strict',
       profile: null,
       allow: ['a', 'b'],
-      sniff: false,
+      legacyPassthrough: false,
       command: ['github-mcp-server', 'stdio'],
       url: null,
       headers: {},
     });
   });
 
-  it('parses --sniff for wrapped commands', () => {
-    expect(ok(parseWrapArgs(['--sniff', '--', 'srv'])).sniff).toBe(true);
+  it('accepts retired --sniff only as legacy passthrough', () => {
+    expect(ok(parseWrapArgs(['--sniff', '--', 'srv'])).legacyPassthrough).toBe(true);
   });
 
   it('defaults mode to annotated', () => {
@@ -243,7 +243,7 @@ describe('wrap --url', () => {
     expect(err(parseWrapArgs(['--url', 'not a url']))).toMatch(/--url/);
   });
 
-  it('rejects --sniff with --url (there is no command to degrade into a pipe)', () => {
+  it('rejects --sniff with --url (legacy passthrough requires a command)', () => {
     expect(err(parseWrapArgs(['--url', 'https://a.test/mcp', '--sniff']))).toMatch(/--sniff/);
   });
 

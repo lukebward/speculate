@@ -12,8 +12,8 @@
  * scopes" diagnostic but uses exactly one).
  *
  * Everything here is pure reading and pure transformation. The things
- * that WRITE — `try` (a throwaway generated config) and `on`/`off` (the
- * host's own `claude mcp` CLI) — live in tryRun.ts and manage.ts.
+ * that WRITE — `on`/`off` through the host's own `claude mcp` CLI —
+ * live in manage.ts.
  *
  * Wrapped entries are self-describing: the original command line survives
  * verbatim after the `--`, and env is carried unchanged. unwrapEntry()

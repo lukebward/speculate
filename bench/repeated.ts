@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import type { DailyArm, DailyRunRecord } from './comparison.js';
+import type { BenchmarkArm, BenchmarkRunRecord } from './comparison.js';
 import { percentile } from './comparison.js';
 import {
   REPEATED_WORKFLOW_IDS,
@@ -27,9 +27,9 @@ import {
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const FIXTURE_SERVER = join(ROOT, 'bench', 'repeatedFixtureServer.ts');
 const TSX_CLI = join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
-const ALL_ARMS: readonly DailyArm[] = ['off', 'stable', 'candidate'];
+const ALL_ARMS: readonly BenchmarkArm[] = ['off', 'stable', 'candidate'];
 
-export interface RepeatedRunRecord extends DailyRunRecord {
+export interface RepeatedRunRecord extends BenchmarkRunRecord {
   phase: 'train' | 'holdout';
   shutdownWaste: number;
   outputDigest: string;
@@ -50,14 +50,14 @@ export interface RepeatedBenchmarkOptions {
   trainSessions: number;
   holdoutSessions: number;
   latencyMs: number;
-  arms: DailyArm[];
+  arms: BenchmarkArm[];
   workflows?: RepeatedWorkflowId[];
   stateRoot?: string;
   onProgress?: (line: string) => void;
 }
 
 export interface RepeatedArmSummary {
-  arm: DailyArm;
+  arm: BenchmarkArm;
   records: number;
   requestedCalls: number;
   hits: number;
@@ -95,12 +95,12 @@ export interface RepeatedBenchmarkArtifact {
   trainSessions: number;
   holdoutSessions: number;
   workflows: RepeatedWorkflowId[];
-  armsRun: DailyArm[];
+  armsRun: BenchmarkArm[];
   executionOrder: Array<{
     seed: number;
     session: number;
     workflow: RepeatedWorkflowId;
-    arms: DailyArm[];
+    arms: BenchmarkArm[];
   }>;
   records: RepeatedRunRecord[];
   holdout: RepeatedArmSummary[];
@@ -129,13 +129,13 @@ export interface RepeatedCliOptions extends RepeatedBenchmarkOptions {
   jsonPath: string;
 }
 
-export function orderedArms<T extends DailyArm>(arms: readonly T[], seed: number, session: number): T[] {
+export function orderedArms<T extends BenchmarkArm>(arms: readonly T[], seed: number, session: number): T[] {
   if (arms.length === 0) return [];
   const offset = (seed + session) % arms.length;
   return [...arms.slice(offset), ...arms.slice(0, offset)];
 }
 
-export function armStatePath(root: string, arm: DailyArm, workflow: string, seed: number): string {
+export function armStatePath(root: string, arm: BenchmarkArm, workflow: string, seed: number): string {
   return join(root, arm, workflow, String(seed), 'state.json');
 }
 
@@ -266,9 +266,9 @@ export function parseRepeatedCliArgs(argv: readonly string[]): RepeatedCliOption
   if (seeds.length === 0 || new Set(seeds).size !== seeds.length) {
     throw new Error('seeds must be a non-empty list without duplicates');
   }
-  const arms = (value('arms') ?? ALL_ARMS.join(','))
+  const arms = (value('arms') ?? (value('baseline') ? ALL_ARMS.join(',') : 'off,candidate'))
     .split(',')
-    .filter(Boolean) as DailyArm[];
+    .filter(Boolean) as BenchmarkArm[];
   if (
     arms.length === 0 ||
     new Set(arms).size !== arms.length ||
@@ -282,7 +282,7 @@ export function parseRepeatedCliArgs(argv: readonly string[]): RepeatedCliOption
     if (!flag.startsWith('--') || !known.has(flag.slice(2))) throw new Error(`unknown option: ${flag}`);
   }
   return {
-    baselineRoot: value('baseline') ?? resolve(ROOT, '..', 'speculate-baseline'),
+    baselineRoot: value('baseline') ?? ROOT,
     candidateRoot: value('candidate') ?? ROOT,
     seeds,
     trainSessions: nonNegativeInteger(value('train') ?? '4', 'train'),
@@ -293,7 +293,7 @@ export function parseRepeatedCliArgs(argv: readonly string[]): RepeatedCliOption
   };
 }
 
-function targetFor(arm: DailyArm, options: RepeatedBenchmarkOptions): string {
+function targetFor(arm: BenchmarkArm, options: RepeatedBenchmarkOptions): string {
   return resolve(arm === 'candidate' ? options.candidateRoot : options.baselineRoot);
 }
 
@@ -313,7 +313,7 @@ async function runSession(
   options: RepeatedBenchmarkOptions,
   stateRoot: string,
   fixture: RepeatedWorkflowSession,
-  arm: DailyArm,
+  arm: BenchmarkArm,
 ): Promise<RepeatedRunRecord> {
   const targetRoot = targetFor(arm, options);
   const targetCli = join(targetRoot, 'dist', 'src', 'cli.js');
@@ -502,7 +502,7 @@ export async function runRepeatedBenchmark(
   }
 }
 
-function summarize(records: readonly RepeatedRunRecord[], arm: DailyArm): RepeatedArmSummary {
+function summarize(records: readonly RepeatedRunRecord[], arm: BenchmarkArm): RepeatedArmSummary {
   const selected = records.filter((record) => record.arm === arm);
   const requestedCalls = selected.reduce((sum, record) => sum + record.requestedCalls, 0);
   const hits = selected.reduce((sum, record) => sum + record.hits, 0);

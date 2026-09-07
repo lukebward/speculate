@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { percentile } from '../bench/comparison.js';
 import {
   REPEATED_WORKFLOW_IDS,
   generateRepeatedWorkflow,
@@ -169,6 +170,22 @@ describe('repeated benchmark orchestration', () => {
       jsonPath: 'out.json',
     });
     expect(() => parseRepeatedCliArgs(['--arms', 'off,other'])).toThrow(/arm/i);
+  });
+
+  it('reports sample percentiles and rejects invalid fractions', () => {
+    expect(percentile([], 0.5)).toBe(0);
+    expect(percentile([3, 1, 2], 0.5)).toBe(2);
+    expect(() => percentile([1], 2)).toThrow(/fraction/);
+  });
+
+  it('runs off and candidate from this checkout unless a baseline is supplied', () => {
+    const standalone = parseRepeatedCliArgs([]);
+    expect(standalone.arms).toEqual(['off', 'candidate']);
+    expect(standalone.baselineRoot).toBe(standalone.candidateRoot);
+    expect(parseRepeatedCliArgs(['--baseline', '/baseline']).arms).toEqual([
+      'off', 'stable', 'candidate',
+    ]);
+    expect(parseRepeatedCliArgs(['--arms', 'candidate']).arms).toEqual(['candidate']);
   });
 
   it(

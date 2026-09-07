@@ -21,25 +21,10 @@ import type { CacheEntryMeta, CacheKey, CacheLookup } from './types.js';
 export const DEFAULT_TTL_MS = 30_000;
 
 /**
- * TTL multiplier for long-horizon predictions (`Prediction.horizon ===
- * 'standing'`) — those that read nothing off the call that just happened.
- *
- * **The default is the identity, and that is a measured decision, not an
- * omission.** The premise of shortening it is that a standing bet waits
- * longer in the buffer than a derived one and so is served closer to expiry.
- * The eval measures the opposite: standing predictions are consumed at a
- * lead of exactly 1.000 calls in every archetype that has any — the same
- * instant as derived ones — so a fraction buys no measured freshness. It
- * does cost: swept over inter-call spacing, a factor of 0.5 is free up to
- * 10 s and then destroys the entire class (at 16 s spacing, 1265 hits → 1150;
- * every standing hit becomes a miss). Unmeasured benefit against measured
- * loss is not a trade worth a default.
- *
- * The lever stays because the argument for it is sound where the evidence is
- * missing rather than contrary — §13.15 session openers, which the corpus
- * cannot see. Operators set it per server via
- * `speculation.longHorizonTtlFactor`; §13.19 records which counters have to
- * move first (`expired`, and `perRule['opener:*'].wasted`).
+ * TTL multiplier for session-opening predictions (`horizon === 'standing'`).
+ * Triggered predictions, including those with constant arguments, use the
+ * ordinary TTL. The default factor remains 1; operators may shorten opener
+ * retention per server with `speculation.longHorizonTtlFactor`.
  */
 export const LONG_HORIZON_TTL_FACTOR = 1;
 

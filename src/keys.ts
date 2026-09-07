@@ -1,7 +1,7 @@
 /**
  * Canonical cache keying (DESIGN.md §6.1).
  */
-import type { ArgsCanonicalizer, CacheKey } from './types.js';
+import type { CacheKey } from './types.js';
 
 /** Stable stringify: objects get sorted keys at every depth. */
 export function stableStringify(value: unknown): string {
@@ -18,10 +18,8 @@ export function canonicalKey(
   server: string,
   tool: string,
   args: Record<string, unknown>,
-  canonicalizer?: ArgsCanonicalizer,
 ): CacheKey {
-  const canonical = canonicalizer ? canonicalizer(args) : args;
-  return `${server} ${tool} ${stableStringify(canonical)}`;
+  return `${server} ${tool} ${stableStringify(args)}`;
 }
 
 export function keyServer(key: CacheKey): string {

@@ -8,6 +8,19 @@
 
 What actually got built, what it measured, and where reality amended the design. The code is the reference; this section records the deltas.
 
+!!! note "Historical record"
+
+    Sections below describe the version and date in each heading. Later
+    releases retired several features, including profiles, CLI speculation,
+    `speculate try`, PATH-shim installation, and protocol sniffing. They are not
+    current setup instructions. Use [Commands](../commands.md) for the supported
+    interface and [benchmark methodology](local-learning-benchmark.md) for
+    current measurement and waste-accounting rules. Historical `npm run bench`
+    results refer to today's `bench:mock` mechanics example. The old zero-write
+    trial claim was inaccurate: its temporary credential-bearing config and
+    normal learner persistence were reasons to remove `try` in v0.20.
+
+
 ### 13.1 Decisions
 
 - **Language: TypeScript** on the official `@modelcontextprotocol/sdk` (1.29). The §10 trade-off resolved in favor of SDK maturity — the protocol plumbing (§3.4) is exactly where an immature SDK would bleed, and `npx`-style install is the MCP-ecosystem norm. A Go single-binary port remains open for v1 if distribution demands it.
@@ -66,7 +79,7 @@ The learner's model and per-rule feedback now survive restarts, so a proxy that 
 
 **What never persists:** tool results. The §6.4 memory-only cache promise is untouched — the state file contains tool names, argument-shape templates (including constant *argument* values, which is why the file is 0600 under a 0700 dir), and counters. Since v0.13 a template keeps up to `MAX_SOURCES_PER_ARG` competing literals per argument rather than the single one the old intersection narrowed to, so more user-supplied values (paths, ids, search queries) now sit in that 0600 file than before: measured 419 to 1,207 bytes on a 12-transition workload, the same class of data inside the same boundary, and more of it.
 
-**Durable usage snapshots:** separate versioned session records are aggregate-only. Beyond schema version and opaque session identity, they contain only source, absolute workspace path, timestamps, and cumulative counters. They never contain command arguments, tool or server names, results, prediction templates, or cache contents; caches and results remain memory-only. `speculate stats` validates and aggregates these records across MCP and CLI sessions, while `speculate try` disables their creation to preserve its zero-write contract.
+**Durable usage snapshots:** separate versioned session records are aggregate-only. Beyond schema version and opaque session identity, they contain only source, absolute workspace path, timestamps, and cumulative counters. They never contain command arguments, tool or server names, results, prediction templates, or cache contents; caches and results remain memory-only. `speculate stats` validates and aggregates these records across MCP and CLI sessions, while `speculate try` disabled their creation. That covered usage records only: learner persistence remained enabled, so the advertised zero-write contract was inaccurate.
 
 **Durability semantics (state is an optimization, never a liability):**
 - Atomic writes (same-directory tmp + rename); a crash mid-save leaves the previous state intact.
@@ -126,7 +139,7 @@ User directive: no touching config files at all — an install-and-it-works flow
 
 **1. `wrap --sniff` — protocol-sniffing pass-through (the enabling primitive).** Extends the §3.3 degradation property to the transport: buffer stdin's first line; a JSON-RPC `initialize` request means MCP → unshift the bytes and run the full proxy; anything else (non-JSON, EOF, size cap, or a quiet client past the 500 ms timeout) → spawn the wrapped command and become a byte-transparent pipe, exit code and signals forwarded. MCP clients send `initialize` immediately without waiting for server output, so real sessions decide on the first line, not the clock; a pathologically slow client degrades to the pipe (fail open — it still works, just unspeculated). Over-wrapping is now harmless by construction, which is what makes blind interposition (shims, below) safe. Implementation note: the sniffer leaves stdin explicitly paused; the CLI resumes it only after the proxy's transport attaches its listener, so no byte can flow into the void.
 
-**2. `speculate try` — the zero-write trial.** Reads the user's real Claude Code config (all three scopes, read-only), wraps every stdio entry in memory, adds the workspace shell server, writes a throwaway file, and execs `claude --mcp-config <tmp> --strict-mcp-config`. Nothing persists. Consent is preserved, not widened: checked-in `.mcp.json` servers are included only when the host's own approval records (`enabledMcpjsonServers` / `enableAllProjectMcpServers`, minus disabled) say the user already accepted them — `try` must never turn "pending approval" into "running".
+**2. `speculate try` — described at the time as a zero-write trial.** Read the user's real Claude Code config (all three scopes, read-only), wrapped every stdio entry in memory, added the workspace shell server, wrote a throwaway file, and ran `claude --mcp-config <tmp> --strict-mcp-config`. The zero-write claim was inaccurate: the temporary file contained server credentials and ordinary learner persistence remained enabled. The command was removed in v0.20. Consent is preserved, not widened: checked-in `.mcp.json` servers are included only when the host's own approval records (`enabledMcpjsonServers` / `enableAllProjectMcpServers`, minus disabled) say the user already accepted them — `try` must never turn "pending approval" into "running".
 
 **3. `speculate on`/`off`/`status` — persistent, through the host's front door.** Every mutation is a `claude mcp remove`/`add-json` invocation — never a JSON edit. Empirical findings this design rests on (verified against Claude Code 2.1): same-named servers resolve local > project > user; a local shadow of a project server *works* (exactly one server is used) but draws a "conflicting scopes" diagnostic. Hence the split: user/local-scope servers are re-registered wrapped IN PLACE (original recorded for exact restore); project-scope servers (checked in, shared) are never touched — a wrapped copy shadows them at local scope, diagnostic accepted as the price of not editing a teammate-visible file. Wrapped entries are self-describing (the original command line survives verbatim after the `--`, env carried unchanged), so `off` reconstructs originals even with a lost state file. The state record lives at `$XDG_STATE_HOME/speculate/managed.json`; `status` reports drift (servers added since `on`). Wrapped entries reference the local install by absolute path (`selfCommand()`); teammates are unaffected because `on` never writes to the shared project scope — shadows live at local scope, which is per-machine.
 
@@ -268,6 +281,12 @@ One behaviour deliberately changed, with its test: a template whose constant goe
 **0.846 is an upper bound, and the DEFAULT transport may not reach it.** recall@3 is what a batch of three is worth once all three are actually issued, which is what an http server does and what the offline harness assumes; on stdio, speculation is serial and idle-only (§7), so the 2nd and 3rd candidates queue behind the 1st and `enqueue` evicts the lowest-confidence tail at the queue cap, which is precisely the beam's hedges. What decides it is how long the agent thinks between calls, measured end to end at seed 1 on stdio for list-detail-varied / paired-args / return-visits: **0.740 / 0.880 / 1.000** when the inter-call gap is 3x upstream latency or more (equal to the eval, and equal to http), 0.470 / 0.600 / 1.000 at 2x, and 0.420 / 0.590 / 0.940 at 1x. So the win converts fully once the agent's gap is roughly 3x upstream latency, and `queue-full` and `queue-expired` in `speculate_stats` are the two counters that say which regime a session is actually in. This is not a regression and the beam is not the cause: at the same 1x spacing a learner capped at one candidate, the pre-beam world, reads 0.360 / 0.560 / 0.600 against K=3's 0.420 / 0.590 / 0.940, so K=3 is ahead at every point. It matters because `speculate wrap` and the plugin both make stdio the default, so a tight-loop session is the shape most likely to read below the headline.
 
 ### 13.19 v0.13 — measuring how stale a served prefetch was (2026-08-02)
+
+**v0.20 correction:** the historical standing class below included learned
+transitions with constant arguments. Those now use the next-call lifetime;
+only startup predictions are standing. This replay corpus does not model
+startup timing, so its former standing measurements cannot justify an opener
+TTL factor. The default remains 1 without new opener-timing evidence.
 
 Prediction quality and freshness pull in **opposite directions**, and §13.16–§13.18 only improved one of them. Each of those changes makes the proxy prefetch more, earlier, and further ahead, which can only raise the **age of an entry at the moment it is consumed** — and every number in the report was age-blind, so the whole sequence could have been trading freshness for recall with nothing showing it. What already bounds the damage is unchanged: TTL from completion, single-use entries, a full per-server flush on any non-read-only call. What was missing was any measurement of the **distribution** inside that bound.
 
@@ -468,7 +487,7 @@ What went: `src/profiles/` entirely, `detectProfile` fingerprinting, per-tool pa
 §13.23 ended "wrapping them needs a mechanism that does not exist yet, and is
 recorded here rather than attempted." The mechanism exists; this section
 supersedes that sentence. Full spec:
-docs/superpowers/specs/2026-08-05-plugin-wrap-design.md.
+.superpowers/archive/specs/2026-08-05-plugin-wrap-design.md.
 
 **The mechanism was measured, not designed first.** Running the real CLI
 (Claude Code 2.1.222, isolated `CLAUDE_CONFIG_DIR`) established: installed

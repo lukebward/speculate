@@ -83,7 +83,6 @@ export class SpeculateProxy {
     opts: {
       now?: () => number;
       statePath?: string | null;
-      stateFallbackPaths?: string[];
       stateScope?: string;
       usageRecorder?: UsageRecorder | null;
     } = {},
@@ -158,7 +157,7 @@ export class SpeculateProxy {
     this.latency = new LatencyModel({ now });
     this.calibration = new CandidateCalibrator({ now });
     this.store = opts.statePath
-      ? new StateStore(opts.statePath, now, opts.stateFallbackPaths ?? [], opts.stateScope, {
+      ? new StateStore(opts.statePath, now, opts.stateScope, {
           retentionDays: config.persistence?.retentionDays,
           maxBytes: config.persistence?.maxBytes,
           secretValues: () => collectRuntimeSecrets(config),
@@ -771,7 +770,7 @@ export class SpeculateProxy {
             const slots = this.openerSlots.get(server) ?? OPENER_RECORD_LIMIT;
             if (slots > 0) {
               this.openerSlots.set(server, slots - 1);
-              this.learner.recordOpener(server, tool, args, latencyMs);
+              this.learner.recordOpener(server, tool, args);
             }
           }
           const predictions = this.predictor.observe({

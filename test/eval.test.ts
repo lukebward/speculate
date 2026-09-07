@@ -23,7 +23,7 @@ import {
   WORKFLOW_ARCHETYPES,
   warmupFor,
 } from '../eval/corpus.js';
-import { baselineLine, table } from '../eval/format.js';
+import { ageTable, baselineLine, table } from '../eval/format.js';
 import {
   DEFAULT_SEEDS,
   replayArchetype,
@@ -334,13 +334,17 @@ describe('age at consumption', () => {
     expect(age.lastQuarterShare).toBeLessThanOrEqual(1);
   });
 
-  it('splits the buffer into the classes that get different TTLs', () => {
+  it('classifies every corpus transition as next and leaves startup timing unmeasured', () => {
     const run = runEvalDetailed(DEFAULT_SEEDS);
-    expect(run.age.next.hits + run.age.standing.hits).toBe(run.age.all.hits);
+    expect(run.age.next).toEqual(run.age.all);
     expect(run.age.all.ages).toHaveLength(run.age.all.hits);
-    // Both classes must stay populated or the comparison is vacuous.
     expect(run.age.next.hits).toBeGreaterThan(0);
-    expect(run.age.standing.hits).toBeGreaterThan(0);
+    expect(run.age.standing.hits).toBe(0);
+    expect(run.age.standing.unconsumed).toBe(0);
+    expect(toAgeReport(run.age.standing).meanLead).toBeNull();
+    expect(ageTable(run).join('\n')).toContain(
+      'startup openers are not modeled; this corpus cannot evaluate their TTL factor.',
+    );
   });
 
   it('MOVES when consumption is delayed — the property the metric rests on', () => {
@@ -384,38 +388,17 @@ describe('age at consumption', () => {
     expect(otherTtl.floor.hitsAt3).toBe(withSim.floor.hitsAt3);
   });
 
-  it('prices the standing-bet TTL multiplier across inter-call spacing', () => {
-    // THE test that decides the shipped default, and the coverage an earlier
-    // version of this work claimed could not exist. Sweep the gap between an
-    // agent's calls; at each one compare the identity against a halved TTL
-    // for standing bets. The multiplier is free only while the gap stays
-    // under half the TTL, and past that it destroys the class outright —
-    // against a benefit the mean-lead column says is zero at every spacing.
-    const sweep = [1_500, 10_000, 16_000, 20_000].map((callSpacingMs) => {
+  it('does not shorten constant-argument transitions when the startup TTL factor changes', () => {
+    // Exercise gaps on both sides of the shortened startup TTL. All corpus
+    // calls are learned as next-call transitions, so that separate factor
+    // must not change their consumption or claim to measure opener timing.
+    for (const callSpacingMs of [1_500, 16_000]) {
       const identity = runEvalDetailed(DEFAULT_SEEDS, { callSpacingMs, standingTtlFactor: 1 });
       const halved = runEvalDetailed(DEFAULT_SEEDS, { callSpacingMs, standingTtlFactor: 0.5 });
-      return { callSpacingMs, identity, halved };
-    });
-
-    for (const { callSpacingMs, identity, halved } of sweep) {
-      // Below half the TTL the entry outlives the gap either way.
-      if (callSpacingMs * 2 < identity.ttlMs) {
-        expect(halved.age.all.hits, `${callSpacingMs} ms: free`).toBe(identity.age.all.hits);
-        expect(halved.age.standing.hits).toBe(identity.age.standing.hits);
-      } else {
-        // Past it, every standing bet expires before the call that wanted it.
-        expect(halved.age.standing.hits, `${callSpacingMs} ms: class gone`).toBe(0);
-        expect(halved.age.all.hits, `${callSpacingMs} ms: hits lost`).toBeLessThan(
-          identity.age.all.hits,
-        );
-      }
-      // And it never buys freshness: the class is claimed by the very next
-      // call at every spacing, so there is no age for a shorter TTL to save.
-      expect(toAgeReport(identity.age.standing).meanLead).toBe(1);
+      expect(identity.age.all.hits).toBeGreaterThan(0);
+      expect(halved.age).toEqual(identity.age);
+      expect(halved.workflow).toEqual(identity.workflow);
     }
-
-    // The class has to stay populated or the sweep proves nothing.
-    expect(sweep[0]!.identity.age.standing.hits).toBeGreaterThan(0);
   });
 
   it('honours single use: one prediction is consumed at most once', () => {

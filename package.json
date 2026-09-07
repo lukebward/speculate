@@ -1,13 +1,13 @@
 {
   "name": "speculate-mcp",
-  "version": "0.19.0",
-  "description": "Speculative-prefetching MCP proxy: make your agent's next tool call instant",
+  "version": "0.20.0",
+  "description": "Local learning MCP proxy that prefetches read-only tool calls to reduce waiting",
   "main": "dist/src/cli.js",
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.cjs",
     "test": "vitest run",
     "test:scenarios": "vitest run test/scenarios.test.ts",
-    "bench": "tsx bench/bench.ts",
+    "bench": "tsx bench/repeated.ts",
     "bench:remote": "tsx bench/remote.ts",
     "bench:repeated": "tsx bench/repeated.ts",
     "eval": "tsx eval/eval.ts",
@@ -16,7 +16,8 @@
     "start": "tsx src/cli.ts",
     "prepare": "node scripts/prepare.cjs",
     "prepublishOnly": "npm run build && npm test",
-    "demo:gif": "node scripts/demo-gif.mjs"
+    "demo:gif": "node scripts/demo-gif.mjs",
+    "bench:mock": "tsx bench/bench.ts"
   },
   "repository": {
     "type": "git",

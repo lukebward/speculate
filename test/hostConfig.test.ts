@@ -1,7 +1,7 @@
 /**
  * §13.12 host-config discovery and entry wrapping: scope precedence,
  * consent preservation for .mcp.json servers, wrap/unwrap round-trips,
- * and the `try` plan builder that composes them.
+ * and remote-server eligibility.
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -21,7 +21,6 @@ import {
   wrapEntry,
 } from '../src/hostConfig.js';
 import { ENV_PLACEHOLDER, HEADER_NAME } from '../src/config.js';
-import { buildTryConfig, parseTryArgs, tryClientEnv } from '../src/tryRun.js';
 
 const SELF = { command: '/usr/bin/node', args: ['/opt/speculate/dist/src/cli.js'] };
 
@@ -396,74 +395,5 @@ describe('remote (http) entries', () => {
   it('keeps a header value containing colons whole', () => {
     const original = { type: 'http', url: URL_, headers: { 'X-Trace': 'a:b:c' } };
     expect(unwrapEntry(wrapEntry(original, SELF))).toEqual(original);
-  });
-});
-
-describe('buildTryConfig', () => {
-  it('wraps stdio servers, passes through http, and nothing else', () => {
-    writeClaudeJson({
-      mcpServers: {
-        github: { command: 'github-mcp-server', args: ['stdio'] },
-        sentry: { url: 'https://mcp.sentry.dev/mcp', type: 'http' },
-      },
-    });
-    const plan = buildTryConfig({ home, cwd, self: SELF });
-    expect(plan.wrapped).toEqual(['github']);
-    expect(plan.passedThrough).toEqual(['sentry']);
-    expect(plan.mcpServers.github!.command).toBe(SELF.command);
-    expect(plan.mcpServers.sentry).toEqual({ url: 'https://mcp.sentry.dev/mcp', type: 'http' });
-    expect(Object.keys(plan.mcpServers).sort()).toEqual(['github', 'sentry']);
-  });
-
-  it('never turns pending .mcp.json approval into running servers', () => {
-    writeMcpJson({ mcpServers: { team: { command: 'team-server' } } });
-    const plan = buildTryConfig({ home, cwd, self: SELF });
-    expect(plan.mcpServers.team).toBeUndefined();
-    expect(plan.skipped.map((s) => s.name)).toEqual(['team']);
-  });
-
-  it('includes approved .mcp.json servers, wrapped', () => {
-    writeClaudeJson({ projects: { [cwd]: { enabledMcpjsonServers: ['team'] } } });
-    writeMcpJson({ mcpServers: { team: { command: 'team-server' } } });
-    const plan = buildTryConfig({ home, cwd, self: SELF });
-    expect(plan.wrapped).toEqual(['team']);
-  });
-
-  it('leaves already-wrapped entries alone', () => {
-    writeClaudeJson({
-      mcpServers: {
-        github: {
-          command: '/usr/bin/node',
-          args: ['/opt/speculate/dist/src/cli.js', 'wrap', '--', 'github-mcp-server'],
-        },
-      },
-    });
-    const plan = buildTryConfig({ home, cwd, self: SELF });
-    expect(plan.passedThrough).toEqual(['github']);
-    expect(Object.keys(plan.mcpServers)).toEqual(['github']);
-  });
-});
-
-describe('parseTryArgs', () => {
-  it('parses flags and client args', () => {
-    const t = parseTryArgs(['--mode', 'strict', '--', '--continue']);
-    expect(t).toEqual({ mode: 'strict', clientArgs: ['--continue'] });
-  });
-  it('rejects unknown flags', () => {
-    expect(parseTryArgs(['--frobnicate'])).toHaveProperty('error');
-  });
-  it('rejects --no-workspace as an unknown flag', () => {
-    const t = parseTryArgs(['--no-workspace']);
-    expect(t).toHaveProperty('error');
-    expect((t as { error: string }).error).toMatch(/--no-workspace/);
-  });
-});
-
-describe('tryClientEnv', () => {
-  it('disables durable usage', () => {
-    expect(tryClientEnv({ KEEP: 'yes' })).toEqual({
-      KEEP: 'yes',
-      SPECULATE_USAGE_OFF: '1',
-    });
   });
 });

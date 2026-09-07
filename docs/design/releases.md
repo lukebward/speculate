@@ -1,6 +1,9 @@
 # Release notes
 
-Version-by-version records of what changed and why, newest last.
+Version-by-version records of what changed and why, newest last. Commands and
+measurements in older entries describe that release. See [Commands](../commands.md)
+for current support and the [benchmark methodology](local-learning-benchmark.md)
+for maintained instruments and historical-accounting limits.
 
 !!! info "Part of the design document"
 
@@ -19,7 +22,7 @@ while MCP's readOnlyHint gives it for free; and the tier carried the
 project's POSIX-only surface (unix sockets, uid checks) plus a Windows
 .git/index watcher loop that flushed every prefetch. `on`/`off` now clean
 up artifacts a ≤0.10 install left behind. Full trail:
-.superpowers/specs/2026-08-01-focus-mcp-design.md.
+.superpowers/archive/specs/2026-08-01-focus-mcp-design.md.
 
 `speculate exec` survives as a verbatim pass-through (no shell, no rewriting,
 the child's exit code) so the ≤0.10 Bash hook keeps working. That hook
@@ -209,7 +212,7 @@ because the plugin installs at user scope, opening a brand-new project also
 gets its already-approved servers wrapped automatically at that project's
 next session start, without `speculate on` ever having run there.
 
-Full trail: .superpowers/specs/2026-08-02-auto-wrap-design.md.
+Full trail: .superpowers/archive/specs/2026-08-02-auto-wrap-design.md.
 
 ## v0.13 (2026-08-02): prediction quality
 
@@ -468,3 +471,53 @@ and live Microsoft Learn checks showed little extra benefit or regressions.
 The [qualification report](local-learning-benchmark.md) records all workflows,
 controls, limits and reproduction details. Linux/macOS/Windows CI and Node 18
 CLI compatibility passed.
+
+## v0.20 (2026-09-07): smaller launch surface and corrected prediction lifetime
+
+`speculate on` and explicit `wrap` are the supported launch paths. PATH-shim
+installation/status, protocol sniffing, and `speculate try` are retired. Old
+`wrap --sniff` invocations now pass through immediately without speculation.
+Existing shim users can run `speculate shims uninstall`, restart their shell, and switch
+to an explicit wrapper configuration. The [migration guide](../getting-started.md#upgrading-from-retired-launch-paths)
+includes saved commands and how to evaluate and undo normal activation.
+
+The trial command's zero-write promise did not match its behavior: it wrote a
+temporary configuration containing server credentials and left ordinary
+learning persistence enabled. It also passed HTTP/SSE entries through without
+wrapping them. Removing it eliminates a separate, incomplete setup path.
+
+Learned transitions now always predict the next call, including transitions
+with constant arguments. Their unfired queued work is retired when the real
+sequence advances. `standing` is reserved for startup predictions, so the
+existing queue cleanup applies consistently. This lifecycle correction does
+not cancel already-issued calls or change cache correctness protections.
+
+Unused custom argument canonicalizers and state-fallback plumbing are removed.
+Cache keys continue to use stable JSON with exact argument values. Memory
+inventory uses the persistence loader's validation instead of a separate weaker
+reader, and admission uses the shared latency model. Outcome feedback and
+calibration share one scoring path. The expiry ablation demonstrated that
+correctness calibration alone does not prevent wasted expired predictions,
+so the operational cutoff remains.
+
+`npm run bench` now runs the general repeated-workflow harness, comparing off
+and on with independent persisted learning in the current checkout. Supplying
+`--baseline` adds a prior-release arm. The former default is available as
+`bench:mock` and is explicitly scoped to GitHub-rule mechanics. The unused
+daily-workflow generator and its unused comparison API are deleted. Paired
+accounting tests, generic replay evaluation, and real-server measurements remain.
+
+Benchmark methods and historical-result caveats now have one
+[authoritative guide](local-learning-benchmark.md). Broad instant-call and
+zero-waste claims are removed. Earlier implementation plans/specifications are
+archived, and unused LinkedIn assets are deleted. Recent-history learning,
+secret filtering, retention/disk limits, and read-only/invalidation protections
+remain in place.
+
+The 360-session paired qualification preserved useful calls (204/336), terminal
+waste (83 calls), and mean tool wait (96.25 ms) versus v0.19.0. The default
+suite passed 853 tests with seven skips; real filesystem/Git checks and an
+installed-package Node 18 MCP smoke test passed. These results support a
+smaller implementation with preserved behavior, not a new speedup claim. The
+[benchmark guide](local-learning-benchmark.md#v020-qualification-against-v019)
+records the methods, feedback ablation, live check, and limitations.

@@ -332,7 +332,6 @@ export function sanitizeLearnerState(
       count: rawTransition['count'],
       ...(finite(rawTransition['score']) ? { score: rawTransition['score'] } : {}),
       lastUpdated: transitionStamp,
-      ...(finite(rawTransition['latencyMs']) ? { latencyMs: rawTransition['latencyMs'] } : {}),
       templates,
       ...(contexts.length > 0 ? { contexts } : {}),
     });
@@ -360,7 +359,6 @@ export function sanitizeLearnerState(
       server: rawOpener['server'], tool: rawOpener['tool'], argsRepr: rawOpener['argsRepr'], count: rawOpener['count'],
       ...(finite(rawOpener['score']) ? { score: rawOpener['score'] } : {}),
       lastUpdated: stamp,
-      ...(finite(rawOpener['latencyMs']) ? { latencyMs: rawOpener['latencyMs'] } : {}),
     });
   }
   return { value: { transitions, openers }, removedSensitive, removedExpired, removedInvalid };

@@ -9,7 +9,7 @@ it('reports retained learning for the current workspace/account scope', async ()
   const directory = mkdtempSync(join(tmpdir(), 'speculate-doctor-'));
   try {
     const path = join(directory, 'state.json');
-    const store = new StateStore(path, Date.now, [], 'current-scope');
+    const store = new StateStore(path, Date.now, 'current-scope');
     expect(store.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
     const lines: string[] = [];
     const config = { mode: 'off', servers: {} } as Parameters<typeof runDoctor>[0];

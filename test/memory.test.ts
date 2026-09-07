@@ -221,4 +221,38 @@ describe('memory command', () => {
     expect(item.removedSensitive).toBe(Number.MAX_SAFE_INTEGER);
     expect(item.removedExpired).toBe(0);
   });
+
+  it('uses loader validation and the configured byte limit for inventory', () => {
+    const root = dir();
+    const path = join(root, 'state-0123456789abcdef.json');
+    const valid = {
+      version: 1, savedAt: Date.now(), scope: 'another-workspace',
+      learner: { transitions: [], openers: [
+        { server: 's', tool: 'list', argsRepr: '{}', count: 3, lastUpdated: Date.now() },
+      ] }, ruleFeedback: {},
+    };
+    writeFileSync(path, JSON.stringify(valid));
+    // Inventory can count other workspaces; loading must still reject them.
+    expect(inventoryMemory(root).stateFiles[0]?.openers.tracked).toBe(1);
+    expect(new StateStore(path, Date.now, 'current-workspace').load()).toBeNull();
+    const original = readFileSync(path, 'utf8');
+    inventoryMemory(root);
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    expect(existsSync(`${path}.generation`)).toBe(false);
+    for (const invalid of [
+      { ...valid, version: 999 },
+      { ...valid, ruleFeedback: null },
+      { ...valid, ruleFeedback: [] },
+    ]) {
+      writeFileSync(path, JSON.stringify(invalid));
+      expect(inventoryMemory(root).stateFiles[0]).toMatchObject({
+        savedAt: null, openers: { tracked: 0, supported: 0 },
+      });
+      expect(StateStore.inspect(path)).toBeNull();
+    }
+    writeFileSync(path, JSON.stringify({ ...valid, padding: 'x'.repeat(70_000) }));
+    const policy = { retentionDays: 30, maxBytes: 65_536 };
+    expect(inventoryMemory(root, undefined, policy).stateFiles[0]?.openers.tracked).toBe(0);
+    expect(new StateStore(path, Date.now, valid.scope, policy).load()).toBeNull();
+  });
 });

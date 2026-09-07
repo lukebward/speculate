@@ -1,9 +1,8 @@
 # Speculate
 
 **Speculative prefetching for coding agents.** Speculate sits between your MCP
-client and its servers. It predicts the next read-only tool call, runs it early,
-and has the answer waiting. Gmail preloads your inbox; this preloads your tool
-calls.
+client and its servers. It learns likely read-only tool calls and runs them early,
+reducing waiting when a prediction is used.
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](https://raw.githubusercontent.com/lukebward/speculate/main/demo/speculate-demo.gif)
 
@@ -32,7 +31,7 @@ speculate on
 
     ---
 
-    `on`, `off`, `status`, `auth`, `stats`, `try`, `doctor` — what each one
+    `on`, `off`, `status`, `auth`, `stats`, `memory`, `doctor` — what each one
     changes and what it leaves alone.
 
     [:octicons-arrow-right-24: CLI reference](commands.md)
@@ -86,37 +85,17 @@ speculate on
 
 ## Measured results
 
-Against real hosted MCP servers, not mocks. Three alternating off/on runs each,
-zero config:
+The [benchmark methodology and results](design/local-learning-benchmark.md)
+explain each maintained instrument and its limits. The v0.19 qualification
+against v0.18 increased useful prefetches from 68.5% to 83.75% and reduced mean
+tool wait by 12.87% across four controlled repeated-workflow fixtures with
+120 ms injected latency. Most additional useful results were joined in flight;
+ready hits and tail latency did not improve.
 
-| Server | Auth | Warm tool wait | Cut |
-|---|---|---|---|
-| Context7 | none | 9.4 s to 3.1 s | **-67%** |
-| GitHub hosted MCP | token | 5.0 s to 1.6 s | **-67%** |
-| Microsoft Learn | none | 2.3 s to 1.1 s | **-54%** |
-| Hugging Face Hub | none | 259 ms to 139 ms | **-46%** |
-
-Zero wasted calls on any of them. The saving tracks how slow the server is,
-which is the point: a local stdio server answering in single-digit milliseconds
-has nothing worth hiding.
-
-!!! warning "Read the caveats before quoting these"
-
-    **Warm** is the median of runs 2 and 3. Expect little from the first pass:
-    Speculate cannot predict a call it has never seen, and warming up takes two
-    or three runs. The benchmark repeats an identical session, so treat it as
-    the best case for a workflow you genuinely repeat.
-
-Three of the four need no credential. Check them yourself:
-
-```bash
-SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
-```
-
-[Release notes](design/releases.md) and
-[implementation notes](design/implementation-notes.md) have every run, including
-the ones that went the wrong way — see especially
-[why the first pass cannot be fast](design/implementation-notes.md#1321-why-the-first-pass-cannot-be-fast-and-why-no-threshold-fixes-it-2026-08-02).
+Historical live-server runs measured larger warm-session savings, but repeated
+identical requests and incomplete shutdown-waste accounting limit those
+snapshots. The report preserves their scope and links to their raw history.
+No measured result guarantees zero wasted calls or whole-task speedup.
 
 ## Non-goals
 
