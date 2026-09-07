@@ -20,6 +20,7 @@ import {
   clearPersistedState,
   defaultStateDirectory,
   defaultStatePath,
+  isCanonicalDirectoryIdentity,
 } from './persistence.js';
 import { sanitizeLearnerState } from './privacy.js';
 
@@ -245,9 +246,7 @@ function safeDirectory(path: string): boolean {
     const stat = lstatSync(absolute);
     if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
     const actual = realpathSync(absolute);
-    return process.platform === 'win32'
-      ? actual.toLowerCase() === absolute.toLowerCase()
-      : actual === absolute;
+    return isCanonicalDirectoryIdentity(absolute, actual);
   } catch {
     return false;
   }

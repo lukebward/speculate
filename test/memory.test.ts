@@ -12,12 +12,28 @@ import {
   withUsageMemoryLock,
 } from '../src/memory.js';
 import { StateStore } from '../src/persistence.js';
+import { isCanonicalDirectoryIdentity } from '../src/persistence.js';
 
 const roots: string[] = [];
 const dir = () => { const value = mkdtempSync(join(tmpdir(), 'speculate-memory-')); roots.push(value); return value; };
 afterEach(() => { for (const root of roots.splice(0)) { try { rmSync(root, { recursive: true, force: true }); } catch {} } });
 
 describe('memory command', () => {
+  it('accepts fixed macOS system aliases without accepting nested linked paths', () => {
+    expect(isCanonicalDirectoryIdentity(
+      '/var/folders/ab/session',
+      '/private/var/folders/ab/session',
+      'darwin',
+      [['/var/folders/ab', '/private/var/folders/ab']],
+    )).toBe(true);
+    expect(isCanonicalDirectoryIdentity(
+      '/var/folders/ab/linked/session',
+      '/private/var/folders/external/session',
+      'darwin',
+      [['/var/folders/ab', '/private/var/folders/ab']],
+    )).toBe(false);
+  });
+
   it('parses inventory and explicit clear scopes', () => {
     expect(parseMemoryArgs([])).toEqual({ action: 'status', json: false });
     expect(parseMemoryArgs(['--json'])).toEqual({ action: 'status', json: true });
@@ -165,6 +181,19 @@ describe('memory command', () => {
     expect(existsSync(record)).toBe(true);
     expect(JSON.parse(output.join(''))).toMatchObject({ failed: 1 });
     expect(inventoryMemory(root).usage.files).toBe(0);
+  });
+
+  it('refuses a linked managed root', () => {
+    const container = dir();
+    const outside = dir();
+    const state = join(outside, 'state-0123456789abcdef.json');
+    writeFileSync(state, '{}');
+    const root = join(container, 'managed');
+    try { symlinkSync(outside, root, process.platform === 'win32' ? 'junction' : 'dir'); } catch { return; }
+    expect(runMemory({ action: 'clear', all: true, json: true }, {
+      directory: root, write: () => {},
+    })).toBe(1);
+    expect(readFileSync(state, 'utf8')).toBe('{}');
   });
 
   it('recovers a stale usage lock and supports a zero-wait attempt', () => {

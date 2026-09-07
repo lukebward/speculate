@@ -28,7 +28,7 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { mergeLatencySnapshots, type LatencySnapshot } from './latency.js';
 import {
   mergeCandidateFeedbackSnapshots,
@@ -617,12 +617,49 @@ function safeStateParent(path: string): boolean {
     const stat = lstatSync(existing);
     if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
     const actual = realpathSync(existing);
-    return process.platform === 'win32'
-      ? actual.toLowerCase() === existing.toLowerCase()
-      : actual === existing;
+    return isCanonicalDirectoryIdentity(existing, actual);
   } catch {
     return false;
   }
+}
+
+/**
+ * Compare a requested directory with its real path without rejecting an OS
+ * alias on the runtime's own temp/home roots. The suffix must remain identical,
+ * so a user-created symlink below either trusted root still fails this check.
+ */
+export function isCanonicalDirectoryIdentity(
+  requested: string,
+  actual: string,
+  platform: NodeJS.Platform = process.platform,
+  trustedRoots: readonly (readonly [requested: string, actual: string])[] = runtimeTrustedRoots(platform),
+): boolean {
+  if (platform === 'win32') return requested.toLowerCase() === actual.toLowerCase();
+  if (requested === actual) return true;
+  if (platform !== 'darwin') return false;
+  for (const [requestedRoot, actualRoot] of trustedRoots) {
+    if (requested === requestedRoot || requested.startsWith(`${requestedRoot}/`)) {
+      return actual === `${actualRoot}${requested.slice(requestedRoot.length)}`;
+    }
+  }
+  return false;
+}
+
+function runtimeTrustedRoots(platform: NodeJS.Platform): readonly (readonly [string, string])[] {
+  if (platform !== 'darwin') return [];
+  const roots: Array<readonly [string, string]> = [];
+  for (const requested of [tmpdir(), homedir()]) {
+    try {
+      const actual = realpathSync(requested);
+      const requestedRoot = requested.replace(/\/$/, '');
+      const actualRoot = actual.replace(/\/$/, '');
+      const fixedAppleAlias = (requestedRoot === '/var' || requestedRoot.startsWith('/var/') ||
+        requestedRoot === '/tmp' || requestedRoot.startsWith('/tmp/')) &&
+        actualRoot === `/private${requestedRoot}`;
+      if (fixedAppleAlias) roots.push([requestedRoot, actualRoot]);
+    } catch {}
+  }
+  return roots;
 }
 
 /** Small bounded synchronous lock: saves happen only during periodic flush/close. */
