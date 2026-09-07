@@ -11,8 +11,6 @@ for the call already in progress. Other calls go upstream normally.
 
 ![Demo: repeated GitHub workflow with prefetched results](demo/speculate-demo.gif)
 
-*Demo uses a mock server with simulated latency.*
-
 ## Setup
 
 Requires Node.js 18 or later. For Claude Code, run from your project:
