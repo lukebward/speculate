@@ -21,8 +21,8 @@ import {
   defaultStateDirectory,
   defaultStatePath,
   isCanonicalDirectoryIdentity,
+  StateStore,
 } from './persistence.js';
-import { sanitizeLearnerState } from './privacy.js';
 
 export type MemoryArgs =
   | { action: 'status'; json: boolean; configPath?: string }
@@ -115,7 +115,7 @@ function displayTimestamp(value: unknown): number | null {
 
 function readStateSummary(
   path: string,
-  retentionDays: number,
+  policy: { retentionDays: number; maxBytes: number },
 ): Omit<MemoryInventory['stateFiles'][number], 'path' | 'bytes'> {
   const empty = {
     savedAt: null,
@@ -127,19 +127,10 @@ function readStateSummary(
     trimmedForSize: 0,
   };
   try {
-    if (statSync(path).size > 67_108_864) return empty;
-    const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
-    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-      const root = value as Record<string, unknown>;
-      const learner = root['learner'] !== null && typeof root['learner'] === 'object' && !Array.isArray(root['learner'])
-        ? root['learner'] as Record<string, unknown>
-        : {};
-      const savedAt = displayTimestamp(root['savedAt']);
-      const clean = sanitizeLearnerState(learner, {
-        now: Date.now(),
-        cutoff: Date.now() - retentionDays * 24 * 60 * 60_000,
-        fallbackTimestamp: savedAt ?? Date.now(),
-      }).value;
+    const state = StateStore.inspect(path, policy);
+    if (state !== null) {
+      const clean = state.learner as { transitions: unknown[]; openers: unknown[] };
+      const savedAt = displayTimestamp(state.savedAt);
       const transitions = clean.transitions;
       const openers = clean.openers;
       const readyTransition = (item: unknown): boolean => {
@@ -153,17 +144,15 @@ function readStateSummary(
       const readyOpener = (item: unknown): boolean => item !== null && typeof item === 'object' &&
         !Array.isArray(item) && typeof (item as Record<string, unknown>)['count'] === 'number' &&
         ((item as Record<string, unknown>)['count'] as number) >= 2;
-      const memory = root['memory'] !== null && typeof root['memory'] === 'object' && !Array.isArray(root['memory'])
-        ? root['memory'] as Record<string, unknown>
-        : {};
+      const memory = state.memory;
       return {
         savedAt,
         transitions: { tracked: transitions.length, supported: transitions.filter(readyTransition).length },
         openers: { tracked: openers.length, supported: openers.filter(readyOpener).length },
-        removedSensitive: boundedCount(memory['removedSensitive']),
-        removedExpired: boundedCount(memory['removedExpired']),
-        removedInvalid: boundedCount(memory['removedInvalid']),
-        trimmedForSize: boundedCount(memory['trimmedForSize']),
+        removedSensitive: boundedCount(memory?.removedSensitive),
+        removedExpired: boundedCount(memory?.removedExpired),
+        removedInvalid: boundedCount(memory?.removedInvalid),
+        trimmedForSize: boundedCount(memory?.trimmedForSize),
       };
     }
   } catch {}
@@ -208,7 +197,7 @@ export function inventoryMemory(
     const parent = dirname(path);
     if (!safeDirectory(parent) || !safeRegularFile(path, parent)) { if (onlyPath === undefined || pathExists(path)) skipped++; continue; }
     const stat = statSync(path);
-    stateFiles.push({ path: resolve(path), bytes: stat.size, ...readStateSummary(path, policy.retentionDays) });
+    stateFiles.push({ path: resolve(path), bytes: stat.size, ...readStateSummary(path, policy) });
   }
   const usageDirectory = join(directory, 'usage');
   let usageFiles = 0;

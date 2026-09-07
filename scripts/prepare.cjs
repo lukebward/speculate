@@ -7,4 +7,4 @@ try {
 } catch {
   process.exit(0);
 }
-require('node:child_process').execSync('npx tsc', { stdio: 'inherit' });
+require('./build.cjs');

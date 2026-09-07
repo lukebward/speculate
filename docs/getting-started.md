@@ -70,24 +70,35 @@ prefetches were.
     - **Approval never widens.** A server pending approval in `.mcp.json` stays
       pending. Revoke it, or delete the server, and the next session start
       removes the wrapped copy.
-    - **`--resume` and `--continue` do not trigger it.** The hook runs on fresh
-      sessions only; `speculate on` always wraps on the spot.
+    - **Session starts include resumes and clears.** The hook runs when Claude
+      Code starts, resumes, or clears a session; `speculate on` always wraps on
+      the spot.
     - **Removing it everywhere:** `off` covers one project. To stop it globally,
       `claude plugin uninstall -s user speculate-autowrap`, then
       `claude plugin marketplace remove speculate-mcp`.
 
-??? note "Auto-wrapping for other clients (`speculate shims install`)"
+## Upgrading from retired launch paths
 
-    Opt-in `npx`/`uvx` shims that wrap any MCP server any client launches. It
-    edits one marked block in your shell rc file. POSIX only.
+v0.20 removes PATH-shim installation, protocol sniffing, and `speculate try`.
+Use `speculate on` for Claude Code or the explicit `wrap` configuration above
+for another MCP client.
 
-## Trying it without committing
+If an earlier version installed PATH shims, run:
 
 ```bash
-speculate try
+speculate shims uninstall
 ```
 
-Launches a throwaway session, writing nothing. See [Commands](commands.md).
+Restart your shell afterward so `npx` and `uvx` resolve normally. Uninstall
+support remains for migration. Saved `wrap --sniff -- ...` commands now pass
+through immediately without speculation. Replace them with `wrap -- ...` only
+where the launched program is an MCP server.
+
+To evaluate Speculate, enable it with `on`, inspect `stats`, and use `off` to
+restore the project's original server registrations. Learning and aggregate
+usage records persist normally; `speculate memory clear --all` removes managed
+learning and usage records if you want to clear them afterward. See
+[Commands](commands.md#memory) for custom state paths.
 
 ## Next steps
 

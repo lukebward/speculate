@@ -7,7 +7,7 @@
 
 📖 **[Documentation](https://lukebward.github.io/speculate/)** · [Getting started](https://lukebward.github.io/speculate/getting-started/) · [Commands](https://lukebward.github.io/speculate/commands/) · [Safety](https://lukebward.github.io/speculate/safety/) · [Design document](https://lukebward.github.io/speculate/design/)
 
-**Speculative prefetching for coding agents.** Speculate sits between your MCP client and its servers. It predicts the next read-only tool call, runs it early, and has the answer waiting. Gmail preloads your inbox; this preloads your tool calls.
+**Speculative prefetching for coding agents.** Speculate sits between your MCP client and its servers. It learns likely read-only tool calls and runs them early, reducing waiting when a prediction is used.
 
 > Built with heavy use of AI coding agents. Everything here is reviewed and tested, and the suite runs on Linux, macOS, and Windows, but weigh that as you would any other statement about how software was made.
 
@@ -18,36 +18,14 @@
 - **Read-only, always.** It runs tools the server marks read-only, and nothing else.
 - **Nothing taken away.** Every change is recorded, and `off` reverses it exactly.
 
-Measured against real hosted MCP servers, not mocks. Three alternating off/on runs each, zero config:
-
-| Server | Auth | Warm tool wait | Cut |
-|---|---|---|---|
-| Context7 | none | 9.4 s to 3.1 s | -67% |
-| GitHub hosted MCP | token | 5.0 s to 1.6 s | -67% |
-| Microsoft Learn | none | 2.3 s to 1.1 s | -54% |
-| Hugging Face Hub | none | 259 ms to 139 ms | -46% |
-
-Those historical snapshots reported zero completed waste, but they predated
-terminal accounting for the final outstanding batch. The current harness
-prints outstanding entries separately and shutdown counts them as abandoned,
-so new runs expose that cost rather than letting it disappear. The saving
-still tracks how slow the server is, which is the point: a local stdio server
-answering in single-digit milliseconds has nothing worth hiding.
-
-**Warm** is the median of runs 2 and 3. Repeated traffic usually helps: the learner can make some schema-backed predictions on a first pass, while learned transitions need evidence. These benchmarks warmed over two or three runs and repeat an identical session, so treat them as a best case for a workflow you repeat. Three of the four need no credential. Check them yourself:
-
-```bash
-SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
-```
-
-The [design document](https://lukebward.github.io/speculate/design/releases/) has every run, including the ones that went the wrong way.
-
-The [v0.19 qualification](docs/design/local-learning-benchmark.md) compares
-changing repeated workflows against v0.18: useful prefetches rose from 68.5%
-to 83.75% and mean tool wait fell 12.87% across four controlled fixtures with
-120 ms injected latency. Most additional useful results were in-flight joins;
-ready hits and tail latency did not improve. See the report for cold starts,
-waste, negative controls, and the limited gains in live-server checks.
+The [benchmark methodology and results](docs/design/local-learning-benchmark.md)
+explain how we measure tool wait, useful predictions, and wasted calls. In the
+v0.19 qualification against v0.18, useful prefetches rose from 68.5% to 83.75%
+and mean tool wait fell 12.87% across four controlled repeated-workflow fixtures
+with 120 ms injected latency. Most additional useful results were in-flight
+joins; ready hits and tail latency did not improve. Historical live-server
+results are scoped separately in that report. These measurements do not establish
+whole-task speedup or a guarantee for a new workflow.
 
 ## Install
 
@@ -74,7 +52,6 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Saved time, conservative net, predictor recall, near misses, and per-server/tool views |
 | `speculate memory [--json]` | Inspect retained learning, size, last-save time, and default limits; `clear --all` removes managed learning and usage records |
-| `speculate try` | Launch a throwaway session to try it, writing nothing |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
 ## Safety
@@ -127,7 +104,9 @@ Speculate resolves `${VAR}` in a header value from the environment at startup, s
 
 Your client sees standard MCP: same tools, same results. Predicted reads come back from a local buffer instead of a network round trip. Ask the agent to call `speculate__stats` for live cache outcomes, predictor recall, time saved versus possible stdio wait, per-tool near misses, and how stale served prefetches were.
 
-`speculate shims install` is auto-wrapping for these clients: opt-in `npx`/`uvx` shims that wrap any MCP server any client launches. It edits one marked block in your shell rc file. POSIX only.
+Upgrading from PATH shims: run `speculate shims uninstall`, restart your shell,
+and configure the explicit `wrap` command above. See the
+[migration notes](docs/getting-started.md#upgrading-from-retired-launch-paths).
 
 </details>
 

@@ -14,14 +14,13 @@ import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { writeFileSync, existsSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
+import { constants as osConstants } from 'node:os';
 import { loadConfig } from './config.js';
 import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
 import { SpeculateProxy } from './proxy.js';
 import { runDoctor } from './doctor.js';
 import { buildWrapConfig, parseWrapArgs } from './wrap.js';
-import { runPipe, sniffFirstLine } from './sniff.js';
 import { selfCommand } from './hostConfig.js';
-import { nodeSignalNumber, parseTryArgs, runTry } from './tryRun.js';
 import {
   projectIsManaged,
   speculateOff,
@@ -30,7 +29,7 @@ import {
   speculateStatusGlobal,
 } from './manage.js';
 import { speculateSync } from './sync.js';
-import { installShims, parseShimsArgs, shimsStatus, uninstallShims } from './shims.js';
+import { parseShimsArgs, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
 import { speculateAuth } from './authCommand.js';
 import { attachStoredOAuth } from './oauthProvider.js';
@@ -42,8 +41,6 @@ import { parseMemoryArgs, runMemory } from './memory.js';
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
 install-and-it-works (no config files edited by hand):
-  speculate try [-- <claude args...>]      zero-write trial: launch Claude Code with every
-                                           MCP server wrapped, this session only
   speculate on [--mode <mode>]             wrap this project's MCP servers via 'claude mcp'
   speculate off                            undo everything 'on' did (exact restore)
   speculate status [path]                  every project at a glance; give a path ('.') for
@@ -58,8 +55,6 @@ install-and-it-works (no config files edited by hand):
                                            clear only the explicitly scoped memory records
   speculate auth [server]                  authorize Speculate with remote servers that need a
                                            login (no argument: every one that does)
-  speculate shims install|uninstall|status opt-in: sniffing npx/uvx shims — wraps every MCP
-                                           server any client launches, even ones added later
 
 manual wrapping:
   speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
@@ -73,7 +68,6 @@ manual wrapping:
 wrap flags (before the '--'):
   --mode <mode>       strict|annotated|off (default for wrap: annotated)
   --allow <t1,t2>     extra read-only allowlist entries
-  --sniff             engage only if the client speaks MCP; else byte-transparent pipe
   --url <url>         wrap a remote http MCP server instead of a child process
   --header "K: V"     request header for --url; repeatable. Values may use
                       \${VAR}, resolved from the environment (unset = fatal),
@@ -86,8 +80,10 @@ options:
   --help            show this help
 
 compatibility:
+  speculate shims uninstall [--rc <path>] [--no-rc]
+                                                remove retired PATH shims and their shell block
   speculate exec [--cwd <dir>] -- <command...>   run <command> verbatim; kept only so a
-                                                stranded ≤0.10 Bash hook still works (removed in 0.13)
+                                                stranded ≤0.10 Bash hook still works
 `;
 
 const STARTER_CONFIG = `{
@@ -229,10 +225,8 @@ function parseArgs(argv: string[]): Args {
  * `git status`/`rg`/`ls` into `speculate exec -- …`) was retired in 0.11, but
  * that hook stays installed per-project until `speculate on` cleans it up.
  * Failing those calls would break the agent's basic workflow in every
- * not-yet-cleaned project, so exec survives one release as a VERBATIM
- * pass-through: no shell, no rewriting, the child's own exit code. 0.12 kept
- * it (a ≤0.10 hook can still sit in a project nobody has run `on` in yet);
- * removal moves to 0.13.
+ * not-yet-cleaned project, so exec remains a verbatim pass-through: no
+ * shell, no rewriting, the child's own exit code.
  */
 interface ExecArgs {
   cwd: string | null;
@@ -264,8 +258,8 @@ export function parseExecArgs(argv: string[]): ExecArgs | { error: string } {
 const EXEC_NOTICE =
   "[speculate] CLI speculation was retired in 0.11 — this is a compatibility pass-through; run 'speculate on' to remove the legacy hook.";
 
-async function runExecPassThrough(execArgs: ExecArgs): Promise<number> {
-  process.stderr.write(`${EXEC_NOTICE}\n`);
+/** Keep retired launch hooks functional without inspecting or buffering stdin. */
+async function runCommandPassThrough(execArgs: ExecArgs, label: string): Promise<number> {
   const command = execArgs.argv[0]!;
   return new Promise<number>((resolveExit) => {
     let child;
@@ -280,18 +274,32 @@ async function runExecPassThrough(execArgs: ExecArgs): Promise<number> {
       // ERR_INVALID_ARG_VALUE for an empty argv0. A legacy hook's call must
       // fail the same fail-soft way whichever door it comes through.
       process.stderr.write(
-        `[speculate] exec: cannot run '${command}': ${(err as Error).message}\n`,
+        `[speculate] ${label}: cannot run '${command}': ${(err as Error).message}\n`,
       );
       resolveExit(127);
       return;
     }
+    const onInt = (): void => {
+      child.kill('SIGINT');
+    };
+    const onTerm = (): void => {
+      child.kill('SIGTERM');
+    };
+    const cleanup = (): void => {
+      process.off('SIGINT', onInt);
+      process.off('SIGTERM', onTerm);
+    };
+    process.on('SIGINT', onInt);
+    process.on('SIGTERM', onTerm);
     child.on('error', (err) => {
-      process.stderr.write(`[speculate] exec: cannot run '${command}': ${err.message}\n`);
+      cleanup();
+      process.stderr.write(`[speculate] ${label}: cannot run '${command}': ${err.message}\n`);
       resolveExit(127);
     });
-    child.on('exit', (code, signal) =>
-      resolveExit(signal ? 128 + (nodeSignalNumber(signal) ?? 1) : (code ?? 0)),
-    );
+    child.on('exit', (code, signal) => {
+      cleanup();
+      resolveExit(signal ? 128 + (osConstants.signals[signal] ?? 1) : (code ?? 0));
+    });
   });
 }
 
@@ -301,8 +309,9 @@ async function main(): Promise<void> {
   if (args.command === 'exec') {
     const execArgs = parseExecArgs(args.rest);
     if ('error' in execArgs) fail(`exec: ${execArgs.error}`);
+    process.stderr.write(`${EXEC_NOTICE}\n`);
     // stdio is inherited, so nothing of the child's is buffered here.
-    process.exitCode = await runExecPassThrough(execArgs);
+    process.exitCode = await runCommandPassThrough(execArgs, 'exec');
     return;
   }
 
@@ -318,10 +327,10 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'try') {
-    const tryArgs = parseTryArgs(args.rest);
-    if ('error' in tryArgs) fail(`try: ${tryArgs.error}`);
-    process.exitCode = await runTry(tryArgs);
-    return; // natural exit: the loop drains, stdout flushes completely
+    fail(
+      "'speculate try' was retired. Use 'speculate on' for this project's MCP servers, " +
+        "or 'speculate wrap -- <server command...>' for explicit wrapping.",
+    );
   }
 
   if (args.command === 'stats') {
@@ -342,13 +351,7 @@ async function main(): Promise<void> {
     const shimsArgs = parseShimsArgs(args.rest);
     if ('error' in shimsArgs) fail(`shims: ${shimsArgs.error}`);
     const opts = { rcPath: shimsArgs.rcPath, noRc: shimsArgs.noRc };
-    const code =
-      shimsArgs.action === 'install'
-        ? installShims(opts)
-        : shimsArgs.action === 'uninstall'
-          ? uninstallShims(opts)
-          : shimsStatus(opts);
-    process.exitCode = code;
+    process.exitCode = uninstallShims(opts);
     return;
   }
 
@@ -464,41 +467,15 @@ async function main(): Promise<void> {
   if (args.command === 'wrap') {
     const wrapArgs = parseWrapArgs(args.rest);
     if ('error' in wrapArgs) fail(`wrap: ${wrapArgs.error}`);
-    if (wrapArgs.sniff) {
-      // §13.12: decide from the first client line whether this is MCP at
-      // all. Non-MCP degrades to a transparent pipe — same command, same
-      // bytes, same exit code — so blind wrapping is always safe.
-      const decision = await sniffFirstLine(process.stdin);
-      if (!decision.mcp) {
-        // The piped stdin can hold the loop open after the child exits, so
-        // this is an exitWhenFlushed path (child output was inherited —
-        // nothing of ours is buffered — but stderr notes might be).
-        exitWhenFlushed(await runPipe(wrapArgs.command, decision.buffered, decision.ended));
-        return;
-      }
-      // Re-inject the sniffed bytes so the proxy's transport sees the
-      // stream from its true beginning (initialize included).
-      if (decision.buffered.length > 0) process.stdin.unshift(decision.buffered);
-      const oauthScope = wrapArgs.url
-        ? (readOAuthRecord(oauthStorePath(), wrapArgs.url)?.authEpoch ?? 'legacy-or-none')
-        : 'none';
-      const { config: wrapConfig, stateKey } = buildWrapConfig(
-        wrapArgs,
-        process.cwd(),
-        oauthScope,
+    if (wrapArgs.legacyPassthrough) {
+      process.stderr.write(
+        "[speculate] PATH shims and --sniff were retired; running the command directly. " +
+          "Run 'speculate shims uninstall', then use 'speculate on' or explicit 'speculate wrap'.\n",
       );
-      await runProxy(
-        wrapConfig,
-        defaultStatePathForKey(stateKey),
-        '(wrap)',
-        // The legacy key was global across projects/accounts and can contain
-        // memorized entity ids. Starting cold is safer than importing it.
-        [],
+      process.exitCode = await runCommandPassThrough(
+        { cwd: null, argv: wrapArgs.command },
+        'wrap --sniff',
       );
-      // Sniffing left stdin explicitly paused; an explicit pause is not
-      // undone by the transport attaching its 'data' listener. Resume only
-      // now that the listener exists, so no byte can flow into the void.
-      process.stdin.resume();
       return;
     }
     const oauthScope = wrapArgs.url
@@ -513,7 +490,6 @@ async function main(): Promise<void> {
       wrapConfig,
       defaultStatePathForKey(stateKey),
       '(wrap)',
-      [],
     );
     return;
   }
@@ -599,7 +575,6 @@ async function runProxy(
   config: import('./types.js').SpeculateConfig,
   statePath: string | null,
   configLabel: string,
-  stateFallbackPaths: string[] = [],
 ): Promise<void> {
   applyStoredOAuth(config);
   const stateScope = createStateScope(config, process.cwd());
@@ -609,7 +584,6 @@ async function runProxy(
   });
   const proxy = new SpeculateProxy(config, {
     statePath,
-    stateFallbackPaths,
     stateScope,
     usageRecorder,
   });

@@ -2,7 +2,7 @@ site_name: Speculate
 site_url: https://lukebward.github.io/speculate/
 site_description: >-
   Speculative prefetching for coding agents. A transparent MCP proxy that
-  predicts the next read-only tool call and has the answer waiting.
+  learns likely read-only tool calls and runs them early to reduce waiting.
 site_author: Luke Ward
 copyright: MIT © 2026 Luke Ward
 
@@ -62,7 +62,7 @@ nav:
       - Design spec: design/index.md
       - Implementation notes: design/implementation-notes.md
       - Release notes: design/releases.md
-      - Local learning benchmark: design/local-learning-benchmark.md
+      - Benchmark methodology and results: design/local-learning-benchmark.md
       - Prior art: design/prior-art.md
   - Proposals:
       - Host-provided wrapper seam: upstream/mcp-wrapper-seam.md

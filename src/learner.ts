@@ -210,7 +210,6 @@ export interface SerializedTransition {
   score?: number;
   /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
   lastUpdated?: number;
-  latencyMs?: number;
   templates: Array<{
     name: string;
     /**
@@ -245,8 +244,6 @@ export interface SerializedOpener {
   score?: number;
   /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
   lastUpdated?: number;
-  /** EWMA of the opener tool's real upstream latency. Absent in legacy state. */
-  latencyMs?: number;
 }
 
 export interface SerializedLearner {
@@ -344,8 +341,6 @@ interface TransitionState {
   score: number;
   /** Injected-clock time `score` was taken at (also recency for eviction). */
   lastUpdated: number;
-  /** EWMA of the target tool's observed upstream latency. */
-  latencyMs: number;
   /** Per-argument templates for the next call's args, keyed by arg name. */
   templates: Map<string, ArgTemplate>;
   contexts: Map<string, ContextEvidence>;
@@ -389,8 +384,6 @@ interface OpenerState {
   score: number;
   /** Injected-clock time of the last sighting (eviction tie-break). */
   lastUpdated: number;
-  /** Persisted so a new session does not assume every opener costs 100 ms. */
-  latencyMs?: number;
 }
 
 interface SchemaPrior {
@@ -506,7 +499,6 @@ export class TransitionLearner {
     server: string,
     tool: string,
     args: Record<string, unknown>,
-    latencyMs?: number,
   ): void {
     try {
       if (server.includes(' ') || tool.includes(' ') || tool.length === 0) return;
@@ -519,11 +511,6 @@ export class TransitionLearner {
         existing.count = Math.min(existing.count + 1, MAX_IMPORTED_OPENER_COUNT);
         existing.score = decayedScore(existing.score, existing.lastUpdated, now) + 1;
         existing.lastUpdated = now;
-        if (Number.isFinite(latencyMs) && latencyMs! >= 0) {
-          existing.latencyMs = existing.latencyMs === undefined
-            ? latencyMs!
-            : existing.latencyMs * 0.8 + latencyMs! * 0.2;
-        }
       } else {
         this.openers.set(key, {
           server,
@@ -532,7 +519,6 @@ export class TransitionLearner {
           count: 1,
           score: 1,
           lastUpdated: now,
-          ...(Number.isFinite(latencyMs) && latencyMs! >= 0 ? { latencyMs } : {}),
         });
         // Evict the weakest opener (lowest decayed score, then stalest),
         // never the one just recorded.
@@ -580,7 +566,6 @@ export class TransitionLearner {
           tool: o.tool,
           args: jsonCopyRecord(args),
           confidence: Math.min(0.5, 0.2 + 0.1 * o.count),
-          ...(o.latencyMs !== undefined ? { expectedLatencyMs: o.latencyMs } : {}),
           ruleId: `opener:${server}:${o.tool}${rank === 1 ? '' : `#${rank}`}`,
           // The longest horizon there is (§6.2): fired before the agent has
           // made a single call, so nothing at all derives it and the wait to
@@ -613,7 +598,6 @@ export class TransitionLearner {
         // process was down.
         score: state.score,
         lastUpdated: state.lastUpdated,
-        latencyMs: state.latencyMs,
         templates: [...state.templates.entries()].map(([name, tpl]) => ({
           name,
           underivable: isUnderivable(tpl),
@@ -636,7 +620,6 @@ export class TransitionLearner {
       count: o.count,
       score: o.score,
       lastUpdated: o.lastUpdated,
-      ...(o.latencyMs !== undefined ? { latencyMs: o.latencyMs } : {}),
     }));
     return openers.length > 0 ? { transitions, openers } : { transitions };
   }
@@ -709,9 +692,6 @@ export class TransitionLearner {
       // weight: recent evidence is worth more than the same volume of old.
       state.score = decayedScore(state.score, state.lastUpdated, now) + 1;
       state.lastUpdated = now;
-      if (Number.isFinite(call.latencyMs) && call.latencyMs >= 0) {
-        state.latencyMs = state.latencyMs * 0.8 + call.latencyMs * 0.2;
-      }
       updateTemplates(state, linked, call.args, now);
       updateContexts(state, linked, now);
     } else {
@@ -725,7 +705,6 @@ export class TransitionLearner {
         count: initial,
         score: initial,
         lastUpdated: now,
-        latencyMs: Number.isFinite(call.latencyMs) && call.latencyMs >= 0 ? call.latencyMs : 0,
         templates: initialTemplates(linked, call.args, now),
         contexts: initialContexts(linked, now),
       };
@@ -816,7 +795,6 @@ export class TransitionLearner {
       score: number;
       weight: number;
       args: Record<string, unknown>;
-      memorized: boolean;
     }> = [];
     const matching = [...this.transitions.values()].filter(
       (state) =>
@@ -875,7 +853,6 @@ export class TransitionLearner {
           score: score * c.weight,
           weight: c.weight,
           args: c.args,
-          memorized: c.memorized,
         });
       }
     }
@@ -901,7 +878,6 @@ export class TransitionLearner {
             count: 2,
             score: 1,
             lastUpdated: now,
-            latencyMs: call.latencyMs,
             templates: new Map(),
             contexts: new Map(),
           },
@@ -909,7 +885,6 @@ export class TransitionLearner {
           score: prediction.confidence,
           weight: prediction.confidence / 0.45,
           args: prediction.args,
-          memorized: false,
         });
       }
     }
@@ -948,13 +923,10 @@ export class TransitionLearner {
         // arrive indistinguishable from its first. The best combo weighs
         // exactly 1, so a single-candidate transition is unchanged.
         confidence: Math.min(0.55, 0.25 + 0.1 * c.state.count) * c.weight,
-        expectedLatencyMs: c.state.latencyMs,
         ruleId: c.ruleId,
-        // §6.2: a call carrying a remembered literal is a bet on "at some
-        // point", not on "next", so the executor fetches it with a shorter
-        // TTL. Classified per argument SOURCE, so two candidates for the
-        // same tool in the same batch can differ.
-        horizon: c.memorized ? 'standing' : 'next',
+        // The observed transition predicts the next call, including when
+        // all arguments are constants. Only session openers are standing.
+        horizon: 'next',
       });
     }
     return out;
@@ -1179,9 +1151,6 @@ function deserializeOpener(raw: unknown, now: number): OpenerState | null {
     count,
     score: importedScore(o.score, count, MAX_IMPORTED_OPENER_COUNT),
     lastUpdated: importedStamp(o.lastUpdated, now),
-    ...(typeof o.latencyMs === 'number' && Number.isFinite(o.latencyMs) && o.latencyMs >= 0
-      ? { latencyMs: Math.min(o.latencyMs, 600_000) }
-      : {}),
   };
 }
 
@@ -1311,10 +1280,6 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
     count,
     score: importedScore(t.score, count, MAX_IMPORTED_COUNT),
     lastUpdated: importedStamp(t.lastUpdated, now),
-    latencyMs:
-      typeof t.latencyMs === 'number' && Number.isFinite(t.latencyMs) && t.latencyMs >= 0
-        ? Math.min(t.latencyMs, 600_000)
-        : 0,
     templates,
     contexts,
   };
@@ -2015,12 +1980,6 @@ interface ArgOption {
   weight: number;
   /** Union of the provenance windows of the sources producing this value. */
   seen: number;
-  /**
-   * True when the value came from a `const` source — remembered, not read off
-   * the call that just happened. That is the freshness distinction (§6.2):
-   * a derived argument says "next", a memorized one says "at some point".
-   */
-  memorized: boolean;
 }
 
 /**
@@ -2077,7 +2036,6 @@ function argOptions(tpl: ArgTemplate, call: PrevCall, now: number): ArgOption[] 
       score: entry.score,
       weight: 1,
       seen: entry.src.seen,
-      memorized: entry.src.s.kind === 'const',
     };
     byRepr.set(repr, option);
     out.push(option);
@@ -2138,27 +2096,6 @@ interface ArgCombo {
   args: Record<string, unknown>;
   /** Product of the per-argument normalized scores; the best combo is 1. */
   weight: number;
-  /**
-   * NOTHING in this call was read off the trigger — every argument is a
-   * remembered literal — so the only thing tying it to now is the transition
-   * itself (§6.2 freshness).
-   *
-   * The test is `every`, not `some`, and the difference is the whole point.
-   * Horizon is about whether the TARGET was derived from the trigger, not
-   * whether every argument was: `read_item {id: <derived>, format: 'json'}`
-   * is a next-call prediction that happens to carry a constant. `some`
-   * classified the modal
-   * next-call prediction as a standing bet.
-   *
-   * KNOWN INCONSISTENCY, recorded in §13.19 rather than repaired here: by the
-   * same principle an ALL-constant argument set is a next-call prediction too
-   * (a zero-argument one already is, three lines below), and the corpus agrees
-   * with that reading, since the standing class is consumed at a lead of
-   * exactly 1.000 calls. Inert while LONG_HORIZON_TTL_FACTOR is 1. Changing it
-   * empties the class rather than moving anything between classes, so it is a
-   * decision about what the class is for, not a one-line fix.
-   */
-  memorized: boolean;
   /** False only when two of the chosen values have never been right together. */
   coherent: boolean;
 }
@@ -2206,8 +2143,6 @@ function materializeCombos(
   const combo = (idx: number[]): ArgCombo => {
     const args: Record<string, unknown> = {};
     let weight = 1;
-    /** Arguments read off the trigger. One is enough to make this next-call. */
-    let derived = 0;
     // Provenance windows intersected across arguments. An argument with no
     // window recorded (a pre-v0.13 state file, or a source whose sightings
     // have aged out of the 32-observation window) contributes no evidence
@@ -2218,7 +2153,6 @@ function materializeCombos(
       const option = options[a]![idx[a]!]!;
       args[names[a]!] = option.value;
       weight *= option.weight;
-      if (!option.memorized) derived++;
       if (option.seen !== 0) {
         support = (support & option.seen) >>> 0;
         known++;
@@ -2227,12 +2161,9 @@ function materializeCombos(
     // Two or more windows that never overlap is positive evidence that this
     // pairing has never occurred; anything less is simply unknown, and
     // unknown must not block a candidate.
-    // A zero-argument call is next-call: there is nothing to derive, and the
-    // transition that triggered it is the derivation.
     return {
       args,
       weight,
-      memorized: n > 0 && derived === 0,
       coherent: known < 2 || support !== 0,
     };
   };

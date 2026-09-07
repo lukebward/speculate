@@ -129,10 +129,10 @@ export interface AgeTotals {
 }
 
 /**
- * The buffer split by the classes that get DIFFERENT TTLs in production
- * (§6.2): `next` is derived from the trigger, `standing` carries a memorized
- * argument and so bets on "at some point" rather than "next". Pooling them
- * would hide exactly the difference the shortened TTL is aimed at.
+ * Prediction lifecycles retained in the JSON report. Every corpus prediction
+ * is a next-call transition, including constant arguments. Session openers
+ * are not modeled, so the standing totals remain empty and cannot establish
+ * an appropriate startup TTL.
  */
 export interface AgeBreakdown {
   all: AgeTotals;
@@ -194,7 +194,7 @@ export interface EvalRun {
   floorAge: AgeBreakdown;
   /** The TTL the buffer simulation ran with, so the ages are interpretable. */
   ttlMs: number;
-  /** The standing-bet TTL multiplier it ran with (§6.2). */
+  /** Startup TTL multiplier; has no effect on this transition-only corpus. */
   standingTtlFactor: number;
   /** Spacing between calls, which on this corpus sets the ages outright. */
   callSpacingMs: number;
@@ -224,7 +224,7 @@ export interface ReplayOptions {
    * production fallback, and an unmeasured guess (see src/cache.ts).
    */
   ttlMs?: number;
-  /** TTL multiplier for standing bets. Default LONG_HORIZON_TTL_FACTOR. */
+  /** Startup TTL multiplier; this corpus contains no openers to apply it to. */
   standingTtlFactor?: number;
   /**
    * Spacing between calls inside a session. Default CALL_SPACING_MS.

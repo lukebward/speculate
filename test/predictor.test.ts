@@ -169,7 +169,7 @@ describe('Predictor.observe', () => {
 
     const out = observe('list', { scope: 'x' }, textResult('{not-json'));
 
-    expect(out).toEqual([pred('meta', { scope: 'x' }, 0.5, 'r-alt')]);
+    expect(out).toEqual([{ ...pred('meta', { scope: 'x' }, 0.5, 'r-alt'), horizon: 'next' }]);
     expect(metrics.events.filter((e) => e.type === 'parser_miss')).toHaveLength(0);
     expect(metrics.events.filter((e) => e.type === 'predicted')).toHaveLength(1);
   });
@@ -268,7 +268,7 @@ describe('Predictor.observe', () => {
     const out = observe('list', {}, jsonResult({}));
 
     // Only the well-formed one survives, with server forced back to the trigger's.
-    expect(out).toEqual([pred('good', { ok: true }, 0.6, 'r-bad')]);
+    expect(out).toEqual([{ ...pred('good', { ok: true }, 0.6, 'r-bad'), horizon: 'next' }]);
     expect(metrics.events.filter((e) => e.type === 'suppressed')).toHaveLength(0);
     expect(metrics.events.filter((e) => e.type === 'predicted')).toHaveLength(1);
   });
@@ -437,7 +437,7 @@ describe('Predictor.observe', () => {
 
 // --- freshness classification (§6.2) -----------------------------------------
 
-describe('prediction horizon passes through validation', () => {
+describe('prediction horizon follows the entrypoint', () => {
   const profile = makeProfile({});
 
   function withLearner(predictions: Prediction[], openers: Prediction[] = []) {
@@ -455,12 +455,9 @@ describe('prediction horizon passes through validation', () => {
     return predictor;
   }
 
-  it('carries a standing bet through to the executor', () => {
-    // The whole TTL shortening hangs off this field surviving validation:
-    // validatePrediction rebuilds the object, so an unpropagated field is a
-    // silent no-op nobody would notice.
+  it('classifies a trigger prediction as next even if its source says standing', () => {
     const p = predictor(withLearner([{ ...pred('t', {}, 0.5, 'learned:x'), horizon: 'standing' }]));
-    expect(p[0]!.horizon).toBe('standing');
+    expect(p[0]!.horizon).toBe('next');
   });
 
   it('carries a next-call classification through unchanged', () => {
@@ -468,19 +465,19 @@ describe('prediction horizon passes through validation', () => {
     expect(p[0]!.horizon).toBe('next');
   });
 
-  it('leaves a rule that says nothing about horizon unclassified', () => {
+  it('classifies a trigger prediction with no supplied horizon as next', () => {
     const p = predictor(withLearner([pred('t', {}, 0.5, 'learned:x')]));
-    expect(p[0]!.horizon).toBeUndefined();
+    expect(p[0]!.horizon).toBe('next');
   });
 
-  it('drops a horizon it does not recognise instead of trusting it', () => {
+  it('classifies a trigger prediction with an invalid supplied horizon as next', () => {
     const raw = { ...pred('t', {}, 0.5, 'learned:x'), horizon: 'forever' } as unknown as Prediction;
     const p = predictor(withLearner([raw]));
-    expect(p[0]!.horizon).toBeUndefined();
+    expect(p[0]!.horizon).toBe('next');
   });
 
   it('classifies session openers as standing bets', () => {
-    const p = withLearner([], [{ ...pred('o', {}, 0.4, 'opener:srv:o'), horizon: 'standing' }]);
+    const p = withLearner([], [pred('o', {}, 0.4, 'opener:srv:o')]);
     expect(p.sessionStart(SERVER)[0]!.horizon).toBe('standing');
   });
 

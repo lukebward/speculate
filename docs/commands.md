@@ -8,7 +8,6 @@
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate memory` | Retained learning inventory; `clear --all` removes managed learning and usage records |
-| `speculate try` | Launch a throwaway session to try it, writing nothing |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
 ## `on` and `off`
@@ -105,3 +104,13 @@ npx -y speculate-mcp wrap --url https://api.githubcopilot.com/mcp/ \
 ```
 
 See [Getting started](getting-started.md) for the surrounding config.
+
+## Retired launch paths
+
+`speculate try`, `shims install`, and `shims status` were removed in v0.20.
+`speculate shims uninstall` remains to clean up an earlier installation. Legacy
+`wrap --sniff -- ...` commands pass through immediately without speculation;
+protocol sniffing is retired.
+Use `on` or an explicit `wrap` configuration; the
+[migration guide](getting-started.md#upgrading-from-retired-launch-paths)
+covers existing PATH shims and saved commands.

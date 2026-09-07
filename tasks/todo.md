@@ -83,7 +83,7 @@ covers the CLI daemon).
       isolated CLAUDE_CONFIG_DIR): installed_plugins.json v2 layout,
       enabledPlugins, cache root vs directory-source root, the
       disabledMcpServers per-project switch gating every connect path
-- [x] Design spec: docs/superpowers/specs/2026-08-05-plugin-wrap-design.md
+- [x] Design spec: .superpowers/archive/specs/2026-08-05-plugin-wrap-design.md
 - [x] Discovery: pluginServers + disabledMcpServers on ClaudeConfigView,
       fail-closed interpolation (13 tests)
 - [x] Wrap/unwrap: copy-then-disable with rollback, teardown, drift

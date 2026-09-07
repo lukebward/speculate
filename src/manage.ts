@@ -2659,7 +2659,7 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
       `[speculate] ${unwrapped} server(s) added since 'speculate on' — run it again to wrap them`,
     );
   } else if (!record && unwrapped > 0) {
-    ctx.log(`[speculate] run 'speculate on' to wrap them (or 'speculate try' for a zero-write trial)`);
+    ctx.log(`[speculate] run 'speculate on' to wrap this project's MCP servers`);
   }
   // Counted apart from `unwrapped` because `on` alone does NOT fix these, and
   // advising it without saying so is the loop this whole block exists to break.

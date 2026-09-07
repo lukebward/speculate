@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript (strict), Node >= 18, vitest, no new dependencies.
 
-**Spec:** `.superpowers/specs/2026-08-02-prediction-quality-design.md` (read it).
+**Spec:** `.superpowers/archive/specs/2026-08-02-prediction-quality-design.md` (read it).
 
 ## Global Constraints
 

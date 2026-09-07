@@ -34,7 +34,7 @@ describe('StateStore', () => {
   it('filters credential canaries before state or atomic temp bytes are written', () => {
     const path = join(dir(), 'state.json');
     const canary = 'credential-canary-0123456789';
-    const store = new StateStore(path, () => 100, [], undefined, { secretValues: [canary] });
+    const store = new StateStore(path, () => 100, undefined, { secretValues: [canary] });
     expect(store.save({
       learner: {
         transitions: [{
@@ -65,7 +65,7 @@ describe('StateStore', () => {
           sources: [{ kind: 'const', repr: JSON.stringify(canary), score: 2, lastUpdated: 100 }] }],
       }] }, ruleFeedback: {},
     }));
-    const store = new StateStore(path, () => 101, [], undefined, { secretValues: [canary] });
+    const store = new StateStore(path, () => 101, undefined, { secretValues: [canary] });
     expect(store.load()?.learner).toMatchObject({ transitions: [] });
     expect(store.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
     expect(readFileSync(path, 'utf8')).not.toContain(canary);
@@ -76,7 +76,7 @@ describe('StateStore', () => {
     const oldCredential = 'old-credential-canary-0123456789';
     const newCredential = 'new-credential-canary-0123456789';
     let current = [oldCredential];
-    const store = new StateStore(path, () => 100, [], undefined, { secretValues: () => current });
+    const store = new StateStore(path, () => 100, undefined, { secretValues: () => current });
     expect(store.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
     current = [newCredential];
     expect(store.save({
@@ -94,7 +94,7 @@ describe('StateStore', () => {
   it('allowlists aggregate snapshots instead of retaining unknown legacy payload fields', () => {
     const path = join(dir(), 'state.json');
     const canary = 'unknown-field-canary-0123456789';
-    const store = new StateStore(path, () => 100, [], undefined, { secretValues: [canary] });
+    const store = new StateStore(path, () => 100, undefined, { secretValues: [canary] });
     expect(store.save({
       learner: { transitions: [] },
       ruleFeedback: { [canary]: { hits: 1, wasted: 0, speculated: 1 } },
@@ -118,7 +118,7 @@ describe('StateStore', () => {
         server: 's', prevTool: 'old', nextTool: 'gone', count: 2, templates: [],
       }] }, ruleFeedback: { old: { hits: 1, wasted: 0, speculated: 1 } },
     }));
-    const store = new StateStore(path, () => 40 * day, [], undefined, { retentionDays: 30 });
+    const store = new StateStore(path, () => 40 * day, undefined, { retentionDays: 30 });
     const loaded = store.load()!;
     expect(loaded.learner).toMatchObject({ transitions: [] });
     expect(loaded.ruleFeedback).toEqual({});
@@ -132,7 +132,7 @@ describe('StateStore', () => {
       templates: [{ name: 'query', underivable: false, derived: 2, missed: 0,
         sources: [{ kind: 'const', repr: JSON.stringify(`ordinary-${i}-${'x'.repeat(1800)}`), score: 1, lastUpdated: i + 1 }] }],
     }));
-    const store = new StateStore(path, () => 101, [], undefined, { maxBytes: 65_536 });
+    const store = new StateStore(path, () => 101, undefined, { maxBytes: 65_536 });
     expect(store.save({ learner: { transitions }, ruleFeedback: {} })).toBe(true);
     expect(statSync(path).size).toBeLessThanOrEqual(65_536);
     expect(store.diagnostics.trimmedForSize).toBeGreaterThan(0);
@@ -141,7 +141,7 @@ describe('StateStore', () => {
   it('refuses an oversized state before reading or parsing it', () => {
     const path = join(dir(), 'state.json');
     writeFileSync(path, 'x'.repeat(65_537));
-    const store = new StateStore(path, Date.now, [], undefined, { maxBytes: 65_536 });
+    const store = new StateStore(path, Date.now, undefined, { maxBytes: 65_536 });
     expect(store.load()).toBeNull();
     expect(store.diagnostics.oversizedReads).toBe(1);
   });
@@ -195,7 +195,7 @@ describe('StateStore', () => {
     writeFileSync(blocker, 'occupied');
     const write = vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as never);
     try {
-      const bad = new StateStore(join(blocker, 'state.json'), Date.now, [], undefined, {
+      const bad = new StateStore(join(blocker, 'state.json'), Date.now, undefined, {
         secretValues: [canary],
       });
       expect(bad.save({ learner: { transitions: [], openers: [{
@@ -209,10 +209,10 @@ describe('StateStore', () => {
 
   it('refuses current state from a different workspace/account scope', () => {
     const path = join(dir(), 'state.json');
-    const a = new StateStore(path, () => 1, [], 'scope-a');
+    const a = new StateStore(path, () => 1, 'scope-a');
     expect(a.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
     expect(a.load()?.scope).toBe('scope-a');
-    expect(new StateStore(path, () => 2, [], 'scope-b').load()).toBeNull();
+    expect(new StateStore(path, () => 2, 'scope-b').load()).toBeNull();
   });
 
   it('merges disjoint concurrent learner entities instead of last-writer loss', () => {

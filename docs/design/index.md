@@ -1,7 +1,12 @@
 # Design spec
 
-**Status:** Draft for review (v2 — revised after adversarial design review)
-**Last updated:** 2026-07-10
+**Status:** Original design, with selected implementation amendments.
+**Original draft:** 2026-07-10
+
+This document preserves the design history; proposals such as vetted profiles
+were later removed. Current behavior is documented in [Commands](../commands.md),
+[Configuration](../configuration.md), and [Safety](../safety.md). Measurement
+methods and scoped results live in the [benchmark guide](local-learning-benchmark.md).
 
 Speculate is a transparent MCP proxy that reduces perceived agent latency by *speculatively prefetching read-only tool calls* — predicting what the agent will ask for next and having the answer cached (or already in flight) before it asks.
 
@@ -172,12 +177,23 @@ The cache is a **speculation buffer**, not a general cache: small, short-lived, 
 
 ### 6.1 Keying and canonicalization
 
-Key = `(server, tool, canonical_args)`. Canonicalization: JSON with sorted keys, plus **profile-supplied normalizations** — default-materialization maps (so `{state: "open"}` and omitted-`state` collide when the profile says the server defaults to open) and case-folding for enums the profile marks case-insensitive. These live in the profile because JSON Schema generally *doesn't* carry them: most real servers apply defaults server-side and invisibly, and the schema has no case-insensitivity vocabulary. No fuzzy matching in MVP — near-miss args are a miss, but **near-miss key distance is logged from day one** (§9) to size the fuzzy-matching opportunity (e.g. a cached `limit: 50` list serving a `limit: 10` request) before building it.
+Key = `(server, tool, canonical_args)`. Arguments use stable JSON with sorted
+object keys. No custom canonicalizer, default materialization, or case-folding
+is applied: omitted values and explicit values remain distinct. Argument
+near-misses are recorded for diagnostics; they never substitute for an exact
+cache key.
 
 ### 6.2 Freshness and invalidation
 
 - **Per-tool TTL** from the server profile, defaulting to **30 s**, capped at a few minutes. The prefetch-to-use gap for intra-turn chains is seconds, so short TTLs retain most of the win while bounding staleness. **The 30 s is an unmeasured guess** — chosen from that gap, never validated against how often a 30 s-old answer is actually wrong; §13.19 records the shadow-validation experiment that would replace it with a number, and why it is deliberately unbuilt.
-- **A long-horizon TTL lever exists, and ships as the identity.** A prediction that reads *anything* off the call that just completed claims "this is the next call"; one where **no** argument does — every argument a remembered literal, or a §13.15 session opener with no trigger at all — claims only "you will ask for this at some point" (`Prediction.horizon === 'standing'`). Standing bets can be fetched at a fraction of the resolved TTL via `speculation.longHorizonTtlFactor`, applied to whatever the normal resolution order produced, so an operator's per-tool freshness decision still sets the ceiling and a per-tool TTL of 0 stays disabled rather than being revived. **`LONG_HORIZON_TTL_FACTOR` defaults to 1** — the premise that standing bets wait longer is measured false (§13.19: lead 1.000, identical to derived predictions) while the cost is measured real (a factor of 0.5 destroys the whole class once an agent's inter-call gap passes half the TTL). §13.19 records the counters that must move before turning it on.
+- **Standing predictions are session openers only.** All learned transitions
+  predict the next call, including transitions whose arguments are constants.
+  Their queued work expires when the real sequence advances. Startup predictions
+  use `Prediction.horizon === 'standing'` and may survive that queue cleanup.
+  `speculation.longHorizonTtlFactor` applies only to standing predictions and
+  defaults to 1; it multiplies the resolved TTL without reviving disabled tools.
+  Historical measurements in §13.19 used the earlier, broader standing class
+  and do not qualify this corrected lifecycle.
 - **Age at consumption is measured, not assumed** (§9): every hit records how long the entry had been ready and what fraction of its TTL that was, because better prediction fires earlier and further ahead and can only push that number up.
 - **Mutation invalidation, conservatively classified:** any real call **not affirmatively classified read-only** (same classification machinery as §4 — allowlist/annotation) invalidates all cached entries for its server. Unknown tools are treated as writes. Coarse per-server invalidation is deliberate; per-resource invalidation is a profile-level refinement later.
 - **Writes outside the proxy are invisible — and for coding agents they're the common case.** An agent that runs `git push` in a shell and then reads the repo through a cached entry can see a pre-push snapshot up to one TTL old. The proxy cannot see non-MCP tools (shell, file edits, other harness tools). This is the sharpest staleness caveat in the design; it is bounded by the TTL, called out in user-facing docs, and per-tool TTL=0 exists for reads where even that is unacceptable.
@@ -244,7 +260,7 @@ The honest metric to watch is **estimated seconds saved per wasted call** — it
 2. Safety policy: `strict` / `annotated` / `off`; annotation check; allowlist/denylist config; auth-error breaker with real-call reset.
 3. Tier-1 rule engine with §5.1 result access (structuredContent + profile parsers + contract tests); per-rule hit-rate feedback.
 4. **One vetted profile: GitHub** (rules + read-only allowlist + TTLs + result parsers) — chosen because its workflows are the most predictable and it's the demo everyone understands.
-5. Per-session in-memory cache: profile-driven canonicalization, TTL, single-use hits, in-flight join, conservative mutation invalidation, restart/re-auth flush.
+5. Per-session in-memory cache: exact argument canonicalization, TTL, single-use hits, in-flight join, conservative mutation invalidation, restart/re-auth flush.
 6. Budgets: per §7, including the stdio idle-only rule.
 7. Observability: decision log, near-miss/parser-miss metrics, `/stats`, session summary.
 8. Benchmark harness: scripted agent sessions replayed with speculation on/off, reporting per-turn wall-clock, hit rate, head-start distribution, waste. Scripted workflows overstate real-world predictability, so the harness includes at least one adversarial/low-predictability script to measure the floor; real-world numbers come from §9 telemetry.
@@ -267,7 +283,7 @@ The honest metric to watch is **estimated seconds saved per wasted call** — it
 |---|---|---|
 | 1 | **Low hit rate in the wild** — real usage is less workflow-shaped than benchmarks, **and a protocol-layer proxy sees strictly less than the research systems reporting 40–55% next-action accuracy** (they read model state/plans; Speculate reads only traffic). Expect lower. | Benchmark honestly (incl. adversarial scripts), measure real-world via §9, explicit 30%/40% thresholds in §10. |
 | 1a | **Result-parser fragility** (§5.1) — Tier-1's best rules depend on parsing server-specific text formats that can change under us. | `structuredContent` when available; versioned parsers with contract-test fixtures gating profile releases; runtime fail-closed to no-prediction; `parser_miss` telemetry. Main ongoing maintenance cost — accepted. |
-| 2 | **Argument mismatch** — agent asks with slightly different args than predicted. | Profile-driven canonicalization in MVP; near-miss key-distance logging from day one to size the fuzzy-matching opportunity before building it. |
+| 2 | **Argument mismatch** — agent asks with slightly different args than predicted. | Exact argument matching; near-miss diagnostics to size the fuzzy-matching opportunity before building it. |
 | 3 | **Stale reads mislead the agent** — external writers *and the agent's own non-MCP writes* (shell/`git push`) are invisible to invalidation. | Short TTLs, single-use hits, conservative mutation invalidation, per-tool TTL=0 opt-out, §6.3 documented stance. Bounded, not eliminated. |
 | 4 | **Quota/cost blowup on busy servers** — worsened where rate-limit state is invisible (incl. the MVP GitHub profile, §7). | Default-conservative budgets (3 per trigger), per-minute caps, waste metrics, kill switch. |
 | 5 | **Reads with side effects** (read receipts, audit noise, metered billing). | `strict` mode + vetted profiles exclude them; documented reviewer checklist for profile contributions. |
