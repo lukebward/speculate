@@ -61,9 +61,9 @@ speculate stats --compact
 it preserves each snapshot and every filter, while avoiding thousands of tiny
 files.
 
-The same numbers are available to the agent mid-session as the
+The agent can inspect current-session equivalents through the
 `speculate__stats` tool, which also reports how stale served prefetches were and
-breaks outcomes down by server and tool.
+breaks outcomes down by server and tool. CLI stats aggregate retained sessions.
 
 ## `memory`
 
@@ -81,8 +81,9 @@ speculate memory clear --all
 `--config` selects an explicit configured state path. `clear --all` removes
 recognized learning and usage records from the managed state directory; custom
 paths must be cleared using their config. Authentication, host registrations,
-and wrapping settings are preserved. Active sessions stop saving into cleared
-generations; start a new session to resume persistent learning.
+and wrapping settings are preserved. Active sessions can continue using their
+in-memory learning, but stop saving into cleared generations. Start a new
+session to resume persistent learning from cleared state.
 
 The inventory shows file size, last-save time, and counts with repeated evidence.
 Those counts do not prove a call can be predicted now: fresh history, eligibility,

@@ -138,9 +138,9 @@ raise `minExpectedSavedMs` when upstream quota matters more than latency.
 
 ## Prediction rules
 
-Rules are the only hand-written prediction source, and you need them for one
-thing: **skipping the warm-up.** A rule fires on the first call, where the
-learner must watch a transition happen before predicting it.
+Rules provide explicit predictions from the first matching call. The learner
+normally builds evidence from repeated transitions, although compatible tool
+schemas can also support a prediction before a transition has been observed.
 
 ``` { .js .annotate }
 "rules": [

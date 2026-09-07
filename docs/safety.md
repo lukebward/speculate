@@ -102,8 +102,8 @@ Code's.
     commits to anything — what the user is *probably* about to do. "Read-only"
     bounds state mutation, not information disclosure.
 
-    Speculate's position: speculation only targets servers the session is
-    already sending real traffic to, never a server the agent hasn't touched.
+    Speculation targets configured, connected upstreams. Learned opening reads
+    can run at startup before the agent's first real call to that server.
     Privacy-sensitive deployments should use per-server denylists or `off`.
     Documented, not solved.
 

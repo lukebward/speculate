@@ -439,3 +439,32 @@ controller, durable per-tool latency explanation, and bounded unknown-latency
 discovery remain follow-up work. Cold discovery stays disabled until a
 negative-control workflow proves that it becomes quiet on unpredictable
 traffic.
+
+## v0.19 (2026-09-07): learning across intervening calls
+
+Argument bindings can now reuse values from bounded earlier calls on the same
+server. Raw history remains in session memory; only compact learned sources
+and evidence persist. Queued next-call predictions are retired once the
+caller advances, reducing obsolete work while preserving already issued and
+standing predictions.
+
+Local learning remains automatic. The storage boundary filters known
+credentials and recognizable secret literals across imports, merges and
+temporary writes. It adds a 30-day learner retention window, an 8 MiB scoped
+state cap, aggregate memory inventory and generation-safe clearing. Arbitrary
+private strings cannot always be recognized. Stats now explain prediction
+coverage, useful calls, unmatched candidates and estimated benefit.
+
+The five-seed full-proxy qualification passed its predeclared gates. Across
+800 held-out repeated-workflow requests per enabled arm, useful hits/joins
+rose from 548 to 670, mean wait fell from 91.78 to 79.96 ms, and terminal
+waste fell from 220 to 216. Ready hits fell from 119 to 104; joins drove the
+gain. Two workflows exceeded both 15% mean wait reduction and a 10-point
+useful-rate improvement. The unpredictable control issued no speculation.
+
+These fixtures inject 120 ms of upstream latency. Cold useful rate stayed
+unchanged, tail latency did not improve, and existing filesystem, local Git
+and live Microsoft Learn checks showed little extra benefit or regressions.
+The [qualification report](local-learning-benchmark.md) records all workflows,
+controls, limits and reproduction details. Linux/macOS/Windows CI and Node 18
+CLI compatibility passed.

@@ -34,13 +34,20 @@ so new runs expose that cost rather than letting it disappear. The saving
 still tracks how slow the server is, which is the point: a local stdio server
 answering in single-digit milliseconds has nothing worth hiding.
 
-**Warm** is the median of runs 2 and 3. Expect little from the first pass: Speculate cannot predict a call it has never seen, and warming up takes two or three runs. The benchmark repeats an identical session, so treat it as the best case for a workflow you genuinely repeat. Three of the four need no credential. Check them yourself:
+**Warm** is the median of runs 2 and 3. Repeated traffic usually helps: the learner can make some schema-backed predictions on a first pass, while learned transitions need evidence. These benchmarks warmed over two or three runs and repeat an identical session, so treat them as a best case for a workflow you repeat. Three of the four need no credential. Check them yourself:
 
 ```bash
 SPECULATE_E2E_LIVE=1 npm run bench:remote -- --scenario context7
 ```
 
 The [design document](https://lukebward.github.io/speculate/design/releases/) has every run, including the ones that went the wrong way.
+
+The [v0.19 qualification](docs/design/local-learning-benchmark.md) compares
+changing repeated workflows against v0.18: useful prefetches rose from 68.5%
+to 83.75% and mean tool wait fell 12.87% across four controlled fixtures with
+120 ms injected latency. Most additional useful results were in-flight joins;
+ready hits and tail latency did not improve. See the report for cold starts,
+waste, negative controls, and the limited gains in live-server checks.
 
 ## Install
 
@@ -129,7 +136,7 @@ Your client sees standard MCP: same tools, same results. Predicted reads come ba
 
 A config file (JSON with comments) adds per-server modes, allow/denylists, TTLs, budgets, and declarative prediction rules. See [`speculate.config.example.json`](speculate.config.example.json); `speculate init` writes a starter.
 
-Rules are the only hand-written prediction source, and you need them for one thing: skipping the warm-up. A rule fires on the first call, where the learner must watch a transition happen before predicting it. Rules select values out of the trigger's arguments or its parsed result (`$args.owner`, `$item.number`, `forEach: "$parsed"`). A server that answers in non-JSON text can therefore be learned but not ruled.
+Rules provide explicit predictions from the first matching call. The learner normally builds evidence from repeated transitions, although compatible tool schemas can also support a prediction before a transition has been observed. Rules select values out of the trigger's arguments or its parsed result (`$args.owner`, `$item.number`, `forEach: "$parsed"`). A server that answers in non-JSON text can therefore be learned but not ruled.
 
 </details>
 
