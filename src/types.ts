@@ -399,7 +399,14 @@ export interface SpeculateConfig {
    * Learned-state persistence (§13.6): transition model + rule feedback.
    * Tool results are never persisted. Default: enabled, XDG state dir.
    */
-  persistence?: { enabled?: boolean; path?: string };
+  persistence?: {
+    enabled?: boolean;
+    path?: string;
+    /** Entries older than this many days are discarded. Default 30. */
+    retentionDays?: number;
+    /** Maximum UTF-8 size of one scoped state file. Default 8 MiB. */
+    maxBytes?: number;
+  };
 }
 
 /** Annotations subset Speculate reads (untrusted hints — §4). */

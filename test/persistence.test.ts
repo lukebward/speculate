@@ -2,7 +2,7 @@
  * Persistence layer (DESIGN.md §13.6): StateStore durability semantics,
  * learner export/import round-trip, and rule-feedback priors with decay.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { hasPosixFileModes } from './platform.js';
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,6 +31,121 @@ function call(
 }
 
 describe('StateStore', () => {
+  it('filters credential canaries before state or atomic temp bytes are written', () => {
+    const path = join(dir(), 'state.json');
+    const canary = 'credential-canary-0123456789';
+    const store = new StateStore(path, () => 100, [], undefined, { secretValues: [canary] });
+    expect(store.save({
+      learner: {
+        transitions: [{
+          server: 's', prevTool: 'a', nextTool: 'b', count: 2, lastUpdated: 100,
+          templates: [{ name: 'id', underivable: false, derived: 2, missed: 0, sources: [
+            { kind: 'parsed', sourceTool: 'a', path: ['id'], score: 2, lastUpdated: 100 },
+            { kind: 'const', repr: JSON.stringify(canary), score: 1, lastUpdated: 100 },
+          ] }],
+          contexts: [],
+        }],
+        openers: [{ server: 's', tool: 'b', argsRepr: JSON.stringify({ password: canary }), count: 2, lastUpdated: 100 }],
+      },
+      ruleFeedback: {},
+    })).toBe(true);
+    const bytes = readFileSync(path, 'utf8');
+    expect(bytes).not.toContain(canary);
+    expect(bytes).toContain('sourceTool');
+    expect(store.diagnostics.removedSensitive).toBeGreaterThanOrEqual(2);
+  });
+
+  it('sanitizes legacy disk state before concurrent merge can copy it forward', () => {
+    const path = join(dir(), 'state.json');
+    const canary = 'legacy-canary-secret-0123456789';
+    writeFileSync(path, JSON.stringify({
+      version: 1, savedAt: 100, learner: { transitions: [{
+        server: 's', prevTool: 'a', nextTool: 'b', count: 2, lastUpdated: 100,
+        templates: [{ name: 'id', underivable: false, derived: 2, missed: 0,
+          sources: [{ kind: 'const', repr: JSON.stringify(canary), score: 2, lastUpdated: 100 }] }],
+      }] }, ruleFeedback: {},
+    }));
+    const store = new StateStore(path, () => 101, [], undefined, { secretValues: [canary] });
+    expect(store.load()?.learner).toMatchObject({ transitions: [] });
+    expect(store.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
+    expect(readFileSync(path, 'utf8')).not.toContain(canary);
+  });
+
+  it('retains prior provider credentials when credentials rotate during a live session', () => {
+    const path = join(dir(), 'state.json');
+    const oldCredential = 'old-credential-canary-0123456789';
+    const newCredential = 'new-credential-canary-0123456789';
+    let current = [oldCredential];
+    const store = new StateStore(path, () => 100, [], undefined, { secretValues: () => current });
+    expect(store.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
+    current = [newCredential];
+    expect(store.save({
+      learner: { transitions: [], openers: [
+        { server: 's', tool: 'old', argsRepr: JSON.stringify({ value: oldCredential }), count: 2, lastUpdated: 100 },
+        { server: 's', tool: 'new', argsRepr: JSON.stringify({ value: newCredential }), count: 2, lastUpdated: 100 },
+      ] },
+      ruleFeedback: {},
+    })).toBe(true);
+    const bytes = readFileSync(path, 'utf8');
+    expect(bytes).not.toContain(oldCredential);
+    expect(bytes).not.toContain(newCredential);
+  });
+
+  it('allowlists aggregate snapshots instead of retaining unknown legacy payload fields', () => {
+    const path = join(dir(), 'state.json');
+    const canary = 'unknown-field-canary-0123456789';
+    const store = new StateStore(path, () => 100, [], undefined, { secretValues: [canary] });
+    expect(store.save({
+      learner: { transitions: [] },
+      ruleFeedback: { [canary]: { hits: 1, wasted: 0, speculated: 1 } },
+      candidateFeedback: { [canary]: { correct: 1, evaluated: 1, lastUpdated: 100 } },
+      latency: {
+        version: 1,
+        tools: [{ server: 's', tool: 't', weight: 1, meanMs: 1, m2Ms2: 0, observations: 1, lastUpdated: 100, payload: canary }],
+        servers: [],
+      } as never,
+    })).toBe(true);
+    const bytes = readFileSync(path, 'utf8');
+    expect(bytes).not.toContain(canary);
+    expect(bytes).not.toContain('payload');
+  });
+
+  it('expires old entries and uses savedAt for legacy timestamps', () => {
+    const path = join(dir(), 'state.json');
+    const day = 24 * 60 * 60_000;
+    writeFileSync(path, JSON.stringify({
+      version: 1, savedAt: day, learner: { transitions: [{
+        server: 's', prevTool: 'old', nextTool: 'gone', count: 2, templates: [],
+      }] }, ruleFeedback: { old: { hits: 1, wasted: 0, speculated: 1 } },
+    }));
+    const store = new StateStore(path, () => 40 * day, [], undefined, { retentionDays: 30 });
+    const loaded = store.load()!;
+    expect(loaded.learner).toMatchObject({ transitions: [] });
+    expect(loaded.ruleFeedback).toEqual({});
+    expect(store.diagnostics.removedExpired).toBeGreaterThanOrEqual(2);
+  });
+
+  it('trims weak entries to the configured UTF-8 byte cap', () => {
+    const path = join(dir(), 'state.json');
+    const transitions = Array.from({ length: 100 }, (_, i) => ({
+      server: 's', prevTool: `a${i}`, nextTool: `b${i}`, count: 2, score: 1, lastUpdated: i + 1,
+      templates: [{ name: 'query', underivable: false, derived: 2, missed: 0,
+        sources: [{ kind: 'const', repr: JSON.stringify(`ordinary-${i}-${'x'.repeat(1800)}`), score: 1, lastUpdated: i + 1 }] }],
+    }));
+    const store = new StateStore(path, () => 101, [], undefined, { maxBytes: 65_536 });
+    expect(store.save({ learner: { transitions }, ruleFeedback: {} })).toBe(true);
+    expect(statSync(path).size).toBeLessThanOrEqual(65_536);
+    expect(store.diagnostics.trimmedForSize).toBeGreaterThan(0);
+  });
+
+  it('refuses an oversized state before reading or parsing it', () => {
+    const path = join(dir(), 'state.json');
+    writeFileSync(path, 'x'.repeat(65_537));
+    const store = new StateStore(path, Date.now, [], undefined, { maxBytes: 65_536 });
+    expect(store.load()).toBeNull();
+    expect(store.diagnostics.oversizedReads).toBe(1);
+  });
+
   // Platform-neutral: this must be covered on every OS in the matrix, so the
   // POSIX mode-bits assertion lives in its own skippable case below.
   it('round-trips state atomically through a nested directory', () => {
@@ -71,6 +186,25 @@ describe('StateStore', () => {
     writeFileSync(blocker, 'occupied');
     const bad = new StateStore(join(blocker, 'child.json'));
     expect(bad.save({ learner: {}, ruleFeedback: {} })).toBe(false);
+  });
+
+  it('does not include sensitive paths or payloads in persistence failure logs', () => {
+    const canary = 'failure-canary-secret-0123456789';
+    const base = dir();
+    const blocker = join(base, canary);
+    writeFileSync(blocker, 'occupied');
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as never);
+    try {
+      const bad = new StateStore(join(blocker, 'state.json'), Date.now, [], undefined, {
+        secretValues: [canary],
+      });
+      expect(bad.save({ learner: { transitions: [], openers: [{
+        server: 's', tool: 't', argsRepr: JSON.stringify({ value: canary }), count: 2,
+      }] }, ruleFeedback: {} })).toBe(false);
+      expect(write.mock.calls.flat().join('')).not.toContain(canary);
+    } finally {
+      write.mockRestore();
+    }
   });
 
   it('refuses current state from a different workspace/account scope', () => {
