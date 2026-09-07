@@ -67,3 +67,15 @@ Files: src/proxy.ts, src/stats.ts, src/usage.ts, src/metrics.ts, stats sections 
 - [ ] Independently review learner correctness/leakage and persistence security plus integrated branch. Resolve important findings and rerun affected checks.
 - [ ] If gates pass, bump semver, update release notes with measured scope/limits, commit, push branch and PR, wait for three-platform CI, merge, tag and run trusted publish. User has authorized these actions conditional on benefit.
 - [ ] Verify published npm version and packed CLI behavior. Final report links release and benchmark artifact, shows before/after times/hits/waste/control results, and identifies unmeasured real-world limitations.
+
+## Evidence-driven queue correction (added after paired smoke)
+
+The 4-train/4-holdout full proxy smoke did not meet the frozen release gates:
+mean waits improved only 7–9% on some fixtures and regressed on one, despite
+higher prediction recall. Source inspection found queued next-call predictions
+can remain queued after the next real call has already arrived, then drain before
+the new trigger is observed. Investigate and test retiring obsolete queued
+next-call predictions when the real sequence advances. Preserve explicit standing
+predictions, already issued calls, cache behavior, policy, budgets, and admission
+formulas. Production code remains generic. Keep the original fixtures and all
+release thresholds unchanged; retain the failed smoke in the report.

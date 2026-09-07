@@ -1,6 +1,6 @@
 {
   "name": "speculate-mcp",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "Speculative-prefetching MCP proxy: make your agent's next tool call instant",
   "main": "dist/src/cli.js",
   "scripts": {
@@ -9,6 +9,7 @@
     "test:scenarios": "vitest run test/scenarios.test.ts",
     "bench": "tsx bench/bench.ts",
     "bench:remote": "tsx bench/remote.ts",
+    "bench:repeated": "tsx bench/repeated.ts",
     "eval": "tsx eval/eval.ts",
     "demo": "tsx demo/demo.ts",
     "mock-github": "tsx mock/mock-github.ts",

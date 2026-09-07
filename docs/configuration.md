@@ -40,12 +40,35 @@ The file is JSON with comments (JSONC).
 | `maxPredictionsPerTrigger` | number | `3` | Per-trigger prediction cap |
 | `log` | `stderr` \| `off` | `stderr` | Decision log destination (JSONL) |
 | `servers` | object | — | Upstream servers, keyed by name |
-| `persistence` | object | enabled | `{ enabled?, path? }` — learned transition model and rule feedback |
+| `persistence` | object | enabled | `{ enabled?, path?, retentionDays?, maxBytes? }` — learned transition model and aggregate evidence |
 
 !!! note "Persistence never holds results"
 
-    What survives a session is tool names and argument templates. Tool results
-    are never written to disk.
+    What survives a session is tool names, argument source descriptors, filtered
+    constants, and aggregate evidence. There is no raw call/result archive.
+
+Learning is written to disk automatically, outside the repository by default:
+`$XDG_STATE_HOME/speculate` when set to an absolute path,
+`%LOCALAPPDATA%/speculate` on Windows, or `~/.local/state/speculate` otherwise.
+State is scoped by workspace, upstream, and account identity.
+
+`persistence.retentionDays` defaults to `30`; `persistence.maxBytes` defaults to
+`8388608` (8 MiB per scoped state). Expired evidence is pruned and weaker/older
+entries are trimmed to fit. Oversized or unreadable state falls back to cold
+learning. Learner retention uses observation timestamps. Aggregate feedback
+and latency models use decay-reference timestamps, refreshed when exported;
+the window is not an absolute maximum age for their underlying observations.
+The byte cap applies to the entire learned state. Aggregate usage records are
+separate and can be compacted with `speculate stats --compact` or removed with
+`speculate memory clear --all`.
+
+Recent raw call payloads are retained only within the running session. The
+added earlier-call history is bounded to eight calls and an estimated 1 MiB
+per server, separate from the current call and speculation cache. Source descriptors
+can reuse a value from an earlier call even when other calls intervene.
+Oversized payloads are skipped for historical reuse without changing real calls.
+See [secret handling](safety.md#local-learning-and-secrets) and
+[memory commands](commands.md#memory).
 
 ## Per-server
 

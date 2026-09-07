@@ -14,6 +14,7 @@
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](demo/speculate-demo.gif)
 
 - **No configuration, nothing per-server.** Speculate learns from your own traffic, so it works the same on a server nobody has heard of.
+- **Memory across sessions.** It writes compact learning to your disk automatically. Recent call payloads stay in bounded session memory; argument bindings can reach across intervening calls. `speculate memory` shows what is retained and `speculate stats` shows whether it helps.
 - **Read-only, always.** It runs tools the server marks read-only, and nothing else.
 - **Nothing taken away.** Every change is recorded, and `off` reverses it exactly.
 
@@ -65,13 +66,15 @@ Speculate never touches connectors you added in the claude.ai UI. The host holds
 | `speculate status [path]` | Every project at a glance; give a path (`.`) for one project's detail |
 | `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
 | `speculate stats` | Saved time, conservative net, predictor recall, near misses, and per-server/tool views |
+| `speculate memory [--json]` | Inspect retained learning, size, last-save time, and default limits; `clear --all` removes managed learning and usage records |
 | `speculate try` | Launch a throwaway session to try it, writing nothing |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
 ## Safety
 
 - Speculate only ever executes tools the server marks read-only (`readOnlyHint` plus your own `allowTools` in `strict` mode; annotations alone in `annotated`, the zero-config default). It never speculates on an unknown tool. It forwards every real call verbatim, writes included, and flushes the cache on any mutation.
-- Cached results are byte-identical, single-use, short-lived, and never hit the disk. What Speculate persists is tool names and argument templates, never results.
+- Cached results are byte-identical, single-use, short-lived, and remain in memory. Disk learning contains tool names, argument source descriptors, filtered constants, and aggregate evidence. Learner observations have a 30-day retention window; state is capped at 8 MiB per workspace/account by default. There is no raw call/result archive.
+- Known credentials and recognizable secret literals are removed before learned state is written or imported. This reduces exposure; arbitrary private strings cannot always be recognized. Local files inherit your account's access controls. See [disk contents and secret handling](docs/safety.md#local-learning-and-secrets).
 - `speculate on` changes config through the host's own CLIs and records everything it did, so `off` can undo it exactly. One scoped exception: wrapping a plugin's server also adds that server's name to `disabledMcpServers` in your own `~/.claude.json` — the key the `/mcp` screen writes and no CLI does — and `off` removes exactly that entry.
 - Speculate registers as its own OAuth client and never reads another application's credential store, so refreshing its token cannot disturb Claude Code's. It never logs a header value: `doctor` shows names and expiry, never the token.
 
