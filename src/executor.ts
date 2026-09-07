@@ -69,6 +69,29 @@ export class SpeculationExecutor {
   }
 
   /**
+   * A real call advances the server past predictions for its previous
+   * trigger. Drop only queued next-call work; issued calls and explicit
+   * standing bets keep their existing lifecycle.
+   */
+  supersedePendingNext(server: string): number {
+    const queue = this.pending.get(server);
+    if (!queue?.length) return 0;
+    const standing: QueuedPrediction[] = [];
+    let dropped = 0;
+    for (const item of queue) {
+      if (item.p.horizon === 'standing') {
+        standing.push(item);
+      } else {
+        this.suppress(item.p, 'superseded-next-call');
+        dropped++;
+      }
+    }
+    if (standing.length > 0) this.pending.set(server, standing);
+    else this.pending.delete(server);
+    return dropped;
+  }
+
+  /**
    * Drop predictions that never acquired an upstream slot before shutdown.
    * They are suppression, not waste: no speculative call was issued. Keeping
    * the event makes the end-of-session funnel reconcile without penalizing a

@@ -7,6 +7,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +19,7 @@ import {
   readUsageReport,
   type UsageCounters,
 } from '../src/usage.js';
+import { usageGenerationPath, withUsageMemoryLock } from '../src/memory.js';
 
 const dir = () => mkdtempSync(join(tmpdir(), 'speculate-usage-'));
 
@@ -59,6 +61,36 @@ afterEach(() => {
 });
 
 describe('UsageRecorder', () => {
+  it('retries a contended final flush after the shared lock is released', async () => {
+    const directory = dir();
+    const recorder = new UsageRecorder({ source: 'mcp', workspace: '/workspace/a', directory,
+      sessionId: 'contended', now: () => 3000, flushDelayMs: 0 });
+    const held = withUsageMemoryLock(directory, () => {
+      recorder.update(counters({ hits: 7 }));
+      return recorder.close();
+    });
+    expect(held.acquired).toBe(true);
+    if (held.acquired) await held.value;
+    expect(JSON.parse(readFileSync(join(directory, '3000-contended.json'), 'utf8')))
+      .toMatchObject({ endedAt: 3000, counters: { hits: 7 } });
+  });
+
+  it('does not resurrect a cleared generation and permits a fresh session', () => {
+    const directory = dir();
+    const first = new UsageRecorder({ source: 'mcp', workspace: '/workspace/a', directory,
+      sessionId: 'first', now: () => 1000, flushDelayMs: 0 });
+    unlinkSync(join(directory, '1000-first.json'));
+    writeFileSync(usageGenerationPath(directory), 'cleared-generation');
+    first.update(counters({ hits: 99 }));
+    first.close();
+    expect(existsSync(join(directory, '1000-first.json'))).toBe(false);
+    const second = new UsageRecorder({ source: 'mcp', workspace: '/workspace/a', directory,
+      sessionId: 'second', now: () => 2000, flushDelayMs: 0 });
+    second.update(counters({ hits: 1 }));
+    second.close();
+    expect(readUsageReport(directory).totals.hits).toBe(1);
+  });
+
   it.skipIf(!hasPosixFileModes)('persists an owner-only snapshot atomically', () => {
     const directory = join(dir(), 'nested');
     let now = 1000;
@@ -204,6 +236,7 @@ describe('UsageRecorder', () => {
     expect(warnings).toHaveLength(1);
     recorder.close();
     expect(warnings).toHaveLength(1);
+    expect(warnings.join('\n')).not.toContain(directory);
   });
 
   it('can be disabled through the environment', () => {

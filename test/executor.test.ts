@@ -176,6 +176,45 @@ describe('long-horizon TTL', () => {
 });
 
 describe('executor drain queue', () => {
+  it('supersedes queued default and next-call predictions after a real call advances', async () => {
+    const { executor, calls, metrics } = makeHarness('stdio');
+    executor.submit([
+      pred('a', 0.9),
+      pred('b', 0.8),
+      { ...pred('c', 0.7), horizon: 'next' },
+      { ...pred('d', 0.6), horizon: 'standing' },
+    ]);
+    expect(calls.map((call) => call.tool)).toEqual(['a']);
+
+    expect(executor.supersedePendingNext('github')).toBe(2);
+    expect(metrics.statsSnapshot().suppressed['superseded-next-call']).toBe(2);
+
+    calls[0]!.deferred.resolve();
+    await settle();
+    expect(calls.map((call) => call.tool)).toEqual(['a', 'd']);
+  });
+
+  it('does not supersede another server queue', async () => {
+    const { executor, calls } = makeHarness('stdio');
+    executor.submit([pred('a', 0.9), pred('b', 0.8)]);
+
+    expect(executor.supersedePendingNext('linear')).toBe(0);
+    calls[0]!.deferred.resolve();
+    await settle();
+    expect(calls.map((call) => call.tool)).toEqual(['a', 'b']);
+  });
+
+  it('does not cancel a prediction that already acquired an upstream slot', async () => {
+    const { executor, calls, cache } = makeHarness('stdio');
+    executor.submit([{ ...pred('a', 0.9), horizon: 'next' }]);
+
+    expect(executor.supersedePendingNext('github')).toBe(0);
+    expect(cache.has(canonicalKey('github', 'a', { tool: 'a' }))).toBe(true);
+    calls[0]!.deferred.resolve();
+    await settle();
+    expect(cache.has(canonicalKey('github', 'a', { tool: 'a' }))).toBe(true);
+  });
+
   it('stdio: queues over-budget predictions and fires them in confidence order', async () => {
     const { executor, calls } = makeHarness('stdio');
     executor.submit([pred('a', 0.9), pred('b', 0.4), pred('c', 0.6)]);
