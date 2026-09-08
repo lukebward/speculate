@@ -166,7 +166,8 @@ describe('Codex executable discovery', () => {
     const first = join(root, 'first'); const second = join(root, 'second');
     mkdirSync(join(first, 'fixture-codex'), { recursive: true }); mkdirSync(second);
     const executable = join(second, 'fixture-codex'); writeFileSync(executable, 'fixture'); chmodSync(executable, 0o755);
-    expect(resolveCodexBin('fixture-codex', { pathEnv: [first, second].join(':'), platform: 'linux', home: root })).toBe(executable);
+    const pathEnv = [first, second].join(process.platform === 'win32' ? ';' : ':');
+    expect(resolveCodexBin('fixture-codex', { pathEnv, home: root })).toBe(executable);
   });
 
   it('finds npm Windows shims and prefers executable files in the same directory', () => {
