@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -14,7 +14,7 @@ let revision: number;
 let writes: CodexConfigWrite[];
 let options: CodexHookOptions;
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'speculate-codex-hooks-'));
+  root = realpathSync(mkdtempSync(join(tmpdir(), 'speculate-codex-hooks-')));
   path = join(root, 'hooks.json'); config = {}; revision = 1; writes = [];
   options = { cwd: root, self: { command: process.execPath, args: [join(root, 'speculate', 'cli.js')] },
     client: { codexHome: root, bin: join(root, 'codex'),
