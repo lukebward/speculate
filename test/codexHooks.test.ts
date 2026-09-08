@@ -14,7 +14,8 @@ let revision: number;
 let writes: CodexConfigWrite[];
 let options: CodexHookOptions;
 beforeEach(() => {
-  root = realpathSync(mkdtempSync(join(tmpdir(), 'speculate-codex-hooks-')));
+  // Native realpath also expands Windows 8.3 names before PowerShell sees cwd.
+  root = realpathSync.native(mkdtempSync(join(tmpdir(), 'speculate-codex-hooks-')));
   path = join(root, 'hooks.json'); config = {}; revision = 1; writes = [];
   options = { cwd: root, self: { command: process.execPath, args: [join(root, 'speculate', 'cli.js')] },
     client: { codexHome: root, bin: join(root, 'codex'),
