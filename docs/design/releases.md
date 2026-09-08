@@ -562,3 +562,34 @@ Qualification includes real Codex 0.153.4 stdio and authenticated HTTP
 fixtures, startup policy changes, exact transport restoration, and an
 installed-package Node 18 smoke test. CI runs the native Codex check on Linux,
 macOS, and Windows. These are functional checks, not a new speedup claim.
+
+## v0.22.0 (2026-09-07): one switch for both clients
+
+`speculate on` now enables Claude Code and Codex together. `off`, `status`,
+`sync`, and `auth` also default to both; `--client claude` or `--client codex`
+targets one without changing the other. Each client is attempted independently,
+and partial failures are reported with a nonzero exit code.
+
+Claude Code activation covers user-scope servers, including entries hidden by
+a project override, and approved servers in known project directories. Its
+session-start hook picks up new projects as they are opened. Global off stops
+automatic wrapping in every project and restores recorded registrations across
+projects. Restore conflicts keep their recovery records. Interactive global
+updates and session hooks share a lock to avoid conflicting writes.
+
+Codex setup installs a user-level session-start hook for automatic sync. Codex
+requires review and trust through `/hooks`; Speculate does not grant that trust
+itself. Off removes Speculate's hook and disables automatic sync. New server
+registrations may take another session to load in either client.
+
+The scope remains MCP servers that the clients can configure. Codex
+project-owned or layered transports, unsupported authentication/helpers,
+hosted connectors, built-in tools, and shell commands remain outside this
+integration. Existing tool restrictions, read-only checks, and prediction
+behavior are unchanged. See the [setup guide](../getting-started.md) for the
+client scopes and hook requirements.
+
+The full local suite passed 1,015 tests with eight skips. Native Claude Code
+and Codex checks covered multiple projects, mode changes, newly added servers,
+independent shutdown, and restoration; stdio/HTTP workflow checks also passed.
+No model/provider calls were made, and no new speedup is claimed.

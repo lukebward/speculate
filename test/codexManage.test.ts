@@ -148,6 +148,36 @@ describe('native Codex registration', () => {
     expect(config).toEqual(original);
   });
 
+  it('carries the selected default mode into new servers discovered by automatic sync', async () => {
+    expect(await speculateCodexOn({ ...options, mode: 'strict' })).toBe(0);
+    expect(readState().mode).toBe('strict');
+    editUser((data) => { data.mcp_servers.new_server = { command: 'cat' }; });
+    expect(await speculateCodexSync(options)).toBe(0);
+    expect(server('new_server').args).toContain('strict');
+    expect(readState().entries.new_server.mode).toBe('strict');
+    editUser((data) => { data.mcp_servers.later_server = { command: 'cat' }; });
+    expect(await speculateCodexOn(options)).toBe(0);
+    expect(server('later_server').args).toContain('strict');
+  });
+
+  it('keeps per-entry mode choices while using the saved default for new servers', async () => {
+    await speculateCodexOn(options);
+    const saved = readState(); saved.mode = 'strict'; writeFileSync(statePath, JSON.stringify(saved));
+    editUser((data) => { data.mcp_servers.new_server = { command: 'cat' }; });
+    expect(await speculateCodexSync(options)).toBe(0);
+    expect(server().args).toContain('annotated');
+    expect(server('new_server').args).toContain('strict');
+  });
+
+  it('loads older state without a default mode while preserving existing wrapper modes', async () => {
+    await speculateCodexOn({ ...options, mode: 'strict' });
+    const saved = readState(); delete saved.mode; writeFileSync(statePath, JSON.stringify(saved));
+    editUser((data) => { data.mcp_servers.new_server = { command: 'cat' }; });
+    expect(await speculateCodexSync(options)).toBe(0);
+    expect(server().args).toContain('strict');
+    expect(server('new_server').args).toContain('annotated');
+  });
+
   it('moves an upstream cwd into wrapper arguments and restores it exactly', async () => {
     const upstreamCwd = join(root, 'upstream'); server().cwd = upstreamCwd;
     const original = structuredClone(config);
@@ -253,6 +283,13 @@ describe('transaction recovery and conflicts', () => {
     expect(logs.join('\n')).not.toContain('fixture-secret');
   });
 
+  it.each(['unsupported', ['strict']])('rejects an invalid saved default mode %j', async (mode) => {
+    await speculateCodexOn(options); const saved = readState(); saved.mode = mode;
+    writeFileSync(statePath, JSON.stringify(saved)); const current = structuredClone(config); const count = writes.length;
+    expect(await speculateCodexSync(options)).toBe(1);
+    expect(config).toEqual(current); expect(writes).toHaveLength(count);
+  });
+
   it('rejects an oversized mode-update journal while keeping the previous restore point usable', async () => {
     const original = structuredClone(config);
     expect(await speculateCodexOn(options)).toBe(0);
@@ -313,6 +350,7 @@ describe('managed Codex launch restrictions', () => {
     expect(await speculateCodexOn({ ...options, mode: 'strict' })).toBe(1);
     expect(config).toEqual(priorWrapper);
     expect(readState().entries.fixture.mode).toBe('annotated');
+    expect(readState().mode).toBe('annotated');
     expect(await speculateCodexOff(options)).toBe(0);
     expect(config).toEqual(original);
   });
@@ -355,6 +393,38 @@ describe('managed Codex launch restrictions', () => {
 });
 
 describe('Codex server ownership and status', () => {
+  it('installs global auto-sync on on, removes it on off, and leaves later sync inactive', async () => {
+    expect(await speculateCodexOn(options)).toBe(0);
+    const hooks = join(root, 'hooks.json');
+    expect(existsSync(hooks)).toBe(true);
+    expect(logs.join('\n')).toContain('/hooks');
+    expect(await speculateCodexOff(options)).toBe(0);
+    expect(existsSync(hooks)).toBe(false);
+    editUser((data) => { data.mcp_servers.new_server = { command: 'cat' }; });
+    expect(await speculateCodexSync(options)).toBe(0);
+    expect(server('new_server')).toEqual({ command: 'cat' });
+    expect(existsSync(hooks)).toBe(false);
+  });
+
+  it('reports unavailable auto-sync for malformed hook files and still restores servers on off', async () => {
+    const original = structuredClone(config); const hooks = join(root, 'hooks.json');
+    writeFileSync(hooks, '{malformed-user-hook');
+    expect(await speculateCodexOn(options)).toBe(1);
+    expect(readFileSync(hooks, 'utf8')).toBe('{malformed-user-hook');
+    expect(await speculateCodexOff(options)).toBe(1);
+    expect(config).toEqual(original);
+    expect(readState().enabled).toBe(false);
+    expect(logs.join('\n')).not.toContain('malformed-user-hook');
+  });
+
+  it('reports disabled native hooks without claiming automatic sync is active', async () => {
+    config.features = { hooks: false };
+    expect(await speculateCodexOn(options)).toBe(1);
+    expect(existsSync(join(root, 'hooks.json'))).toBe(false);
+    expect(logs.join('\n')).toContain('Automatic Codex sync is unavailable');
+    expect(logs.join('\n')).not.toContain('SessionStart hook installed');
+  });
+
   it('skips disabled, project-only, and transport-shadowed servers', async () => {
     raw({ disabled: { command: 'cat', enabled: false }, shadowed: { command: 'cat' }, fixture: { command: 'cat' } });
     project({ project_only: { command: 'cat' }, shadowed: { args: ['project-args'] } });

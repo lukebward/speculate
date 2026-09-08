@@ -80,7 +80,7 @@ if (cli.length === 0 || !cli.every((p) => existsSync(p))) process.exit(0);
 
 let child;
 try {
-  child = spawn(process.execPath, [...cli, 'sync', ...extra], {
+  child = spawn(process.execPath, [...cli, 'sync', '--client', 'claude', '--quiet', ...extra], {
     stdio: ['ignore', 'ignore', 'pipe'],
     windowsHide: true,
   });

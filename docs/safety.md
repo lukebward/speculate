@@ -42,8 +42,8 @@ A tool is eligible only if both hold:
 - **Speculative results are never fabricated or merged.** A cache hit returns
   exactly the bytes the upstream server returned earlier; a miss goes upstream.
   Speculate never synthesizes tool output.
-- **Every real call is forwarded verbatim**, writes included, and the cache is
-  flushed on any mutation.
+- **Calls without a reusable result go upstream normally.** Mutations also
+  clear that server's buffer.
 - **Auth errors suspend, successes reset.** A speculative call failing with an
   auth or permission error is dropped (not cached) and that tool is suspended
   from speculation until a subsequent *real* call to the same tool succeeds.
@@ -119,8 +119,11 @@ The original transport fields are recorded locally for undo and can include
 credentials already present in the host configuration. `off --client codex`
 restores those fields only when the current transport still matches Speculate's
 record. It reports conflicts and preserves unrelated later edits. It also
-preserves learning and authentication. Codex setup does not install a hook;
-refresh explicitly with `on --client codex` or `sync --client codex`.
+preserves learning and authentication. Setup installs a user-level sync hook;
+Codex requires you to review and trust it through `/hooks`. Speculate does not
+approve its own hook. `off --client codex` disables automatic sync and removes
+that hook. Claude Code's global off likewise prevents future session hooks
+from re-enabling wrapping in another project.
 
 ## Risks that read-only does not solve
 

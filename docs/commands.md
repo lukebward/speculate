@@ -2,27 +2,27 @@
 
 | Command | What it does |
 |---|---|
-| `speculate on [--client claude\|codex]` | Wrap supported MCP servers for the selected client |
-| `speculate off [--client claude\|codex]` | Restore registrations changed for the selected client |
-| `speculate status [path] [--client claude\|codex]` | Inspect wrapping and configuration in the selected client |
-| `speculate sync [--client claude\|codex]` | Wrap servers added since the last setup |
-| `speculate auth [server] [--client claude\|codex]` | Authorize remote servers (`--forget` removes Speculate's login) |
+| `speculate on [--client claude\|codex\|both]` | Wrap supported MCP servers for the selected client |
+| `speculate off [--client claude\|codex\|both]` | Restore registrations changed for the selected client |
+| `speculate status [path] [--client claude\|codex\|both]` | Inspect wrapping and configuration in the selected client |
+| `speculate sync [--client claude\|codex\|both]` | Wrap servers added since the last setup |
+| `speculate auth [server] [--client claude\|codex\|both]` | Authorize remote servers (`--forget` removes Speculate's login) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate memory` | Retained learning inventory; `clear --all` removes managed learning and usage records |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
 ## `on` and `off`
 
-`--client claude` is the default. Claude Code setup uses its own CLI to wrap
-approved servers for this project and installs a shared session-start hook.
-`off` restores the recorded registrations and stops automatic wrapping for that
-project; the shared hook, learning, and OAuth credentials remain. To remove the
-Claude Code hook globally:
+The default is both clients. `speculate on` enables Claude Code and Codex;
+`speculate off` disables both. Select one client with `--client claude` or
+`--client codex` to leave the other alone. Each client is attempted separately,
+so an unavailable client does not prevent setup for the other. Partial failures
+are reported and return a nonzero exit code.
 
-```bash
-claude plugin uninstall -s user speculate-autowrap
-claude plugin marketplace remove speculate-mcp
-```
+Claude Code setup wraps user servers and approved servers in known projects,
+and installs a shared session-start hook for future projects and new servers.
+`off --client claude` disables that automatic wrapping globally and restores
+recorded registrations across projects.
 
 `--client codex` uses Codex's configuration API and changes enabled, supported
 **user-level** MCP registrations. Restart Codex afterward. Server names,
@@ -30,12 +30,12 @@ environment settings, and tool policies are preserved. Project-owned or
 shadowed transports and unsupported helpers are reported and skipped. See
 [Codex setup](getting-started.md#codex) for the supported scope.
 
-Codex `off` restores only transport fields that still match the recorded
-wrapper. It preserves unrelated later edits and reports conflicts. Neither
+Codex `off` disables automatic sync, removes Speculate's hook, and restores
+only transport fields that still match the recorded wrapper. It preserves unrelated later edits and reports conflicts. Neither
 client's `off` deletes learned state or OAuth credentials.
 
 `--mode strict|annotated|off` is available on `on`. The default wrapping mode is
-`annotated`. Add `--codex-bin PATH` with `--client codex` to select an executable.
+`annotated`. Add `--codex-bin PATH` to select the Codex executable.
 There is no scope flag for Codex: native writes remain user-level.
 
 ## `status`, `sync`, and `auth`
@@ -46,17 +46,19 @@ and trusted project layers in the current or selected directory, without
 changing the write scope. It does not see another session's `--profile` or
 `-c` overrides; see [the scope limit](getting-started.md#codex).
 
-`sync --client codex` explicitly wraps newly added supported servers. Codex has
-no auto-wrap hook. Claude Code's installed session-start hook runs `sync` for
-its managed projects.
+`sync` checks both enabled clients for newly added supported servers. The
+installed session-start hooks sync their own client. Codex requires you to
+review and trust its hook through `/hooks`. Newly wrapped servers may need
+another session before the client loads them. Turning a client off prevents
+its hook from enabling it again.
 
-Use `auth --client codex [server]` for Codex registrations, or `auth [server]`
-for Claude Code. A server name or URL selects a remote endpoint; without a
+Use `auth --client codex [server]` for Codex registrations, or
+`auth --client claude [server]` for Claude Code. Plain `auth` checks both. A server name or URL selects a remote endpoint; without a
 target, Codex auth visits remote servers in its user configuration. Speculate
 uses its own OAuth client and does not reuse
 another client's credential store. `--forget` removes Speculate's saved login.
-For Codex, `--forget` requires a server name or URL and first restores managed
-Codex registrations sharing that URL.
+With both clients or Codex selected, `--forget` requires a server name or URL.
+Codex first restores its managed registrations sharing that URL.
 
 ## `doctor`
 

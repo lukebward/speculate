@@ -272,6 +272,10 @@ export interface ManagedEntry {
    * saveManagedState), and no log line ever prints a header value.
    */
   original?: McpServerEntry;
+  /** Exact entry written by this version, for conflict-safe global restore. */
+  wrapped?: McpServerEntry;
+  /** A previous restore removed the wrapper but could not re-add its original. */
+  restorePending?: boolean;
 }
 
 /**
@@ -288,6 +292,8 @@ export function managedKey(scope: ClaudeScope, name: string): string {
 export interface ManagedState {
   version: 1;
   projects: Record<string, { entries: ManagedEntry[]; updatedAt: number }>;
+  /** Absent in older installs, whose per-project hook behavior is preserved. */
+  global?: { enabled: boolean; mode?: SpeculationMode };
   /**
    * ≤0.10 only: true when that host's `on` run added the (host-global)
    * plugin marketplace registration itself, as opposed to finding one
@@ -364,7 +370,8 @@ export function projectIsManaged(opts: { cwd?: string; statePath?: string } = {}
 export function adoptLegacyProjectRecords(state: ManagedState, cwd: string): void {
   const root = normalizeProjectKey(cwd);
   const legacy = Object.keys(state.projects).filter(
-    (key) => key !== cwd && normalizeProjectKey(key).startsWith(`${root}/`),
+    (key) => key !== cwd && normalizeProjectKey(key).startsWith(`${root}/`) &&
+      normalizeProjectKey(projectRoot(key)) === root,
   );
   if (legacy.length === 0) return;
   const current = state.projects[cwd] ?? { entries: [], updatedAt: 0 };
@@ -400,6 +407,69 @@ export function saveManagedState(path: string, state: ManagedState): void {
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
   renameSync(tmp, path);
+}
+
+export function claudeIsGloballyEnabled(opts: { statePath?: string } = {}): boolean {
+  return loadManagedState(opts.statePath ?? managedStatePath()).global?.enabled === true;
+}
+
+/** Global on/off and SessionStart share the same host-wide mutation lock. */
+export function acquireManagementLock(path: string): (() => void) | null {
+  const dead = (value: string): boolean => {
+    const owner = Number.parseInt(value, 10);
+    if (!Number.isSafeInteger(owner) || owner <= 0) return true;
+    try { process.kill(owner, 0); return false; } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+  };
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const token = `${process.pid}-${Date.now()}-${Math.random()}`;
+    try {
+      writeFileSync(path, token, { flag: 'wx', mode: 0o600 });
+    } catch {
+      const reclaim = `${path}.reclaim`;
+      try { writeFileSync(reclaim, token, { flag: 'wx', mode: 0o600 }); } catch {
+        // A process can die inside stale recovery as well as inside a
+        // config update. Only a sufficiently old, dead guard is removable.
+        const previous = readFileSync(reclaim, 'utf8');
+        if (Date.now() - statSync(reclaim).mtimeMs < 180_000 || !dead(previous)) return null;
+        if (readFileSync(reclaim, 'utf8') !== previous) return null;
+        unlinkSync(reclaim);
+        try { writeFileSync(reclaim, token, { flag: 'wx', mode: 0o600 }); } catch { return null; }
+      }
+      try {
+        if (Date.now() - statSync(path).mtimeMs < 180_000) return null;
+        // A global sweep can outlast the hook timeout. Never steal a live
+        // owner's lock. Serialize stale recovery so a second contender
+        // cannot remove the replacement lock after checking the old one.
+        if (!dead(readFileSync(path, 'utf8'))) return null;
+        if (readFileSync(reclaim, 'utf8') !== token) return null;
+        unlinkSync(path);
+        try { writeFileSync(path, token, { flag: 'wx', mode: 0o600 }); } catch { return null; }
+      } finally {
+        try { if (readFileSync(reclaim, 'utf8') === token) unlinkSync(reclaim); } catch { /* gone */ }
+      }
+    }
+    return () => {
+      try { if (readFileSync(path, 'utf8') === token) unlinkSync(path); } catch { /* gone */ }
+    };
+  } catch { return null; }
+}
+
+async function withManagementLock(ctx: Ctx, run: () => Promise<number>): Promise<number> {
+  const path = join(dirname(ctx.statePath), 'sync.lock');
+  const until = Date.now() + 5_000;
+  let release = acquireManagementLock(path);
+  while (!release && Date.now() < until) {
+    await new Promise((done) => setTimeout(done, 25));
+    release = acquireManagementLock(path);
+  }
+  if (!release) {
+    ctx.log('[speculate] another Claude configuration update is running; retry this command when it finishes');
+    return 1;
+  }
+  try { return await run(); } finally { release(); }
 }
 
 /**
@@ -1265,6 +1335,43 @@ export async function wrapEffectiveServers(
       continue;
     }
     if (isWrappedEntry(scoped.entry)) {
+      const rec = managed.get(managedKey(scoped.scope, name));
+      if (rec && rec.action !== 'pluginShadowed' && opts.mode && wrappedModeOf(scoped.entry) !== opts.mode) {
+        const args = [...(scoped.entry.args ?? [])];
+        const wrapIndex = args.indexOf('wrap');
+        const oldExpected = rec.wrapped ?? (rec.original ? wrapEntry(rec.original,
+          { command: scoped.entry.command!, args: args.slice(0, wrapIndex) },
+          { mode: wrappedModeOf(scoped.entry) }) : undefined);
+        if (!oldExpected || JSON.stringify(canonicalizeForHash(scoped.entry)) !== JSON.stringify(canonicalizeForHash(oldExpected))) {
+          ctx.log(`[speculate] ${name}: configuration changed since wrapping; mode left unchanged`);
+          failed++;
+          continue;
+        }
+        const flagEnd = args.indexOf('--', wrapIndex + 1);
+        const modeIndex = args.indexOf('--mode', wrapIndex + 1);
+        if (modeIndex !== -1 && (flagEnd === -1 || modeIndex < flagEnd)) args[modeIndex + 1] = opts.mode;
+        else args.splice(wrapIndex + 1, 0, '--mode', opts.mode);
+        const updated = { ...scoped.entry, args };
+        const removed = await mcpRemove(ctx, name, scoped.scope);
+        if (removed.code !== 0) {
+          ctx.log(`[speculate] ${name}: could not update speculation mode`);
+          failed++;
+          continue;
+        }
+        const added = await mcpAddJson(ctx, name, updated, scoped.scope);
+        if (added.code !== 0) {
+          const restored = await mcpAddJson(ctx, name, scoped.entry, scoped.scope);
+          if (restored.code !== 0) managed.set(managedKey(scoped.scope, name), { ...rec, restorePending: true });
+          ctx.log(`[speculate] ${name}: mode update failed; ${restored.code === 0 ? 'previous wrapper restored' : 'restore failed; original remains in the managed record'}`);
+          failed++;
+          continue;
+        }
+        managed.set(managedKey(scoped.scope, name), { ...rec, wrapped: updated });
+        ctx.log(`[speculate] ${name}: speculation mode updated to ${opts.mode}`);
+        opts.onWrapped?.(name);
+        changed++;
+        continue;
+      }
       ctx.log(`[speculate] ${name}: already wrapped — skipping`);
       continue;
     }
@@ -1319,7 +1426,7 @@ export async function wrapEffectiveServers(
         failed++;
         continue;
       }
-      managed.set(managedKey('local', name), { name, scope: 'local', action: 'shadowed' });
+      managed.set(managedKey('local', name), { name, scope: 'local', action: 'shadowed', wrapped });
       ctx.log(`[speculate] ${name}: wrapped via local shadow (.mcp.json untouched; local wins)`);
       opts.onWrapped?.(name);
       changed++;
@@ -1357,6 +1464,7 @@ export async function wrapEffectiveServers(
       scope: scoped.scope,
       action: 'rewrote',
       original: scoped.entry,
+      wrapped,
     });
     ctx.log(
       `[speculate] ${name}: wrapped (${scoped.scope} scope${remote?.wrappable ? ', remote' : ''})`,
@@ -1538,6 +1646,7 @@ export async function wrapEffectiveServers(
         continue;
       }
       ctx.log(`[speculate] ${qual}: refreshed the wrapped copy (plugin updated)`);
+      managed.set(managedKey('local', copyName), { ...rec!, wrapped: expected });
       changed++;
       continue;
     }
@@ -1604,6 +1713,7 @@ export async function wrapEffectiveServers(
       scope: 'local',
       action: 'pluginShadowed',
       pluginServer: qual,
+      wrapped,
     });
     anyScopeNames.set(copyName, { name: copyName, scope: 'local', entry: wrapped });
     localByName.set(copyName, { name: copyName, scope: 'local', entry: wrapped });
@@ -2055,7 +2165,7 @@ async function installAutowrapPlugin(ctx: Ctx): Promise<void> {
 
 // -- on ---------------------------------------------------------------------------
 
-export async function speculateOn(opts: ManageOptions): Promise<number> {
+export async function speculateOn(opts: ManageOptions, internal: { skipHook?: boolean } = {}): Promise<number> {
   const ctx = makeCtx(opts);
   if (!(await frontDoorAvailable(ctx))) {
     ctx.log(
@@ -2125,7 +2235,7 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
   // Servers added AFTER this run are the auto-wrap plugin's job. Installed
   // after the wrap so its one line lands with the summary rather than in the
   // middle of the per-server output — and it can never fail `on`.
-  await installAutowrapPlugin(ctx);
+  if (!internal.skipHook) await installAutowrapPlugin(ctx);
 
   state.projects[ctx.cwd] = { entries: [...managed.values()], updatedAt: Date.now() };
   // The ownership flag authorized exactly one host-global removal; consume it
@@ -2155,7 +2265,10 @@ export async function speculateOn(opts: ManageOptions): Promise<number> {
 
 // -- off --------------------------------------------------------------------------
 
-export async function speculateOff(opts: ManageOptions): Promise<number> {
+export async function speculateOff(
+  opts: ManageOptions,
+  internal: { global?: boolean; scope?: 'user' | 'project'; recordKey?: string } = {},
+): Promise<number> {
   const ctx = makeCtx(opts);
   if (!(await frontDoorAvailable(ctx))) {
     ctx.log(
@@ -2165,11 +2278,14 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   }
   const preView = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
   const state = loadManagedState(ctx.statePath);
-  adoptLegacyProjectRecords(state, ctx.cwd);
-  const record = state.projects[ctx.cwd];
+  if (!internal.recordKey) adoptLegacyProjectRecords(state, ctx.cwd);
+  const recordKey = internal.recordKey ?? ctx.cwd;
+  const record = state.projects[recordKey];
+  const included = (scope: ClaudeScope): boolean =>
+    internal.scope === 'user' ? scope === 'user' : internal.scope === 'project' ? scope !== 'user' : true;
   let legacyCleanup: LegacyCleanupResult = NO_LEGACY_CLEANUP;
   try {
-    legacyCleanup = await cleanupLegacyArtifacts(ctx, preView, {
+    if (internal.scope !== 'user') legacyCleanup = await cleanupLegacyArtifacts(ctx, preView, {
       marketplaceAddedByOn: readMarketplaceAddedByOn(state),
       pluginRecorded: (record?.entries ?? []).some((e) => e.action === 'plugin'),
     });
@@ -2192,10 +2308,45 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
    * server that entry holds the credential — which the failure message
    * deliberately does not print. Dropping it would destroy it.
    */
-  const unfinished: ManagedEntry[] = [];
+  const unfinished: ManagedEntry[] = (record?.entries ?? []).filter((entry) => !included(entry.scope));
 
   for (const entry of record?.entries ?? []) {
+    if (!included(entry.scope)) continue;
     handled.add(managedKey(entry.scope, entry.name));
+    if (internal.global && entry.name !== WORKSPACE_SERVER_NAME && entry.action !== 'plugin') {
+      const current = preView.servers.find((server) => server.scope === entry.scope && server.name === entry.name)?.entry;
+      const same = (a: unknown, b: unknown): boolean =>
+        JSON.stringify(canonicalizeForHash(a)) === JSON.stringify(canonicalizeForHash(b));
+      // Already restored (including by another legacy project record).
+      if (entry.original && current && same(current, entry.original)) continue;
+      if (!current && entry.action !== 'rewrote') {
+        if (entry.action === 'pluginShadowed' && entry.pluginServer) {
+          const enabled = setPluginServerDisabled(ctx, entry.pluginServer, false);
+          if (!enabled.ok) { failed++; unfinished.push(entry); }
+        }
+        continue;
+      }
+      if (!current && entry.restorePending && entry.original) {
+        const restored = await mcpAddJson(ctx, entry.name, entry.original, entry.scope);
+        if (restored.code !== 0) { failed++; unfinished.push(entry); }
+        else ctx.log(`[speculate] ${entry.name}: original restored (${entry.scope} scope)`);
+        continue;
+      }
+      let expected = entry.wrapped;
+      if (!expected && current && entry.original && isWrappedEntry(current)) {
+        const args = current.args ?? [];
+        expected = wrapEntry(entry.original, { command: current.command!, args: args.slice(0, args.indexOf('wrap')) }, { mode: wrappedModeOf(current) });
+      }
+      const ours = current && isWrappedEntry(current) &&
+        (expected ? same(current, expected) : entry.action !== 'rewrote') &&
+        (entry.action !== 'pluginShadowed' || pluginOriginOf(current) === entry.pluginServer);
+      if (!ours) {
+        ctx.log(`[speculate] ${entry.name}: configuration changed since wrapping; left unchanged (restore record kept)`);
+        failed++;
+        unfinished.push(entry);
+        continue;
+      }
+    }
     if (entry.name === WORKSPACE_SERVER_NAME) {
       // Legacy (≤0.10) record for the retired workspace server.
       // cleanupLegacyArtifacts (above) already removed it from the HOST if
@@ -2336,7 +2487,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
         `[speculate]   the exact original is still recorded in ${ctx.statePath} — rerunning 'speculate off' retries it`,
       );
       failed++;
-      unfinished.push(entry);
+      unfinished.push({ ...entry, restorePending: true });
       continue;
     }
     if (entry.scope === 'user') userScopeUnwrapped++;
@@ -2351,7 +2502,11 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     postView.servers.filter((s) => s.scope === 'project').map((s) => s.name),
   );
   for (const scoped of postView.servers) {
+    if (!included(scoped.scope)) continue;
     if (handled.has(managedKey(scoped.scope, scoped.name)) || scoped.scope === 'project') continue;
+    if (internal.global && scoped.scope === 'user' && Object.entries(state.projects).some(
+      ([key, value]) => key !== recordKey && value.entries.some((entry) => entry.scope === 'user' && entry.name === scoped.name),
+    )) continue;
     if (!isWrappedEntry(scoped.entry)) continue;
     if (scoped.name.startsWith('-')) {
       // Same guard `on` applies: `claude mcp remove/add-json` take the name
@@ -2421,9 +2576,9 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
 
   if (record) {
     if (unfinished.length > 0) {
-      state.projects[ctx.cwd] = { entries: unfinished, updatedAt: Date.now() };
+      state.projects[recordKey] = { entries: unfinished, updatedAt: Date.now() };
     } else {
-      delete state.projects[ctx.cwd];
+      delete state.projects[recordKey];
     }
   }
   // Consume the marketplace-ownership flag exactly once (see on()).
@@ -2431,20 +2586,20 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   // Opt this project out of a later `sync`'s auto-wrap (see ManagedState.
   // syncOptOut) — the global plugin, if installed, would otherwise re-wrap
   // it at the next session start. `on` clears this.
-  state.syncOptOut = { ...(state.syncOptOut ?? {}), [ctx.cwd]: true };
+  if (!internal.global) state.syncOptOut = { ...(state.syncOptOut ?? {}), [ctx.cwd]: true };
   // What `off` cannot do, said plainly. The servers it just unwrapped at USER
   // scope are shared by every project on this machine, while the opt-out it
   // records covers this project only — so the next session start in ANY other
   // project re-wraps them at user scope, and they come back wrapped here too,
   // within one session. Nothing short of removing the plugin stops that.
-  if (userScopeUnwrapped > 0) {
+  if (!internal.global && userScopeUnwrapped > 0) {
     ctx.log(
       `[speculate] note: ${userScopeUnwrapped} of those live at USER scope, shared by every project — ` +
         'this opt-out covers this project only, so any other project’s next session start re-wraps them ' +
         'and they are wrapped here again.',
     );
   }
-  if (await detectAutowrapPlugin(ctx)) {
+  if (!internal.global && await detectAutowrapPlugin(ctx)) {
     ctx.log(
       '[speculate] auto-wrap is still installed globally (this project is now opted out).',
     );
@@ -2457,7 +2612,7 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
     ctx.log(
       `[speculate]   and its marketplace: ${ctx.claudeBin} plugin marketplace remove ${AUTOWRAP_MARKETPLACE_ID}`,
     );
-  } else if (userScopeUnwrapped > 0) {
+  } else if (!internal.global && userScopeUnwrapped > 0) {
     // Detection is fail-soft (an older host has no `claude plugin` CLI at
     // all), so the one command that really stops it is named either way.
     ctx.log(
@@ -2467,6 +2622,153 @@ export async function speculateOff(opts: ManageOptions): Promise<number> {
   saveManagedState(ctx.statePath, state);
   ctx.log(`[speculate] off: done${failed ? ` (${failed} failure(s))` : ''}.`);
   return failed > 0 ? 1 : 0;
+}
+
+/** Only paths already known to Claude or Speculate; never scan the filesystem. */
+function knownClaudeProjects(ctx: Ctx, state: ManagedState): string[] {
+  let hostProjects: string[] = [];
+  try {
+    const config = JSON.parse(readFileSync(claudeJsonPath(ctx.home), 'utf8'));
+    if (config.projects && typeof config.projects === 'object' && !Array.isArray(config.projects)) {
+      hostProjects = Object.keys(config.projects);
+    }
+  } catch { /* state and the invoking directory still identify projects */ }
+  const projects = new Map<string, string>();
+  for (const path of [ctx.cwd, ...hostProjects, ...Object.keys(state.projects), ...Object.keys(state.syncOptOut ?? {})]) {
+    if (!isAbsolute(path)) continue;
+    const root = existsSync(path) ? projectRoot(path) : path;
+    const key = normalizeProjectKey(root);
+    if (!projects.has(key)) projects.set(key, root);
+  }
+  return [...projects.values()];
+}
+
+/** Interactive global refresh; shared with manual sync, which never installs hooks. */
+export async function refreshClaudeGlobal(opts: ManageOptions, enable = false): Promise<number> {
+  const ctx = makeCtx(opts);
+  const needsAuth = new Map<string, { name: string; url: string }>();
+  const result = await withManagementLock(ctx, async () => {
+    const state = loadManagedState(ctx.statePath);
+    if (!enable && state.global?.enabled === false) {
+      ctx.log("[speculate] Claude is off globally; run 'speculate on --client claude' to enable it");
+      return 0;
+    }
+    if (!enable && state.global?.enabled !== true && Object.keys(state.projects).length === 0) {
+      ctx.log("[speculate] Claude is not enabled; run 'speculate on --client claude' first");
+      return 0;
+    }
+    if (!(await frontDoorAvailable(ctx))) {
+      ctx.log(`[speculate] cannot run '${ctx.claudeBin} mcp' — is Claude Code installed and on PATH?`);
+      return 1;
+    }
+    const mode = opts.mode ?? state.global?.mode;
+    if (enable) {
+      state.global = { enabled: true, ...(mode ? { mode } : {}) };
+      // Explicit global activation supersedes old project opt-outs.
+      state.syncOptOut = {};
+      state.syncHashes = {};
+      saveManagedState(ctx.statePath, state);
+    }
+    const projects = knownClaudeProjects(ctx, state);
+    let failed = 0;
+    // User entries are host-global even when a same-named local/project
+    // registration hides them in the invoking directory. Wrap them first,
+    // independently of the effective-scope selection in a project pass.
+    const view = readClaudeServers({ home: ctx.home, cwd: ctx.cwd });
+    const userView: ClaudeConfigView = { ...view, servers: view.servers.filter((s) => s.scope === 'user'), pluginServers: [] };
+    const current = loadManagedState(ctx.statePath);
+    adoptLegacyProjectRecords(current, ctx.cwd);
+    const managed = new Map((current.projects[ctx.cwd]?.entries ?? []).map((entry) => [managedKey(entry.scope, entry.name), entry]));
+    const userManaged = new Map<string, ManagedEntry>();
+    const userOwners = new Map<string, string>();
+    for (const [owner, record] of Object.entries(current.projects)) {
+      for (const entry of record.entries) {
+        if (entry.scope !== 'user') continue;
+        const key = managedKey('user', entry.name);
+        if (!userManaged.has(key)) { userManaged.set(key, entry); userOwners.set(key, owner); }
+      }
+    }
+    const outcome = await wrapEffectiveServers(ctx, userView, userManaged, { mode });
+    for (const [key, entry] of userManaged) {
+      const owner = userOwners.get(key);
+      if (!owner || owner === ctx.cwd) managed.set(key, entry);
+      else {
+        const record = current.projects[owner]!;
+        record.entries = record.entries.map((previous) => managedKey(previous.scope, previous.name) === key ? entry : previous);
+        record.updatedAt = Date.now();
+      }
+    }
+    for (const server of outcome.needsAuth) needsAuth.set(server.url, server);
+    if (outcome.failed) failed++;
+    if (managed.size > 0) current.projects[ctx.cwd] = { entries: [...managed.values()], updatedAt: Date.now() };
+    saveManagedState(ctx.statePath, current);
+    for (const cwd of projects) {
+      if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
+        ctx.log(`[speculate] ${cwd}: directory unavailable; deferred until it is available again`);
+        continue;
+      }
+      if (!enable && current.syncOptOut?.[cwd]) continue;
+      ctx.log(`[speculate] Claude project: ${cwd}`);
+      const code = await speculateOn({ ...opts, cwd, mode, onNeedsAuth: async (servers) => {
+        for (const server of servers) needsAuth.set(server.url, server);
+        return false;
+      } }, { skipHook: true });
+      if (code) failed++;
+    }
+    if (enable) await installAutowrapPlugin(ctx);
+    ctx.log(`[speculate] Claude ${enable ? 'on' : 'sync'}: global user configuration and ${projects.length} known project(s) checked${failed ? `; ${failed} failure(s)` : ''}. Restart Claude sessions to use changes.`);
+    return failed ? 1 : 0;
+  });
+  // Login can itself refresh management, so it must run after releasing the
+  // host lock. Repeating on/sync is idempotent after the authorized login.
+  if (needsAuth.size && opts.onNeedsAuth && await opts.onNeedsAuth([...needsAuth.values()])) {
+    return refreshClaudeGlobal({ ...opts, onNeedsAuth: undefined }, enable);
+  }
+  return result;
+}
+
+export async function speculateOnGlobal(opts: ManageOptions): Promise<number> {
+  return refreshClaudeGlobal(opts, true);
+}
+
+export async function speculateOffGlobal(opts: ManageOptions): Promise<number> {
+  const ctx = makeCtx(opts);
+  return withManagementLock(ctx, async () => {
+    const state = loadManagedState(ctx.statePath);
+    // Persist the gate before touching any transport. Failed restores remain
+    // retryable, while every project's future hook stays disabled.
+    state.global = { ...state.global, enabled: false };
+    state.syncHashes = {};
+    saveManagedState(ctx.statePath, state);
+    if (!(await frontDoorAvailable(ctx))) {
+      ctx.log(`[speculate] Claude auto-wrap disabled globally, but cannot run '${ctx.claudeBin} mcp' to restore servers; retry when Claude Code is available`);
+      return 1;
+    }
+    let failed = 0;
+    // User originals may have been recorded from a project that no longer
+    // exists. Their restore uses the invoking directory and the old record
+    // key, because the host's user scope is independent of that project.
+    for (const [recordKey, record] of Object.entries(state.projects)) {
+      if (!record.entries.some((entry) => entry.scope === 'user')) continue;
+      if (await speculateOff(opts, { global: true, scope: 'user', recordKey })) failed++;
+    }
+    // Also restore self-describing user wraps when their state was lost.
+    if (await speculateOff(opts, { global: true, scope: 'user' })) failed++;
+    for (const cwd of knownClaudeProjects(ctx, loadManagedState(ctx.statePath))) {
+      if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
+        const record = loadManagedState(ctx.statePath).projects[cwd];
+        if (record?.entries.some((entry) => entry.scope !== 'user')) {
+          ctx.log(`[speculate] ${cwd}: directory unavailable; restore records kept for a later 'speculate off --client claude'`);
+          failed++;
+        }
+        continue;
+      }
+      ctx.log(`[speculate] Claude project: ${cwd}`);
+      if (await speculateOff({ ...opts, cwd }, { global: true, scope: 'project' })) failed++;
+    }
+    ctx.log(`[speculate] Claude off globally: auto-wrap disabled in every project${failed ? `; ${failed} restore failure(s) or conflict(s), records kept` : '; managed servers restored'}.`);
+    return failed ? 1 : 0;
+  });
 }
 
 // -- status -----------------------------------------------------------------------
@@ -2678,7 +2980,9 @@ export async function speculateStatus(opts: ManageOptions): Promise<number> {
     // hook performs lands in the NEXT session, because the host snapshots
     // MCP config before running the hook. Measured, inherent, not hidden.
     ctx.log(
-      state.syncOptOut?.[ctx.cwd]
+      state.global?.enabled === false
+        ? '[speculate]   auto-wrap: disabled globally for Claude'
+        : state.syncOptOut?.[ctx.cwd]
         ? "[speculate]   auto-wrap: installed, but this project is opted out ('speculate off' did that) — run 'speculate on' here to re-enable"
         : '[speculate]   auto-wrap: installed (new servers wrap at the next session start)',
     );
@@ -2739,11 +3043,13 @@ export async function speculateStatusGlobal(opts: ManageOptions): Promise<number
 
   const autowrap = autowrapRecord(await fetchPluginList(ctx));
   ctx.log(
-    autowrap !== null
+    state.global?.enabled === false
+      ? '[speculate] auto-wrap: disabled globally for Claude'
+      : autowrap !== null
       ? '[speculate] auto-wrap: installed (new servers wrap at each project’s next session start)'
       : "[speculate] auto-wrap: not installed — 'speculate on' anywhere sets it up",
   );
-  if (autowrap !== null) {
+  if (autowrap !== null && state.global?.enabled !== false) {
     const warning = autowrapHookWarning(ctx, autowrap);
     if (warning) ctx.log(`[speculate] ${warning}`);
   }

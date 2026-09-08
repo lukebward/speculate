@@ -28,6 +28,7 @@ import {
   execFileRunner,
   resolveClaudeBin,
   speculateOff,
+  speculateOffGlobal,
   speculateOn,
   speculateStatus,
   speculateStatusGlobal,
@@ -1390,6 +1391,7 @@ describe('speculate off', () => {
 });
 
 describe('upgrading from a cwd-keyed managed record', () => {
+  beforeEach(() => mkdirSync(join(cwd, '.git')));
   // Through v0.14.3 the record was keyed by the current directory; from
   // v0.14.4 it is the repository root. Orphaning it is not cosmetic: `off`
   // then reconstructs each entry from its own wrapped command line, which
@@ -2734,6 +2736,25 @@ describe('plugin server wrapping (the §13.23 fifth row)', () => {
     expect(logs.join('\n')).toContain('refreshed the wrapped copy');
   });
 
+  it('persists a hook-refreshed plugin snapshot so global off can restore it', async () => {
+    installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
+    expect(await speculateOn(opts())).toBe(0);
+    const oldCopy = readClaudeJson().projects[cwd].mcpServers.probesrv;
+    const newRoot = installPluginFixture(
+      { probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } },
+      { version: '2.0.0' },
+    );
+    expect(await speculateSync(opts())).toBe(0);
+    const copy = readClaudeJson().projects[cwd].mcpServers.probesrv;
+    expect(copy).not.toEqual(oldCopy);
+    expect(copy.args.slice(-1)).toEqual([`${newRoot}/server.js`]);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.projects[cwd].entries.find((e: AnyRecord) => e.name === 'probesrv').wrapped).toEqual(copy);
+    expect(await speculateOffGlobal(opts())).toBe(0);
+    expect(readClaudeJson().projects[cwd].mcpServers?.probesrv).toBeUndefined();
+    expect(readClaudeJson().projects[cwd].disabledMcpServers).toEqual([]);
+  });
+
   it('off restores the pair: original re-enabled, copy removed, record dropped', async () => {
     const root = installPluginFixture({ probesrv: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/server.js'] } });
     seedManagedRecord();
@@ -2876,6 +2897,9 @@ describe('auto-wrap on GUI-launched hosts', () => {
     });
     expect(JSON.parse(readFileSync(argvOut, 'utf8'))).toEqual([
       'sync',
+      '--client',
+      'claude',
+      '--quiet',
       '--claude-bin',
       '/somewhere/claude',
     ]);

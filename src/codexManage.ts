@@ -15,6 +15,7 @@ import { managedStatePath } from './manage.js';
 import { probeRemote, type RemoteProber } from './remoteProbe.js';
 import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import { speculateAuth } from './authCommand.js';
+import { CodexHookError, codexSessionHookInstalled, installCodexSessionHook, removeCodexSessionHook } from './codexHooks.js';
 import type { SpeculationMode } from './types.js';
 
 type Entry = Record<string, unknown>;
@@ -22,7 +23,7 @@ type Patch = Record<string, unknown>;
 type Client = Pick<CodexClient, 'bin' | 'codexHome' | 'readConfig' | 'writeConfig' | 'close'> &
   Partial<Pick<CodexClient, 'listServers'>>;
 interface ManagedEntry { before: Patch; after: Patch; previousAfter?: Patch; mode: SpeculationMode }
-interface State { version: 1; configFile: string; enabled: boolean; entries: Record<string, ManagedEntry> }
+interface State { version: 1; configFile: string; enabled: boolean; mode?: SpeculationMode; entries: Record<string, ManagedEntry> }
 class SetupError extends Error {}
 const MAX_RESTORE_BYTES = 8 * 1024 * 1024;
 
@@ -82,6 +83,7 @@ function loadState(path: string, configFile: string): State {
     const state: unknown = JSON.parse(readFileSync(path, 'utf8'));
     if (!object(state) || state.version !== 1 || state.configFile !== configFile ||
         typeof state.enabled !== 'boolean' || !object(state.entries) ||
+        (state.mode !== undefined && (typeof state.mode !== 'string' || !['strict', 'annotated', 'off'].includes(state.mode))) ||
         !Object.values(state.entries).every((entry) => object(entry) && object(entry.before) &&
           object(entry.after) && (entry.previousAfter === undefined || object(entry.previousAfter)) &&
           ['strict', 'annotated', 'off'].includes(String(entry.mode)))) throw new Error();
@@ -263,7 +265,7 @@ async function withContext(
     const state = loadState(statePath, user.name.file!);
     return await action({ client, view, user, state, statePath, log, cwd });
   } catch (error) {
-    const message = error instanceof CodexClientError || error instanceof SetupError ? error.message :
+    const message = error instanceof CodexClientError || error instanceof SetupError || error instanceof CodexHookError ? error.message :
       'Could not update Codex setup; no restore records were discarded.';
     log(`[speculate] ${message}`);
     return 1;
@@ -282,6 +284,8 @@ async function activate(opts: CodexManageOptions, sync: boolean): Promise<number
       return 0;
     }
     state.enabled = true;
+    const previousMode = state.mode;
+    if (!sync) state.mode = opts.mode ?? state.mode ?? 'annotated';
     const previousRecords = structuredClone(state.entries);
     const available = client.listServers ? new Map((await client.listServers()).map((entry) => [entry.name, entry])) : undefined;
     const requests: CodexConfigEdit[] = [];
@@ -313,7 +317,7 @@ async function activate(opts: CodexManageOptions, sync: boolean): Promise<number
       if (available && (available.get(name)?.enabled !== true || available.get(name)?.disabledReason)) {
         log(`[speculate] ${label(name)}: Codex does not allow this server in the current context.`); continue;
       }
-      const mode = opts.mode ?? previous?.mode ?? 'annotated';
+      const mode = opts.mode ?? previous?.mode ?? state.mode ?? 'annotated';
       const prefix = wrapPrefix(name, client, mode, opts);
       if (previous && matchesWrapped(raw, previous) && raw.command === opts.self.command &&
           Array.isArray(raw.args) && isDeepStrictEqual(raw.args.slice(0, prefix.length), prefix)) continue;
@@ -353,6 +357,7 @@ async function activate(opts: CodexManageOptions, sync: boolean): Promise<number
           }
           await client.writeConfig({ filePath: user.name.file!, expectedVersion: fresh.version, edits: undoRequests });
           state.entries = previousRecords;
+          state.mode = previousMode;
           saveState(ctx.statePath, state);
           log('[speculate] Codex did not allow the wrapped registrations. This setup change was undone; previous registrations remain.');
           return 1;
@@ -360,11 +365,15 @@ async function activate(opts: CodexManageOptions, sync: boolean): Promise<number
       }
       for (const name of wrapped) log(`[speculate] ${label(name)}: wrapped for Codex.`);
     }
+    if (!sync) {
+      const hook = await installCodexSessionHook({ client, cwd: ctx.cwd, self: opts.self });
+      log(`[speculate] Codex SessionStart hook ${hook.changed ? 'installed or updated' : 'already installed'}. Codex policy controls availability; open /hooks to review and trust it when user hooks are permitted.`);
+    }
     const projectOnly = Object.keys(effective).filter((name) => !Object.hasOwn(entries, name));
     for (const name of projectOnly) log(`[speculate] ${label(name)}: outside user configuration; left unchanged.`);
     log(`[speculate] Codex user configuration: ${user.name.file}`);
     log('[speculate] Policy checks use on-disk configuration; session-only --profile and -c overrides are not inherited.');
-    log(`[speculate] ${wrapped.length} server(s) updated. Restart Codex to load changes. Rerun sync --client codex after adding servers.`);
+    log(`[speculate] ${wrapped.length} server(s) updated. Restart Codex to load changes. Session-start sync prepares new servers for a following session.`);
     return conflicts ? 1 : 0;
   });
   // Browser interaction happens after the configuration transaction and lock.
@@ -401,14 +410,27 @@ async function restore(ctx: Context, only?: Set<string>): Promise<number> {
 }
 export function speculateCodexOff(opts: CodexManageOptions): Promise<number> {
   return withContext(opts, true, async (ctx) => {
+    // Disable the hook's sync gate before removing it, so a concurrent or
+    // already-loaded hook can never reactivate wrapping after off.
+    ctx.state.enabled = false;
+    saveState(ctx.statePath, ctx.state);
+    let hookRemovalFailed = false;
+    try { await removeCodexSessionHook({ client: ctx.client, cwd: ctx.cwd, self: opts.self }); }
+    catch (error) {
+      hookRemovalFailed = true;
+      ctx.log(`[speculate] ${error instanceof CodexHookError || error instanceof CodexClientError
+        ? error.message : 'Could not remove the Codex sync hook; automatic sync remains disabled.'}`);
+    }
+    ctx.view = await ctx.client.readConfig(ctx.cwd);
+    ctx.user = userLayer(ctx.view);
     const unrecorded = Object.entries(servers(ctx.user.config))
       .filter(([name, entry]) => isCodexWrapped(entry) && !Object.hasOwn(ctx.state.entries, name));
     const result = await restore(ctx);
     for (const [name] of unrecorded) {
       ctx.log(`[speculate] ${label(name)}: cannot restore without its Codex restore record; current wrapper retained.`);
     }
-    const incomplete = result !== 0 || unrecorded.length > 0;
-    ctx.log(incomplete ? '[speculate] Codex sync is off; some wrappers still need attention. Learning and authentication remain.'
+    const incomplete = result !== 0 || unrecorded.length > 0 || hookRemovalFailed;
+    ctx.log(incomplete ? '[speculate] Codex sync is off; some setup records still need attention. Learning and authentication remain.'
       : '[speculate] Codex setup is off. Restart Codex to load restored entries. Learning and authentication remain.');
     return incomplete ? 1 : 0;
   });
@@ -431,7 +453,13 @@ export function speculateCodexStatus(opts: CodexManageOptions): Promise<number> 
     for (const name of Object.keys(effective).filter((name) => !Object.hasOwn(entries, name))) {
       ctx.log(`[speculate] ${label(name)}: outside user configuration.`);
     }
-    ctx.log('[speculate] Plugin/app tools are managed by Codex. New user servers need sync --client codex; no Codex hook is installed.');
+    const hookInstalled = await codexSessionHookInstalled({ client: ctx.client, cwd: ctx.cwd, self: opts.self });
+    ctx.log(hookInstalled && !ctx.state.enabled
+      ? '[speculate] SessionStart hook remains installed, but Speculate sync is disabled; it cannot re-enable wrapping.'
+      : hookInstalled
+      ? '[speculate] SessionStart hook is installed. Codex policy and /hooks control whether it can run; newly wrapped servers load in a following session.'
+      : '[speculate] No Speculate SessionStart hook is installed. Run on --client codex to set up automatic sync.');
+    ctx.log('[speculate] Plugin/app tools and project-owned transports are managed by Codex.');
     ctx.log('[speculate] Policy checks use on-disk configuration; session-only --profile and -c overrides are not inherited.');
     return 0;
   });

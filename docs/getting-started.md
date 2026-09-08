@@ -1,28 +1,27 @@
 # Getting started
 
-=== "Claude Code"
+```bash
+npm install -g speculate-mcp
+speculate on
+```
 
-    ```bash
-    npm install -g speculate-mcp
-    speculate on
-    ```
+`on` enables both Claude Code and Codex. It wraps supported MCP servers and
+installs session-start hooks that pick up new registrations. Restart your
+clients afterward. In Codex, review and trust the Speculate hook through
+`/hooks` before it can run automatically.
 
-    That is the whole setup. `speculate on` re-registers this project's MCP
-    servers wrapped, going through Claude Code's own `claude mcp` CLI instead of
-    editing files by hand. It also installs a hook, so servers you add later get
-    wrapped too.
+To manage one client, add `--client claude` or `--client codex`:
 
-=== "Codex"
+```bash
+speculate off --client codex   # leave Claude Code enabled
+speculate on --client codex
+speculate off                  # disable both
+```
 
-    ```bash
-    npm install -g speculate-mcp
-    speculate on --client codex
-    ```
-
-    Restart Codex. Speculate wraps enabled, supported MCP servers in Codex's
-    user configuration. There is no Codex auto-wrap hook; rerun `on --client
-    codex` or `sync --client codex` after adding servers. See [Codex](#codex)
-    below for scope and authentication.
+The command is global after installation. Configuration applies to the local
+client host: it does not reach another machine, hosted connectors, built-in
+agent tools, or ordinary shell commands. Unsupported registrations are reported
+and left alone. See the client scopes below.
 
 === "Any other MCP client"
 
@@ -73,8 +72,13 @@ Codex host. Restart the client after changing registrations. See
 [OpenAI's MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
 Server names, tool enable/disable policies, and environment settings are
-preserved. Native setup does not install a Codex hook. Rerun `on` or `sync` with
-`--client codex` when adding servers; `status --client codex [path]` inspects the
+preserved. Setup installs a user-level session-start hook for automatic sync.
+Codex requires review and trust through `/hooks`; installation does not approve
+the hook. See [Codex hook controls](https://learn.chatgpt.com/docs/hooks) for
+trust and administrator restrictions. You can also run `sync --client codex`
+directly after adding servers.
+New registrations may take another session to load.
+`status --client codex [path]` inspects the
 base on-disk configuration and trusted project layers for that directory. A path changes the inspection
 context, not the user-level write scope. Add `--codex-bin /path/to/codex` to any
 of these commands when the executable is not on PATH.
@@ -98,16 +102,30 @@ speculate auth --client codex
 speculate on --client codex
 ```
 
-`off --client codex` restores the transport fields Speculate changed, preserving
+`off --client codex` disables automatic sync, removes Speculate's hook, and
+restores the transport fields Speculate changed, preserving
 unrelated later configuration edits, learned state, and authentication. If a
 changed transport no longer matches the recorded wrapper, `off` reports a
 conflict instead of overwriting it.
 
+## Claude Code
+
+Claude Code setup wraps user-scope MCP servers across projects and approved
+servers in known project directories. It uses Claude Code's own CLI to change
+registrations. Shared `.mcp.json` files stay intact; approved entries receive
+local wrapped copies. A user-level session-start hook discovers new projects
+as you open them and wraps newly added, approved servers.
+
+`off --client claude` disables automatic wrapping everywhere and restores
+recorded registrations across projects. Conflicts are reported and retained
+for recovery. Learning and authentication remain.
+
 ## Keeping your token out of the file
 
-Speculate resolves `${VAR}` in a header value from the environment at startup.
-An unset variable fails at startup and names itself; Speculate never sends a
-literal `${GITHUB_TOKEN}` upstream.
+Speculate resolves `${VAR}` in `--header` values from the environment at startup.
+An unset variable fails at startup and names itself. Codex static `http_headers`
+are preserved literally; use its environment-backed header settings to reference
+environment variables.
 
 ## What your client sees
 
@@ -131,15 +149,14 @@ prefetches were.
     - **Session starts include resumes and clears.** The hook runs when Claude
       Code starts, resumes, or clears a session; `speculate on` always wraps on
       the spot.
-    - **Removing it everywhere:** `off` covers one project. To stop it globally,
-      `claude plugin uninstall -s user speculate-autowrap`, then
-      `claude plugin marketplace remove speculate-mcp`.
+    - **Turning it off everywhere:** `speculate off --client claude` stops
+      automatic wrapping and restores managed registrations across projects.
 
 ## Upgrading from retired launch paths
 
 v0.20 removes PATH-shim installation, protocol sniffing, and `speculate try`.
-Use `speculate on` for Claude Code, `speculate on --client codex` for Codex,
-or the explicit `wrap` configuration above for another MCP client.
+Use `speculate on` for both clients, select one with `--client claude` or
+`--client codex`, or use explicit `wrap` configuration for another MCP client.
 
 If an earlier version installed PATH shims, run:
 
