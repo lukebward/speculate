@@ -314,6 +314,8 @@ export interface ServerConfig {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
+  /** Working directory for a stdio child; omitted to inherit the proxy cwd. */
+  cwd?: string;
   /** streamable-HTTP upstream */
   url?: string;
   /**

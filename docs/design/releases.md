@@ -521,3 +521,44 @@ installed-package Node 18 MCP smoke test passed. These results support a
 smaller implementation with preserved behavior, not a new speedup claim. The
 [benchmark guide](local-learning-benchmark.md#v020-qualification-against-v019)
 records the methods, feedback ablation, live check, and limitations.
+
+## v0.21.0 (2026-09-07): native Codex setup
+
+`on`, `off`, `status`, `sync`, and `auth` now accept `--client codex`; Claude
+Code remains the default. Codex setup wraps enabled, supported user-level
+stdio and Streamable HTTP MCP servers through Codex's configuration API.
+Server names, tool policies, and environment settings are preserved. Local
+CLI, app, and IDE clients using the same Codex host share that configuration;
+restart the client after setup.
+
+Configuration writes use version checks and save recovery records before
+changing registrations. `off` restores the fields Speculate changed while
+preserving unrelated later edits. Conflicts retain their recovery records and
+are reported instead of overwritten. Learning and OAuth credentials remain.
+At proxy startup, Speculate rereads Codex tool policy from base on-disk
+configuration and trusted project layers. It excludes disabled or
+approval-requiring reads and disables speculation if those policies cannot
+be read or understood. Requested calls continue through the ordinary proxy path.
+
+Native setup changes only user configuration. Project-owned or layered
+transports, remote executors, header helpers, ChatGPT session authentication,
+and custom OAuth settings are skipped. Hosted plugin/app tools are outside
+local MCP wrapping. Speculate uses its own OAuth login through
+`auth --client codex`. No Codex hook is installed: rerun `on --client codex` or
+`sync --client codex` after adding servers. See the
+[Codex setup guide](../getting-started.md#codex) for scope and recovery behavior.
+
+Session-only `--profile` and `-c` overrides in another Codex process are not
+visible to these checks. Sessions relying on those MCP restrictions require
+explicit configuration or speculation off until that context is supported.
+
+The wrapper now forwards the environment supplied by its host to stdio
+children, including credentials and server-specific settings. Codex server
+working directories and literal HTTP headers retain their original meaning.
+Setup checks Codex's server eligibility before and after registration and
+undoes changes rejected by managed policy.
+
+Qualification includes real Codex 0.153.4 stdio and authenticated HTTP
+fixtures, startup policy changes, exact transport restoration, and an
+installed-package Node 18 smoke test. CI runs the native Codex check on Linux,
+macOS, and Windows. These are functional checks, not a new speedup claim.

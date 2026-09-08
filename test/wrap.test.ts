@@ -4,8 +4,14 @@
  * removed, so `--profile` is accepted and ignored: wrapped entries already
  * written into people's MCP config must not start failing.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { join, resolve } from 'node:path';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { buildWrapConfig, parseWrapArgs, type WrapArgs } from '../src/wrap.js';
+import { Upstream, resultText } from '../src/upstream.js';
+
+afterEach(() => vi.unstubAllEnvs());
 
 // --- helpers -----------------------------------------------------------------
 
@@ -28,6 +34,10 @@ function mkArgs(over: Partial<WrapArgs> = {}): WrapArgs {
     command: over.command ?? [],
     url: over.url ?? null,
     headers: over.headers ?? {},
+    ...(over.codexServer === undefined ? {} : { codexServer: over.codexServer }),
+    ...(over.codexBin === undefined ? {} : { codexBin: over.codexBin }),
+    ...(over.codexHome === undefined ? {} : { codexHome: over.codexHome }),
+    ...(over.cwd === undefined ? {} : { cwd: over.cwd }),
   };
 }
 
@@ -55,6 +65,35 @@ describe('parseWrapArgs', () => {
 
   it('defaults mode to annotated', () => {
     expect(ok(parseWrapArgs(['--', 'srv'])).mode).toBe('annotated');
+  });
+
+  it('keeps native Codex policy context separate from the child working directory', () => {
+    const args = ok(parseWrapArgs([
+      '--codex-server', 'files', '--codex-bin', '/bin/codex', '--codex-home', '/home/codex',
+      '--cwd', '/server/root', '--', 'server', '--cwd', 'child-option',
+    ]));
+    expect(args).toMatchObject({
+      codexServer: 'files', codexBin: '/bin/codex', codexHome: '/home/codex', cwd: '/server/root',
+      command: ['server', '--cwd', 'child-option'],
+    });
+  });
+
+  it('requires the complete native Codex context and a value for each flag', () => {
+    for (const flags of [
+      ['--codex-server', 'files'],
+      ['--codex-bin', '/bin/codex', '--codex-home', '/home/codex'],
+    ]) {
+      expect(err(parseWrapArgs([...flags, '--', 'server']))).toMatch(/provided together/);
+    }
+    for (const flag of ['--codex-server', '--codex-bin', '--codex-home', '--cwd']) {
+      expect(err(parseWrapArgs([flag]))).toMatch(/requires a value/);
+      expect(err(parseWrapArgs([flag, '--', 'server']))).toMatch(/requires a value/);
+    }
+  });
+
+  it('rejects a child cwd for a remote server', () => {
+    expect(err(parseWrapArgs(['--cwd', '/tmp', '--url', 'https://example.test/mcp'])))
+      .toMatch(/--cwd applies to stdio/);
   });
 
   it('rejects an invalid --mode value', () => {
@@ -145,6 +184,60 @@ describe('buildWrapConfig', () => {
     expect(config.servers['upstream']!.args).toEqual(['-y', 'srv', 'stdio']);
   });
 
+  it('forwards inherited credentials and ordinary environment settings to the stdio child', () => {
+    vi.stubEnv('SPECULATE_TEST_AUTH_TOKEN', 'child-secret');
+    vi.stubEnv('SPECULATE_TEST_SERVER_COLOR', 'blue');
+    const { config, stateKey } = buildWrapConfig(mkArgs({ command: ['server'] }));
+    expect(config.servers.upstream!.env).toMatchObject({
+      SPECULATE_TEST_AUTH_TOKEN: 'child-secret', SPECULATE_TEST_SERVER_COLOR: 'blue',
+    });
+    expect(stateKey).not.toContain('child-secret');
+    vi.stubEnv('SPECULATE_TEST_SERVER_COLOR', 'red');
+    expect(config.servers.upstream!.env!.SPECULATE_TEST_SERVER_COLOR).toBe('blue');
+  });
+
+  it('forwards child cwd and isolates learned state by its resolved path', () => {
+    const args = mkArgs({ command: ['server'], cwd: 'data' });
+    const first = buildWrapConfig(args, '/project');
+    expect(first.config.servers.upstream!.cwd).toBe(resolve('/project', 'data'));
+    expect(first.stateKey).not.toBe(buildWrapConfig(mkArgs({ command: ['server'], cwd: 'other' }), '/project').stateKey);
+    expect(first.stateKey).toBe(buildWrapConfig(mkArgs({ command: ['server'], cwd: './data' }), '/project').stateKey);
+  });
+
+  it('launches a real stdio upstream with the inherited environment and configured cwd', async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'speculate-wrap-context-')));
+    vi.stubEnv('SPECULATE_WRAP_CHILD_TOKEN', 'test-credential');
+    const server = `
+      const { createInterface } = require('node:readline');
+      createInterface({ input: process.stdin }).on('line', (line) => {
+        const message = JSON.parse(line);
+        if (message.id === undefined) return;
+        let result;
+        if (message.method === 'initialize') result = {
+          protocolVersion: message.params.protocolVersion,
+          serverInfo: { name: 'context-fixture', version: '1' }, capabilities: { tools: {} }
+        };
+        else if (message.method === 'tools/list') result = { tools: [{
+          name: 'context', inputSchema: { type: 'object' }, annotations: { readOnlyHint: true }
+        }] };
+        else result = { content: [{ type: 'text', text: JSON.stringify({
+          cwd: process.cwd(), token: process.env.SPECULATE_WRAP_CHILD_TOKEN
+        }) }] };
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\\n');
+      });
+    `;
+    const { config } = buildWrapConfig(mkArgs({ command: [process.execPath, '-e', server], cwd }));
+    const upstream = new Upstream('upstream', config.servers.upstream!);
+    try {
+      await upstream.connect();
+      expect(JSON.parse(resultText(await upstream.callTool('context', {}))))
+        .toEqual({ cwd, token: 'test-credential' });
+    } finally {
+      await upstream.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('derives a stateKey stable for the same command and distinct for different ones', () => {
     const a1 = buildWrapConfig(mkArgs({ command: ['srv', 'stdio'] })).stateKey;
     const a2 = buildWrapConfig(mkArgs({ command: ['srv', 'stdio'] })).stateKey;
@@ -185,6 +278,28 @@ describe('buildWrapConfig', () => {
 // --- remote (http) wrapping ----------------------------------------------------
 
 describe('wrap --url', () => {
+  it('preserves literal Codex headers without expanding placeholders or trimming their values', () => {
+    vi.stubEnv('SPECULATE_WRAP_TOKEN', 'do-not-substitute');
+    const args = ok(parseWrapArgs([
+      '--url', 'https://example.test/mcp',
+      '--literal-header', 'Authorization: Bearer ${SPECULATE_WRAP_TOKEN} ',
+      '--literal-header', 'X-Padded:   value  ',
+      '--literal-header', 'X-Empty:',
+    ]));
+    expect(args.headers).toEqual({
+      Authorization: 'Bearer ${SPECULATE_WRAP_TOKEN} ', 'X-Padded': '  value  ', 'X-Empty': '',
+    });
+  });
+
+  it('rejects invalid literal headers without repeating their contents', () => {
+    for (const raw of ['private-secret', 'Bad Name: private-secret', 'X: private-secret\nInjected: yes']) {
+      const message = err(parseWrapArgs(['--url', 'https://example.test/mcp', '--literal-header', raw]));
+      expect(message).toMatch(/--literal-header/);
+      expect(message).not.toContain('private-secret');
+    }
+    expect(err(parseWrapArgs(['--literal-header', 'X: private-secret', '--', 'server']))).toMatch(/--url/);
+  });
+
   it('wraps a remote server with no command at all', () => {
     const args = ok(parseWrapArgs(['--url', 'https://api.example.test/mcp/']));
     expect(args.url).toBe('https://api.example.test/mcp/');

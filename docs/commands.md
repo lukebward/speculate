@@ -2,30 +2,61 @@
 
 | Command | What it does |
 |---|---|
-| `speculate on` | Wrap this project's MCP servers, and keep new ones wrapped |
-| `speculate off` | Restore this project exactly, and stop auto-wrapping it |
-| `speculate status` | What is wrapped here, what needs a login, and what changed since `on` |
-| `speculate auth [server]` | Log in to remote servers that need it (`--forget` to undo) |
+| `speculate on [--client claude\|codex]` | Wrap supported MCP servers for the selected client |
+| `speculate off [--client claude\|codex]` | Restore registrations changed for the selected client |
+| `speculate status [path] [--client claude\|codex]` | Inspect wrapping and configuration in the selected client |
+| `speculate sync [--client claude\|codex]` | Wrap servers added since the last setup |
+| `speculate auth [server] [--client claude\|codex]` | Authorize remote servers (`--forget` removes Speculate's login) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate memory` | Retained learning inventory; `clear --all` removes managed learning and usage records |
 | `speculate doctor` | Why a given tool is or is not eligible for speculation |
 
 ## `on` and `off`
 
-`on` changes config only through the host's own CLIs and records everything it
-did, so `off` can undo it exactly.
-
-!!! tip "`off` is a real undo, not a disable flag"
-
-    It restores the project to the exact server registrations it found, and
-    stops auto-wrapping that project. Nothing is left behind to clean up.
-
-`off` covers one project. To stop auto-wrapping globally:
+`--client claude` is the default. Claude Code setup uses its own CLI to wrap
+approved servers for this project and installs a shared session-start hook.
+`off` restores the recorded registrations and stops automatic wrapping for that
+project; the shared hook, learning, and OAuth credentials remain. To remove the
+Claude Code hook globally:
 
 ```bash
 claude plugin uninstall -s user speculate-autowrap
 claude plugin marketplace remove speculate-mcp
 ```
+
+`--client codex` uses Codex's configuration API and changes enabled, supported
+**user-level** MCP registrations. Restart Codex afterward. Server names,
+environment settings, and tool policies are preserved. Project-owned or
+shadowed transports and unsupported helpers are reported and skipped. See
+[Codex setup](getting-started.md#codex) for the supported scope.
+
+Codex `off` restores only transport fields that still match the recorded
+wrapper. It preserves unrelated later edits and reports conflicts. Neither
+client's `off` deletes learned state or OAuth credentials.
+
+`--mode strict|annotated|off` is available on `on`. The default wrapping mode is
+`annotated`. Add `--codex-bin PATH` with `--client codex` to select an executable.
+There is no scope flag for Codex: native writes remain user-level.
+
+## `status`, `sync`, and `auth`
+
+Claude Code `status` alone lists managed projects; `status .` inspects this
+project. Codex `status --client codex [path]` reads base on-disk configuration
+and trusted project layers in the current or selected directory, without
+changing the write scope. It does not see another session's `--profile` or
+`-c` overrides; see [the scope limit](getting-started.md#codex).
+
+`sync --client codex` explicitly wraps newly added supported servers. Codex has
+no auto-wrap hook. Claude Code's installed session-start hook runs `sync` for
+its managed projects.
+
+Use `auth --client codex [server]` for Codex registrations, or `auth [server]`
+for Claude Code. A server name or URL selects a remote endpoint; without a
+target, Codex auth visits remote servers in its user configuration. Speculate
+uses its own OAuth client and does not reuse
+another client's credential store. `--forget` removes Speculate's saved login.
+For Codex, `--forget` requires a server name or URL and first restores managed
+Codex registrations sharing that URL.
 
 ## `doctor`
 
@@ -91,7 +122,7 @@ and admission still matter. The bare command displays default limits; use
 
 ## `wrap`
 
-The primitive the other commands build on, and what you put in a non-Claude-Code
+The primitive the other commands build on, and what you can put in another MCP
 client's config directly:
 
 ```bash

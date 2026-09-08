@@ -13,7 +13,7 @@
  * trade-off, overridable with --mode/--allow), persistence on (keyed by
  * the workspace, upstream, and account scope).
  */
-import { resolveHeaderValue } from './config.js';
+import { HEADER_NAME, resolveHeaderValue } from './config.js';
 import type { SpeculateConfig, SpeculationMode } from './types.js';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -38,6 +38,12 @@ export interface WrapArgs {
    * value (see Upstream#redact).
    */
   headers: Record<string, string>;
+  /** Native Codex integration: policy is reread for each wrapper startup. */
+  codexServer?: string;
+  codexBin?: string;
+  codexHome?: string;
+  /** Child working directory; the wrapper retains the host's project cwd. */
+  cwd?: string;
 }
 
 export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
@@ -76,6 +82,13 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       out.allow.push(...list.split(',').map((s) => s.trim()).filter(Boolean));
     } else if (a === '--sniff') {
       out.legacyPassthrough = true;
+    } else if (a === '--codex-server' || a === '--codex-bin' || a === '--codex-home' || a === '--cwd') {
+      const value = argv[++i];
+      if (!value || value.startsWith('--')) return { error: `${a} requires a value` };
+      if (a === '--codex-server') out.codexServer = value;
+      else if (a === '--codex-bin') out.codexBin = value;
+      else if (a === '--codex-home') out.codexHome = value;
+      else out.cwd = value;
     } else if (a === '--url') {
       const u = argv[++i];
       if (!u) return { error: '--url requires a URL' };
@@ -89,6 +102,18 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
         return { error: `--url must be http or https (got '${parsed.protocol}')` };
       }
       out.url = u;
+    } else if (a === '--literal-header') {
+      const raw = argv[++i];
+      if (!raw) return { error: '--literal-header requires a "Name: value" pair' };
+      const split = raw.indexOf(':');
+      const name = raw.slice(0, split);
+      if (split <= 0 || !HEADER_NAME.test(name) || /[\r\n]/.test(raw)) {
+        return { error: '--literal-header requires a valid HTTP header without newlines' };
+      }
+      // Codex static headers are literal. Remove only the optional separator
+      // space inserted by our argv builder, retaining every value byte.
+      const value = raw.slice(split + 1);
+      out.headers[name] = value.startsWith(' ') ? value.slice(1) : value;
     } else if (a === '--header') {
       const raw = argv[++i];
       if (!raw) return { error: '--header requires a "Name: value" pair' };
@@ -109,6 +134,16 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
     } else {
       return { error: `unknown wrap argument '${a}' (flags go before '--', the wrapped command after)` };
     }
+  }
+  const codexFlags = [out.codexServer, out.codexBin, out.codexHome].filter((value) => value !== undefined);
+  if (codexFlags.length !== 0 && codexFlags.length !== 3) {
+    return { error: '--codex-server, --codex-bin, and --codex-home must be provided together' };
+  }
+  if (codexFlags.length && out.legacyPassthrough) {
+    return { error: '--sniff cannot be combined with Codex integration' };
+  }
+  if (out.url && out.cwd !== undefined) {
+    return { error: '--cwd applies to stdio servers only' };
   }
   // Exactly one upstream: a remote URL or a child process, never both.
   if (out.url && out.command.length > 0) {
@@ -163,7 +198,17 @@ export function buildWrapConfig(
         url: args.url,
         ...(Object.keys(args.headers).length ? { headers: { ...args.headers } } : {}),
       }
-    : { command: args.command[0]!, args: args.command.slice(1) };
+    : {
+        command: args.command[0]!,
+        args: args.command.slice(1),
+        // The SDK's default environment deliberately includes only a small
+        // allowlist. A wrapper must preserve the environment the host gave it,
+        // including credentials and server-specific settings.
+        env: Object.fromEntries(Object.entries(process.env).filter(
+          (entry): entry is [string, string] => typeof entry[1] === 'string',
+        )),
+        ...(args.cwd === undefined ? {} : { cwd: resolve(workspace, args.cwd) }),
+      };
   return {
     config: {
       mode: args.mode,
@@ -181,7 +226,10 @@ export function buildWrapConfig(
     // projects using the same server. v2 is structured and workspace-local.
     stateKey: `wrap:v2:${JSON.stringify({
       workspace: resolve(workspace),
-      upstream: args.url ? { url: args.url } : { command: args.command },
+      upstream: args.url ? { url: args.url } : {
+        command: args.command,
+        ...(args.cwd === undefined ? {} : { cwd: resolve(workspace, args.cwd) }),
+      },
       // Only a one-way scope discriminator is retained. A changed account or
       // API token starts clean without ever putting a credential in a path.
       credentialScope,
