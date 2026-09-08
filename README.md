@@ -13,29 +13,30 @@ for the call already in progress. Other calls go upstream normally.
 
 ## Setup
 
-Requires Node.js 18 or later. Install, then choose your client:
+Requires Node.js 18 or later:
 
 ```bash
 npm install -g speculate-mcp
-
-# Claude Code: run from your project
 speculate on
-
-# Codex: wrap enabled user-level MCP servers
-speculate on --client codex
 ```
 
-Restart the selected client. Claude Code setup wraps supported, approved servers
-for this project and installs a shared session-start hook for new servers.
-Codex setup uses its configuration API for enabled user-level stdio and Streamable
-HTTP servers, shared by CLI, app, and IDE clients on the same Codex host.
-Codex has no auto-wrap hook: rerun `on --client codex` or `sync --client codex`
-after adding servers.
+`on` enables both Claude Code and Codex. It wraps supported MCP servers and
+installs session-start hooks to pick up new ones across projects. Restart your
+clients afterward; in Codex, review and trust the Speculate hook through `/hooks`.
+A newly wrapped server may take another session to load.
 
-Use `speculate off` or `speculate off --client codex` to restore registrations
-changed for that client. Stored learning and authentication remain.
-See the [setup guide](https://lukebward.github.io/speculate/getting-started/#codex)
-for Codex scope, unsupported configurations, and OAuth.
+```bash
+speculate off                  # turn off both clients
+speculate off --client codex   # turn off only Codex
+speculate on --client claude   # turn on only Claude Code
+```
+
+Claude Code setup covers user servers and approved servers in known projects.
+Codex setup covers enabled user-level servers on the same host. Built-in tools,
+shell commands, hosted connectors, and unsupported registrations are outside
+MCP wrapping. See the [setup guide](https://lukebward.github.io/speculate/getting-started/)
+for scope, hook setup, and authentication. Turning off preserves stored learning
+and authentication.
 
 ### Other MCP clients
 

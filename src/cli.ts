@@ -22,13 +22,15 @@ import { runDoctor } from './doctor.js';
 import { buildWrapConfig, parseWrapArgs } from './wrap.js';
 import { selfCommand } from './hostConfig.js';
 import {
+  claudeIsGloballyEnabled,
   projectIsManaged,
-  speculateOff,
+  speculateOffGlobal,
   speculateOn,
+  speculateOnGlobal,
   speculateStatus,
   speculateStatusGlobal,
 } from './manage.js';
-import { speculateSync } from './sync.js';
+import { speculateSync, speculateSyncGlobal } from './sync.js';
 import { parseShimsArgs, uninstallShims } from './shims.js';
 import { parseStatsArgs, runStats } from './stats.js';
 import { speculateAuth } from './authCommand.js';
@@ -48,8 +50,8 @@ import { applyCodexPolicy } from './codexPolicy.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
-managed setup (on/off/status/sync/auth accept --client claude|codex):
-  speculate on [--mode <mode>]             wrap supported MCP servers for the selected client
+managed setup (on/off/status/sync/auth accept --client both|claude|codex):
+  speculate on [--mode <mode>]             wrap supported MCP servers for both clients
   speculate off                            restore registrations changed by 'on'
   speculate status [path]                  inspect wrapping for the selected client
   speculate sync                           wrap servers added since the last run
@@ -62,13 +64,15 @@ managed setup (on/off/status/sync/auth accept --client claude|codex):
                                            clear only the explicitly scoped memory records
   speculate auth [server]                  authorize Speculate with remote servers that need a
                                            login (no argument: every one that does)
+  speculate auth <server> --forget         forget a saved remote-server login
 
 client scope:
-  --client claude     default: this Claude Code project; 'on' installs an auto-wrap hook
+  --client both      default: configure Claude Code and Codex independently
+  --client claude     Claude Code setup across known projects; 'on' installs an auto-wrap hook
                       'status' alone lists projects; 'status .' inspects this project
   --client codex      Codex user MCP config shared by local clients; restart Codex afterward
-                      no auto-wrap hook: rerun 'on' or 'sync' when adding servers
-  --codex-bin <path>  Codex executable for --client codex (default: codex on PATH)
+                      a session-start hook wraps new servers for later sessions
+  --codex-bin <path>  Codex executable for both/codex (default: codex on PATH)
 
 manual wrapping:
   speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
@@ -152,22 +156,22 @@ const REST_COMMANDS = new Set([
 ] as const);
 
 interface ClientArgs {
-  client: 'claude' | 'codex';
+  client: 'both' | 'claude' | 'codex';
   codexBin?: string;
   rest: string[];
 }
 
 /** Client selection belongs to management commands, never the wrapped server. */
 export function parseClientArgs(argv: string[]): ClientArgs | { error: string } {
-  const out: ClientArgs = { client: 'claude', rest: [] };
+  const out: ClientArgs = { client: 'both', rest: [] };
   let selected = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--client') {
       if (selected) return { error: '--client may only be specified once' };
       const value = argv[++i];
-      if (value !== 'claude' && value !== 'codex') {
-        return { error: '--client must be claude or codex' };
+      if (value !== 'both' && value !== 'claude' && value !== 'codex') {
+        return { error: '--client must be both, claude, or codex' };
       }
       selected = true;
       out.client = value;
@@ -180,10 +184,36 @@ export function parseClientArgs(argv: string[]): ClientArgs | { error: string } 
       out.rest.push(arg);
     }
   }
-  if (out.codexBin !== undefined && out.client !== 'codex') {
-    return { error: '--codex-bin requires --client codex' };
+  if (out.codexBin !== undefined && out.client === 'claude') {
+    return { error: '--codex-bin requires --client both or --client codex' };
   }
   return out;
+}
+
+/** One unavailable client must not prevent the other from being configured. */
+async function runSelectedClients(
+  selection: ClientArgs['client'],
+  command: string,
+  actions: Record<'claude' | 'codex', () => Promise<number>>,
+): Promise<number> {
+  const clients: Array<'claude' | 'codex'> = selection === 'both' ? ['claude', 'codex'] : [selection];
+  let failed = false;
+  for (const client of clients) {
+    let code: number;
+    try {
+      code = await actions[client]();
+    } catch {
+      // Host errors can quote configuration or credentials. The client name
+      // and operation identify the failed work without echoing those values.
+      process.stderr.write(`[speculate] ${client === 'claude' ? 'Claude Code' : 'Codex'} ${command} failed; check the client installation and configuration.\n`);
+      code = 1;
+    }
+    failed ||= code !== 0;
+    if (selection === 'both') {
+      process.stderr.write(`[speculate] ${client === 'claude' ? 'Claude Code' : 'Codex'} ${command}: ${code === 0 ? 'completed' : 'failed'}.\n`);
+    }
+  }
+  return failed ? 1 : 0;
 }
 
 /**
@@ -354,9 +384,13 @@ async function runCommandPassThrough(execArgs: ExecArgs, label: string): Promise
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  let selectedClient: ClientArgs = { client: 'claude', rest: args.rest };
+  let selectedClient: ClientArgs = { client: 'both', rest: args.rest };
   if (['on', 'off', 'status', 'sync', 'auth'].includes(args.command)) {
-    const parsed = parseClientArgs(args.rest);
+    // Hooks installed before client selection existed baked only this flag.
+    // Keep those invocations local and quiet when the default becomes both.
+    const legacyClaudeHook = args.command === 'sync' && args.rest.includes('--claude-bin')
+      && !args.rest.includes('--client');
+    const parsed = parseClientArgs(legacyClaudeHook ? [...args.rest, '--client', 'claude', '--quiet'] : args.rest);
     if ('error' in parsed) fail(parsed.error);
     selectedClient = parsed;
     args.rest = parsed.rest;
@@ -384,7 +418,7 @@ async function main(): Promise<void> {
 
   if (args.command === 'try') {
     fail(
-      "'speculate try' was retired. Use 'speculate on' for this project's MCP servers, " +
+      "'speculate try' was retired. Use 'speculate on' for your MCP servers, " +
         "or 'speculate wrap -- <server command...>' for explicit wrapping.",
     );
   }
@@ -412,63 +446,49 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'sync') {
-    if (selectedClient.client === 'codex') {
-      if (args.rest.length > 0) fail(`unknown sync argument '${args.rest[0]}'`);
-      process.exitCode = await speculateCodexSync({
-        self: selfCommand(),
-        codexBin: selectedClient.codexBin,
-      });
-      return;
-    }
-    // `--claude-bin <abs>` is baked into the auto-wrap hook command at
-    // install time: `on` runs in a terminal where `claude` is on PATH, and
-    // this carries that knowledge into GUI-launched sessions whose minimal
-    // OS PATH has neither node's version-manager shims nor the host CLI.
-    // Used only while the baked path still exists — a stale bake (the CLI
-    // moved or was uninstalled) silently falls back to normal resolution,
-    // because a hook argument must never turn into a session-start error.
     const rest = [...args.rest];
+    const quietIndex = rest.indexOf('--quiet');
+    const quiet = quietIndex !== -1;
+    if (quiet) rest.splice(quietIndex, 1);
+    if (quiet && selectedClient.client === 'both') {
+      fail('--quiet requires --client claude or --client codex');
+    }
+    // Older Claude hooks bake an absolute executable for GUI launches. A
+    // moved executable falls back to normal resolution instead of breaking
+    // every session start.
     let claudeBin: string | undefined;
-    const binIdx = rest.indexOf('--claude-bin');
-    if (binIdx !== -1) {
-      const value = rest[binIdx + 1];
-      rest.splice(binIdx, value !== undefined ? 2 : 1);
+    const binIndex = rest.indexOf('--claude-bin');
+    if (binIndex !== -1) {
+      if (selectedClient.client === 'codex') fail('--claude-bin applies to Claude Code only');
+      const value = rest[binIndex + 1];
+      if (!quiet && (value === undefined || value.startsWith('--'))) fail('--claude-bin requires an executable path');
+      rest.splice(binIndex, value !== undefined ? 2 : 1);
       if (value !== undefined && isAbsolute(value) && existsSync(value)) claudeBin = value;
     }
     if (rest.length > 0) fail(`unknown sync argument '${rest[0]}'`);
-    // The real budget is COOPERATIVE and lives in speculateSync, which stops
-    // BETWEEN servers so a wrap is never cut in half. This timer is only the
-    // last resort for a hang no layer below can end (every `claude mcp` call
-    // already carries its own 30s execFile timeout): far enough out that it
-    // does not fire in the window between a server's `mcp remove` and the
-    // `mcp add-json` that puts it back — killing the process THERE would
-    // leave the server deleted with no restore and no state record. 120s is
-    // the 5s budget plus three 30s execFile timeouts, with slack because that
-    // 30s is NOT a hard bound: execFile's timeout sends SIGTERM and then
-    // waits for stdio to close, so a child that ignores SIGTERM stretches
-    // past it (60s, then 100s, were both close enough to the arithmetic to
-    // put the hard exit back inside the restore window). Unref'd so it never
-    // keeps an idle process alive.
-    //
-    // Arithmetic is the weak form of this guarantee. The strong one is a
-    // marker file (or an in-memory flag plus a crash-recovery pass) held
-    // across the remove→add pair, so the exit can simply refuse to fire while
-    // one is open, and the restore is replayable if the process dies anyway.
-    // That is the right long-term fix; this timer is the interim.
-    const timer = setTimeout(() => process.exit(0), 120_000).unref();
-    try {
-      process.exitCode = await speculateSync({
-        self: selfCommand(),
-        mode: null,
-        ...(claudeBin !== undefined ? { claudeBin } : {}),
-      });
-    } catch {
-      // selfCommand() throws when the entrypoint can't be located (a
-      // half-removed install with the plugin still there). The hook must
-      // still exit 0 silently rather than error on every launch forever.
+    if (quiet) {
+      // Hook failures must not block a host session. Keep the existing
+      // Claude emergency cap beyond its remove/add transaction timeouts;
+      // manual commands use the clients' ordinary bounded operations.
+      const timer = selectedClient.client === 'claude'
+        ? setTimeout(() => process.exit(0), 120_000).unref() : undefined;
+      try {
+        if (selectedClient.client === 'claude') {
+          await speculateSync({ self: selfCommand(), mode: null, log: () => {},
+            ...(claudeBin !== undefined ? { claudeBin } : {}) });
+        } else {
+          await speculateCodexSync({ self: selfCommand(), codexBin: selectedClient.codexBin, log: () => {} });
+        }
+      } catch { /* A stale installation must not turn into a session-start error. */ }
+      finally { if (timer !== undefined) clearTimeout(timer); }
       process.exitCode = 0;
+      return;
     }
-    clearTimeout(timer);
+    process.exitCode = await runSelectedClients(selectedClient.client, args.command, {
+      claude: () => speculateSyncGlobal({ self: selfCommand(), mode: null,
+        ...(claudeBin !== undefined ? { claudeBin } : {}) }),
+      codex: () => speculateCodexSync({ self: selfCommand(), codexBin: selectedClient.codexBin }),
+    });
     return;
   }
 
@@ -494,35 +514,36 @@ async function main(): Promise<void> {
         fail(`unknown ${args.command} argument '${args.rest[i]}'`);
       }
     }
-    if (selectedClient.client === 'codex') {
-      const self = selfCommand();
-      const codexOpts = {
-        self,
-        mode,
-        codexBin: selectedClient.codexBin,
-        ...(statusPath !== undefined ? { cwd: resolve(statusPath) } : {}),
-        onNeedsAuth: (servers: { name: string; url: string }[]) => onNeedsAuth(
-          servers,
-          (target) => speculateCodexAuth({ self, codexBin: selectedClient.codexBin, target }),
-        ),
-      };
-      process.exitCode = args.command === 'on'
-        ? await speculateCodexOn(codexOpts)
-        : args.command === 'off'
-          ? await speculateCodexOff(codexOpts)
-          : await speculateCodexStatus(codexOpts);
-      return;
-    }
-    const manageOpts = { self: selfCommand(), mode, onNeedsAuth };
-    const code =
-      args.command === 'on'
-        ? await speculateOn(manageOpts)
-        : args.command === 'off'
-          ? await speculateOff(manageOpts)
-          : statusPath !== undefined
-            ? await speculateStatus({ ...manageOpts, cwd: resolve(statusPath) })
-            : await speculateStatusGlobal(manageOpts);
-    process.exitCode = code;
+    process.exitCode = await runSelectedClients(selectedClient.client, args.command, {
+      claude: async () => {
+        const manageOpts = { self: selfCommand(), mode, onNeedsAuth };
+        return args.command === 'on'
+          ? await speculateOnGlobal(manageOpts)
+          : args.command === 'off'
+            ? await speculateOffGlobal(manageOpts)
+            : statusPath !== undefined
+              ? await speculateStatus({ ...manageOpts, cwd: resolve(statusPath) })
+              : await speculateStatusGlobal(manageOpts);
+      },
+      codex: async () => {
+        const self = selfCommand();
+        const codexOpts = {
+          self,
+          mode,
+          codexBin: selectedClient.codexBin,
+          ...(statusPath !== undefined ? { cwd: resolve(statusPath) } : {}),
+          onNeedsAuth: (servers: { name: string; url: string }[]) => onNeedsAuth(
+            servers,
+            (target) => speculateCodexAuth({ self, codexBin: selectedClient.codexBin, target }),
+          ),
+        };
+        return args.command === 'on'
+          ? await speculateCodexOn(codexOpts)
+          : args.command === 'off'
+            ? await speculateCodexOff(codexOpts)
+            : await speculateCodexStatus(codexOpts);
+      },
+    });
     return;
   }
 
@@ -535,24 +556,27 @@ async function main(): Promise<void> {
       else if (target === undefined) target = arg;
       else fail(`auth takes at most one server (got '${arg}' as well as '${target}')`);
     }
-    if (selectedClient.client === 'codex') {
-      process.exitCode = await speculateCodexAuth({
-        self: selfCommand(),
-        codexBin: selectedClient.codexBin,
-        target,
-        forget,
-      });
-      return;
+    // Claude permits forgetting all logins, while Codex requires a named
+    // server. Validate the shared command before either client changes the
+    // credential store.
+    if (forget && target === undefined && selectedClient.client !== 'claude') {
+      fail('auth --forget requires a server name for --client both or --client codex');
     }
-    const code = await speculateAuth({ target, forget });
-    // Finish the job rather than leaving a second command as homework: a
-    // server authorized just now is still unwrapped until a wrap pass runs.
-    // Only where `on` was already run, though -- wrapping a project that
-    // never opted in would be a config change nobody asked for.
-    if (code === 0 && !forget && projectIsManaged()) {
-      await speculateOn({ self: selfCommand(), mode: null });
-    }
-    process.exitCode = code;
+    process.exitCode = await runSelectedClients(selectedClient.client, args.command, {
+      claude: async () => {
+        const code = await speculateAuth({ target, forget });
+        // Finish wrapping newly authorized servers only where setup was
+        // already enabled; auth alone does not opt a project in.
+        if (code === 0 && !forget && claudeIsGloballyEnabled()) {
+          return await speculateSyncGlobal({ self: selfCommand(), mode: null });
+        }
+        if (code === 0 && !forget && projectIsManaged()) {
+          return await speculateOn({ self: selfCommand(), mode: null });
+        }
+        return code;
+      },
+      codex: () => speculateCodexAuth({ self: selfCommand(), codexBin: selectedClient.codexBin, target, forget }),
+    });
     return;
   }
 

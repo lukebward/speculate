@@ -422,6 +422,7 @@ describe('speculate sync', () => {
         scope: 'user',
         action: 'rewrote',
         original: { command: 'gh-server', args: ['stdio'] },
+        wrapped: readClaudeJson().mcpServers.github,
       },
     ]);
   });
