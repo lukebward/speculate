@@ -13,19 +13,29 @@ for the call already in progress. Other calls go upstream normally.
 
 ## Setup
 
-Requires Node.js 18 or later. For Claude Code, run from your project:
+Requires Node.js 18 or later. Install, then choose your client:
 
 ```bash
 npm install -g speculate-mcp
+
+# Claude Code: run from your project
 speculate on
+
+# Codex: wrap enabled user-level MCP servers
+speculate on --client codex
 ```
 
-Start a new Claude Code session. `on` wraps supported, approved MCP servers and
-installs a shared session-start hook to detect servers added later. Newly added
-servers may need another session before wrapping takes effect.
+Restart the selected client. Claude Code setup wraps supported, approved servers
+for this project and installs a shared session-start hook for new servers.
+Codex setup uses its configuration API for enabled user-level stdio and Streamable
+HTTP servers, shared by CLI, app, and IDE clients on the same Codex host.
+Codex has no auto-wrap hook: rerun `on --client codex` or `sync --client codex`
+after adding servers.
 
-Run `speculate off` to restore this project's recorded server registrations and
-stop automatic wrapping there. The shared hook and stored learning remain.
+Use `speculate off` or `speculate off --client codex` to restore registrations
+changed for that client. Stored learning and authentication remain.
+See the [setup guide](https://lukebward.github.io/speculate/getting-started/#codex)
+for Codex scope, unsupported configurations, and OAuth.
 
 ### Other MCP clients
 

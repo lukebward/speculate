@@ -16,3 +16,9 @@ jobs:
       - run: npm ci
       - run: npx tsc
       - run: npm test
+      - name: Install Codex for native integration checks
+        run: npm install --global @openai/codex@0.153.4
+      - name: Check native Codex setup and MCP calls
+        run: npm test -- test/codex-real-e2e.test.ts
+        env:
+          SPECULATE_REAL_CODEX_TEST: '1'

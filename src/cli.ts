@@ -37,15 +37,22 @@ import { oauthStorePath, readOAuthRecord } from './oauthStore.js';
 import { createUsageRecorder } from './usage.js';
 import { VERSION } from './version.js';
 import { parseMemoryArgs, runMemory } from './memory.js';
+import {
+  speculateCodexAuth,
+  speculateCodexOff,
+  speculateCodexOn,
+  speculateCodexStatus,
+  speculateCodexSync,
+} from './codexManage.js';
+import { applyCodexPolicy } from './codexPolicy.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
-install-and-it-works (no config files edited by hand):
-  speculate on [--mode <mode>]             wrap this project's MCP servers via 'claude mcp'
-  speculate off                            undo everything 'on' did (exact restore)
-  speculate status [path]                  every project at a glance; give a path ('.') for
-                                           one project's detail, reachability included
-  speculate sync                           wrap MCP servers added since the last run (run by the auto-wrap hook)
+managed setup (on/off/status/sync/auth accept --client claude|codex):
+  speculate on [--mode <mode>]             wrap supported MCP servers for the selected client
+  speculate off                            restore registrations changed by 'on'
+  speculate status [path]                  inspect wrapping for the selected client
+  speculate sync                           wrap servers added since the last run
   speculate stats [--json] [--since 7d] [--workspace PATH]
                    [--by-server] [--by-tool] [--compact]
                                            cumulative usage and prediction quality
@@ -55,6 +62,13 @@ install-and-it-works (no config files edited by hand):
                                            clear only the explicitly scoped memory records
   speculate auth [server]                  authorize Speculate with remote servers that need a
                                            login (no argument: every one that does)
+
+client scope:
+  --client claude     default: this Claude Code project; 'on' installs an auto-wrap hook
+                      'status' alone lists projects; 'status .' inspects this project
+  --client codex      Codex user MCP config shared by local clients; restart Codex afterward
+                      no auto-wrap hook: rerun 'on' or 'sync' when adding servers
+  --codex-bin <path>  Codex executable for --client codex (default: codex on PATH)
 
 manual wrapping:
   speculate wrap [flags] -- <server command...>              zero config: wrap any MCP server
@@ -136,6 +150,41 @@ const REST_COMMANDS = new Set([
   'auth',
   'exec',
 ] as const);
+
+interface ClientArgs {
+  client: 'claude' | 'codex';
+  codexBin?: string;
+  rest: string[];
+}
+
+/** Client selection belongs to management commands, never the wrapped server. */
+export function parseClientArgs(argv: string[]): ClientArgs | { error: string } {
+  const out: ClientArgs = { client: 'claude', rest: [] };
+  let selected = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === '--client') {
+      if (selected) return { error: '--client may only be specified once' };
+      const value = argv[++i];
+      if (value !== 'claude' && value !== 'codex') {
+        return { error: '--client must be claude or codex' };
+      }
+      selected = true;
+      out.client = value;
+    } else if (arg === '--codex-bin') {
+      if (out.codexBin !== undefined) return { error: '--codex-bin may only be specified once' };
+      const value = argv[++i];
+      if (!value || value.startsWith('-')) return { error: '--codex-bin requires an executable path' };
+      out.codexBin = value;
+    } else {
+      out.rest.push(arg);
+    }
+  }
+  if (out.codexBin !== undefined && out.client !== 'codex') {
+    return { error: '--codex-bin requires --client codex' };
+  }
+  return out;
+}
 
 /**
  * Exit policy: never call process.exit() while output may still be
@@ -305,6 +354,13 @@ async function runCommandPassThrough(execArgs: ExecArgs, label: string): Promise
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  let selectedClient: ClientArgs = { client: 'claude', rest: args.rest };
+  if (['on', 'off', 'status', 'sync', 'auth'].includes(args.command)) {
+    const parsed = parseClientArgs(args.rest);
+    if ('error' in parsed) fail(parsed.error);
+    selectedClient = parsed;
+    args.rest = parsed.rest;
+  }
 
   if (args.command === 'exec') {
     const execArgs = parseExecArgs(args.rest);
@@ -356,6 +412,14 @@ async function main(): Promise<void> {
   }
 
   if (args.command === 'sync') {
+    if (selectedClient.client === 'codex') {
+      if (args.rest.length > 0) fail(`unknown sync argument '${args.rest[0]}'`);
+      process.exitCode = await speculateCodexSync({
+        self: selfCommand(),
+        codexBin: selectedClient.codexBin,
+      });
+      return;
+    }
     // `--claude-bin <abs>` is baked into the auto-wrap hook command at
     // install time: `on` runs in a terminal where `claude` is on PATH, and
     // this carries that knowledge into GUI-launched sessions whose minimal
@@ -430,6 +494,25 @@ async function main(): Promise<void> {
         fail(`unknown ${args.command} argument '${args.rest[i]}'`);
       }
     }
+    if (selectedClient.client === 'codex') {
+      const self = selfCommand();
+      const codexOpts = {
+        self,
+        mode,
+        codexBin: selectedClient.codexBin,
+        ...(statusPath !== undefined ? { cwd: resolve(statusPath) } : {}),
+        onNeedsAuth: (servers: { name: string; url: string }[]) => onNeedsAuth(
+          servers,
+          (target) => speculateCodexAuth({ self, codexBin: selectedClient.codexBin, target }),
+        ),
+      };
+      process.exitCode = args.command === 'on'
+        ? await speculateCodexOn(codexOpts)
+        : args.command === 'off'
+          ? await speculateCodexOff(codexOpts)
+          : await speculateCodexStatus(codexOpts);
+      return;
+    }
     const manageOpts = { self: selfCommand(), mode, onNeedsAuth };
     const code =
       args.command === 'on'
@@ -451,6 +534,15 @@ async function main(): Promise<void> {
       else if (arg.startsWith('-')) fail(`unknown auth argument '${arg}'`);
       else if (target === undefined) target = arg;
       else fail(`auth takes at most one server (got '${arg}' as well as '${target}')`);
+    }
+    if (selectedClient.client === 'codex') {
+      process.exitCode = await speculateCodexAuth({
+        self: selfCommand(),
+        codexBin: selectedClient.codexBin,
+        target,
+        forget,
+      });
+      return;
     }
     const code = await speculateAuth({ target, forget });
     // Finish the job rather than leaving a second command as homework: a
@@ -486,6 +578,7 @@ async function main(): Promise<void> {
       process.cwd(),
       oauthScope,
     );
+    await applyCodexPolicy(wrapConfig, wrapArgs);
     await runProxy(
       wrapConfig,
       defaultStatePathForKey(stateKey),
@@ -544,7 +637,10 @@ async function confirm(question: string): Promise<boolean> {
  * what to run. Returns true only if something was actually authorized, which
  * is what tells `on` to re-run the wrap.
  */
-async function onNeedsAuth(servers: { name: string; url: string }[]): Promise<boolean> {
+async function onNeedsAuth(
+  servers: { name: string; url: string }[],
+  authorize: (target: string) => Promise<number> = (target) => speculateAuth({ target }),
+): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stderr.isTTY) return false;
   const names = servers.map((s) => s.name).join(', ');
   const subject = servers.length > 1 ? `${servers.length} servers` : names;
@@ -556,7 +652,7 @@ async function onNeedsAuth(servers: { name: string; url: string }[]): Promise<bo
   }
   let authorized = false;
   for (const server of servers) {
-    if ((await speculateAuth({ target: server.url })) === 0) authorized = true;
+    if ((await authorize(server.url)) === 0) authorized = true;
   }
   return authorized;
 }
@@ -660,7 +756,7 @@ function createStateScope(
       name,
       upstream: server.url
         ? { url: server.url }
-        : { command: server.command, args: server.args ?? [] },
+        : { command: server.command, args: server.args ?? [], ...(server.cwd ? { cwd: server.cwd } : {}) },
       identity: {
         oauth: server.oauthAuthEpoch ?? 'none',
         headers: Object.entries(server.headers ?? {}).sort(([a], [b]) => a.localeCompare(b)),

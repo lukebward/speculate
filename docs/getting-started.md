@@ -12,6 +12,18 @@
     editing files by hand. It also installs a hook, so servers you add later get
     wrapped too.
 
+=== "Codex"
+
+    ```bash
+    npm install -g speculate-mcp
+    speculate on --client codex
+    ```
+
+    Restart Codex. Speculate wraps enabled, supported MCP servers in Codex's
+    user configuration. There is no Codex auto-wrap hook; rerun `on --client
+    codex` or `sync --client codex` after adding servers. See [Codex](#codex)
+    below for scope and authentication.
+
 === "Any other MCP client"
 
     No install. Prefix the server command already in your client's config:
@@ -38,12 +50,58 @@
     ```
 
 Speculate wraps remote (streamable HTTP) servers too, which is where most of the
-latency lives. For the ones needing a login (Sentry, Notion, Linear), `on`
-offers to sign you in: say yes, click once in the browser, done.
+latency lives. For servers needing OAuth, `on` can offer a browser login. Select the same
+client for setup and authentication, for example `speculate auth --client codex`.
 
 !!! info "Connectors added in the claude.ai UI are untouched"
 
     The host holds those, so nothing here can see them.
+
+## Codex
+
+```bash
+speculate on --client codex
+speculate status --client codex
+speculate sync --client codex
+speculate off --client codex
+```
+
+Native Codex support is maintained by Speculate. It uses Codex's configuration
+API to wrap enabled **user-level** stdio and Streamable HTTP MCP servers. The
+local CLI, desktop app, and IDE extension share MCP configuration for the same
+Codex host. Restart the client after changing registrations. See
+[OpenAI's MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+Server names, tool enable/disable policies, and environment settings are
+preserved. Native setup does not install a Codex hook. Rerun `on` or `sync` with
+`--client codex` when adding servers; `status --client codex [path]` inspects the
+base on-disk configuration and trusted project layers for that directory. A path changes the inspection
+context, not the user-level write scope. Add `--codex-bin /path/to/codex` to any
+of these commands when the executable is not on PATH.
+
+Setup and policy checks cannot observe session-only `--profile` or `-c`
+overrides in another Codex process. If you rely on those overrides to restrict
+MCP tools, use explicit configuration or `speculate off --client codex` until
+that session context is supported.
+
+Project-owned transports, transports shadowed across configuration layers,
+remote executors, header helpers, ChatGPT session authentication, and custom
+OAuth settings are reported as unsupported and skipped.
+Hosted plugin or app tools outside local MCP registrations are not wrapped.
+Speculate does not move these servers into a different configuration scope.
+
+OAuth credentials belong to Speculate's own OAuth client. Existing Codex login
+credentials are not reused. Authenticate and rerun setup when needed:
+
+```bash
+speculate auth --client codex
+speculate on --client codex
+```
+
+`off --client codex` restores the transport fields Speculate changed, preserving
+unrelated later configuration edits, learned state, and authentication. If a
+changed transport no longer matches the recorded wrapper, `off` reports a
+conflict instead of overwriting it.
 
 ## Keeping your token out of the file
 
@@ -80,8 +138,8 @@ prefetches were.
 ## Upgrading from retired launch paths
 
 v0.20 removes PATH-shim installation, protocol sniffing, and `speculate try`.
-Use `speculate on` for Claude Code or the explicit `wrap` configuration above
-for another MCP client.
+Use `speculate on` for Claude Code, `speculate on --client codex` for Codex,
+or the explicit `wrap` configuration above for another MCP client.
 
 If an earlier version installed PATH shims, run:
 
@@ -95,7 +153,7 @@ through immediately without speculation. Replace them with `wrap -- ...` only
 where the launched program is an MCP server.
 
 To evaluate Speculate, enable it with `on`, inspect `stats`, and use `off` to
-restore the project's original server registrations. Learning and aggregate
+restore the selected client's changed server registrations. Learning and aggregate
 usage records persist normally; `speculate memory clear --all` removes managed
 learning and usage records if you want to clear them afterward. See
 [Commands](commands.md#memory) for custom state paths.

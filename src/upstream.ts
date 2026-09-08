@@ -139,6 +139,7 @@ export class Upstream {
           command: this.config.command!,
           args: this.config.args ?? [],
           env: { ...getDefaultEnvironment(), ...(this.config.env ?? {}) },
+          ...(this.config.cwd === undefined ? {} : { cwd: this.config.cwd }),
           stderr: 'inherit',
         });
     await client.connect(transport);

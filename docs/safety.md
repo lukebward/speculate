@@ -92,7 +92,35 @@ commands preserve OAuth credentials and host configuration. See
 
 Speculate registers as its own OAuth client and never reads another
 application's credential store, so refreshing its token cannot disturb Claude
-Code's.
+Code's or Codex's.
+
+## Native client configuration
+
+Codex integration writes supported user-level MCP transport fields through
+Codex's configuration API. Server names, environment settings, enabled/disabled
+tool policies, and unrelated settings are preserved. Project-owned or shadowed
+transports, remote executors, header helpers, ChatGPT session authentication,
+and custom OAuth settings are skipped with an explanation.
+Hosted plugin and app tools outside local MCP configuration are outside this
+integration's scope.
+
+At startup, a native wrapper rereads Codex tool policy from base on-disk
+configuration and trusted project layers. Disabled tools and reads requiring
+approval in those layers are excluded from prefetching. If that policy cannot
+be read or understood, speculation is disabled and requested calls continue
+through the proxy.
+
+These checks cannot observe session-only `--profile` or `-c` overrides in
+another Codex process. Sessions relying on those overrides for MCP restrictions
+need explicit configuration or `speculate off --client codex`. Do not rely on
+native setup to enforce a policy it cannot see.
+
+The original transport fields are recorded locally for undo and can include
+credentials already present in the host configuration. `off --client codex`
+restores those fields only when the current transport still matches Speculate's
+record. It reports conflicts and preserves unrelated later edits. It also
+preserves learning and authentication. Codex setup does not install a hook;
+refresh explicitly with `on --client codex` or `sync --client codex`.
 
 ## Risks that read-only does not solve
 
