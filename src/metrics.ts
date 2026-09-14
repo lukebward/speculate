@@ -11,6 +11,8 @@ import process from 'node:process';
 import type {
   AgeAtHitReport,
   DecisionEvent,
+  ObserverLifecycleEvent,
+  ObserverSuppression,
   RuleStats,
   SpeculationMode,
   StatsReport,
@@ -121,6 +123,7 @@ export class Metrics {
   private readonly onUsage:
     | ((counters: UsageCounters, breakdown: UsageBreakdown) => void)
     | undefined;
+  private readonly onObserverLifecycle: ((event: ObserverLifecycleEvent) => void) | undefined;
   private readonly startedAt: number;
 
   private realCalls = 0;
@@ -187,11 +190,13 @@ export class Metrics {
     log: 'stderr' | 'off';
     now?: () => number;
     onUsage?: (counters: UsageCounters, breakdown: UsageBreakdown) => void;
+    onObserverLifecycle?: (event: ObserverLifecycleEvent) => void;
   }) {
     this.mode = opts.mode;
     this.log = opts.log;
     this.now = opts.now ?? Date.now;
     this.onUsage = opts.onUsage;
+    this.onObserverLifecycle = opts.onObserverLifecycle;
     this.startedAt = this.now();
   }
 
@@ -390,6 +395,10 @@ export class Metrics {
     }
     if (usageChanged) {
       this.onUsage?.(this.usageCounters(), this.usageBreakdown());
+    }
+    const lifecycle = observerLifecycle(event);
+    if (lifecycle) {
+      try { this.onObserverLifecycle?.(lifecycle); } catch {}
     }
   }
 
@@ -658,5 +667,47 @@ export class Metrics {
       this.perRule.set(ruleId, c);
     }
     return c;
+  }
+}
+
+function observerLifecycle(event: DecisionEvent): ObserverLifecycleEvent | null {
+  if (!event.ruleId || event.timestamp === undefined) return null;
+  const attribution = event.observerIssue ?? event.observerAttribution;
+  if (!attribution) return null;
+  if (
+    event.type !== 'suppressed' && event.type !== 'speculated' && event.type !== 'hit' &&
+    event.type !== 'joined' && event.type !== 'expired' && event.type !== 'invalidated' &&
+    event.type !== 'abandoned' && event.type !== 'spec_error'
+  ) return null;
+  const issue = event.observerIssue;
+  return {
+    type: event.type,
+    timestamp: event.timestamp,
+    ruleId: event.ruleId,
+    observerAttribution: {
+      client: attribution.client,
+      source: attribution.source,
+      routeId: attribution.routeId,
+      generation: attribution.generation,
+      candidateCreatedAt: attribution.candidateCreatedAt,
+    },
+    ...(issue ? { issueId: issue.issueId, specDispatchAt: issue.specDispatchAt } : {}),
+    ...(event.realDemandAt !== undefined ? { realDemandAt: event.realDemandAt } : {}),
+    ...(event.type === 'suppressed' ? { suppression: observerSuppression(event.reason) } : {}),
+  };
+}
+
+function observerSuppression(reason: string | undefined): ObserverSuppression {
+  switch (reason) {
+    case 'dedup':
+    case 'feedback':
+    case 'low-utility':
+    case 'per-trigger-cap':
+    case 'stale-generation':
+    case 'queue-expired':
+    case 'session-end':
+      return reason;
+    default:
+      return 'other';
   }
 }

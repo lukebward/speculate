@@ -45,6 +45,7 @@ function isToolUnavailable(err: McpError): boolean {
 
 export class SpeculationExecutor {
   private readonly pending = new Map<string, QueuedPrediction[]>();
+  private observerIssueSequence = 0;
 
   constructor(
     private readonly deps: {
@@ -189,11 +190,18 @@ export class SpeculationExecutor {
       return 'dropped';
     }
 
+    const specDispatchAt = now();
+    const observerIssue = p.observerAttribution ? {
+      ...p.observerAttribution,
+      issueId: `observer-issue:${++this.observerIssueSequence}`,
+      specDispatchAt,
+    } : undefined;
     const meta = {
       server: p.server,
       tool: p.tool,
       ruleId: p.ruleId,
-      issuedAt: now(),
+      issuedAt: specDispatchAt,
+      observerIssue,
     };
 
     const promise = upstream
@@ -241,6 +249,8 @@ export class SpeculationExecutor {
       tool: p.tool,
       ruleId: p.ruleId,
       confidence: p.confidence,
+      timestamp: specDispatchAt,
+      observerIssue,
     });
     return 'issued';
   }
@@ -271,6 +281,7 @@ export class SpeculationExecutor {
       ruleId: p.ruleId,
       confidence: p.confidence,
       reason,
+      observerAttribution: p.observerAttribution,
     });
   }
 

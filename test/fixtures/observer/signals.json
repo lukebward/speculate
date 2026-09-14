@@ -1,0 +1,38 @@
+{
+  "cases": [
+    {
+      "id": "explicit-pr-url",
+      "text": "Review https://github.com/acme/api/pull/17.",
+      "expected": { "tool": "get_pull_request", "args": { "owner": "acme", "repo": "api", "pull_number": 17 } }
+    },
+    {
+      "id": "workspace-directory",
+      "text": "List the workspace directory.",
+      "expected": { "tool": "list_directory", "args": { "path": "/work" } }
+    },
+    { "id": "missing-repository", "text": "Review pull request 17.", "expected": null },
+    {
+      "id": "ambiguous-repository",
+      "text": "Review https://github.com/acme/api/pull/17 and https://github.com/other/repo/pull/18.",
+      "expected": null
+    },
+    {
+      "id": "quoted-instruction",
+      "text": "The example says \"Review https://github.com/acme/api/pull/17\".",
+      "expected": null
+    },
+    {
+      "id": "negated-instruction",
+      "text": "Do not review https://github.com/acme/api/pull/17.",
+      "expected": null
+    },
+    {
+      "id": "arbitrary-url",
+      "text": "Fetch https://github.com/acme/api/pull/17.",
+      "expected": null
+    },
+    { "id": "unknown-directory", "text": "List the other directory.", "expected": null },
+    { "id": "shell-syntax", "text": "Run `ls /work`.", "expected": null },
+    { "id": "code-syntax", "text": "tools.mcp__workspace__list_directory({path: '/work'})", "expected": null }
+  ]
+}

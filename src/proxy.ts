@@ -38,7 +38,7 @@ import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
 import { candidateSchema, type AgentKind, type Candidate, type HostPermissionGate, type LocalRouteDescriptor, type Observation, type RegisteredRoute } from './observerTypes.js';
-import type { ExecutionLease, Rule, SpeculateConfig } from './types.js';
+import type { ExecutionLease, ObserverLifecycleEvent, Rule, SpeculateConfig } from './types.js';
 import type { UsageRecorder } from './usage.js';
 
 const STATS_TOOL = 'speculate__stats';
@@ -137,6 +137,7 @@ export class SpeculateProxy {
       stateScope?: string;
       usageRecorder?: UsageRecorder | null;
       session?: ProxySessionConfig;
+      onObserverLifecycle?: (event: ObserverLifecycleEvent) => void;
     } = {},
   ) {
     this.config = config;
@@ -150,6 +151,7 @@ export class SpeculateProxy {
       log: config.log,
       now,
       onUsage: (counters, breakdown) => this.usageRecorder?.update(counters, breakdown),
+      onObserverLifecycle: opts.onObserverLifecycle,
     });
     this.cache = new SpeculationCache({
       now,
@@ -160,6 +162,7 @@ export class SpeculateProxy {
           tool: ev.meta.tool,
           ruleId: ev.meta.ruleId,
           reason: ev.error,
+          observerIssue: ev.meta.observerIssue,
         }),
     });
     this.policy = new SafetyPolicy(
@@ -752,6 +755,8 @@ export class SpeculateProxy {
           // §9: how stale the answer we just served actually was.
           ageMs: found.ageMs,
           ttlFraction: found.ttlFraction,
+          observerIssue: found.meta.observerIssue,
+          realDemandAt: startedAt,
         });
       } else if (found.outcome === 'joined') {
         const tJoin = this.now();
@@ -765,6 +770,8 @@ export class SpeculateProxy {
             tool,
             ruleId: found.meta.ruleId,
             savedMs: saved,
+            observerIssue: found.meta.observerIssue,
+            realDemandAt: startedAt,
           });
         } catch (err) {
           // Speculative call failed — fall through to a real call (never
@@ -777,6 +784,8 @@ export class SpeculateProxy {
             tool,
             ruleId: found.meta.ruleId,
             reason: `join-failed: ${(err as Error)?.message?.slice(0, 200) ?? 'unknown'}`,
+            observerIssue: found.meta.observerIssue,
+            realDemandAt: startedAt,
           });
           result = null;
         }
@@ -916,6 +925,13 @@ export class SpeculateProxy {
             confidence: candidate.confidence,
             candidateId: ruleId,
             ruleId,
+            observerAttribution: {
+              client: this.session!.hostClient,
+              source: candidate.source,
+              routeId: route.routeId,
+              generation: route.generation,
+              candidateCreatedAt: candidate.createdAt,
+            },
           };
         }),
         { timestamp: now, trackNextCall: false },

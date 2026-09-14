@@ -48,7 +48,12 @@ const observationBase = {
 };
 
 export const observationSchema = z.discriminatedUnion('kind', [
-  z.object({ ...observationBase, kind: z.literal('prompt'), text: z.string().max(MAX_OBSERVATION_BYTES) }).strict(),
+  z.object({
+    ...observationBase,
+    kind: z.literal('prompt'),
+    occurrenceId: id.optional(),
+    text: z.string().max(MAX_OBSERVATION_BYTES),
+  }).strict(),
   z.object({
     ...observationBase,
     kind: z.literal('tool-complete'),

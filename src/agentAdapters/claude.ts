@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
+import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -42,17 +43,19 @@ function inspectableEncoding(headers: Readonly<Record<string, string | string[] 
   return encoding === null || encoding.trim().toLowerCase() === 'identity';
 }
 
-function currentPrompt(body: Record<string, unknown>): string | null {
+function currentPrompt(body: Record<string, unknown>): { text: string; nativeId: string } | null {
   if (!Array.isArray(body.messages)) return null;
   for (let index = body.messages.length - 1; index >= 0; index--) {
     const message = body.messages[index];
     if (!object(message) || message.role !== 'user') continue;
-    if (typeof message.content === 'string') return message.content || null;
+    if (typeof message.content === 'string') {
+      return message.content ? { text: message.content, nativeId: promptNativeId(body.messages.slice(0, index + 1)) } : null;
+    }
     if (!Array.isArray(message.content)) return null;
     const text = message.content.flatMap((block) =>
       object(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : []
     ).join('\n');
-    if (text) return text;
+    if (text) return { text, nativeId: promptNativeId(body.messages.slice(0, index + 1)) };
     if (message.content.every((block) => object(block) && block.type === 'tool_result')) continue;
     return null;
   }
@@ -83,6 +86,7 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     private readonly context: SessionContext,
     private readonly request: AgentAdapterRequest,
     private readonly environment: AgentAdapterEnvironment,
+    private readonly promptOccurrences: PromptOccurrenceCorrelator,
     private readonly release: () => void,
   ) {}
 
@@ -104,15 +108,16 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     }
     this.captureRoutes(parsed.tools);
     this.requestReady = true;
-    const text = currentPrompt(parsed);
-    if (text === null) return [];
+    const current = currentPrompt(parsed);
+    if (current === null) return [];
     const stableId = createHash('sha256').update(this.context.conversationId).update('\0').update(Buffer.from(body)).digest('base64url');
     return this.observation({
       kind: 'prompt',
       context: this.context,
       eventId: this.eventId('prompt', stableId),
       observedAt: this.now(),
-      text,
+      occurrenceId: this.promptOccurrences.identify(this.context.conversationId, current.text, 'proxy', current.nativeId),
+      text: current.text,
     });
   }
 
@@ -300,7 +305,10 @@ class ClaudeConnection implements AgentAdapterConnection {
   private readonly requests = new Set<ClaudeRequestObserver>();
   private closed = false;
 
-  constructor(private readonly environment: AgentAdapterEnvironment) {}
+  constructor(
+    private readonly environment: AgentAdapterEnvironment,
+    private readonly promptOccurrences: PromptOccurrenceCorrelator,
+  ) {}
 
   startRequest(request: AgentAdapterRequest): AgentAdapterRequestObserver | null {
     if (this.closed || request.transport !== 'http' || request.method.toUpperCase() !== 'POST' || requestPath(request.path) !== '/v1/messages') return null;
@@ -309,7 +317,13 @@ class ClaudeConnection implements AgentAdapterConnection {
     const context = this.context(conversationId);
     if (!context) return null;
     let observer!: ClaudeRequestObserver;
-    observer = new ClaudeRequestObserver(context, request, this.environment, () => this.requests.delete(observer));
+    observer = new ClaudeRequestObserver(
+      context,
+      request,
+      this.environment,
+      this.promptOccurrences,
+      () => this.requests.delete(observer),
+    );
     this.requests.add(observer);
     return observer;
   }
@@ -332,9 +346,10 @@ class ClaudeConnection implements AgentAdapterConnection {
 }
 
 export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapter {
+  const promptOccurrences = new PromptOccurrenceCorrelator(() => environment.now?.() ?? Date.now());
   return {
     agent: 'claude',
-    createConnection: () => new ClaudeConnection(environment),
+    createConnection: () => new ClaudeConnection(environment, promptOccurrences),
     normalizeHook(payload: unknown): readonly Observation[] {
       if (!object(payload) || payload.hook_event_name !== 'UserPromptSubmit' || typeof payload.session_id !== 'string' || typeof payload.prompt !== 'string') return [];
       if (payload.session_id.length === 0 || payload.session_id.length > 512 ||
@@ -355,6 +370,7 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
         context,
         eventId,
         observedAt: environment.now?.() ?? Date.now(),
+        occurrenceId: promptOccurrences.identify(context.conversationId, payload.prompt, 'hook'),
         text: payload.prompt,
       });
       return parsed.success ? [parsed.data] : [];

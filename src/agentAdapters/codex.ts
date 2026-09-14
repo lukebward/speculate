@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
+import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -158,7 +159,10 @@ class CodexConnection implements AgentAdapterConnection {
   private readonly retainedBudget = new RetainedBudget();
   private closed = false;
 
-  constructor(private readonly environment: AgentAdapterEnvironment) {}
+  constructor(
+    private readonly environment: AgentAdapterEnvironment,
+    private readonly promptOccurrences: PromptOccurrenceCorrelator,
+  ) {}
 
   startRequest(request: AgentAdapterRequest): AgentAdapterRequestObserver | null {
     if (this.closed || request.transport !== 'http' || request.method.toUpperCase() !== 'POST' ||
@@ -170,6 +174,7 @@ class CodexConnection implements AgentAdapterConnection {
       context,
       request,
       this.environment,
+      this.promptOccurrences,
       this.retainedBudget,
       (responseId, responseContext) => this.remember(responseId, responseContext),
       (responseId) => this.completed.get(responseId)?.context ?? null,
@@ -188,6 +193,7 @@ class CodexConnection implements AgentAdapterConnection {
     observer = new CodexWebSocketObserver(
       context,
       this.environment,
+      this.promptOccurrences,
       this.retainedBudget,
       (responseId, responseContext) => this.remember(responseId, responseContext),
       (responseId) => this.completed.get(responseId)?.context ?? null,
@@ -267,6 +273,7 @@ class ResponseTracker {
   constructor(
     private readonly context: SessionContext,
     private readonly environment: AgentAdapterEnvironment,
+    private readonly promptOccurrences: PromptOccurrenceCorrelator,
     private readonly retainedBudget: RetainedBudget,
     private readonly remember: (responseId: string, responseContext: ResponseContext) => void,
     private readonly previous: (responseId: string) => ResponseContext | null,
@@ -301,11 +308,13 @@ class ResponseTracker {
     const text = inputText(value.input);
     if (text === null) return [];
     const stableId = createHash('sha256').update(this.context.conversationId).update('\0').update(Buffer.from(bytes)).digest('base64url');
+    const nativeId = promptNativeId({ previousResponseId: value.previous_response_id ?? null, input: value.input });
     return this.observation({
       kind: 'prompt',
       context: this.context,
       eventId: this.eventId('prompt', stableId),
       observedAt: this.now(),
+      occurrenceId: this.promptOccurrences.identify(this.context.conversationId, text, 'proxy', nativeId),
       text,
     });
   }
@@ -554,12 +563,13 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
     context: SessionContext,
     private readonly request: AgentAdapterRequest,
     environment: AgentAdapterEnvironment,
+    promptOccurrences: PromptOccurrenceCorrelator,
     retainedBudget: RetainedBudget,
     remember: (responseId: string, responseContext: ResponseContext) => void,
     previous: (responseId: string) => ResponseContext | null,
     private readonly release: () => void,
   ) {
-    this.tracker = new ResponseTracker(context, environment, retainedBudget, remember, previous);
+    this.tracker = new ResponseTracker(context, environment, promptOccurrences, retainedBudget, remember, previous);
   }
 
   observeRequestBody(body: Uint8Array): readonly Observation[] {
@@ -689,6 +699,7 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
   constructor(
     private readonly context: SessionContext,
     private readonly environment: AgentAdapterEnvironment,
+    private readonly promptOccurrences: PromptOccurrenceCorrelator,
     private readonly retainedBudget: RetainedBudget,
     private readonly remember: (responseId: string, responseContext: ResponseContext) => void,
     private readonly previous: (responseId: string) => ResponseContext | null,
@@ -708,7 +719,14 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
     if (!this.ready || this.stopped || message.binary || message.data.byteLength > MAX_OBSERVATION_BYTES) return [];
     const parsed = this.parse(message.data);
     if (!parsed || parsed.type !== 'response.create' || this.trackers.size >= MAX_ACTIVE_RESPONSES) return [];
-    const tracker = new ResponseTracker(this.context, this.environment, this.retainedBudget, this.remember, this.previous);
+    const tracker = new ResponseTracker(
+      this.context,
+      this.environment,
+      this.promptOccurrences,
+      this.retainedBudget,
+      this.remember,
+      this.previous,
+    );
     const lane = boundedId(parsed.stream_id) ? parsed.stream_id : '';
     if (tracker.isStopped || !tracker.retainLane(lane)) {
       tracker.abort();
@@ -830,9 +848,10 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
 }
 
 export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter {
+  const promptOccurrences = new PromptOccurrenceCorrelator(() => environment.now?.() ?? Date.now());
   return {
     agent: 'codex',
-    createConnection: () => new CodexConnection(environment),
+    createConnection: () => new CodexConnection(environment, promptOccurrences),
     normalizeHook: () => [],
   };
 }

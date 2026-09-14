@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 import { TransitionLearner } from './learner.js';
 import { candidateSchema, type Candidate, type Observation, type RegisteredRoute } from './observerTypes.js';
 import type { ObservedCall } from './types.js';
@@ -40,16 +41,14 @@ export class SessionPredictor {
       this.invalidate(event.routeIds);
       return [];
     }
-    if (event.kind !== 'tool-complete') return [];
-
     const now = this.now();
     this.pruneReplay(now);
-    const replayKey = `${event.context.conversationId}\0${event.routeId}\0${event.eventId}`;
-    if (this.replay.has(replayKey)) return [];
-    this.replay.set(replayKey, now);
-    while (this.replay.size > MAX_REPLAY_IDS) this.replay.delete(this.replay.keys().next().value!);
-
     const routes = this.options.routes();
+    if (event.kind === 'prompt') return this.intentCandidates(event, routes, now);
+    if (event.kind === 'stream-call') return this.streamCandidate(event, routes, now);
+    if (event.kind !== 'tool-complete') return [];
+
+    if (!this.claimReplay(`${event.context.conversationId}\0${event.routeId}\0${event.eventId}`, now)) return [];
     const source = routes.find((route) => route.routeId === event.routeId);
     if (!source) return [];
 
@@ -116,6 +115,67 @@ export class SessionPredictor {
     }).slice(0, 3);
   }
 
+  private intentCandidates(
+    event: Extract<Observation, { kind: 'prompt' }>,
+    routes: readonly RegisteredRoute[],
+    now: number,
+  ): Candidate[] {
+    const sourceEventId = event.occurrenceId ?? event.eventId;
+    const mapped = explicitIntent(event.text, event.context.cwd, routes.filter((route) =>
+      route.hostClient === event.context.agent));
+    if (!mapped) return [];
+    const replayKey = `${event.context.conversationId}\0${mapped.route.routeId}\0${sourceEventId}`;
+    if (!this.claimReplay(replayKey, now)) return [];
+    return this.candidate(event, mapped.route, sourceEventId, 'intent', mapped.args, 0.95, now);
+  }
+
+  private streamCandidate(
+    event: Extract<Observation, { kind: 'stream-call' }>,
+    routes: readonly RegisteredRoute[],
+    now: number,
+  ): Candidate[] {
+    const matches = routes.filter((route) =>
+      route.routeId === event.routeId && route.hostClient === event.context.agent);
+    if (matches.length !== 1 || !validArgs(matches[0]!, event.args)) return [];
+    const replayKey = `${event.context.conversationId}\0${event.routeId}\0${event.callId}`;
+    if (!this.claimReplay(replayKey, now)) return [];
+    return this.candidate(event, matches[0]!, event.callId, 'stream', event.args, 1, now);
+  }
+
+  private candidate(
+    event: Exclude<Observation, { kind: 'invalidate' | 'tool-complete' }>,
+    route: RegisteredRoute,
+    sourceEventId: string,
+    source: 'intent' | 'stream',
+    args: Record<string, unknown>,
+    confidence: number,
+    now: number,
+  ): Candidate[] {
+    const copied = copyJsonRecord(args);
+    if (!copied.ok) return [];
+    const parsed = candidateSchema.safeParse({
+      version: 1 as const,
+      launchId: event.context.launchId,
+      conversationId: event.context.conversationId,
+      candidateId: `${source}:${++this.candidateSequence}`,
+      routeId: route.routeId,
+      generation: route.generation,
+      sourceEventId,
+      source,
+      args: copied.value,
+      confidence,
+      createdAt: now,
+    });
+    return parsed.success ? [parsed.data] : [];
+  }
+
+  private claimReplay(key: string, now: number): boolean {
+    if (this.replay.has(key)) return false;
+    this.replay.set(key, now);
+    while (this.replay.size > MAX_REPLAY_IDS) this.replay.delete(this.replay.keys().next().value!);
+    return true;
+  }
+
   invalidate(routeIds: string[]): void {
     if (routeIds.length === 0) {
       this.conversations.clear();
@@ -179,6 +239,67 @@ export class SessionPredictor {
     for (const [key, at] of this.replay) {
       if (now - at > REPLAY_RETENTION_MS) this.replay.delete(key);
     }
+  }
+}
+
+function explicitIntent(
+  text: string,
+  cwd: string,
+  routes: readonly RegisteredRoute[],
+): { route: RegisteredRoute; args: Record<string, unknown> } | null {
+  const input = text.trim();
+  const pull = /^(?:please\s+)?(?:review|inspect|read|open|check)\s+(?:the\s+)?(?:(?:pull request|pr)\s+(?:at\s+)?)?https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9]\d*)\.?$/i.exec(input);
+  if (pull) {
+    const pullNumber = Number(pull[3]);
+    if (!Number.isSafeInteger(pullNumber)) return null;
+    return uniqueMappedRoute(routes, [
+      { tool: 'get_pull_request', args: { owner: pull[1]!, repo: pull[2]!, pull_number: pullNumber } },
+      { tool: 'pull_request_read', args: { owner: pull[1]!, repo: pull[2]!, pullNumber, method: 'get' } },
+    ]);
+  }
+
+  const workspace = /^(?:please\s+)?(?:list|show)(?:\s+me)?\s+(?:(?:the\s+)?(?:contents|files|entries)\s+(?:in|of)\s+)?(?:the\s+)?(?:workspace|current|working)(?:\s+directory)?\.?$/i.exec(input);
+  if (workspace) return uniqueMappedRoute(routes, [{ tool: 'list_directory', args: { path: cwd } }]);
+
+  const absolute = /^(?:please\s+)?(?:list|show)(?:\s+me)?\s+(?:(?:the\s+)?(?:contents|files|entries)\s+(?:in|of)\s+)?(\/[^\s"'`]+?)\.?$/i.exec(input);
+  if (absolute) return uniqueMappedRoute(routes, [{ tool: 'list_directory', args: { path: absolute[1]! } }]);
+  return null;
+}
+
+function uniqueMappedRoute(
+  routes: readonly RegisteredRoute[],
+  mappings: readonly { tool: string; args: Record<string, unknown> }[],
+): { route: RegisteredRoute; args: Record<string, unknown> } | null {
+  const matches = mappings.flatMap((mapping) => routes
+    .filter((route) => route.exposedTool === mapping.tool &&
+      compatibleMapping(route.inputSchema, mapping.args) && validArgs(route, mapping.args))
+    .map((route) => ({ route, args: mapping.args })));
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function compatibleMapping(schema: Record<string, unknown>, args: Record<string, unknown>): boolean {
+  if (schema.type !== 'object' || schema.properties === null || typeof schema.properties !== 'object' ||
+    Array.isArray(schema.properties) || !Array.isArray(schema.required)) return false;
+  const properties = schema.properties as Record<string, unknown>;
+  const required = new Set(schema.required.filter((item): item is string => typeof item === 'string'));
+  for (const [key, value] of Object.entries(args)) {
+    const property = properties[key];
+    if (!required.has(key) || property === null || typeof property !== 'object' || Array.isArray(property)) return false;
+    const shape = property as Record<string, unknown>;
+    if (typeof value === 'string' && shape.type !== 'string') return false;
+    if (typeof value === 'number' && shape.type !== 'number' && shape.type !== 'integer') return false;
+    if (key === 'method' && shape.const !== value &&
+      (!Array.isArray(shape.enum) || !shape.enum.includes(value))) return false;
+  }
+  return true;
+}
+
+function validArgs(route: RegisteredRoute, args: Record<string, unknown>): boolean {
+  try {
+    return new AjvJsonSchemaValidator()
+      .getValidator<Record<string, unknown>>(route.inputSchema as never)(args).valid;
+  } catch {
+    return false;
   }
 }
 

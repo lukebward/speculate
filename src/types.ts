@@ -6,6 +6,7 @@
  * meet here.
  */
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
+import type { AgentKind, SignalKind } from './observerTypes.js';
 
 // ---------------------------------------------------------------------------
 // Speculation policy (DESIGN.md §4)
@@ -65,6 +66,20 @@ export interface Prediction {
    */
   horizon?: 'next' | 'standing';
   executionLease?: ExecutionLease;
+  observerAttribution?: ObserverAttribution;
+}
+
+export interface ObserverAttribution {
+  client: AgentKind;
+  source: SignalKind;
+  routeId: string;
+  generation: number;
+  candidateCreatedAt: number;
+}
+
+export interface ObserverIssue extends ObserverAttribution {
+  issueId: string;
+  specDispatchAt: number;
 }
 
 export interface ExecutionLease {
@@ -111,6 +126,7 @@ export interface CacheEntryMeta {
   issuedAt: number;
   /** Upstream latency of the speculative call (set once resolved). */
   upstreamLatencyMs?: number;
+  observerIssue?: ObserverIssue;
 }
 
 export type CacheLookup =
@@ -195,6 +211,30 @@ export interface DecisionEvent {
   /** For candidate_evaluated: whether admission returned this candidate. */
   admitted?: boolean;
   timestamp?: number;
+  observerAttribution?: ObserverAttribution;
+  observerIssue?: ObserverIssue;
+  realDemandAt?: number;
+}
+
+export type ObserverSuppression =
+  | 'dedup'
+  | 'feedback'
+  | 'low-utility'
+  | 'per-trigger-cap'
+  | 'stale-generation'
+  | 'queue-expired'
+  | 'session-end'
+  | 'other';
+
+export interface ObserverLifecycleEvent {
+  type: 'suppressed' | 'speculated' | 'hit' | 'joined' | 'expired' | 'invalidated' | 'abandoned' | 'spec_error';
+  timestamp: number;
+  ruleId: string;
+  observerAttribution: ObserverAttribution;
+  issueId?: string;
+  specDispatchAt?: number;
+  realDemandAt?: number;
+  suppression?: ObserverSuppression;
 }
 
 export interface RuleStats {

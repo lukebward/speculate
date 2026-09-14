@@ -327,7 +327,8 @@ describe('Predictor.observe', () => {
       ['X', 0.8, 'r-two'],
     ]);
     expect(metrics.events.filter((e) => e.type === 'predicted')).toHaveLength(2);
-    expect(metrics.events.filter((e) => e.type === 'suppressed')).toHaveLength(0);
+    expect(metrics.events.filter((e) => e.type === 'suppressed').map((event) => [event.ruleId, event.reason]))
+      .toEqual([['r-one', 'dedup'], ['r-two', 'dedup']]);
   });
 
   it('ranks by confidence × effectiveness and applies the per-trigger cap', () => {

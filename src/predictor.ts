@@ -94,6 +94,7 @@ export interface ResolvedCandidate {
   expectedLatencyMs?: number;
   candidateId: string;
   ruleId: string;
+  observerAttribution?: import('./types.js').ObserverAttribution;
 }
 
 export class Predictor {
@@ -264,7 +265,14 @@ export class Predictor {
       const key = dedupeKey(cand.prediction, cand.order);
       if (!key.startsWith('\x00unkeyable:')) cand.prediction.key = key;
       const existing = byKey.get(key);
-      if (!existing || cand.score > existing.score) byKey.set(key, cand);
+      if (!existing) {
+        byKey.set(key, cand);
+      } else if (cand.score > existing.score) {
+        this.recordSuppressed(existing.prediction, 'dedup', timestamp);
+        byKey.set(key, cand);
+      } else {
+        this.recordSuppressed(cand.prediction, 'dedup', timestamp);
+      }
     }
 
     const ranked = [...byKey.values()].sort(
@@ -285,29 +293,13 @@ export class Predictor {
     const useful = admission.enabled
       ? ranked.filter((candidate) => {
           if (this.utility(candidate) >= admission.minExpectedSavedMs) return true;
-          this.metrics.record({
-            type: 'suppressed',
-            server: candidate.prediction.server,
-            tool: candidate.prediction.tool,
-            ruleId: candidate.prediction.ruleId,
-            reason: 'low-utility',
-            confidence: candidate.prediction.confidence,
-            timestamp,
-          });
+          this.recordSuppressed(candidate.prediction, 'low-utility', timestamp);
           return false;
         })
       : ranked;
     const kept = useful.slice(0, this.maxPerTrigger);
     for (const cut of useful.slice(kept.length)) {
-      this.metrics.record({
-        type: 'suppressed',
-        server: cut.prediction.server,
-        tool: cut.prediction.tool,
-        ruleId: cut.prediction.ruleId,
-        reason: 'per-trigger-cap',
-        confidence: cut.prediction.confidence,
-        timestamp,
-      });
+      this.recordSuppressed(cut.prediction, 'per-trigger-cap', timestamp);
     }
 
     for (const { prediction } of kept) {
@@ -318,6 +310,7 @@ export class Predictor {
         ruleId: prediction.ruleId,
         confidence: prediction.confidence,
         timestamp,
+        observerAttribution: prediction.observerAttribution,
       });
     }
     const admitted = new Set(kept);
@@ -414,15 +407,7 @@ export class Predictor {
       feedback.speculated >= FEEDBACK_MIN_SPECULATED &&
       operational < FEEDBACK_EFFECTIVENESS_FLOOR
     ) {
-      this.metrics.record({
-        type: 'suppressed',
-        server: prediction.server,
-        tool: prediction.tool,
-        ruleId: prediction.ruleId,
-        reason: 'feedback',
-        confidence: prediction.confidence,
-        timestamp,
-      });
+      this.recordSuppressed(prediction, 'feedback', timestamp);
       return null;
     }
     return {
@@ -433,6 +418,19 @@ export class Predictor {
         : prediction.confidence * operational,
       order,
     };
+  }
+
+  private recordSuppressed(prediction: Prediction, reason: string, timestamp?: number): void {
+    this.metrics.record({
+      type: 'suppressed',
+      server: prediction.server,
+      tool: prediction.tool,
+      ruleId: prediction.ruleId,
+      reason,
+      confidence: prediction.confidence,
+      timestamp,
+      observerAttribution: prediction.observerAttribution,
+    });
   }
 }
 
@@ -543,6 +541,7 @@ function validatePrediction(
     args?: unknown;
     confidence?: unknown;
     expectedLatencyMs?: unknown;
+    observerAttribution?: unknown;
   };
   if (typeof p.tool !== 'string' || p.tool.length === 0) return null;
   if (typeof p.args !== 'object' || p.args === null || Array.isArray(p.args)) return null;
@@ -561,7 +560,26 @@ function validatePrediction(
     // Timing follows the entrypoint: trigger batches predict the next
     // call; only session-start predictions may outlive the next real call.
     horizon,
+    ...(validObserverAttribution(p.observerAttribution)
+      ? { observerAttribution: {
+          client: p.observerAttribution.client,
+          source: p.observerAttribution.source,
+          routeId: p.observerAttribution.routeId,
+          generation: p.observerAttribution.generation,
+          candidateCreatedAt: p.observerAttribution.candidateCreatedAt,
+        } }
+      : {}),
   };
+}
+
+function validObserverAttribution(value: unknown): value is import('./types.js').ObserverAttribution {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Partial<import('./types.js').ObserverAttribution>;
+  return (item.client === 'claude' || item.client === 'codex') &&
+    (item.source === 'intent' || item.source === 'transition' || item.source === 'stream') &&
+    typeof item.routeId === 'string' && item.routeId.length > 0 &&
+    typeof item.generation === 'number' && Number.isInteger(item.generation) && item.generation > 0 &&
+    typeof item.candidateCreatedAt === 'number' && Number.isFinite(item.candidateCreatedAt) && item.candidateCreatedAt >= 0;
 }
 
 /** Canonical key for in-batch dedupe; degrades rather than throws. */
