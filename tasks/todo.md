@@ -144,7 +144,7 @@ covers the CLI daemon).
 - [x] Set up isolated worktree and Sol workers
 - [x] Task 1: Compatibility fixtures/baseline (Sol review approved; native account routing spike passed both)
 - [x] Task 2: Live route bridge and candidate ingress (Sol review approved after permission/state corrections)
-- [ ] Task 3: Session cross-server learner
+- [x] Task 3: Session cross-server learner (Sol review approved after retained-state/close corrections)
 - [ ] Task 4: Claude transparent model transport
 - [ ] Task 5: Codex Responses and WebSocket transport
 - [ ] Task 6: Intent and completed-stream prediction

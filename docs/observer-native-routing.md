@@ -39,7 +39,7 @@ Observed traffic:
 
 1. Two authenticated `GET /backend-api/codex/models?client_version=0.154.0` requests -> `200` for both.
 2. Codex selected WebSocket itself and requested `GET /backend-api/codex/responses` -> `101 Switching Protocols`.
-3. Codex completed over the tunneled WebSocket and exited `0`, without timeout or signal.
+3. Codex exited `0`, without timeout or signal. The scratch harness discarded output and did not independently assert a completed model response.
 
 Observed model-discovery request header names:
 
@@ -53,7 +53,7 @@ Observed upgrade response header names:
 
 `cf-cache-status`, `cf-ray`, `connection`, `cross-origin-opener-policy`, `date`, `nel`, `referrer-policy`, `report-to`, `sec-websocket-accept`, `sec-websocket-extensions`, `server`, `set-cookie`, `strict-transport-security`, `upgrade`, `x-content-type-options`, `x-models-etag`, `x-openai-proxy-wasm`.
 
-Conclusion: for the built-in OpenAI provider under a native ChatGPT account, a session-only `openai_base_url` override routes model discovery and the client-selected Responses WebSocket through loopback while retaining native account headers and model/provider selection. Production proxy mode must support `/models` plus WebSocket upgrade and bidirectional frames; forcing HTTP would break native transport parity.
+Conclusion: for the built-in OpenAI provider under a native ChatGPT account, a session-only `openai_base_url` override routes model discovery and the client-selected Responses WebSocket through loopback while retaining native account headers and model/provider selection. This establishes routing and authentication feasibility. Codex can exit successfully without a model response, so production smoke tests must separately assert a terminal response and expected output. Production proxy mode must support `/models` plus WebSocket upgrade and bidirectional message payloads; forcing HTTP would break native transport parity.
 
 ## Launcher implications
 
