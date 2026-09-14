@@ -93,7 +93,7 @@ Therefore:
 - Codex 0.154.0 does not send this MCP tool as a flat Responses function definition on the initial request, despite having already fetched the MCP tool list.
 - The first model-visible callable is the custom `functions.exec` tool inside the `functions` namespace. The per-MCP alias/schema is deferred behind that runtime.
 - It is a supported inference from the `exec` contract that this route's runtime identifier is `tools.mcp__shape_probe__lookup`. This probe did not fabricate a model response or execute a tool, so the exact emitted `functions.exec` argument text for a real MCP invocation remains unverified.
-- Task 4/5 fixtures should represent the observed namespace/custom-tool envelope. A flat Codex `mcp__alias__tool` tool-call fixture is not representative of the initial native model request. Any deterministic extraction of calls from `functions.exec` code needs a separate captured call fixture before being treated as complete.
+- Task 4/5 fixtures should represent the observed namespace/custom-tool envelope. A flat Codex `mcp__alias__tool` tool-call fixture is not representative of the initial native model request. Opaque `functions.exec` code remains observation-only and is never evaluated or prefetched.
 
 Codex made one authenticated `GET /models`, then three WebSocket upgrades to `GET /responses` after the fake closed each request without a response. Model-discovery header names were `accept`, `authorization`, `chatgpt-account-id`, `host`, `originator`, `user-agent`, `version`. WebSocket header names were `authorization`, `chatgpt-account-id`, `connection`, `host`, `openai-beta`, `originator`, `sec-websocket-extensions`, `sec-websocket-key`, `sec-websocket-version`, `session-id`, `thread-id`, `upgrade`, `user-agent`, `version`, `x-client-request-id`, `x-codex-beta-features`, `x-codex-routing-hint`, `x-codex-turn-metadata`, `x-codex-window-id`.
 
@@ -107,4 +107,19 @@ type NativeObservedTool =
   | { client: 'codex'; namespace: 'functions'; customTool: 'exec'; deferred: true };
 ```
 
-Claude can map the model request name directly to `(alias, tool)`. Codex must retain wrapper/bridge route identity separately and must not claim that a flat name was observed in the first provider request. The model relay can observe `functions.exec`; proving a particular nested MCP call requires a verified, bounded parser for the custom-tool payload or a later native fixture that captures the deferred resolution/call boundary.
+Claude can map the model request name directly to `(alias, tool)`. Codex must retain wrapper/bridge route identity separately and must not claim that a flat name was observed in the first provider request. The model relay can observe `functions.exec` context and boundaries while abstaining from extracting executable calls. Prompt and transition prediction can use the live MCP registry independently; direct stream prediction requires a visible, complete structured tool call with a verified route and schema.
+
+## Claude temporary alias ownership
+
+A separate isolated Claude 2.1.268 startup probe verified `claude --print --mcp-config=<path>` without `--strict-mcp-config`. Synthetic inherited user configuration and temporary launch configuration both defined `dup_alias`; each also defined a distinct alias.
+
+| Definition | Initialized and listed | Advertised to provider |
+| --- | --- | --- |
+| Inherited `dup_alias` | No | No |
+| Temporary `dup_alias` | Yes | Yes |
+| Distinct inherited alias | Yes | Yes |
+| Distinct temporary alias | Yes | Yes |
+
+The temporary duplicate therefore owns the launch route while unrelated inherited aliases remain present. The fake provider returned HTTP 400 after recording only synthetic tool names; no model inference occurred. The probe used temporary configuration, a synthetic API sentinel, and loopback endpoints, then removed its scratch files. This verifies registration precedence, not tool preauthorization or every plugin/connector source.
+
+`claude mcp list` did not apply the launch table and was unsuitable for this check. The actual `--print` startup provided the evidence above.
