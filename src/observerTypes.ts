@@ -133,8 +133,21 @@ export interface AgentAdapterRequestObserver {
   abort(): void;
 }
 
+export interface WebSocketMessage {
+  data: Uint8Array;
+  binary: boolean;
+}
+
+export interface AgentAdapterWebSocketObserver {
+  observeResponseStart(response: AgentAdapterResponse): readonly Observation[];
+  observeClientMessage(message: WebSocketMessage): readonly Observation[];
+  observeServerMessage(message: WebSocketMessage): readonly Observation[];
+  abort(): void;
+}
+
 export interface AgentAdapterConnection {
   startRequest(request: AgentAdapterRequest): AgentAdapterRequestObserver | null;
+  startWebSocket?(request: AgentAdapterRequest): AgentAdapterWebSocketObserver | null;
   close(): void;
 }
 

@@ -44,11 +44,13 @@
   "homepage": "https://github.com/lukebward/speculate#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "ws": "8.21.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",
     "@types/node": "^26.1.1",
+    "@types/ws": "8.18.1",
     "tsx": "^4.23.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"

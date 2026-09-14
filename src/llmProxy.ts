@@ -8,12 +8,15 @@ import {
 } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { Socket } from 'node:net';
+import type { Duplex } from 'node:stream';
+import WebSocket, { WebSocketServer } from 'ws';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
   type AgentAdapter,
   type AgentAdapterConnection,
   type AgentAdapterRequestObserver,
+  type AgentAdapterWebSocketObserver,
   type LlmHeaders,
   type Observation,
 } from './observerTypes.js';
@@ -31,6 +34,14 @@ const ALWAYS_HOP_BY_HOP = new Set([
   'trailer',
   'transfer-encoding',
   'upgrade',
+]);
+const WEBSOCKET_HANDSHAKE_HEADERS = new Set([
+  'host',
+  'sec-websocket-accept',
+  'sec-websocket-extensions',
+  'sec-websocket-key',
+  'sec-websocket-protocol',
+  'sec-websocket-version',
 ]);
 
 export interface LlmProxy {
@@ -64,6 +75,8 @@ interface ConnectionState {
   adapter: AgentAdapterConnection | null;
   closed: boolean;
   socketClosed: boolean;
+  webSocket: boolean;
+  webSocketFinished: boolean;
   pendingObservationJobs: number;
   partialRequests: Set<() => void>;
 }
@@ -186,6 +199,44 @@ function forwardHeaders(rawHeaders: readonly string[], parsedHeaders: IncomingHt
   return out;
 }
 
+function webSocketRequestHeaders(rawHeaders: readonly string[], parsedHeaders: IncomingHttpHeaders, upstreamHost: string): Record<string, string> {
+  const removed = connectionTokens(parsedHeaders);
+  const out: Record<string, string> = {};
+  for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
+    const name = rawHeaders[index]!;
+    const lower = name.toLowerCase();
+    if (ALWAYS_HOP_BY_HOP.has(lower) || WEBSOCKET_HANDSHAKE_HEADERS.has(lower) || removed.has(lower)) continue;
+    const value = rawHeaders[index + 1]!;
+    out[name] = out[name] === undefined ? value : `${out[name]}, ${value}`;
+  }
+  out.Host = upstreamHost;
+  return out;
+}
+
+function webSocketProtocols(headers: IncomingHttpHeaders): string[] {
+  const value = headers['sec-websocket-protocol'];
+  const joined = Array.isArray(value) ? value.join(',') : value ?? '';
+  return joined.split(',').map((protocol) => protocol.trim()).filter(Boolean);
+}
+
+function providerUpgradeHeaders(response: IncomingMessage): string[] {
+  const removed = connectionTokens(response.headers);
+  const out: string[] = [];
+  for (let index = 0; index + 1 < response.rawHeaders.length; index += 2) {
+    const name = response.rawHeaders[index]!;
+    const lower = name.toLowerCase();
+    if (ALWAYS_HOP_BY_HOP.has(lower) || WEBSOCKET_HANDSHAKE_HEADERS.has(lower) || removed.has(lower)) continue;
+    out.push(`${name}: ${response.rawHeaders[index + 1]!}`);
+  }
+  return out;
+}
+
+function rawData(data: WebSocket.RawData): Buffer {
+  if (Buffer.isBuffer(data)) return Buffer.from(data);
+  if (Array.isArray(data)) return Buffer.concat(data);
+  return Buffer.from(data);
+}
+
 function normalizedHeaders(headers: IncomingHttpHeaders): LlmHeaders {
   return Object.fromEntries(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]));
 }
@@ -209,7 +260,21 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
   const observations = new ObservationQueue(options.onObservation);
   const sockets = new Set<Socket>();
   const upstreamRequests = new Set<ClientRequest>();
-  const connections = new Map<Socket, ConnectionState>();
+  const webSockets = new Set<WebSocket>();
+  const connections = new Map<Duplex, ConnectionState>();
+  const selectedProtocols = new WeakMap<IncomingMessage, string>();
+  const upgradeHeaders = new WeakMap<IncomingMessage, string[]>();
+  const webSocketServer = new WebSocketServer({
+    noServer: true,
+    allowSynchronousEvents: false,
+    autoPong: false,
+    clientTracking: false,
+    perMessageDeflate: true,
+    handleProtocols(_protocols, request) {
+      return selectedProtocols.get(request) ?? false;
+    },
+  });
+  webSocketServer.on('headers', (headers, request) => headers.push(...(upgradeHeaders.get(request) ?? [])));
 
   const server = createServer((request, response) => {
     const path = upstreamPath(upstream, request.url ?? '/');
@@ -244,6 +309,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       adapter: connection,
       closed: false,
       socketClosed: false,
+      webSocket: false,
+      webSocketFinished: false,
       pendingObservationJobs: 0,
       partialRequests: new Set(),
     };
@@ -252,16 +319,38 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       sockets.delete(socket);
       connections.delete(socket);
       state.socketClosed = true;
-      for (const abort of state.partialRequests) abort();
-      state.partialRequests.clear();
-      closeConnection(state);
+      if (!state.webSocket) {
+        for (const abort of state.partialRequests) abort();
+        state.partialRequests.clear();
+        closeConnection(state);
+      } else if (state.webSocketFinished) closeConnection(state);
     });
   });
   server.on('connect', (_request, socket) => {
     socket.end('HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n');
   });
-  server.on('upgrade', (_request, socket) => {
-    socket.end('HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n\r\n');
+  server.on('upgrade', (request, socket, head) => {
+    const path = upstreamPath(upstream, request.url ?? '/');
+    if (path === null) {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      return;
+    }
+    const state = connections.get(socket) ?? null;
+    if (state) state.webSocket = true;
+    relayWebSocket({
+      request,
+      socket,
+      head,
+      upstream,
+      path,
+      state,
+      observations,
+      onObservation: options.onObservation !== undefined,
+      webSocketServer,
+      selectedProtocols,
+      upgradeHeaders,
+      webSockets,
+    });
   });
   server.on('clientError', (_error, socket) => {
     if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
@@ -293,6 +382,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       if (closePromise) return closePromise;
       observations.close();
       for (const request of upstreamRequests) request.destroy();
+      for (const webSocket of webSockets) webSocket.terminate();
+      webSockets.clear();
       for (const connection of connections.values()) closeConnection(connection, true);
       connections.clear();
       for (const socket of sockets) socket.destroy();
@@ -453,4 +544,316 @@ function relayRequest(input: {
     upstreamRequest.destroy();
     upstreamResponse?.destroy();
   });
+}
+
+function relayWebSocket(input: {
+  request: IncomingMessage;
+  socket: Duplex;
+  head: Buffer;
+  upstream: URL;
+  path: string;
+  state: ConnectionState | null;
+  observations: ObservationQueue;
+  onObservation: boolean;
+  webSocketServer: WebSocketServer;
+  selectedProtocols: WeakMap<IncomingMessage, string>;
+  upgradeHeaders: WeakMap<IncomingMessage, string[]>;
+  webSockets: Set<WebSocket>;
+}): void {
+  const {
+    request,
+    socket,
+    head,
+    upstream,
+    state,
+    observations,
+    webSocketServer,
+    selectedProtocols,
+    upgradeHeaders,
+    webSockets,
+  } = input;
+  let observer: AgentAdapterWebSocketObserver | null = null;
+  if (input.onObservation && state?.adapter?.startWebSocket) {
+    try {
+      observer = state.adapter.startWebSocket({
+        transport: 'websocket',
+        method: request.method ?? 'GET',
+        path: request.url ?? '/',
+        headers: normalizedHeaders(request.headers),
+      });
+    } catch {}
+  }
+  let observationActive = observer !== null;
+  let observationFinished = false;
+  let transportFinished = false;
+
+  const abortObservation = () => {
+    state?.partialRequests.delete(abortObservation);
+    if (!observationActive) return;
+    observationActive = false;
+    try {
+      observer?.abort();
+    } catch {}
+  };
+
+  const enqueue = (bytes: number, run: () => readonly Observation[]): boolean => {
+    if (!observationActive || bytes > MAX_OBSERVATION_BYTES) return false;
+    if (state) state.pendingObservationJobs++;
+    const accepted = observations.push({
+      bytes,
+      run() {
+        try {
+          return observationActive ? run() : [];
+        } finally {
+          if (state) releaseConnectionJob(state);
+        }
+      },
+    });
+    if (accepted) return true;
+    if (state) releaseConnectionJob(state);
+    abortObservation();
+    return false;
+  };
+
+  const finishObservation = () => {
+    if (observationFinished) return;
+    observationFinished = true;
+    state?.partialRequests.delete(abortObservation);
+    if (!observationActive) return;
+    if (state) state.pendingObservationJobs++;
+    const accepted = observations.push({
+      bytes: 0,
+      run() {
+        try {
+          if (observationActive) {
+            observationActive = false;
+            observer?.abort();
+          }
+          return [];
+        } finally {
+          if (state) releaseConnectionJob(state);
+        }
+      },
+    });
+    if (!accepted) {
+      if (state) releaseConnectionJob(state);
+      abortObservation();
+    }
+  };
+
+  const finishTransport = (drainObservation: boolean) => {
+    if (transportFinished) return;
+    transportFinished = true;
+    if (drainObservation) finishObservation();
+    else abortObservation();
+    if (state) {
+      state.webSocketFinished = true;
+      if (state.socketClosed) closeConnection(state);
+    }
+  };
+
+  if (observationActive) state?.partialRequests.add(abortObservation);
+
+  const wsUrl = new URL(upstream.toString());
+  wsUrl.protocol = upstream.protocol === 'https:' ? 'wss:' : 'ws:';
+  wsUrl.pathname = input.path.split('?', 1)[0] ?? '/';
+  const query = input.path.includes('?') ? input.path.slice(input.path.indexOf('?')) : '';
+  wsUrl.search = query;
+  const requestedProtocols = webSocketProtocols(request.headers);
+  let upgradeResponse: IncomingMessage | null = null;
+  let downstream: WebSocket | null = null;
+  let failureResponse = false;
+  let upstreamSocket: WebSocket;
+  try {
+    upstreamSocket = new WebSocket(wsUrl, requestedProtocols, {
+      allowSynchronousEvents: false,
+      autoPong: false,
+      followRedirects: false,
+      headers: webSocketRequestHeaders(request.rawHeaders, request.headers, upstream.host),
+      perMessageDeflate: request.headers['sec-websocket-extensions']?.includes('permessage-deflate') ?? false,
+    });
+  } catch {
+    finishTransport(false);
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
+  webSockets.add(upstreamSocket);
+
+  const failBeforeUpgrade = () => {
+    if (downstream || failureResponse || socket.destroyed) return;
+    finishTransport(false);
+    socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+  };
+
+  upstreamSocket.once('upgrade', (response) => {
+    upgradeResponse = response;
+    upstreamSocket.pause();
+  });
+  upstreamSocket.once('unexpected-response', (_upstreamRequest, response) => {
+    failureResponse = true;
+    finishTransport(false);
+    relayUpgradeFailure(socket, response, () => {
+      webSockets.delete(upstreamSocket);
+      upstreamSocket.terminate();
+    });
+  });
+  upstreamSocket.once('open', () => {
+    if (!upgradeResponse || socket.destroyed) {
+      upstreamSocket.terminate();
+      failBeforeUpgrade();
+      return;
+    }
+    if (upstreamSocket.protocol) selectedProtocols.set(request, upstreamSocket.protocol);
+    upgradeHeaders.set(request, providerUpgradeHeaders(upgradeResponse));
+    try {
+      webSocketServer.handleUpgrade(request, socket, head, (accepted) => {
+        downstream = accepted;
+        webSockets.add(accepted);
+        accepted.once('close', () => webSockets.delete(accepted));
+        enqueue(0, () => observer!.observeResponseStart({
+          status: 101,
+          headers: normalizedHeaders(upgradeResponse!.headers),
+        }));
+        bridgeWebSockets(accepted, upstreamSocket, {
+          clientMessage(message) {
+            if (message.data.byteLength <= MAX_OBSERVATION_BYTES) {
+              enqueue(message.data.byteLength, () => observer!.observeClientMessage(message));
+            } else abortObservation();
+          },
+          serverMessage(message) {
+            if (message.data.byteLength <= MAX_OBSERVATION_BYTES) {
+              enqueue(message.data.byteLength, () => observer!.observeServerMessage(message));
+            } else abortObservation();
+          },
+          error() {
+            finishTransport(false);
+          },
+          close() {
+            finishTransport(true);
+          },
+        });
+        upstreamSocket.resume();
+      });
+    } catch {
+      upstreamSocket.terminate();
+      failBeforeUpgrade();
+    }
+  });
+  upstreamSocket.once('error', () => {
+    if (!downstream) failBeforeUpgrade();
+  });
+  upstreamSocket.once('close', () => webSockets.delete(upstreamSocket));
+  socket.once('close', () => {
+    if (!downstream) {
+      upstreamSocket.terminate();
+      finishTransport(false);
+    }
+  });
+}
+
+function relayUpgradeFailure(socket: Duplex, response: IncomingMessage, finished: () => void): void {
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    finished();
+  };
+  const status = response.statusCode ?? 502;
+  const message = response.statusMessage ?? '';
+  const headers = forwardHeaders(response.rawHeaders, response.headers)
+    .reduce<string[]>((lines, value, index, values) => index % 2 === 0 ? [...lines, `${value}: ${values[index + 1] ?? ''}`] : lines, []);
+  socket.write([`HTTP/1.1 ${status}${message ? ` ${message}` : ''}`, ...headers, 'Connection: close', '', ''].join('\r\n'));
+  response.on('data', (chunk: Buffer) => {
+    if (!socket.write(chunk)) {
+      response.pause();
+      socket.once('drain', () => response.resume());
+    }
+  });
+  response.once('end', () => {
+    settle();
+    socket.end();
+  });
+  response.once('aborted', () => {
+    settle();
+    socket.destroy();
+  });
+  response.once('error', () => {
+    settle();
+    socket.destroy();
+  });
+  socket.once('close', () => response.destroy());
+}
+
+function bridgeWebSockets(
+  client: WebSocket,
+  provider: WebSocket,
+  lifecycle: {
+    clientMessage(message: { data: Uint8Array; binary: boolean }): void;
+    serverMessage(message: { data: Uint8Array; binary: boolean }): void;
+    error(): void;
+    close(): void;
+  },
+): void {
+  let closed = false;
+  let errors = false;
+
+  const fail = () => {
+    errors = true;
+    client.terminate();
+    provider.terminate();
+    lifecycle.error();
+  };
+
+  const relay = (source: WebSocket, target: WebSocket, observe: (message: { data: Uint8Array; binary: boolean }) => void) => {
+    source.on('message', (value, binary) => {
+      const data = rawData(value);
+      observe({ data, binary });
+      if (target.readyState !== WebSocket.OPEN) return;
+      source.pause();
+      target.send(data, { binary }, (error) => {
+        if (error) {
+          fail();
+          return;
+        }
+        source.resume();
+      });
+    });
+    source.on('ping', (data) => {
+      if (target.readyState === WebSocket.OPEN) target.ping(data, undefined, (error) => {
+        if (error) fail();
+      });
+    });
+    source.on('pong', (data) => {
+      if (target.readyState === WebSocket.OPEN) target.pong(data, undefined, (error) => {
+        if (error) fail();
+      });
+    });
+  };
+
+  const closePeer = (source: WebSocket, target: WebSocket, code: number, reason: Buffer) => {
+    if (target.readyState === WebSocket.OPEN) {
+      if (code === 1006) target.terminate();
+      else if (code === 1005) target.close();
+      else target.close(code, reason);
+    } else if (target.readyState === WebSocket.CONNECTING) target.terminate();
+    if (!closed) {
+      closed = true;
+      if (errors || code === 1006) lifecycle.error();
+      else lifecycle.close();
+    }
+    source.removeAllListeners('message');
+  };
+
+  relay(client, provider, lifecycle.clientMessage);
+  relay(provider, client, lifecycle.serverMessage);
+  client.once('error', () => {
+    errors = true;
+    provider.terminate();
+  });
+  provider.once('error', () => {
+    errors = true;
+    client.terminate();
+  });
+  client.once('close', (code, reason) => closePeer(client, provider, code, reason));
+  provider.once('close', (code, reason) => closePeer(provider, client, code, reason));
 }
