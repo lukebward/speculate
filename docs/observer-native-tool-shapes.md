@@ -138,3 +138,12 @@ A separate Codex 0.154.0 native-account invocation through the production relay 
 The completed-response to linked-continuation window enclosed the entire MCP call. One verified thread and the response chain supplied context; no `stream_id` appeared. Native CLI MCP lifecycle events bracketed the local call within 1–2 ms. Provider events alone exposed neither the nested route nor its actual execution interval.
 
 This establishes an ordinary execution window, not safe correlation for arbitrary parallel or subagent activity. Production correlation still requires wrapper-authoritative route, arguments, and timing, full interval containment, and unambiguous context tracking. Missing boundaries or overlapping possible contexts must abstain. The probe did not inspect or retain the opaque program, prompts, arguments, results, credentials, or response text; only the final equality check and sanitized lifecycle evidence were retained.
+
+A subsequent single native invocation verified parent/subagent concurrency. It completed in 34.084 seconds with the expected final output and completed turn. The child inherited the relay override and temporary MCP configuration, appearing on a distinct thread and starting a separate MCP instance. Two synthetic seven-second reads overlapped for 5.034 seconds:
+
+| Context | Completed-response to continuation window | Actual MCP interval |
+| --- | --- | --- |
+| Parent thread | 19,637–26,915 ms | 19,880–26,883 ms |
+| Child thread | 21,818–28,939 ms | 21,849–28,851 ms |
+
+Each complete interval fitted only its own window. Overlap alone therefore need not prevent attribution; two containing windows or incomplete tracking must. Output-item events lacked `response_id` and were associated only through the sole active response on each thread. No lane or explicit parent-child identity link appeared, so this evidence does not justify joining their histories. A close boundary arrived up to 88 ms after the local call ended; correlation may wait a bounded interval off the real response path and abstain if the boundary remains absent. Both synthetic MCP processes and scratch files were removed.
