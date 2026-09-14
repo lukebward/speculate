@@ -2,6 +2,7 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type In
 import { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket, { WebSocketServer } from 'ws';
+import { codexAdapter } from '../src/agentAdapters/codex.js';
 import { startLlmProxy, type LlmProxy } from '../src/llmProxy.js';
 import type {
   AgentAdapter,
@@ -300,6 +301,85 @@ describe('LLM WebSocket relay', () => {
     expect(received.map((body) => body.equals(initial) || body.equals(continuation) || body.equals(large))).toEqual([true, true, true]);
     expect(observedMessages).toBeLessThanOrEqual(2);
     expect(aborted).toBe(1);
+  });
+
+  it('continues the persistent transport after Codex analysis exhausts its retained-state budget', async () => {
+    const provider = await listenProvider();
+    const providerMessages: string[] = [];
+    provider.wss.on('connection', (socket) => {
+      socket.on('message', async (data) => {
+        const message = toBuffer(data).toString();
+        providerMessages.push(message);
+        const request = JSON.parse(message) as { input?: string };
+        if (request.input === 'saturate') {
+          socket.send('{"type":"response.created","stream_id":"budget","response":{"id":"budget-response"}}');
+          for (let index = 0; index < 70; index++) {
+            socket.send(JSON.stringify({
+              type: 'response.output_item.added', stream_id: 'budget', response_id: 'budget-response',
+              item: { id: `item-${index}`, type: 'function_call', call_id: `call-${index}`, name: 'mcp__workspace__read_file', arguments: '' },
+            }));
+            socket.send(JSON.stringify({
+              type: 'response.function_call_arguments.delta', stream_id: 'budget', response_id: 'budget-response',
+              item_id: `item-${index}`, delta: 'x'.repeat(64 * 1024),
+            }));
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
+          socket.send('{"type":"provider.marker","value":"budget-forwarded"}');
+        } else {
+          socket.send('{"type":"response.created","stream_id":"continued","response":{"id":"continued-response"}}');
+          socket.send('{"type":"response.output_item.done","stream_id":"continued","response_id":"continued-response","item":{"type":"function_call","call_id":"continued-call","name":"mcp__workspace__read_file","arguments":"{\\"path\\":\\"/work/continued\\"}"}}');
+          socket.send('{"type":"response.completed","stream_id":"continued","response":{"id":"continued-response","status":"completed"}}');
+          socket.send('{"type":"provider.marker","value":"continuation-forwarded"}');
+        }
+      });
+    });
+    const observations: Observation[] = [];
+    const inputSchema = {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+    };
+    const adapter = codexAdapter({
+      contextForConversation: (conversationId) => conversationId === 'thread-budget'
+        ? { launchId: 'launch', conversationId, agent: 'codex', cwd: '/work' }
+        : null,
+      routes: () => [{
+        routeId: 'workspace-read', generation: 1, instanceId: 'workspace-owner', hostClient: 'codex',
+        hostServerAlias: 'workspace', exposedTool: 'read_file', upstreamServer: 'upstream', upstreamTool: 'read_file', inputSchema,
+      }],
+    });
+    const proxy = await startLlmProxy({
+      upstreamBaseUrl: provider.baseUrl,
+      adapter,
+      onObservation: (observation) => { observations.push(observation); },
+    });
+    proxies.push(proxy);
+    const client = await openClient(`${proxy.baseUrl.replace(/^http/, 'ws')}/responses`, [], { 'thread-id': 'thread-budget' });
+    const serverMessages: string[] = [];
+    client.on('message', (data) => serverMessages.push(toBuffer(data).toString()));
+    const tool = { type: 'function', name: 'mcp__workspace__read_file', parameters: inputSchema };
+
+    client.send(JSON.stringify({ type: 'response.create', stream_id: 'budget', input: 'saturate', tools: [tool] }));
+    let deadline = Date.now() + 2_000;
+    while (!serverMessages.some((message) => message.includes('budget-forwarded')) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    client.send(JSON.stringify({
+      type: 'response.create', stream_id: 'continued', previous_response_id: 'budget-response', input: 'continue', tools: [tool],
+    }));
+    deadline = Date.now() + 2_000;
+    while ((!serverMessages.some((message) => message.includes('continuation-forwarded')) ||
+      !observations.some((observation) => observation.kind === 'stream-call' && observation.callId === 'continued-call')) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    expect(provider.connections).toHaveLength(1);
+    expect(providerMessages).toHaveLength(2);
+    expect(serverMessages.some((message) => message.includes('budget-forwarded'))).toBe(true);
+    expect(serverMessages.some((message) => message.includes('continuation-forwarded'))).toBe(true);
+    expect(observations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'stream-call', routeId: 'workspace-read', callId: 'continued-call' }),
+    ]));
   });
 
   it('preserves message order and completeness while the provider reader is paused', async () => {

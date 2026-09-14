@@ -340,6 +340,144 @@ describe('Codex Responses adapter', () => {
     ]);
   });
 
+  it('reclaims every non-success terminal response before observing later continuations', () => {
+    const ws = webSocketObserver();
+    for (let index = 0; index < 68; index++) {
+      const lane = `failed-lane-${index}`;
+      const responseId = `failed-response-${index}`;
+      ws.observeClientMessage({ data: Buffer.from(JSON.stringify({
+        type: 'response.create', stream_id: lane, input: `attempt ${index}`,
+        tools: [functionTool('mcp__workspace__read_file', routes[0]!.inputSchema)],
+      })), binary: false });
+      if (index % 2 === 0) {
+        ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+          type: 'response.created', stream_id: lane, response: { id: responseId },
+        })), binary: false });
+        ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+          type: 'response.output_item.added', stream_id: lane, response_id: responseId,
+          item: { id: `failed-item-${index}`, type: 'function_call', call_id: `failed-call-${index}`, name: 'mcp__workspace__read_file', arguments: '' },
+        })), binary: false });
+        ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+          type: 'response.function_call_arguments.delta', stream_id: lane, response_id: responseId,
+          item_id: `failed-item-${index}`, delta: '{"path":"partial',
+        })), binary: false });
+      }
+      const terminal = [
+        { type: 'response.failed', stream_id: lane, response: { id: responseId } },
+        { type: 'response.incomplete', stream_id: lane, response: { id: responseId } },
+        { type: 'response.cancelled', stream_id: lane, response_id: responseId },
+        { type: 'error', stream_id: lane, response_id: responseId, error: { message: 'synthetic' } },
+      ][index % 4]!;
+      expect(ws.observeServerMessage({ data: Buffer.from(JSON.stringify(terminal)), binary: false })).toEqual([]);
+    }
+
+    ws.observeClientMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.create', stream_id: 'failed-continuation', previous_response_id: 'failed-response-0', input: [],
+    })), binary: false });
+    ws.observeServerMessage({ data: Buffer.from('{"type":"response.created","stream_id":"failed-continuation","response":{"id":"failed-context-probe"}}'), binary: false });
+    expect(ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', stream_id: 'failed-continuation', response_id: 'failed-context-probe',
+      item: { type: 'function_call', call_id: 'failed-context-call', name: 'mcp__workspace__read_file', arguments: '{"path":"/work/rejected"}' },
+    })), binary: false })).toEqual([]);
+    ws.observeServerMessage({ data: Buffer.from('{"type":"response.completed","stream_id":"failed-continuation","response":{"id":"failed-context-probe"}}'), binary: false });
+
+    const lane = 'valid-after-failures';
+    ws.observeClientMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.create', stream_id: lane, input: 'read valid',
+      tools: [functionTool('mcp__workspace__read_file', routes[0]!.inputSchema)],
+    })), binary: false });
+    ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.created', stream_id: lane, response: { id: 'valid-response' },
+    })), binary: false });
+    expect(ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', stream_id: lane, response_id: 'valid-response',
+      item: { type: 'function_call', call_id: 'valid-call', name: 'mcp__workspace__read_file', arguments: '{"path":"/work/valid"}' },
+    })), binary: false })).toEqual([
+      expect.objectContaining({ kind: 'stream-call', routeId: 'workspace-read', callId: 'valid-call' }),
+    ]);
+    ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.completed', stream_id: lane, response: { id: 'valid-response' },
+    })), binary: false });
+
+    ws.observeClientMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.create', stream_id: 'valid-continuation', previous_response_id: 'valid-response', input: [],
+    })), binary: false });
+    ws.observeServerMessage({ data: Buffer.from('{"type":"response.created","stream_id":"valid-continuation","response":{"id":"continued-response"}}'), binary: false });
+    expect(ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', stream_id: 'valid-continuation', response_id: 'continued-response',
+      item: { type: 'function_call', call_id: 'continued-call', name: 'mcp__workspace__read_file', arguments: '{"path":"/work/continued"}' },
+    })), binary: false })).toEqual([
+      expect.objectContaining({ kind: 'stream-call', routeId: 'workspace-read', callId: 'continued-call' }),
+    ]);
+  });
+
+  it('drops analysis at the aggregate byte budget and releases it for a fresh socket observer', () => {
+    const conn = connection();
+    const ws = webSocketObserver(conn);
+    ws.observeClientMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.create', stream_id: 'budget-lane', input: 'read many',
+      tools: [functionTool('mcp__workspace__read_file', routes[0]!.inputSchema)],
+    })), binary: false });
+    ws.observeServerMessage({ data: Buffer.from('{"type":"response.created","stream_id":"budget-lane","response":{"id":"budget-response"}}'), binary: false });
+    for (let index = 0; index < 140; index++) {
+      ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+        type: 'response.output_item.added', stream_id: 'budget-lane', response_id: 'budget-response',
+        item: { id: `budget-item-${index}`, type: 'function_call', call_id: `budget-call-${index}`, name: 'mcp__workspace__read_file', arguments: '' },
+      })), binary: false });
+      ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+        type: 'response.function_call_arguments.delta', stream_id: 'budget-lane', response_id: 'budget-response',
+        item_id: `budget-item-${index}`, delta: 'x'.repeat(64 * 1024),
+      })), binary: false });
+    }
+    expect(ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', stream_id: 'budget-lane', response_id: 'budget-response',
+      item: { id: 'budget-final', type: 'function_call', call_id: 'budget-final', name: 'mcp__workspace__read_file', arguments: '{"path":"/work/leaked"}' },
+    })), binary: false })).toEqual([]);
+
+    const fresh = webSocketObserver(conn);
+    fresh.observeClientMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.create', input: 'fresh',
+      tools: [functionTool('mcp__workspace__read_file', routes[0]!.inputSchema)],
+    })), binary: false });
+    fresh.observeServerMessage({ data: Buffer.from('{"type":"response.created","response":{"id":"fresh-response"}}'), binary: false });
+    expect(fresh.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', response_id: 'fresh-response',
+      item: { type: 'function_call', call_id: 'fresh-budget-call', name: 'mcp__workspace__read_file', arguments: '{"path":"/work/fresh"}' },
+    })), binary: false })).toEqual([
+      expect.objectContaining({ kind: 'stream-call', routeId: 'workspace-read', callId: 'fresh-budget-call' }),
+    ]);
+  });
+
+  it('rejects oversized call names before retention without poisoning later calls', () => {
+    const ws = webSocketObserver();
+    ws.observeClientMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.create', input: 'names',
+      tools: [functionTool('mcp__workspace__read_file', routes[0]!.inputSchema)],
+    })), binary: false });
+    ws.observeServerMessage({ data: Buffer.from('{"type":"response.created","response":{"id":"name-response"}}'), binary: false });
+    for (let index = 0; index < 256; index++) {
+      ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+        type: 'response.output_item.added', response_id: 'name-response',
+        item: { id: `name-item-${index}`, type: 'function_call', call_id: `name-call-${index}`, name: 'x'.repeat(2048), arguments: '' },
+      })), binary: false });
+    }
+
+    ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.output_item.added', response_id: 'name-response',
+      item: { id: 'bounded-item', type: 'function_call', call_id: 'bounded-name-call', name: 'mcp__workspace__read_file', arguments: '' },
+    })), binary: false });
+    ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.function_call_arguments.delta', response_id: 'name-response',
+      item_id: 'bounded-item', delta: '{"path":"/work/name"}',
+    })), binary: false });
+    expect(ws.observeServerMessage({ data: Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', response_id: 'name-response',
+      item: { id: 'bounded-item', type: 'function_call', call_id: 'bounded-name-call', name: 'mcp__workspace__read_file' },
+    })), binary: false })).toEqual([
+      expect.objectContaining({ kind: 'stream-call', routeId: 'workspace-read', callId: 'bounded-name-call' }),
+    ]);
+  });
+
   it('does not reuse response context or route generations after reconnect', () => {
     let liveRoutes: readonly RegisteredRoute[] = routes;
     const adapter = makeAdapter(() => liveRoutes);
