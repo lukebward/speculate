@@ -275,6 +275,36 @@ describe('Claude adapter', () => {
     expect(adapter.normalizeHook(postToolUse)).toEqual([]);
   });
 
+  it('rejects oversized hook identity and prompt fields before environment work', () => {
+    let contextLookups = 0;
+    let eventIds = 0;
+    const adapter = claudeAdapter({
+      contextForConversation: () => {
+        contextLookups++;
+        return context;
+      },
+      routes: () => routes,
+      eventId: () => {
+        eventIds++;
+        return 'event';
+      },
+    });
+
+    expect(adapter.normalizeHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 's'.repeat(513),
+      prompt: 'small',
+    })).toEqual([]);
+    expect(adapter.normalizeHook({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: context.conversationId,
+      prompt: 'é'.repeat(1024 * 1024 + 1),
+    })).toEqual([]);
+
+    expect(contextLookups).toBe(0);
+    expect(eventIds).toBe(0);
+  });
+
   it('discards partial state after abort and connection teardown', () => {
     const adapter = makeAdapter();
     const connection = adapter.createConnection();

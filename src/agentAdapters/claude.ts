@@ -337,6 +337,9 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
     createConnection: () => new ClaudeConnection(environment),
     normalizeHook(payload: unknown): readonly Observation[] {
       if (!object(payload) || payload.hook_event_name !== 'UserPromptSubmit' || typeof payload.session_id !== 'string' || typeof payload.prompt !== 'string') return [];
+      if (payload.session_id.length === 0 || payload.session_id.length > 512 ||
+        Buffer.byteLength(payload.session_id, 'utf8') > 512 || payload.prompt.length > MAX_OBSERVATION_BYTES ||
+        Buffer.byteLength(payload.prompt, 'utf8') > MAX_OBSERVATION_BYTES) return [];
       let context: SessionContext | null = null;
       try {
         const parsed = sessionContextSchema.safeParse(environment.contextForConversation(payload.session_id));

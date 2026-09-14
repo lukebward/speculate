@@ -1,5 +1,5 @@
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
-import { AddressInfo } from 'node:net';
+import { AddressInfo, createConnection, createServer as createNetServer, type Server as NetServer } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { startLlmProxy, type LlmProxy } from '../src/llmProxy.js';
 import type {
@@ -25,10 +25,12 @@ interface Upstream {
 
 const proxies: LlmProxy[] = [];
 const upstreams: Upstream[] = [];
+const netServers: NetServer[] = [];
 
 afterEach(async () => {
   await Promise.allSettled(proxies.splice(0).map((proxy) => proxy.close()));
   await Promise.allSettled(upstreams.splice(0).map(({ server }) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  await Promise.allSettled(netServers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
 });
 
 function prompt(id: string): Observation {
@@ -279,6 +281,48 @@ describe('LLM HTTP relay', () => {
     expect(seen).toEqual(['first', 'second', 'third']);
   });
 
+  it('drains completed observation jobs after a normal non-keep-alive response', async () => {
+    const upstream = await listen((request, response) => {
+      request.resume();
+      request.on('end', () => response.writeHead(200, { 'content-type': 'text/event-stream' }).end('complete'));
+    });
+    let connectionClosed = false;
+    const base = adapter({
+      observeResponseEnd: () => connectionClosed ? [] : [prompt('completed-before-close')],
+    });
+    const lifecycleAdapter: AgentAdapter = {
+      ...base,
+      createConnection() {
+        const connection = base.createConnection();
+        return {
+          ...connection,
+          close() {
+            connectionClosed = true;
+            connection.close();
+          },
+        };
+      },
+    };
+    const seen: string[] = [];
+    const proxy = await startLlmProxy({
+      upstreamBaseUrl: upstream.baseUrl,
+      adapter: lifecycleAdapter,
+      onObservation: (observation) => { seen.push(observation.eventId); },
+    });
+    proxies.push(proxy);
+
+    const result = await exchange({
+      url: `${proxy.baseUrl}/v1/messages`,
+      headers: { connection: 'close' },
+      body: Buffer.from('{}'),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(result.body.toString()).toBe('complete');
+    expect(seen).toContain('completed-before-close');
+    expect(connectionClosed).toBe(true);
+  });
+
   it('bounds unresolved observer callbacks by count', async () => {
     const upstream = await listen((request, response) => {
       request.resume();
@@ -426,6 +470,60 @@ describe('LLM HTTP relay', () => {
       new Promise((_, reject) => setTimeout(() => reject(new Error('provider request remained active')), 500)),
     ])).resolves.toBeUndefined();
   });
+
+  it('settles a paused upload when the provider disconnects before drain', async () => {
+    const provider = createNetServer((socket) => {
+      socket.pause();
+      setTimeout(() => socket.destroy(), 30);
+    });
+    netServers.push(provider);
+    await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve));
+    const { port: providerPort } = provider.address() as AddressInfo;
+    const proxy = await startLlmProxy({
+      upstreamBaseUrl: `http://127.0.0.1:${providerPort}`,
+      adapter: adapter(),
+    });
+    proxies.push(proxy);
+    const { port: proxyPort } = new URL(proxy.baseUrl);
+
+    await new Promise<void>((resolve, reject) => {
+      const socket = createConnection(Number(proxyPort), '127.0.0.1');
+      const total = 32 * 1024 * 1024;
+      const chunk = Buffer.alloc(64 * 1024, 120);
+      let sent = 0;
+      let response = '';
+      const timeout = setTimeout(() => {
+        socket.destroy();
+        reject(new Error(`upload remained paused after ${sent} of ${total} bytes`));
+      }, 2_000);
+      const finish = () => {
+        if (sent !== total || !response.includes('502 Bad Gateway')) return;
+        clearTimeout(timeout);
+        socket.destroy();
+        resolve();
+      };
+      const write = () => {
+        while (sent < total) {
+          const size = Math.min(chunk.byteLength, total - sent);
+          sent += size;
+          if (!socket.write(size === chunk.byteLength ? chunk : chunk.subarray(0, size))) {
+            socket.once('drain', write);
+            return;
+          }
+        }
+        finish();
+      };
+      socket.on('connect', () => {
+        socket.write(`POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\nConnection: keep-alive\r\n\r\n`);
+        write();
+      });
+      socket.on('data', (data) => {
+        response += data.toString('latin1');
+        finish();
+      });
+      socket.on('error', reject);
+    });
+  }, 5_000);
 
   it('surfaces an abrupt provider disconnect and closes active connections', async () => {
     const upstream = await listen((request, response) => {

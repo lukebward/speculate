@@ -58,14 +58,22 @@ interface CallbackBudget {
 interface ConnectionState {
   adapter: AgentAdapterConnection | null;
   closed: boolean;
+  socketClosed: boolean;
+  pendingObservationJobs: number;
+  partialRequests: Set<() => void>;
 }
 
-function closeConnection(state: ConnectionState): void {
-  if (state.closed) return;
+function closeConnection(state: ConnectionState, force = false): void {
+  if (state.closed || (!force && state.pendingObservationJobs > 0)) return;
   state.closed = true;
   try {
     state.adapter?.close();
   } catch {}
+}
+
+function releaseConnectionJob(state: ConnectionState): void {
+  state.pendingObservationJobs = Math.max(0, state.pendingObservationJobs - 1);
+  if (state.socketClosed) closeConnection(state);
 }
 
 function releaseCallback(budget: CallbackBudget, bytes: number): void {
@@ -205,7 +213,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       response.writeHead(400).end();
       return;
     }
-    const connection = connections.get(request.socket)?.adapter ?? null;
+    const connectionState = connections.get(request.socket) ?? null;
+    const connection = connectionState?.adapter ?? null;
     let observer: AgentAdapterRequestObserver | null = null;
     if (options.onObservation && connection) {
       try {
@@ -217,7 +226,7 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
         });
       } catch {}
     }
-    relayRequest({ request, response, upstream, path, observer, observations, upstreamRequests });
+    relayRequest({ request, response, upstream, path, observer, observations, upstreamRequests, connectionState });
   });
 
   server.on('connection', (socket) => {
@@ -226,11 +235,20 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
     try {
       connection = options.adapter.createConnection();
     } catch {}
-    const state = { adapter: connection, closed: false };
+    const state: ConnectionState = {
+      adapter: connection,
+      closed: false,
+      socketClosed: false,
+      pendingObservationJobs: 0,
+      partialRequests: new Set(),
+    };
     connections.set(socket, state);
     socket.once('close', () => {
       sockets.delete(socket);
       connections.delete(socket);
+      state.socketClosed = true;
+      for (const abort of state.partialRequests) abort();
+      state.partialRequests.clear();
       closeConnection(state);
     });
   });
@@ -262,7 +280,7 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       if (closePromise) return closePromise;
       observations.close();
       for (const request of upstreamRequests) request.destroy();
-      for (const connection of connections.values()) closeConnection(connection);
+      for (const connection of connections.values()) closeConnection(connection, true);
       connections.clear();
       for (const socket of sockets) socket.destroy();
       server.closeAllConnections?.();
@@ -280,18 +298,39 @@ function relayRequest(input: {
   observer: AgentAdapterRequestObserver | null;
   observations: ObservationQueue;
   upstreamRequests: Set<ClientRequest>;
+  connectionState: ConnectionState | null;
 }): void {
-  const { request, response, upstream, observer, observations, upstreamRequests } = input;
+  const { request, response, upstream, observer, observations, upstreamRequests, connectionState } = input;
   let observationActive = observer !== null;
   let observedRequestBytes = 0;
   let requestChunks: Buffer[] = [];
   let upstreamResponse: IncomingMessage | null = null;
   let settled = false;
+  let uploadPaused = false;
+  let uploadWritable = true;
+
+  const settleUploadBackpressure = () => {
+    if (!uploadPaused) return;
+    uploadPaused = false;
+    request.resume();
+  };
 
   const enqueue = (bytes: number, run: () => readonly Observation[]): boolean => {
     if (!observationActive) return false;
     const activeAtRun = () => observationActive ? run() : [];
-    if (observations.push({ bytes, run: activeAtRun })) return true;
+    if (connectionState) connectionState.pendingObservationJobs++;
+    const accepted = observations.push({
+      bytes,
+      run() {
+        try {
+          return activeAtRun();
+        } finally {
+          if (connectionState) releaseConnectionJob(connectionState);
+        }
+      },
+    });
+    if (accepted) return true;
+    if (connectionState) releaseConnectionJob(connectionState);
     observationActive = false;
     requestChunks = [];
     try {
@@ -301,16 +340,19 @@ function relayRequest(input: {
   };
 
   const abortObservation = () => {
+    connectionState?.partialRequests.delete(abortObservation);
     if (!observationActive) return;
     observationActive = false;
     try {
       observer?.abort();
     } catch {}
   };
+  if (observationActive) connectionState?.partialRequests.add(abortObservation);
 
   const fail = () => {
     if (settled) return;
     settled = true;
+    settleUploadBackpressure();
     abortObservation();
     if (!response.headersSent) response.writeHead(502).end();
     else response.destroy(new Error('upstream disconnected'));
@@ -327,7 +369,12 @@ function relayRequest(input: {
     setHost: false,
   });
   upstreamRequests.add(upstreamRequest);
-  upstreamRequest.once('close', () => upstreamRequests.delete(upstreamRequest));
+  upstreamRequest.once('close', () => {
+    upstreamRequests.delete(upstreamRequest);
+    uploadWritable = false;
+    settleUploadBackpressure();
+    if (!request.complete) abortObservation();
+  });
   upstreamRequest.once('error', fail);
   upstreamRequest.once('response', (received) => {
     upstreamResponse = received;
@@ -355,6 +402,7 @@ function relayRequest(input: {
     received.once('end', () => {
       if (settled) return;
       settled = true;
+      connectionState?.partialRequests.delete(abortObservation);
       response.end();
       enqueue(0, () => observer!.observeResponseEnd());
     });
@@ -363,7 +411,7 @@ function relayRequest(input: {
   });
 
   request.on('data', (chunk: Buffer) => {
-    if (settled) return;
+    if (settled || !uploadWritable) return;
     const forwarded = upstreamRequest.write(chunk);
     if (observationActive) {
       observedRequestBytes += chunk.byteLength;
@@ -371,12 +419,13 @@ function relayRequest(input: {
       else abortObservation();
     }
     if (!forwarded) {
+      uploadPaused = true;
       request.pause();
-      upstreamRequest.once('drain', () => request.resume());
+      upstreamRequest.once('drain', settleUploadBackpressure);
     }
   });
   request.once('end', () => {
-    upstreamRequest.end();
+    if (uploadWritable) upstreamRequest.end();
     if (observationActive) {
       const body = Buffer.concat(requestChunks, observedRequestBytes);
       requestChunks = [];
