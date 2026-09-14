@@ -36,6 +36,11 @@ const ALWAYS_HOP_BY_HOP = new Set([
 export interface LlmProxy {
   baseUrl: string;
   close(): Promise<void>;
+  debugObservationState(): {
+    connections: number;
+    pendingJobs: number;
+    partialRequests: number;
+  };
 }
 
 export interface LlmProxyOptions {
@@ -276,6 +281,14 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
   let closePromise: Promise<void> | null = null;
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
+    debugObservationState() {
+      const states = [...connections.values()];
+      return {
+        connections: states.length,
+        pendingJobs: states.reduce((sum, state) => sum + state.pendingObservationJobs, 0),
+        partialRequests: states.reduce((sum, state) => sum + state.partialRequests.size, 0),
+      };
+    },
     close(): Promise<void> {
       if (closePromise) return closePromise;
       observations.close();
@@ -331,11 +344,7 @@ function relayRequest(input: {
     });
     if (accepted) return true;
     if (connectionState) releaseConnectionJob(connectionState);
-    observationActive = false;
-    requestChunks = [];
-    try {
-      observer?.abort();
-    } catch {}
+    abortObservation();
     return false;
   };
 
@@ -343,6 +352,7 @@ function relayRequest(input: {
     connectionState?.partialRequests.delete(abortObservation);
     if (!observationActive) return;
     observationActive = false;
+    requestChunks = [];
     try {
       observer?.abort();
     } catch {}
