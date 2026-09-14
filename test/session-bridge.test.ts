@@ -8,6 +8,7 @@ import type { Candidate, SessionContext } from '../src/observerTypes.js';
 import type { LocalRouteDescriptor, RegisteredRoute, HostPermissionDecision } from '../src/observerTypes.js';
 import { SpeculateProxy, type ProxySessionRuntime } from '../src/proxy.js';
 import type { Upstream } from '../src/upstream.js';
+import { canonicalKey } from '../src/keys.js';
 
 const context: SessionContext = {
   launchId: 'launch',
@@ -145,6 +146,26 @@ describe('SessionBridge bounds and event seam', () => {
     expect(bridge.submit(candidate(route!.routeId, route!.generation, { candidateId: 'late', sourceEventId: 'later' }))).toBe(false);
   });
 
+  it('caps source-event tracking across more than 4096 unique events', async () => {
+    const bridge = await start(() => 100);
+    const received: Candidate[][] = [];
+    const connection = await owner(bridge, 'files', received);
+    const [route] = await connection.register([localRoute]);
+    for (let index = 0; index < 4_097; index++) {
+      expect(bridge.submit(candidate(route!.routeId, route!.generation, {
+        candidateId: `candidate-${index}`,
+        sourceEventId: `event-${index}`,
+      }))).toBe(true);
+      if (index % 64 === 63) {
+        for (let attempt = 0; attempt < 20 && received.length <= index; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      }
+    }
+
+    expect((bridge as unknown as { eventCounts: Map<string, unknown> }).eventCounts.size).toBe(4_096);
+  });
+
   it('publishes only known-conversation observations to subscribers', async () => {
     const bridge = await start();
     const seen: string[] = [];
@@ -251,7 +272,7 @@ function proxyHarness(
 ) {
   const runtime = new FakeRuntime(hostClient, 'files');
   const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
-  let permissionContext: string | null = 'context-1';
+  let permissionContext: string | null | Error = 'context-1';
   let conversationId: string | null = null;
   const events: import('../src/proxy.js').ProxySessionEvent[] = [];
   const proxy = new SpeculateProxy({
@@ -266,7 +287,10 @@ function proxyHarness(
       hostClient,
       hostServerAlias: 'files',
       runtime,
-      permissionContext: () => permissionContext,
+      permissionContext: () => {
+        if (permissionContext instanceof Error) throw permissionContext;
+        return permissionContext;
+      },
       permissionGate: { check: () => decision() },
       conversationIdForCall: () => conversationId,
       onEvent: (event) => events.push(event),
@@ -294,7 +318,7 @@ function proxyHarness(
     runtime,
     calls,
     events,
-    setPermissionContext(value: string | null) { permissionContext = value; },
+    setPermissionContext(value: string | null | Error) { permissionContext = value; },
     setConversationId(value: string | null) { conversationId = value; },
   };
 }
@@ -390,6 +414,61 @@ describe('SpeculateProxy observed candidate ingress', () => {
     h.runtime.deliver(candidate(route.routeId, route.generation));
     await new Promise((resolve) => setImmediate(resolve));
     expect(h.calls).toEqual([]);
+  });
+
+  it('drops queued candidates when their admitted permission context changes', async () => {
+    const h = proxyHarness('claude', () => 'allowed');
+    const route = await readyRuntime(h.runtime);
+    expect(h.proxy.budget.tryAcquire('upstream')).toEqual({ ok: true });
+    h.runtime.deliver(candidate(route.routeId, route.generation));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.calls).toEqual([]);
+
+    h.setPermissionContext('context-2');
+    h.proxy.budget.release('upstream');
+    h.proxy.executor.drainServer('upstream');
+
+    expect(h.calls).toEqual([]);
+  });
+
+  it.each([
+    ['missing', null],
+    ['unavailable', new Error('permission context unavailable')],
+  ] as const)('does not publish an in-flight result when permission context becomes %s', async (_label, nextContext) => {
+    const h = proxyHarness('claude', () => 'allowed');
+    const route = await readyRuntime(h.runtime);
+    let issued = 0;
+    let resolveResult!: (result: { content: Array<{ type: 'text'; text: string }> }) => void;
+    const pending = new Promise<{ content: Array<{ type: 'text'; text: string }> }>((resolve) => {
+      resolveResult = resolve;
+    });
+    h.proxy.upstreams.get('upstream')!.callTool = async () => {
+      issued++;
+      return pending;
+    };
+    h.runtime.deliver(candidate(route.routeId, route.generation));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(issued).toBe(1);
+
+    h.setPermissionContext(nextContext);
+    resolveResult({ content: [{ type: 'text', text: 'stale' }] });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(h.proxy.cache.lookup(canonicalKey('upstream', 'read', { path: '/a' })).outcome).toBe('miss');
+  });
+
+  it('does not let wire candidate IDs select persisted calibration identities', async () => {
+    const h = proxyHarness('claude', () => 'allowed');
+    const route = await readyRuntime(h.runtime);
+    for (let index = 0; index < 100; index++) {
+      (h.proxy as unknown as { calibration: { observe(id: string, correct: boolean, at: number): void } })
+        .calibration.observe('ordinary-rule', false, 100);
+    }
+
+    h.runtime.deliver(candidate(route.routeId, route.generation, { candidateId: 'ordinary-rule' }));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(h.calls).toEqual([{ tool: 'read', args: { path: '/a' } }]);
   });
 
   it('rejects malformed args, replay, stale generations, and off mode', async () => {

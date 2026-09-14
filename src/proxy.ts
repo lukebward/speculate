@@ -865,7 +865,7 @@ export class SpeculateProxy {
     if (!this.session || this.config.mode === 'off' || !Array.isArray(candidates) || candidates.length > 3) return;
     const now = this.now();
     this.pruneObservedReplay(now);
-    const accepted = new Map<string, Array<{ candidate: Candidate; route: RegisteredRoute }>>();
+    const accepted = new Map<string, Array<{ candidate: Candidate; route: RegisteredRoute; permissionContext: string }>>();
     for (const raw of candidates) {
       const parsed = candidateSchema.safeParse(raw);
       if (!parsed.success) continue;
@@ -895,7 +895,7 @@ export class SpeculateProxy {
       if (permission !== 'allowed') continue;
       this.observedReplay.set(replayKey, now);
       const group = accepted.get(registered.route.upstreamServer) ?? [];
-      group.push({ candidate, route: registered.route });
+      group.push({ candidate, route: registered.route, permissionContext });
       accepted.set(registered.route.upstreamServer, group);
     }
     while (this.observedReplay.size > 4_096) this.observedReplay.delete(this.observedReplay.keys().next().value!);
@@ -903,13 +903,16 @@ export class SpeculateProxy {
     for (const [server, group] of accepted) {
       const admitted = this.predictor.admitResolved(
         server,
-        group.map(({ candidate, route }) => ({
-          tool: route.upstreamTool,
-          args: candidate.args,
-          confidence: candidate.confidence,
-          candidateId: candidate.candidateId,
-          ruleId: `observer:${this.session!.hostClient}:${candidate.source}`,
-        })),
+        group.map(({ candidate, route }) => {
+          const ruleId = `observer:${this.session!.hostClient}:${candidate.source}`;
+          return {
+            tool: route.upstreamTool,
+            args: candidate.args,
+            confidence: candidate.confidence,
+            candidateId: ruleId,
+            ruleId,
+          };
+        }),
         { timestamp: now, trackNextCall: false },
       );
       for (const prediction of admitted) {
@@ -918,6 +921,7 @@ export class SpeculateProxy {
         if (match) prediction.executionLease = {
           routeId: match.route.routeId,
           generation: match.route.generation,
+          permissionContext: match.permissionContext,
         };
       }
       this.executor.submit(admitted);
@@ -963,7 +967,15 @@ export class SpeculateProxy {
   }
 
   private isCurrentObservedLease(lease: ExecutionLease): boolean {
-    return this.observedRoutes.get(lease.routeId)?.route.generation === lease.generation;
+    if (
+      this.observedRoutes.get(lease.routeId)?.route.generation !== lease.generation ||
+      typeof lease.permissionContext !== 'string'
+    ) return false;
+    try {
+      return this.session?.permissionContext?.() === lease.permissionContext;
+    } catch {
+      return false;
+    }
   }
 
   private pruneObservedReplay(now: number): void {

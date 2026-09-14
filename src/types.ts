@@ -70,6 +70,7 @@ export interface Prediction {
 export interface ExecutionLease {
   routeId: string;
   generation: number;
+  permissionContext?: string;
 }
 
 export interface LeaseValidator {

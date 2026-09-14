@@ -19,6 +19,7 @@ const MAX_LINE_BYTES = 2 * 1024 * 1024 + 4096;
 const MAX_CANDIDATES_PER_EVENT = 3;
 const MAX_CANDIDATE_AGE_MS = 1_000;
 const MAX_REPLAY_IDS = 4_096;
+const MAX_SOURCE_EVENTS = 4_096;
 const REPLAY_RETENTION_MS = 120_000;
 const MAX_PENDING_OBSERVATIONS = 256;
 const MAX_PENDING_OBSERVATION_BYTES = 8 * 1024 * 1024;
@@ -247,6 +248,7 @@ export class SessionBridge {
     this.replay.set(replayKey, now);
     this.eventCounts.set(eventKey, { count: count + 1, at: now });
     while (this.replay.size > MAX_REPLAY_IDS) this.replay.delete(this.replay.keys().next().value!);
+    while (this.eventCounts.size > MAX_SOURCE_EVENTS) this.eventCounts.delete(this.eventCounts.keys().next().value!);
     const delivered = send(owner.socket, { type: 'candidates', candidates: [candidate] });
     if (!delivered) owner.socket.destroy();
     return delivered;
