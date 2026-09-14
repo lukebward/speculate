@@ -36,6 +36,8 @@ export interface ExchangeRequest {
 }
 
 export interface ExchangeResult {
+  status: number;
+  headers: IncomingHttpHeaders;
   originalPayload: Buffer;
   receivedPayload: Buffer;
   calls: ProviderCallRecord[];
@@ -66,6 +68,8 @@ export interface ToolServerHandle {
 }
 
 interface ResponsePlan {
+  status: number;
+  headers: Record<string, string>;
   chunks: Array<{ body: Buffer; delayMs: number }>;
   requestReceived?: number;
   responseChunks: number[];
@@ -147,13 +151,15 @@ export class ObserverHarness {
         plan.providerAbort = call.abortedAt;
       });
       response.once('close', () => {
+        plan.finish();
         if (response.writableEnded) return;
         call.abortedAt = performance.now();
         plan.providerAbort = call.abortedAt;
       });
-      response.writeHead(200, {
+      response.writeHead(plan.status, {
         'content-type': options.transport === 'sse' ? 'text/event-stream' : 'application/json',
         'cache-control': 'no-cache',
+        ...plan.headers,
       });
       for (const chunk of plan.chunks) {
         if (chunk.delayMs > 0) await delay(chunk.delayMs);
@@ -162,7 +168,17 @@ export class ObserverHarness {
           return;
         }
         plan.responseChunks.push(performance.now());
-        if (!response.write(chunk.body)) await new Promise<void>((resolve) => response.once('drain', resolve));
+        if (!response.write(chunk.body)) await new Promise<void>((resolve) => {
+          const settle = () => {
+            response.off('drain', settle);
+            response.off('close', settle);
+            response.off('error', settle);
+            resolve();
+          };
+          response.once('drain', settle);
+          response.once('close', settle);
+          response.once('error', settle);
+        });
       }
       response.end();
       plan.finish();
@@ -249,15 +265,27 @@ export class ObserverHarness {
     };
   }
 
-  async exchange(options: { request: ExchangeRequest; chunks: ProviderChunk[] }): Promise<ExchangeResult> {
-    const provider = this.providers.at(-1);
-    if (!provider) throw new Error('startProvider must be called before exchange');
+  async exchange(options: {
+    request: ExchangeRequest;
+    chunks: ProviderChunk[];
+    status?: number;
+    headers?: Record<string, string>;
+    provider?: ProviderHandle;
+  }): Promise<ExchangeResult> {
+    const origin = options.provider?.baseUrl ?? new URL(options.request.url).origin;
+    const provider = this.providers.find((entry) => entry.handle.baseUrl === origin)
+      ?? (options.provider === undefined && this.providers.length === 1 ? this.providers[0] : undefined);
+    if (!provider) throw new Error('exchange requires an unambiguous provider');
     const chunks = options.chunks.map(normalizeChunk);
     let finishPlan = (): void => {};
     const finished = new Promise<void>((resolve) => {
       finishPlan = resolve;
     });
-    const plan: ResponsePlan = { chunks, responseChunks: [], finished, finish: finishPlan };
+    const plan: ResponsePlan = {
+      status: options.status ?? 200,
+      headers: options.headers ?? {},
+      chunks, responseChunks: [], finished, finish: finishPlan,
+    };
     provider.plans.push(plan);
     const originalPayload = Buffer.concat(chunks.map((chunk) => chunk.body));
     const receivedChunks: Buffer[] = [];
@@ -265,6 +293,8 @@ export class ObserverHarness {
     const started = performance.now();
     let cancelled = false;
     let clientAbort: number | undefined;
+    let status = 0;
+    let headers: IncomingHttpHeaders = {};
 
     await new Promise<void>((resolve, reject) => {
       const url = new URL(options.request.url);
@@ -274,6 +304,8 @@ export class ObserverHarness {
       });
       request.once('error', (error) => cancelled ? resolve() : reject(error));
       request.once('response', (response) => {
+        status = response.statusCode ?? 0;
+        headers = response.headers;
         response.on('data', (chunk: Buffer) => {
           receivedChunks.push(Buffer.from(chunk));
           receivedChunkTimes.push(performance.now());
@@ -295,6 +327,8 @@ export class ObserverHarness {
     const call = provider.calls.at(-1);
     if (!call || plan.requestReceived === undefined) throw new Error('provider did not record the exchange');
     return {
+      status,
+      headers,
       originalPayload,
       receivedPayload: Buffer.concat(receivedChunks),
       calls: [...provider.calls],

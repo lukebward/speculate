@@ -8,14 +8,16 @@ The fixtures are sanitized protocol examples, not captured user traffic. IDs, pr
 
 | Client | Installed version | Offline model transport | Tool transport | Hooks | API-key forwarding | Native subscription forwarding |
 | --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | `2.1.268` | Messages JSON and SSE pass through the loopback HTTP harness; count-tokens is described | Real MCP stdio round trip through Speculate and the mock GitHub server | Synthetic lifecycle/subagent fixture only; native ordering and permission behavior unverified | Unverified | Existing `claude.ai` login is available; forwarding through a temporary relay is unverified |
-| Codex CLI | `0.154.0` | Responses JSON and SSE pass through the loopback HTTP harness; model listing is described; WebSocket continuation is fixture-only | Real MCP stdio round trip through Speculate and the mock GitHub server | Synthetic lifecycle/subagent fixture only; native ordering and trust behavior unverified | Unverified | Existing ChatGPT login is available; forwarding through a temporary relay is unverified |
+| Claude Code | `2.1.268` | Messages JSON and SSE pass through the loopback HTTP harness; count-tokens is described | Real MCP stdio round trip through Speculate and the mock GitHub server | Synthetic lifecycle/subagent fixture only; native ordering and permission behavior unverified | Unverified | Scratch HTTP relay passed with native `claude.ai`; production relay pending |
+| Codex CLI | `0.154.0` | Responses JSON and SSE pass through the loopback HTTP harness; model listing is described; WebSocket continuation is fixture-only | Real MCP stdio round trip through Speculate and the mock GitHub server | Synthetic lifecycle/subagent fixture only; native ordering and trust behavior unverified | Unverified | Scratch WebSocket relay passed with native ChatGPT; production relay pending |
 
-The unresolved API-key and subscription forwarding rows block enabling the full model proxy by default. Hook-only observation can proceed independently. A separate isolated native Codex MCP smoke test passed, but that does not prove provider-request routing or account forwarding through the future relay.
+The unresolved API-key and production-relay forwarding rows block enabling the full model proxy by default. Hook-only observation can proceed independently. A separate isolated native Codex MCP smoke test passed, but that does not prove provider-request routing or account forwarding through the future relay.
 
 Claude's current help exposes session-local `--settings`, `--mcp-config`, `--strict-mcp-config`, `--allowedTools`, `--disallowedTools`, `--permission-mode`, `--permission-prompts`, `--model`, `--betas`, stream JSON options, and `--agents`. Its documented gateway route uses `ANTHROPIC_BASE_URL`; a launcher must preserve auth variables and generated auth/version/beta headers.
 
 Codex's current help exposes highest-precedence `-c key=value` overrides plus `--model`, `--profile`, `--sandbox`, `--ask-for-approval`, `--ephemeral`, `--ignore-user-config`, and `--ignore-rules`. Current configuration documents `openai_base_url` for the built-in provider and `model_providers.<id>.base_url` for custom providers. A launcher must preserve the selected provider, model, effort, credential source, and WebSocket setting.
+
+The [CLI contract fixture](../test/fixtures/observer/client-cli-contracts.json) records command arguments, exit codes and public help/version output excerpts. [Native routing evidence](observer-native-routing.md) records the successful account smoke tests through a scratch relay.
 
 Official contract references:
 
@@ -37,7 +39,7 @@ Each `createObserverHarness()` instance owns its servers, response queues, monot
 
 - `startProvider({ transport })` for loopback JSON or SSE HTTP. `websocket` fails explicitly until Task 5.
 - `startToolServer({ alias, latencyMs })` for the real Speculate CLI over the existing synthetic GitHub MCP server.
-- `exchange({ request, chunks })` for an exact-byte request/response exchange. It returns the concatenated source and received buffers, provider call records, cancellation state, and monotonic request/chunk/completion times.
+- `exchange({ request, chunks, status?, headers?, provider? })` for an exact-byte request/response exchange. It returns response status/headers, the concatenated source and received buffers, provider call records, cancellation state, and monotonic request/chunk/completion times.
 - `close()` to close clients and sockets and remove temporary files.
 
 ## Baseline evidence
@@ -48,4 +50,6 @@ The pre-change full suite passed 43 files and 1,015 tests with 8 skipped in 85.5
 
 `npm run bench:mock -- --latency 400` passed with 7 synthetic tool calls: 2.86 s tool wait with speculation off and 983 ms with strict speculation, 4 ready hits, 1 join, 7 speculative calls, and 0 recorded waste. This is a deterministic mock-mechanics baseline. It does not measure client task time, the new observer, real provider traffic, or a context-aware speedup.
 
-Native provider authentication, live request byte shapes, native hook ordering, hook permission behavior, WebSocket forwarding, and lowest supported client versions remain unverified. Tasks 4 and 5 must extend or correct the synthetic fixtures from observed current-client behavior without checking credentials or user traffic into the repository.
+Native account routing is proven through a scratch relay. Production relay authentication, live body normalization, native hook ordering, hook permission behavior, and lowest supported client versions remain unverified. Tasks 4 and 5 must extend or correct the synthetic fixtures from observed current-client behavior without checking credentials or user traffic into the repository.
+
+Review regression tests passed 8/8 in 2.75 seconds, including HTTP status/header replay, multiple-provider selection, cancellation under backpressure and both streaming completion lifecycles. Strict TypeScript verification passed.

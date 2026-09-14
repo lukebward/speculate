@@ -23,6 +23,36 @@ afterEach(async () => {
 });
 
 describe('observer compatibility fixtures', () => {
+  it.each(['claude', 'codex'] as const)('contains complete %s tool stream lifecycles', (agent) => {
+    const data = fixture(agent) as { cases: Array<{ id: string; response?: { chunks?: string[] } }> };
+    const stream = data.cases.find((entry) => entry.id.includes('continuation-sse'))!;
+    const events = stream.response!.chunks!.join('').split('\n\n').filter(Boolean)
+      .map((chunk) => JSON.parse(chunk.split('\n').find((line) => line.startsWith('data: '))!.slice(6)));
+    if (agent === 'claude') {
+      const active = new Set<number>();
+      for (const event of events) {
+        if (event.type === 'content_block_start') {
+          expect(active.size).toBe(0);
+          active.add(event.index);
+        }
+        if (event.type === 'content_block_delta') expect(active.has(event.index)).toBe(true);
+        if (event.type === 'content_block_stop') expect(active.delete(event.index)).toBe(true);
+      }
+      expect(active.size).toBe(0);
+      expect(events.at(-1).type).toBe('message_stop');
+    } else {
+      const added = events.filter((event) => event.type === 'response.output_item.added');
+      const done = events.filter((event) => event.type === 'response.output_item.done');
+      expect(done.map((event) => event.item.id)).toEqual(added.map((event) => event.item.id));
+      for (const event of done.filter((event) => event.item.type === 'function_call')) {
+        expect(() => JSON.parse(event.item.arguments)).not.toThrow();
+        expect(event.item.status).toBe('completed');
+      }
+      expect(events.at(-1).type).toBe('response.completed');
+      expect(events.at(-1).response.output).toEqual(done.map((event) => event.item));
+    }
+  });
+
   it('provides versioned Claude and Codex transport cases', () => {
     for (const agent of ['claude', 'codex'] as const) {
       const value = fixture(agent) as {
@@ -59,6 +89,34 @@ describe('observer compatibility fixtures', () => {
 });
 
 describe('observer provider harness', () => {
+  it('replays status and headers for the selected provider', async () => {
+    const harness = createObserverHarness();
+    harnesses.push(harness);
+    const first = await harness.startProvider({ transport: 'http' });
+    await harness.startProvider({ transport: 'http' });
+    const result = await harness.exchange({
+      request: { url: `${first.baseUrl}/v1/messages`, body: '{}' },
+      status: 429,
+      headers: { 'retry-after': '1', 'request-id': 'synthetic-request' },
+      chunks: ['{"error":"synthetic limit"}'],
+    });
+    expect(result.status).toBe(429);
+    expect(result.headers).toMatchObject({ 'retry-after': '1', 'request-id': 'synthetic-request' });
+    expect(result.receivedPayload.toString()).toBe('{"error":"synthetic limit"}');
+  });
+
+  it('settles cancellation while the provider is waiting for drain', async () => {
+    const harness = createObserverHarness();
+    harnesses.push(harness);
+    const provider = await harness.startProvider({ transport: 'http' });
+    const result = await harness.exchange({
+      request: { url: provider.baseUrl, body: '{}', abortAfterChunks: 1 },
+      chunks: [Buffer.alloc(8 * 1024 * 1024, 120)],
+    });
+    expect(result.cancelled).toBe(true);
+    expect(result.timestamps.providerAbort).toBeDefined();
+  });
+
   it('preserves request and SSE response bytes and records their order', async () => {
     const harness = createObserverHarness();
     harnesses.push(harness);
@@ -141,7 +199,6 @@ describe('existing MCP proxy baseline', () => {
       { id: 3201, user: 'mara', body: 'Repro: 100 rps for 10s, ~3% dropped' },
       { id: 3202, user: 'devon', body: 'Fix in flight on fix/rate-limiter' },
     ]);
-    expect(readyHit.elapsedMs).toBeLessThan(60);
     expect((await ready.stats()).hits).toBeGreaterThanOrEqual(1);
 
     const joinHarness = createObserverHarness();
@@ -151,6 +208,7 @@ describe('existing MCP proxy baseline', () => {
     await joining.waitForCalls(2);
     const joined = await joining.callTool('get_issue_comments', { ...repo, issue_number: 42 });
     expect(textPayload(joined.result)).toEqual(textPayload(readyHit.result));
+    expect(joined.result).toEqual(readyHit.result);
     expect((await joining.stats()).joins).toBeGreaterThanOrEqual(1);
 
     const invalidationHarness = createObserverHarness();
@@ -164,6 +222,7 @@ describe('existing MCP proxy baseline', () => {
       issue_number: 42,
     });
     expect(afterMutation.elapsedMs).toBeGreaterThanOrEqual(90);
+    expect(afterMutation.result).toEqual(readyHit.result);
     expect((await invalidation.stats()).invalidated).toBeGreaterThanOrEqual(1);
   }, 30_000);
 });

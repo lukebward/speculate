@@ -1,0 +1,56 @@
+{
+  "recordedAt": "2026-09-14",
+  "scope": "Public CLI help and version output excerpts; no configuration or credential values.",
+  "commands": [
+    {
+      "argv": [
+        "claude",
+        "--version"
+      ],
+      "exitCode": 0,
+      "stdoutExcerpt": "2.1.268 (Claude Code)"
+    },
+    {
+      "argv": [
+        "claude",
+        "--help"
+      ],
+      "exitCode": 0,
+      "stdoutExcerpt": "                                        apiKeyHelper via --settings (OAuth and\n                                        keychain are never read). 3P providers\n                                        (Bedrock/Vertex/Foundry) use their own\n                                        --settings, --agents, --plugin-dir.\n  --betas <betas...>                    Beta headers to include in API requests\n                                        (API key users only)\n  --disable-slash-commands              Disable all skills\n  --disallowedTools, --disallowed-tools <tools...>\n      Comma or space-separated list of tool names to deny (e.g. \"Bash(git *)\n                                        --print and --output-format=stream-json)\n  --from-pr [value]                     Resume a session linked to a PR by PR\n                                        number/URL, or open interactive picker\n                                        --output-format=stream-json)\n  --include-partial-messages            Include partial message chunks as they\n                                        arrive (only works with --print and\n                                        --output-format=stream-json)\n  --input-format <format>               Input format (only works with --print):\n                                        \"text\" (default), or \"stream-json\"\n  --model <model>                       Model for the current session. Provide\n                                        an alias for the latest model (e.g.\n                                        'fable', 'opus', or 'sonnet') or a\n  --no-session-persistence              Disable session persistence - sessions\n                                        will not be saved to disk and cannot be\n                                        resumed (only works with --print)\n  --output-format <format>              Output format (only works with --print):\n                                        \"text\" (default), \"json\" (single\n                                        result), or \"stream-json\" (realtime\n  --permission-mode <mode>              Permission mode to use for the session\n                                        (choices: \"acceptEdits\", \"auto\",\n                                        \"bypassPermissions\", \"manual\",\n  --permission-prompts <target>         Who answers permission prompts with\n                                        --print: \"host\" (the SDK host or\n                                        --permission-prompt-tool) or \"none\"\n                                        (nobody: anything that would prompt is\n                                        denied automatically; the permission\n                                        --output-format=stream-json)\n  --restricted                          Restricted mode: removes the built-in\n                                        tools that run commands or code (Bash,\n                                        --tools names them, and ignores user,\n                                        project and local settings files\n                                        (managed settings and --settings still\n                                        apply; add --strict-mcp-config to skip\n                                        MCP servers too). Also confines the file\n  --safe-mode                           Start with all customizations\n                                        (CLAUDE.md, skills, plugins, hooks, MCP\n                                        servers, custom commands and agents,\n  --settings <file-or-json>             Path to a settings JSON file or a JSON\n                                        string to load additional settings from\n  --strict-mcp-config                   Only use MCP servers from --mcp-config,\n  --tools <tools...>                    Specify the list of available tools from\n                                        the built-in set. Use \"\" to disable all\n                                        tools, \"default\" to use all tools, or"
+    },
+    {
+      "argv": [
+        "codex",
+        "--version"
+      ],
+      "exitCode": 0,
+      "stdoutExcerpt": "codex-cli 0.154.0"
+    },
+    {
+      "argv": [
+        "codex",
+        "--help"
+      ],
+      "exitCode": 0,
+      "stdoutExcerpt": "  -c, --config <key=value>\n          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.\n          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed\n      --disable <FEATURE>\n          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`\n\n  -m, --model <MODEL>\n          Model the agent should use\n\n  -p, --profile <CONFIG_PROFILE_V2>\n          Layer $CODEX_HOME/<name>.config.toml on top of the base user config\n\n  -s, --sandbox <SANDBOX_MODE>\n          Select the sandbox policy to use when executing model-generated shell commands\n          "
+    },
+    {
+      "argv": [
+        "codex",
+        "exec",
+        "--help"
+      ],
+      "exitCode": 0,
+      "stdoutExcerpt": "  -c, --config <key=value>\n          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.\n          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed\n      --disable <FEATURE>\n          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`\n\n  -m, --model <MODEL>\n          Model the agent should use\n\n  -p, --profile <CONFIG_PROFILE_V2>\n          Layer $CODEX_HOME/<name>.config.toml on top of the base user config\n\n  -s, --sandbox <SANDBOX_MODE>\n          Select the sandbox policy to use when executing model-generated shell commands\n          \n      --ephemeral\n          Run without persisting session files to disk\n\n      --ignore-user-config\n          Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`\n\n      --ignore-rules\n          Do not load user or project execpolicy `.rules` files\n\n      --output-schema <FILE>\n          Path to a JSON Schema file describing the model's final response shape\n\n  -o, --output-last-message <FILE>\n          Specifies file where the last message from the agent should be written\n"
+    },
+    {
+      "argv": [
+        "codex",
+        "app-server",
+        "--help"
+      ],
+      "exitCode": 0,
+      "stdoutExcerpt": "  generate-json-schema  [experimental] Generate JSON Schema for the app server protocol\n  help                  Print this message or the help of the given subcommand(s)\n\n  -c, --config <key=value>\n          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.\n          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed\n      --disable <FEATURE>\n          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`\n\n      --listen <URL>\n          Transport endpoint URL. Supported values: `stdio://` (default), `unix://`, `unix://PATH`,\n          `ws://IP:PORT`, `off`\n          Use stdio as the transport (equivalent to `--listen stdio://`)\n\n      --analytics-default-enabled"
+    }
+  ]
+}
