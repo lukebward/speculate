@@ -1,5 +1,20 @@
 # Native account routing through a transparent loopback relay
 
+## Production relay verification
+
+The production relay at commit `93e7ae0` passed native account smoke checks on 2026-09-14 using an immutable compiled snapshot. Both clients returned the expected final `OK` and a completed response event, with exit code zero and no timeout. Only each client's session base URL changed; existing accounts and model selection were preserved.
+
+| Client | Native transport | Observed model response | Final output and completion |
+| --- | --- | --- | --- |
+| Claude Code 2.1.268 | HTTP Messages | HTTP 200 | Passed |
+| Codex CLI 0.154.0 | Responses WebSocket | Upgrade 101 | Passed |
+
+Claude also requested `HEAD /api/hello`; Codex requested `/models` before its WebSocket upgrade. The real adapters emitted prompt observations for both clients. The checks used temporary empty working directories and a prompt requesting no tool use. Reports retained only endpoint/status counts and completion booleans, and scratch working directories were removed.
+
+This verifies native account routing and actual response completion through the implementation. It does not establish tool-consumption speedups, every provider variant, or live API-key compatibility. Neither `OPENAI_API_KEY` nor `ANTHROPIC_API_KEY` was available; synthetic API-key fixtures cover forwarding, while live API-key checks remain unverified. The new observer remains experimental pending the full correctness and performance gates.
+
+## Earlier scratch routing probe
+
 Tested 2026-09-14 with Claude Code `2.1.268` authenticated through `claude.ai` and Codex CLI `0.154.0` authenticated through ChatGPT. Authentication status was supplied through sanitized CLI status; no credential store or token value was read.
 
 Both tests used an empty temporary working directory, a tiny prompt requesting only `OK`, no explicit model override, a 120-second process cap, discarded native-client stdout/stderr, and a scratch HTTP/WebSocket relay bound to `127.0.0.1`. The relay streamed request and response bytes without inspecting or logging bodies. It recorded only method, destination path, status, transport, and header names. No durable client configuration was written.
