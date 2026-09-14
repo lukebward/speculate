@@ -143,7 +143,7 @@ covers the CLI daemon).
 - [x] Fetch and inspect current main; preserve v0.22 integrations
 - [x] Set up isolated worktree and Sol workers
 - [x] Task 1: Compatibility fixtures/baseline (Sol review approved; native account routing spike passed both)
-- [ ] Task 2: Live route bridge and candidate ingress
+- [x] Task 2: Live route bridge and candidate ingress (Sol review approved after permission/state corrections)
 - [ ] Task 3: Session cross-server learner
 - [ ] Task 4: Claude transparent model transport
 - [ ] Task 5: Codex Responses and WebSocket transport

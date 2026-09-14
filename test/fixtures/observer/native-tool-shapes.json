@@ -1,0 +1,210 @@
+{
+  "generatedAt": "2026-09-14T21:17:24.288Z",
+  "syntheticAlias": "shape_probe",
+  "syntheticTool": "lookup",
+  "handling": "Request bodies were parsed in memory and discarded. Only this synthetic shape, namespace metadata, paths, counts, and header names were retained.",
+  "claude": {
+    "clientVersion": "2.1.268",
+    "capturedModelRequest": true,
+    "modelResponseSupplied": false,
+    "completedSession": false,
+    "clientExitCode": 1,
+    "traffic": [
+      {
+        "method": "HEAD",
+        "path": "/api/hello",
+        "count": 1,
+        "headerNames": [
+          "accept",
+          "accept-encoding",
+          "connection",
+          "host",
+          "user-agent"
+        ]
+      },
+      {
+        "method": "POST",
+        "path": "/v1/messages",
+        "count": 2,
+        "headerNames": [
+          "accept",
+          "accept-encoding",
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "authorization",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      }
+    ],
+    "modelRequestPath": "$.tools[23]",
+    "toolShape": {
+      "name": "mcp__shape_probe__lookup",
+      "description": "Looks up one synthetic record.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Synthetic query."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3,
+            "default": 1
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "sourceFieldsNotForwarded": [
+      "title",
+      "annotations"
+    ]
+  },
+  "codex": {
+    "clientVersion": "0.154.0",
+    "capturedModelRequest": true,
+    "modelResponseSupplied": false,
+    "completedSession": false,
+    "clientExitedZeroDespiteMissingModelResponse": true,
+    "mcpMethods": [
+      "initialize",
+      "notifications/initialized",
+      "tools/list"
+    ],
+    "traffic": [
+      {
+        "method": "GET",
+        "path": "/models",
+        "headerNames": [
+          "accept",
+          "authorization",
+          "chatgpt-account-id",
+          "host",
+          "originator",
+          "user-agent",
+          "version"
+        ],
+        "count": 1
+      },
+      {
+        "method": "GET",
+        "path": "/responses",
+        "transport": "websocket",
+        "headerNames": [
+          "authorization",
+          "chatgpt-account-id",
+          "connection",
+          "host",
+          "openai-beta",
+          "originator",
+          "sec-websocket-extensions",
+          "sec-websocket-key",
+          "sec-websocket-version",
+          "session-id",
+          "thread-id",
+          "upgrade",
+          "user-agent",
+          "version",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-routing-hint",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ],
+        "count": 3
+      }
+    ],
+    "syntheticAliasPresentInCapturedModelRequest": false,
+    "syntheticToolDefinitionPresentInCapturedModelRequest": false,
+    "modelRequestPath": "$.input[0].tools[0]",
+    "namespaceShape": {
+      "path": "$.input[0].tools[0]",
+      "keys": [
+        "description",
+        "name",
+        "tools",
+        "type"
+      ],
+      "type": "namespace",
+      "name": "functions",
+      "childCount": 4,
+      "children": [
+        {
+          "keys": [
+            "description",
+            "format",
+            "name",
+            "type"
+          ],
+          "type": "custom",
+          "name": "exec",
+          "advertisesDeferredNestedTools": true,
+          "exposesAllTools": true,
+          "documentsMcpNameNormalization": true
+        },
+        {
+          "keys": [
+            "description",
+            "name",
+            "parameters",
+            "strict",
+            "type"
+          ],
+          "type": "function",
+          "name": "wait",
+          "advertisesDeferredNestedTools": false,
+          "exposesAllTools": false,
+          "documentsMcpNameNormalization": false
+        },
+        {
+          "keys": [
+            "description",
+            "name",
+            "parameters",
+            "strict",
+            "type"
+          ],
+          "type": "function",
+          "name": "request_user_input",
+          "advertisesDeferredNestedTools": false,
+          "exposesAllTools": false,
+          "documentsMcpNameNormalization": false
+        },
+        {
+          "keys": [
+            "description",
+            "name",
+            "parameters",
+            "strict",
+            "type"
+          ],
+          "type": "function",
+          "name": "request_user_input_async",
+          "advertisesDeferredNestedTools": false,
+          "exposesAllTools": false,
+          "documentsMcpNameNormalization": false
+        }
+      ]
+    }
+  }
+}
