@@ -10,3 +10,5 @@
 - Fetch origin/main before starting a feature batch and again before pushing:
   parallel implementations of the same feature happen. Reconcile by treating
   main as canonical — keep theirs, port only what doesn't exist upstream.
+
+- Treat Codex and Claude Code as first-class peers in setup, transport, authentication, recovery, testing, and release criteria.

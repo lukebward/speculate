@@ -137,3 +137,18 @@ covers the CLI daemon).
 - [x] Cheap pre-filter so hundreds of serverless projects cost existsSync,
       not config parses; dead-path projects classified from raw entries
 - [x] Verified live against the real host; suite green; DESIGN §13.28
+
+# Context-aware speculation (2026-09-14)
+
+- [x] Fetch and inspect current main; preserve v0.22 integrations
+- [x] Set up isolated worktree and Sol workers
+- [ ] Task 1: Compatibility fixtures/baseline
+- [ ] Task 2: Live route bridge and candidate ingress
+- [ ] Task 3: Session cross-server learner
+- [ ] Task 4: Claude transparent model transport
+- [ ] Task 5: Codex Responses and WebSocket transport
+- [ ] Task 6: Intent and completed-stream prediction
+- [ ] Task 7: Symmetric session launch and diagnostics
+- [ ] Task 8: Both clients consume existing registered MCP results
+- [ ] Task 9: Recovery/isolation verification
+- [ ] Task 10: Benchmarks, documentation, final review and push main
