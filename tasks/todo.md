@@ -147,8 +147,12 @@ covers the CLI daemon).
 - [x] Task 3: Session cross-server learner (Sol review approved after retained-state/close corrections)
 - [x] Task 4: Claude transparent model transport (Sol review approved after lifecycle fixes; 47 focused tests)
 - [x] Task 5: Codex Responses and WebSocket transport (Sol review approved; 72 focused tests; native relay smoke passed both)
-- [ ] Task 6: Intent and completed-stream prediction
+- [x] Task 6: Intent and completed-stream prediction (Sol review approved; 227 focused tests plus 77 callback-fix tests)
 - [ ] Task 7: Symmetric session launch and diagnostics
 - [ ] Task 8: Both clients consume existing registered MCP results
 - [ ] Task 9: Recovery/isolation verification
 - [ ] Task 10: Benchmarks, documentation, final review and push main
+
+## Context-aware review evidence
+
+- Tasks 1–6 core snapshot `9fa3064`: build passed; full suite passed 1,197 tests with 8 skipped (84.05s). Launcher and final branch verification remain pending.
