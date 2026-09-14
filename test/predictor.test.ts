@@ -433,6 +433,43 @@ describe('Predictor.observe', () => {
   });
 });
 
+describe('Predictor.admitResolved', () => {
+  it('uses the existing feedback cutoff and assigns canonical keys locally', () => {
+    const metrics = makeMetrics({
+      'observer:claude:intent': { hits: 0, wasted: 8, speculated: 8 },
+    });
+    const predictor = new Predictor({ maxPerTrigger: 3, metrics });
+    const admitted = predictor.admitResolved(SERVER, [
+      { tool: 'read', args: { path: '/a' }, confidence: 0.9, candidateId: 'good', ruleId: 'observer:codex:intent' },
+      { tool: 'read', args: { path: '/b' }, confidence: 0.9, candidateId: 'muted', ruleId: 'observer:claude:intent' },
+    ], { timestamp: 10, trackNextCall: false });
+
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]).toMatchObject({ server: SERVER, tool: 'read', args: { path: '/a' }, ruleId: 'observer:codex:intent' });
+    expect(admitted[0]!.key).toEqual(expect.any(String));
+    expect(metrics.events).toContainEqual(expect.objectContaining({ type: 'suppressed', reason: 'feedback', ruleId: 'observer:claude:intent' }));
+  });
+
+  it('does not overwrite the ordinary next-call evaluation batch when tracking is disabled', () => {
+    const calibration = new CandidateCalibrator({ now: () => 1 });
+    const metrics = makeMetrics();
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      calibration,
+      extraRules: { [SERVER]: [argRule('ordinary', 'list', 'detail', 0.8)] },
+    });
+    predictor.observe({ server: SERVER, tool: 'list', args: { scope: 'x' }, result: jsonResult({}), latencyMs: 5, timestamp: 1 });
+    predictor.admitResolved(SERVER, [
+      { tool: 'other', args: {}, confidence: 0.8, candidateId: 'external', ruleId: 'observer:codex:stream' },
+    ], { timestamp: 2, trackNextCall: false });
+    predictor.observe({ server: SERVER, tool: 'detail', args: { scope: 'x' }, result: jsonResult({}), latencyMs: 5, timestamp: 3 });
+
+    expect(metrics.events).toContainEqual(expect.objectContaining({ type: 'candidate_evaluated', candidateId: 'ordinary', correct: true }));
+    expect(metrics.events).not.toContainEqual(expect.objectContaining({ type: 'candidate_evaluated', candidateId: 'external' }));
+  });
+});
+
 // --- parseResult helper -------------------------------------------------------
 
 // --- freshness classification (§6.2) -----------------------------------------

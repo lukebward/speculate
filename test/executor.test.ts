@@ -275,6 +275,37 @@ describe('executor drain queue', () => {
     expect(h.calls.map((c) => c.tool)).toEqual(['a']); // b dropped, not fired
   });
 
+  it('drops a stale route lease before queued work issues', async () => {
+    const h = makeHarness('stdio');
+    let generation = 1;
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.leaseValidator = { isCurrent: (lease: { generation: number }) => lease.generation === generation };
+    h.executor.submit([
+      { ...pred('a', 0.9), executionLease: { routeId: 'a', generation: 1 } },
+      { ...pred('b', 0.8), executionLease: { routeId: 'b', generation: 1 } },
+    ]);
+    generation = 2;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+
+    expect(h.calls.map((call) => call.tool)).toEqual(['a']);
+    expect(h.metrics.statsSnapshot().suppressed['stale-generation']).toBe(1);
+  });
+
+  it('prevents an issued result from publishing after its route lease changes', async () => {
+    const h = makeHarness('http');
+    let generation = 1;
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.leaseValidator = { isCurrent: (lease: { generation: number }) => lease.generation === generation };
+    const prediction = { ...pred('a', 0.9), executionLease: { routeId: 'a', generation: 1 } };
+    h.executor.submit([prediction]);
+    generation = 2;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+
+    expect(h.cache.lookup(canonicalKey('github', 'a', { tool: 'a' })).outcome).toBe('miss');
+  });
+
   it('never exceeds the queue cap', async () => {
     const { executor, calls, metrics } = makeHarness('stdio');
     const many = Array.from({ length: 12 }, (_, i) => pred(`a`, 0.9 - i * 0.01));

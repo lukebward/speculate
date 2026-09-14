@@ -16,6 +16,7 @@ import { canonicalKey } from './keys.js';
 import { looksLikeAuthError, resultText, type Upstream } from './upstream.js';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import type {
+  LeaseValidator,
   Prediction,
   SpeculateConfig,
 } from './types.js';
@@ -54,6 +55,7 @@ export class SpeculationExecutor {
       metrics: Metrics;
       config: SpeculateConfig;
       now?: () => number;
+      leaseValidator?: LeaseValidator;
     },
   ) {}
 
@@ -142,6 +144,11 @@ export class SpeculationExecutor {
     const { cache, policy, budget, metrics, upstreams } = this.deps;
     const now = this.deps.now ?? Date.now;
 
+    if (p.executionLease && !this.deps.leaseValidator?.isCurrent(p.executionLease)) {
+      this.suppress(p, 'stale-generation');
+      return 'dropped';
+    }
+
     const upstream = upstreams.get(p.server);
     if (!upstream?.connected) {
       this.suppress(p, 'upstream-unavailable');
@@ -219,7 +226,15 @@ export class SpeculationExecutor {
       });
 
     // The cache attaches handlers synchronously, so rejections are owned there.
-    cache.putInFlight(key, meta, promise, ttlMs);
+    cache.putInFlight(
+      key,
+      meta,
+      promise,
+      ttlMs,
+      p.executionLease
+        ? () => this.deps.leaseValidator?.isCurrent(p.executionLease!) === true
+        : undefined,
+    );
     metrics.record({
       type: 'speculated',
       server: p.server,

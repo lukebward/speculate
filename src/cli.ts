@@ -17,9 +17,9 @@ import { isAbsolute, resolve } from 'node:path';
 import { constants as osConstants } from 'node:os';
 import { loadConfig } from './config.js';
 import { defaultStatePath, defaultStatePathForKey } from './persistence.js';
-import { SpeculateProxy } from './proxy.js';
+import { SpeculateProxy, type ProxySessionConfig } from './proxy.js';
 import { runDoctor } from './doctor.js';
-import { buildWrapConfig, parseWrapArgs } from './wrap.js';
+import { buildWrapConfig, parseWrapArgs, readWrapSessionMetadata } from './wrap.js';
 import { selfCommand } from './hostConfig.js';
 import {
   claudeIsGloballyEnabled,
@@ -603,10 +603,32 @@ async function main(): Promise<void> {
       oauthScope,
     );
     await applyCodexPolicy(wrapConfig, wrapArgs);
+    let session: ProxySessionConfig | undefined;
+    try {
+      const metadata = readWrapSessionMetadata(wrapArgs);
+      if (metadata) {
+        const { connectSessionBridgeOwner } = await import('./sessionBridge.js');
+        const runtime = await connectSessionBridgeOwner(metadata.coordinates, {
+          hostClient: metadata.hostClient,
+          hostServerAlias: metadata.hostServerAlias,
+          onCandidates: () => {},
+        });
+        session = {
+          launchId: metadata.coordinates.launchId,
+          hostClient: metadata.hostClient,
+          hostServerAlias: metadata.hostServerAlias,
+          runtime,
+          cwd: process.cwd(),
+        };
+      }
+    } catch (err) {
+      process.stderr.write(`[speculate] session observer inactive: ${(err as Error).message}\n`);
+    }
     await runProxy(
       wrapConfig,
       defaultStatePathForKey(stateKey),
       '(wrap)',
+      session,
     );
     return;
   }
@@ -695,6 +717,7 @@ async function runProxy(
   config: import('./types.js').SpeculateConfig,
   statePath: string | null,
   configLabel: string,
+  session?: ProxySessionConfig,
 ): Promise<void> {
   applyStoredOAuth(config);
   const stateScope = createStateScope(config, process.cwd());
@@ -706,6 +729,7 @@ async function runProxy(
     statePath,
     stateScope,
     usageRecorder,
+    session,
   });
   const shutdown = async (): Promise<void> => {
     try {

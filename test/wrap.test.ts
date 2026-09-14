@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { join, resolve } from 'node:path';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { buildWrapConfig, parseWrapArgs, type WrapArgs } from '../src/wrap.js';
+import { buildWrapConfig, parseWrapArgs, readWrapSessionMetadata, type WrapArgs } from '../src/wrap.js';
 import { Upstream, resultText } from '../src/upstream.js';
 
 afterEach(() => vi.unstubAllEnvs());
@@ -76,6 +76,16 @@ describe('parseWrapArgs', () => {
       codexServer: 'files', codexBin: '/bin/codex', codexHome: '/home/codex', cwd: '/server/root',
       command: ['server', '--cwd', 'child-option'],
     });
+  });
+
+  it.each(['claude', 'codex'] as const)('parses generic %s wrapper identity', (hostClient) => {
+    expect(ok(parseWrapArgs(['--host-client', hostClient, '--host-server', 'files', '--', 'server'])))
+      .toMatchObject({ hostClient, hostServerAlias: 'files' });
+  });
+
+  it('requires host client and server identity together', () => {
+    expect(err(parseWrapArgs(['--host-client', 'claude', '--', 'server']))).toMatch(/provided together/);
+    expect(err(parseWrapArgs(['--host-client', 'other', '--host-server', 'files', '--', 'server']))).toMatch(/claude\|codex/);
   });
 
   it('requires the complete native Codex context and a value for each flag', () => {
@@ -159,6 +169,28 @@ describe('parseWrapArgs', () => {
   });
 });
 
+describe('session metadata', () => {
+  it('reads complete bridge coordinates only for an identified wrapper', () => {
+    const args = ok(parseWrapArgs(['--host-client', 'codex', '--host-server', 'files', '--', 'server']));
+    expect(readWrapSessionMetadata(args, {
+      SPECULATE_SESSION_SOCKET: '/tmp/bridge',
+      SPECULATE_SESSION_CAPABILITY: 'secret',
+      SPECULATE_SESSION_LAUNCH_ID: 'launch',
+    })).toEqual({
+      hostClient: 'codex',
+      hostServerAlias: 'files',
+      coordinates: { socketPath: '/tmp/bridge', capability: 'secret', launchId: 'launch' },
+    });
+    expect(readWrapSessionMetadata(mkArgs({ command: ['server'] }), {})).toBeNull();
+  });
+
+  it('rejects partial session coordinates', () => {
+    const args = ok(parseWrapArgs(['--host-client', 'claude', '--host-server', 'files', '--', 'server']));
+    expect(() => readWrapSessionMetadata(args, { SPECULATE_SESSION_SOCKET: '/tmp/bridge' }))
+      .toThrow(/incomplete session bridge/i);
+  });
+});
+
 // --- buildWrapConfig ------------------------------------------------------------
 
 describe('buildWrapConfig', () => {
@@ -194,6 +226,20 @@ describe('buildWrapConfig', () => {
     expect(stateKey).not.toContain('child-secret');
     vi.stubEnv('SPECULATE_TEST_SERVER_COLOR', 'red');
     expect(config.servers.upstream!.env!.SPECULATE_TEST_SERVER_COLOR).toBe('blue');
+  });
+
+  it('does not forward session bridge coordinates to the upstream tool process', () => {
+    vi.stubEnv('SPECULATE_SESSION_SOCKET', '/tmp/bridge');
+    vi.stubEnv('SPECULATE_SESSION_CAPABILITY', 'bridge-secret');
+    vi.stubEnv('SPECULATE_SESSION_LAUNCH_ID', 'launch');
+    vi.stubEnv('SPECULATE_TEST_SERVER_COLOR', 'blue');
+    const { config } = buildWrapConfig(mkArgs({ command: ['server'] }));
+    const env = config.servers['upstream']!.env!;
+
+    expect(env.SPECULATE_SESSION_SOCKET).toBeUndefined();
+    expect(env.SPECULATE_SESSION_CAPABILITY).toBeUndefined();
+    expect(env.SPECULATE_SESSION_LAUNCH_ID).toBeUndefined();
+    expect(env.SPECULATE_TEST_SERVER_COLOR).toBe('blue');
   });
 
   it('forwards child cwd and isolates learned state by its resolved path', () => {

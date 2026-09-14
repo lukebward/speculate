@@ -70,6 +70,7 @@ interface EntryBase {
    * (undefined = not yet parsed; null = unparseable).
    */
   parsedArgs?: Record<string, unknown> | null;
+  readonly canPublish?: () => boolean;
 }
 
 interface InFlightEntry extends EntryBase {
@@ -111,6 +112,7 @@ export class SpeculationCache {
     meta: CacheEntryMeta,
     promise: Promise<CallToolResult>,
     ttlMs: number,
+    canPublish?: () => boolean,
   ): void {
     const existing = this.entries.get(key);
     if (existing !== undefined) {
@@ -132,6 +134,7 @@ export class SpeculationCache {
       promise,
       doomed: false,
       claimed: false,
+      canPublish,
     };
     this.entries.set(key, entry);
     promise.then(
@@ -254,7 +257,8 @@ export class SpeculationCache {
     entry.meta.upstreamLatencyMs = t - entry.meta.issuedAt;
     // A claimed entry belongs to its joiner: nothing to store, no events.
     if (entry.claimed) return;
-    if (entry.doomed) {
+    if (entry.doomed || (entry.canPublish && !entry.canPublish())) {
+      if (this.entries.get(key) === entry) this.entries.delete(key);
       this.emit({ type: 'invalidated', key, meta: entry.meta });
       return;
     }

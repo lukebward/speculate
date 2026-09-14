@@ -704,19 +704,38 @@ export function selfCommand(): { command: string; args: string[] } {
 export function wrapEntry(
   entry: McpServerEntry,
   self: { command: string; args: string[] },
-  opts: { mode?: 'strict' | 'annotated' | 'off' } = {},
+  opts: {
+    mode?: 'strict' | 'annotated' | 'off';
+    session?: {
+      hostClient: 'claude' | 'codex';
+      hostServerAlias: string;
+      socketPath: string;
+      capability: string;
+      launchId: string;
+    };
+  } = {},
 ): McpServerEntry {
   const modeArgs = opts.mode ? ['--mode', opts.mode] : [];
+  const identityArgs = opts.session
+    ? ['--host-client', opts.session.hostClient, '--host-server', opts.session.hostServerAlias]
+    : [];
+  const sessionEnv: Record<string, string> | null = opts.session ? {
+    SPECULATE_SESSION_SOCKET: opts.session.socketPath,
+    SPECULATE_SESSION_CAPABILITY: opts.session.capability,
+    SPECULATE_SESSION_LAUNCH_ID: opts.session.launchId,
+  } : null;
   const remote = planRemoteWrap(entry);
   if (remote?.wrappable) {
     const { url, type, headers, ...rest } = entry;
     return {
       ...rest,
       command: self.command,
+      ...(sessionEnv ? { env: { ...(entry.env ?? {}), ...sessionEnv } } : {}),
       args: [
         ...self.args,
         'wrap',
         ...modeArgs,
+        ...identityArgs,
         '--url',
         remote.url,
         ...remote.headers.flatMap(([name, value]) => ['--header', `${name}: ${value}`]),
@@ -726,7 +745,8 @@ export function wrapEntry(
   return {
     ...entry,
     command: self.command,
-    args: [...self.args, 'wrap', ...modeArgs, '--', entry.command!, ...(entry.args ?? [])],
+    ...(sessionEnv ? { env: { ...(entry.env ?? {}), ...sessionEnv } } : {}),
+    args: [...self.args, 'wrap', ...modeArgs, ...identityArgs, '--', entry.command!, ...(entry.args ?? [])],
   };
 }
 

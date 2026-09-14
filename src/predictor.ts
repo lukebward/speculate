@@ -87,6 +87,15 @@ interface ScoredPrediction {
   order: number;
 }
 
+export interface ResolvedCandidate {
+  tool: string;
+  args: Record<string, unknown>;
+  confidence: number;
+  expectedLatencyMs?: number;
+  candidateId: string;
+  ruleId: string;
+}
+
 export class Predictor {
   private readonly extraRules: Map<string, Rule[]>;
   private readonly learner: PredictorOptions['learner'];
@@ -224,6 +233,21 @@ export class Predictor {
     return this.selectBatch(candidates, server);
   }
 
+  admitResolved(
+    server: string,
+    resolved: readonly ResolvedCandidate[],
+    options: { timestamp: number; trackNextCall: boolean },
+  ): Prediction[] {
+    const candidates: ScoredPrediction[] = [];
+    for (const [order, candidate] of resolved.entries()) {
+      const prediction = validatePrediction(candidate, server, candidate.ruleId, 'next');
+      if (!prediction) continue;
+      const scored = this.scoreCandidate(prediction, candidate.candidateId, order, options.timestamp);
+      if (scored) candidates.push(scored);
+    }
+    return this.selectBatch(candidates, server, options.timestamp, options.trackNextCall);
+  }
+
   /**
    * Shared batch tail: dedupe on canonical cache key (keeping the
    * higher-scored prediction; the key is stamped so the executor reuses it
@@ -233,6 +257,7 @@ export class Predictor {
     candidates: ScoredPrediction[],
     server: string,
     timestamp?: number,
+    trackNextCall = true,
   ): Prediction[] {
     const byKey = new Map<string, ScoredPrediction>();
     for (const cand of candidates) {
@@ -296,7 +321,7 @@ export class Predictor {
       });
     }
     const admitted = new Set(kept);
-    this.pendingEvaluation.set(server, evaluated.map((candidate, index) => {
+    if (trackNextCall) this.pendingEvaluation.set(server, evaluated.map((candidate, index) => {
       const { prediction } = candidate;
       return {
         key: dedupeKey(prediction, index),
@@ -554,4 +579,3 @@ function dedupeKey(p: Prediction, order: number): string {
     return `${p.server}:${p.tool}:#${order}`;
   }
 }
-

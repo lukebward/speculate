@@ -64,6 +64,16 @@ export interface Prediction {
    * them with a configurable TTL factor (§6.2, LONG_HORIZON_TTL_FACTOR).
    */
   horizon?: 'next' | 'standing';
+  executionLease?: ExecutionLease;
+}
+
+export interface ExecutionLease {
+  routeId: string;
+  generation: number;
+}
+
+export interface LeaseValidator {
+  isCurrent(lease: ExecutionLease): boolean;
 }
 
 /** A Tier-1 co-occurrence rule (DESIGN.md §5.2). */

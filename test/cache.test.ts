@@ -378,6 +378,21 @@ describe('invalidateServer', () => {
   });
 });
 
+describe('publication guard', () => {
+  it('drops a resolved result when its route lease changed in flight', async () => {
+    const { cache, events } = makeCache();
+    const d = deferred<CallToolResult>();
+    let current = true;
+    cache.putInFlight(K1, meta(), d.promise, 1000, () => current);
+    current = false;
+    d.resolve(res('stale'));
+    await tick();
+
+    expect(cache.lookup(K1).outcome).toBe('miss');
+    expect(events).toEqual([{ type: 'invalidated', key: K1, meta: expect.any(Object) }]);
+  });
+});
+
 describe('flushAll', () => {
   it('counts ready and in-flight entries, emitting/dooming respectively', async () => {
     const { cache, events } = makeCache();

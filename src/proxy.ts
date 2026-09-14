@@ -33,10 +33,12 @@ import { StateStore } from './persistence.js';
 import { collectRuntimeSecrets } from './privacy.js';
 import { LatencyModel } from './latency.js';
 import { CandidateCalibrator } from './calibration.js';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
-import type { Rule, SpeculateConfig } from './types.js';
+import { candidateSchema, type AgentKind, type Candidate, type HostPermissionGate, type LocalRouteDescriptor, type Observation, type RegisteredRoute } from './observerTypes.js';
+import type { ExecutionLease, Rule, SpeculateConfig } from './types.js';
 import type { UsageRecorder } from './usage.js';
 
 const STATS_TOOL = 'speculate__stats';
@@ -50,6 +52,44 @@ const OPENER_RECORD_LIMIT = 3;
 interface Route {
   server: string;
   tool: Tool;
+  exposed: string;
+}
+
+export interface ProxySessionRuntime {
+  setCandidateHandler(handler: (candidates: unknown) => void): void;
+  setDisconnectHandler?(handler: () => void): void;
+  replaceRoutes(routes: readonly LocalRouteDescriptor[]): Promise<readonly RegisteredRoute[]>;
+  invalidateServer(upstreamServer?: string, reason?: string): Promise<void>;
+  publishObservation?(observation: Observation): Promise<boolean>;
+  close(): Promise<void>;
+}
+
+export interface ProxySessionEvent {
+  kind: 'tool-complete';
+  launchId: string;
+  hostClient: AgentKind;
+  hostServerAlias: string;
+  conversationId: string | null;
+  eventId: string;
+  exposedTool: string;
+  upstreamServer: string;
+  upstreamTool: string;
+  args: Record<string, unknown>;
+  result: CallToolResult;
+  latencyMs: number;
+  completedAt: number;
+}
+
+export interface ProxySessionConfig {
+  launchId: string;
+  hostClient: AgentKind;
+  hostServerAlias: string;
+  runtime: ProxySessionRuntime;
+  permissionContext?: () => string | null;
+  permissionGate?: HostPermissionGate;
+  cwd?: string;
+  conversationIdForCall?: (input: { exposedTool: string; upstreamServer: string; upstreamTool: string; args: Readonly<Record<string, unknown>> }) => string | null;
+  onEvent?: (event: ProxySessionEvent) => void;
 }
 
 export class SpeculateProxy {
@@ -73,6 +113,13 @@ export class SpeculateProxy {
   private readonly calibration: CandidateCalibrator;
   private readonly store: StateStore | null;
   private readonly usageRecorder: UsageRecorder | null;
+  private readonly session: ProxySessionConfig | null;
+  private readonly observedRoutes = new Map<string, { route: RegisteredRoute; validate(args: unknown): { valid: boolean } }>();
+  private readonly observedReplay = new Map<string, number>();
+  private readonly observedEventCounts = new Map<string, { count: number; at: number }>();
+  private sessionOps: Promise<void> = Promise.resolve();
+  private sessionRouteRevision = 0;
+  private sessionEventSequence = 0;
   private saveTimer: NodeJS.Timeout | null = null;
   private savedStamp = '';
   /** Remaining opener-recording slots per server this session (§13.15). */
@@ -85,11 +132,13 @@ export class SpeculateProxy {
       statePath?: string | null;
       stateScope?: string;
       usageRecorder?: UsageRecorder | null;
+      session?: ProxySessionConfig;
     } = {},
   ) {
     this.config = config;
     this.now = opts.now ?? Date.now;
     this.usageRecorder = opts.usageRecorder ?? null;
+    this.session = opts.session ?? null;
     const now = this.now;
 
     this.metrics = new Metrics({
@@ -201,6 +250,7 @@ export class SpeculateProxy {
       metrics: this.metrics,
       config,
       now,
+      leaseValidator: { isCurrent: (lease) => this.isCurrentObservedLease(lease) },
     });
 
     for (const [name, sc] of Object.entries(config.servers)) {
@@ -214,6 +264,8 @@ export class SpeculateProxy {
       { capabilities: { tools: { listChanged: true } } },
     );
     this.registerHandlers();
+    this.session?.runtime.setCandidateHandler((candidates) => this.submitObservedCandidates(candidates));
+    this.session?.runtime.setDisconnectHandler?.(() => this.handleSessionDisconnect());
   }
 
   // -------------------------------------------------------------------------
@@ -349,8 +401,11 @@ export class SpeculateProxy {
     // those entries vanish here makes poor rules look artificially effective.
     this.executor.abandonPending();
     this.cache.abandonAll();
+    this.observedRoutes.clear();
     this.saveState(); // best-effort final flush, including abandonment feedback
     try {
+      await this.sessionOps.catch(() => {});
+      await this.session?.runtime.close().catch(() => {});
       await Promise.all([...this.upstreams.values()].map((u) => u.close()));
       await this.server.close();
     } finally {
@@ -413,10 +468,11 @@ export class SpeculateProxy {
           }
           exposed = `${name}__${exposed}`;
         }
-        if (renamable) routes.set(exposed, { server: name, tool });
+        if (renamable) routes.set(exposed, { server: name, tool, exposed });
       }
     }
     this.routes = routes;
+    this.publishSessionRoutes();
   }
 
   private exposedTools(): Tool[] {
@@ -510,6 +566,7 @@ export class SpeculateProxy {
   private handleUpstreamToolsChanged(up: Upstream): void {
     // §3.4: flush that server's entries and re-run eligibility on new tools.
     this.policy.updateTools(up.name, up.tools);
+    this.invalidateObservedServer(up.name, 'tool-list-changed');
     this.cache.invalidateServer(up.name);
     this.primeLearner(up);
     this.rebuildRoutes();
@@ -542,6 +599,7 @@ export class SpeculateProxy {
     // §6.4 restart flush: entries fetched over the dead connection are gone;
     // a restarted process may carry a different identity/config.
     process.stderr.write(`[speculate] upstream '${up.name}' disconnected\n`);
+    this.invalidateObservedServer(up.name, 'disconnect');
     this.cache.invalidateServer(up.name);
     this.policy.updateTools(up.name, []);
     this.rebuildRoutes();
@@ -654,7 +712,10 @@ export class SpeculateProxy {
     // §6.2 conservative invalidation: unknown/mutating tools invalidate on
     // issue and again on settle (success OR failure — a timed-out write may
     // still have applied upstream; see finally below).
-    if (!isReadOnly) this.cache.invalidateServer(server);
+    if (!isReadOnly) {
+      this.invalidateObservedServer(server, 'mutation-start');
+      this.cache.invalidateServer(server);
+    }
 
     // stdio contention visibility (§3.1/§9): a real call arriving while a
     // speculative call is in flight on a serial transport may queue.
@@ -739,7 +800,11 @@ export class SpeculateProxy {
         // write may still have applied) → flush + doom BEFORE draining, so
         // queued speculation can't fire into a pre-flush window or be
         // issued-then-instantly-doomed.
-        if (!isReadOnly) this.cache.invalidateServer(server);
+        if (!isReadOnly) {
+          this.invalidateObservedServer(server, 'mutation-settle');
+          this.cache.invalidateServer(server);
+          this.publishSessionRoutes();
+        }
         this.executor.drainServer(server);
       }
       latencyMs = this.now() - t0;
@@ -761,6 +826,7 @@ export class SpeculateProxy {
     // learning, no state persistence. Off means off (§13.7): a disabled
     // proxy must not accumulate learned argument data on disk.
     const finalResult = result;
+    if (!finalResult.isError) this.publishCompletedRouteCall(route, args, finalResult, latencyMs);
     if (!finalResult.isError && this.config.mode !== 'off') {
       setImmediate(() => {
         try {
@@ -793,5 +859,155 @@ export class SpeculateProxy {
     }
 
     return finalResult;
+  }
+
+  submitObservedCandidates(candidates: unknown): void {
+    if (!this.session || this.config.mode === 'off' || !Array.isArray(candidates) || candidates.length > 3) return;
+    const now = this.now();
+    this.pruneObservedReplay(now);
+    const accepted = new Map<string, Array<{ candidate: Candidate; route: RegisteredRoute }>>();
+    for (const raw of candidates) {
+      const parsed = candidateSchema.safeParse(raw);
+      if (!parsed.success) continue;
+      const candidate = parsed.data;
+      if (candidate.launchId !== this.session.launchId || candidate.createdAt > now || now - candidate.createdAt > 1_000) continue;
+      const eventKey = `${candidate.conversationId}\0${candidate.sourceEventId}`;
+      const eventCount = this.observedEventCounts.get(eventKey)?.count ?? 0;
+      if (eventCount >= 3) continue;
+      this.observedEventCounts.set(eventKey, { count: eventCount + 1, at: now });
+      const replayKey = `${candidate.conversationId}\0${candidate.candidateId}`;
+      if (this.observedReplay.has(replayKey)) continue;
+      const registered = this.observedRoutes.get(candidate.routeId);
+      if (!registered || registered.route.generation !== candidate.generation) continue;
+      if (!registered.validate(candidate.args).valid) continue;
+      const permissionContext = this.session.permissionContext?.() ?? null;
+      if (!permissionContext || !this.session.permissionGate) continue;
+      let permission: ReturnType<HostPermissionGate['check']> = 'unverifiable';
+      try {
+        permission = this.session.permissionGate.check({
+          hostClient: this.session.hostClient,
+          hostServerAlias: registered.route.hostServerAlias,
+          exposedTool: registered.route.exposedTool,
+          args: candidate.args,
+          permissionContext,
+        });
+      } catch {}
+      if (permission !== 'allowed') continue;
+      this.observedReplay.set(replayKey, now);
+      const group = accepted.get(registered.route.upstreamServer) ?? [];
+      group.push({ candidate, route: registered.route });
+      accepted.set(registered.route.upstreamServer, group);
+    }
+    while (this.observedReplay.size > 4_096) this.observedReplay.delete(this.observedReplay.keys().next().value!);
+    while (this.observedEventCounts.size > 4_096) this.observedEventCounts.delete(this.observedEventCounts.keys().next().value!);
+    for (const [server, group] of accepted) {
+      const admitted = this.predictor.admitResolved(
+        server,
+        group.map(({ candidate, route }) => ({
+          tool: route.upstreamTool,
+          args: candidate.args,
+          confidence: candidate.confidence,
+          candidateId: candidate.candidateId,
+          ruleId: `observer:${this.session!.hostClient}:${candidate.source}`,
+        })),
+        { timestamp: now, trackNextCall: false },
+      );
+      for (const prediction of admitted) {
+        const match = group.find(({ candidate, route }) =>
+          route.upstreamTool === prediction.tool && candidate.args === prediction.args);
+        if (match) prediction.executionLease = {
+          routeId: match.route.routeId,
+          generation: match.route.generation,
+        };
+      }
+      this.executor.submit(admitted);
+    }
+  }
+
+  invalidateObservedServer(server: string, reason: string): void {
+    if (!this.session) return;
+    this.sessionRouteRevision++;
+    for (const [routeId, registered] of this.observedRoutes) {
+      if (registered.route.upstreamServer === server) this.observedRoutes.delete(routeId);
+    }
+    this.sessionOps = this.sessionOps
+      .then(() => this.session!.runtime.invalidateServer(server, reason))
+      .catch(() => {});
+  }
+
+  private publishSessionRoutes(): void {
+    if (!this.session || this.closing) return;
+    const revision = ++this.sessionRouteRevision;
+    const descriptors = [...this.routes.values()].map(({ server, tool, exposed }) => ({
+      exposedTool: exposed,
+      upstreamServer: server,
+      upstreamTool: tool.name,
+      inputSchema: tool.inputSchema as Record<string, unknown>,
+    }));
+    this.sessionOps = this.sessionOps.then(async () => {
+      const registered = await this.session!.runtime.replaceRoutes(descriptors);
+      if (revision !== this.sessionRouteRevision || this.closing) return;
+      const validators = new Map<string, { route: RegisteredRoute; validate(args: unknown): { valid: boolean } }>();
+      const provider = new AjvJsonSchemaValidator();
+      for (const route of registered) {
+        try {
+          validators.set(route.routeId, {
+            route,
+            validate: provider.getValidator<Record<string, unknown>>(route.inputSchema as never),
+          });
+        } catch {}
+      }
+      this.observedRoutes.clear();
+      for (const [routeId, route] of validators) this.observedRoutes.set(routeId, route);
+    }).catch(() => {});
+  }
+
+  private isCurrentObservedLease(lease: ExecutionLease): boolean {
+    return this.observedRoutes.get(lease.routeId)?.route.generation === lease.generation;
+  }
+
+  private pruneObservedReplay(now: number): void {
+    for (const [key, at] of this.observedReplay) {
+      if (now - at > 120_000) this.observedReplay.delete(key);
+    }
+    for (const [key, value] of this.observedEventCounts) {
+      if (now - value.at > 120_000) this.observedEventCounts.delete(key);
+    }
+  }
+
+  private handleSessionDisconnect(): void {
+    const servers = new Set([...this.observedRoutes.values()].map(({ route }) => route.upstreamServer));
+    this.sessionRouteRevision++;
+    this.observedRoutes.clear();
+    for (const server of servers) this.cache.invalidateServer(server);
+  }
+
+  private publishCompletedRouteCall(route: Route, args: Record<string, unknown>, result: CallToolResult, latencyMs: number): void {
+    if (!this.session) return;
+    let conversationId: string | null = null;
+    try {
+      conversationId = this.session.conversationIdForCall?.({
+        exposedTool: route.exposed,
+        upstreamServer: route.server,
+        upstreamTool: route.tool.name,
+        args,
+      }) ?? null;
+    } catch {}
+    const event: ProxySessionEvent = {
+      kind: 'tool-complete',
+      launchId: this.session.launchId,
+      hostClient: this.session.hostClient,
+      hostServerAlias: this.session.hostServerAlias,
+      conversationId,
+      eventId: `${this.session.hostServerAlias}:${++this.sessionEventSequence}`,
+      exposedTool: route.exposed,
+      upstreamServer: route.server,
+      upstreamTool: route.tool.name,
+      args,
+      result,
+      latencyMs,
+      completedAt: this.now(),
+    };
+    try { this.session.onEvent?.(event); } catch {}
   }
 }

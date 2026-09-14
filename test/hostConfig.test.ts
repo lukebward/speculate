@@ -220,6 +220,27 @@ describe('entry classification and wrapping', () => {
     expect(wrapped.args).toEqual([...SELF.args, 'wrap', '--mode', 'strict', '--', 'srv']);
   });
 
+  it('adds ephemeral bridge coordinates and generic host identity when requested', () => {
+    const wrapped = wrapEntry({ command: 'srv', env: { KEEP: 'yes' } }, SELF, {
+      session: {
+        hostClient: 'claude',
+        hostServerAlias: 'files',
+        socketPath: '/tmp/bridge',
+        capability: 'secret',
+        launchId: 'launch',
+      },
+    });
+    expect(wrapped.args).toEqual([
+      ...SELF.args, 'wrap', '--host-client', 'claude', '--host-server', 'files', '--', 'srv',
+    ]);
+    expect(wrapped.env).toEqual({
+      KEEP: 'yes',
+      SPECULATE_SESSION_SOCKET: '/tmp/bridge',
+      SPECULATE_SESSION_CAPABILITY: 'secret',
+      SPECULATE_SESSION_LAUNCH_ID: 'launch',
+    });
+  });
+
   it('does not mistake unrelated wrap tokens for our wrapper', () => {
     expect(isWrappedEntry({ command: 'other-tool', args: ['wrap', '--', 'x'] })).toBe(false);
     expect(

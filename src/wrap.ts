@@ -17,6 +17,8 @@ import { HEADER_NAME, resolveHeaderValue } from './config.js';
 import type { SpeculateConfig, SpeculationMode } from './types.js';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import type { AgentKind } from './observerTypes.js';
+import type { SessionBridgeCoordinates } from './sessionBridge.js';
 
 export interface WrapArgs {
   mode: SpeculationMode;
@@ -42,6 +44,8 @@ export interface WrapArgs {
   codexServer?: string;
   codexBin?: string;
   codexHome?: string;
+  hostClient?: AgentKind;
+  hostServerAlias?: string;
   /** Child working directory; the wrapper retains the host's project cwd. */
   cwd?: string;
 }
@@ -82,6 +86,14 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
       out.allow.push(...list.split(',').map((s) => s.trim()).filter(Boolean));
     } else if (a === '--sniff') {
       out.legacyPassthrough = true;
+    } else if (a === '--host-client') {
+      const value = argv[++i];
+      if (value !== 'claude' && value !== 'codex') return { error: '--host-client must be claude|codex' };
+      out.hostClient = value;
+    } else if (a === '--host-server') {
+      const value = argv[++i];
+      if (!value || value.startsWith('--')) return { error: '--host-server requires a value' };
+      out.hostServerAlias = value;
     } else if (a === '--codex-server' || a === '--codex-bin' || a === '--codex-home' || a === '--cwd') {
       const value = argv[++i];
       if (!value || value.startsWith('--')) return { error: `${a} requires a value` };
@@ -139,6 +151,9 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
   if (codexFlags.length !== 0 && codexFlags.length !== 3) {
     return { error: '--codex-server, --codex-bin, and --codex-home must be provided together' };
   }
+  if ((out.hostClient === undefined) !== (out.hostServerAlias === undefined)) {
+    return { error: '--host-client and --host-server must be provided together' };
+  }
   if (codexFlags.length && out.legacyPassthrough) {
     return { error: '--sniff cannot be combined with Codex integration' };
   }
@@ -168,6 +183,31 @@ export function parseWrapArgs(argv: string[]): WrapArgs | { error: string } {
     out.profile = null;
   }
   return out;
+}
+
+export interface WrapSessionMetadata {
+  hostClient: AgentKind;
+  hostServerAlias: string;
+  coordinates: SessionBridgeCoordinates;
+}
+
+export function readWrapSessionMetadata(
+  args: WrapArgs,
+  env: Record<string, string | undefined> = process.env,
+): WrapSessionMetadata | null {
+  const socketPath = env.SPECULATE_SESSION_SOCKET;
+  const capability = env.SPECULATE_SESSION_CAPABILITY;
+  const launchId = env.SPECULATE_SESSION_LAUNCH_ID;
+  const hasCoordinates = [socketPath, capability, launchId].some((value) => value !== undefined);
+  if (!args.hostClient && !args.hostServerAlias && !hasCoordinates) return null;
+  if (!args.hostClient || !args.hostServerAlias || !socketPath || !capability || !launchId) {
+    throw new Error('incomplete session bridge metadata');
+  }
+  return {
+    hostClient: args.hostClient,
+    hostServerAlias: args.hostServerAlias,
+    coordinates: { socketPath, capability, launchId },
+  };
 }
 
 /** Build the in-memory SpeculateConfig for a wrap invocation. */
@@ -205,7 +245,8 @@ export function buildWrapConfig(
         // allowlist. A wrapper must preserve the environment the host gave it,
         // including credentials and server-specific settings.
         env: Object.fromEntries(Object.entries(process.env).filter(
-          (entry): entry is [string, string] => typeof entry[1] === 'string',
+          (entry): entry is [string, string] =>
+            typeof entry[1] === 'string' && !entry[0].startsWith('SPECULATE_SESSION_'),
         )),
         ...(args.cwd === undefined ? {} : { cwd: resolve(workspace, args.cwd) }),
       };
