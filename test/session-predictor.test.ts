@@ -152,6 +152,51 @@ describe('SessionPredictor', () => {
 
     expect(predictor.observe(completed('fresh-a2', 'issues-r2', { issue: 2 }))).toEqual([]);
   });
+
+  it('drops a conversation before retained observation material exceeds its cap', () => {
+    const predictor = new SessionPredictor({ routes: () => [issueRoute, searchRoute], now: () => 50 });
+    trainCopiedWorkflow(predictor);
+    for (let index = 0; index < 5; index++) {
+      predictor.observe(completed(`large-${index}`, issueRoute.routeId, {}, {
+        large: `${index}:${'x'.repeat(1_800_000)}`,
+      }));
+    }
+
+    const candidates = predictor.observe(completed('after-cap', issueRoute.routeId, { issue: 9 }));
+
+    expect(candidates.some((candidate) => candidate.routeId === searchRoute.routeId)).toBe(false);
+  });
+
+  it('evicts the oldest conversation before the session estimate exceeds 32 MiB', () => {
+    const predictor = new SessionPredictor({ routes: () => [issueRoute, searchRoute], now: () => 50 });
+    trainCopiedWorkflow(predictor);
+    for (let index = 0; index < 5; index++) {
+      predictor.observe(completed(`session-large-${index}`, issueRoute.routeId, {}, {
+        large: `${index}:${'x'.repeat(1_700_000)}`,
+      }, { context: { ...baseContext, conversationId: index === 0 ? 'thread' : `thread-${index}` } }));
+    }
+
+    const candidates = predictor.observe(completed('after-session-cap', issueRoute.routeId, { issue: 9 }));
+
+    expect(candidates.some((candidate) => candidate.routeId === searchRoute.routeId)).toBe(false);
+  });
+
+  it('evicts the oldest conversation through the same accounting path at the count cap', () => {
+    const predictor = new SessionPredictor({ routes: () => [issueRoute, searchRoute], now: () => 50 });
+    trainCopiedWorkflow(predictor);
+    for (let index = 1; index < 256; index++) {
+      predictor.observe(completed(`fill-${index}`, issueRoute.routeId, {}, null, {
+        context: { ...baseContext, conversationId: `thread-${index}` },
+      }));
+    }
+    predictor.observe(completed('newest', issueRoute.routeId, {}, null, {
+      context: { ...baseContext, conversationId: 'thread-newest' },
+    }));
+
+    const candidates = predictor.observe(completed('after-count-cap', issueRoute.routeId, { issue: 9 }));
+
+    expect(candidates.some((candidate) => candidate.routeId === searchRoute.routeId)).toBe(false);
+  });
 });
 
 describe('real completion bridge integration', () => {

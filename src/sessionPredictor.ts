@@ -6,6 +6,10 @@ import type { ObservedCall } from './types.js';
 const MAX_CONVERSATIONS = 256;
 const MAX_REPLAY_IDS = 4_096;
 const REPLAY_RETENTION_MS = 120_000;
+const MAX_CONVERSATION_BYTES = 8 * 1024 * 1024;
+const MAX_SESSION_BYTES = 32 * 1024 * 1024;
+const LEARNER_RETAINED_COPY_FACTOR = 4;
+const OBSERVATION_STATE_OVERHEAD_BYTES = 512;
 
 export interface SessionPredictorOptions {
   routes(): readonly RegisteredRoute[];
@@ -15,6 +19,8 @@ export interface SessionPredictorOptions {
 interface ConversationState {
   learner: TransitionLearner;
   routeIds: Set<string>;
+  retainedBytes: number;
+  lastUsed: number;
 }
 
 export class SessionPredictor {
@@ -22,6 +28,8 @@ export class SessionPredictor {
   private readonly conversations = new Map<string, ConversationState>();
   private readonly replay = new Map<string, number>();
   private candidateSequence = 0;
+  private stateSequence = 0;
+  private retainedBytes = 0;
 
   constructor(private readonly options: SessionPredictorOptions) {
     this.now = options.now ?? Date.now;
@@ -47,18 +55,31 @@ export class SessionPredictor {
 
     let state = this.conversations.get(event.context.conversationId);
     if (!state) {
-      if (this.conversations.size >= MAX_CONVERSATIONS) return [];
+      if (this.conversations.size >= MAX_CONVERSATIONS) this.dropOldestConversation();
       state = this.newConversation();
       this.conversations.set(event.context.conversationId, state);
     }
     if (!event.ordered) {
-      this.conversations.set(event.context.conversationId, this.newConversation());
+      this.resetConversation(event.context.conversationId);
       return [];
     }
 
     const args = copyJsonRecord(event.args);
     const parsed = copyJson(event.parsed);
     if (!args.ok || !parsed.ok) return [];
+    const retainedBytes = OBSERVATION_STATE_OVERHEAD_BYTES +
+      LEARNER_RETAINED_COPY_FACTOR * (args.bytes + parsed.bytes);
+    if (retainedBytes > MAX_CONVERSATION_BYTES) {
+      this.dropConversation(event.context.conversationId);
+      return [];
+    }
+    if (state.retainedBytes + retainedBytes > MAX_CONVERSATION_BYTES) {
+      state = this.resetConversation(event.context.conversationId);
+    }
+    state.retainedBytes += retainedBytes;
+    state.lastUsed = ++this.stateSequence;
+    this.retainedBytes += retainedBytes;
+    this.enforceSessionBytes(event.context.conversationId);
     const server = conversationToken(event.context.conversationId);
     const tool = routeToken(source);
     const observed: ObservedCall = {
@@ -99,12 +120,13 @@ export class SessionPredictor {
     if (routeIds.length === 0) {
       this.conversations.clear();
       this.replay.clear();
+      this.retainedBytes = 0;
       return;
     }
     const removed = new Set(routeIds);
     for (const [conversationId, state] of this.conversations) {
       if ([...state.routeIds].some((routeId) => removed.has(routeId))) {
-        this.conversations.delete(conversationId);
+        this.dropConversation(conversationId);
       }
     }
   }
@@ -117,7 +139,40 @@ export class SessionPredictor {
         maxPredictionsPerTrigger: 3,
       }),
       routeIds: new Set(),
+      retainedBytes: 0,
+      lastUsed: ++this.stateSequence,
     };
+  }
+
+  private resetConversation(conversationId: string): ConversationState {
+    this.dropConversation(conversationId);
+    const state = this.newConversation();
+    this.conversations.set(conversationId, state);
+    return state;
+  }
+
+  private dropConversation(conversationId: string): void {
+    const state = this.conversations.get(conversationId);
+    if (!state) return;
+    this.retainedBytes -= state.retainedBytes;
+    this.conversations.delete(conversationId);
+  }
+
+  private enforceSessionBytes(protectedConversationId: string): void {
+    while (this.retainedBytes > MAX_SESSION_BYTES) {
+      if (!this.dropOldestConversation(protectedConversationId)) return;
+    }
+  }
+
+  private dropOldestConversation(excludedConversationId?: string): boolean {
+    let oldest: { conversationId: string; lastUsed: number } | null = null;
+    for (const [conversationId, state] of this.conversations) {
+      if (conversationId === excludedConversationId) continue;
+      if (!oldest || state.lastUsed < oldest.lastUsed) oldest = { conversationId, lastUsed: state.lastUsed };
+    }
+    if (!oldest) return false;
+    this.dropConversation(oldest.conversationId);
+    return true;
   }
 
   private pruneReplay(now: number): void {
@@ -139,19 +194,25 @@ function digest(value: string): string {
   return createHash('sha256').update(value).digest('base64url');
 }
 
-function copyJson(value: unknown): { ok: true; value: unknown } | { ok: false } {
+function copyJson(value: unknown): { ok: true; value: unknown; bytes: number } | { ok: false } {
   try {
-    return { ok: true, value: JSON.parse(JSON.stringify(value)) as unknown };
+    const serialized = JSON.stringify(value);
+    if (typeof serialized !== 'string') return { ok: false };
+    return {
+      ok: true,
+      value: JSON.parse(serialized) as unknown,
+      bytes: Buffer.byteLength(serialized, 'utf8'),
+    };
   } catch {
     return { ok: false };
   }
 }
 
 function copyJsonRecord(value: Record<string, unknown>):
-  { ok: true; value: Record<string, unknown> } | { ok: false } {
+  { ok: true; value: Record<string, unknown>; bytes: number } | { ok: false } {
   const copied = copyJson(value);
   if (!copied.ok || copied.value === null || typeof copied.value !== 'object' || Array.isArray(copied.value)) {
     return { ok: false };
   }
-  return { ok: true, value: copied.value as Record<string, unknown> };
+  return { ok: true, value: copied.value as Record<string, unknown>, bytes: copied.bytes };
 }

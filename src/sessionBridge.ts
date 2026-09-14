@@ -189,6 +189,7 @@ export class SessionBridge {
   }
 
   registerConversation(context: SessionContext): boolean {
+    if (this.closed) return false;
     const parsed = sessionContextSchema.safeParse(context);
     if (!parsed.success) return false;
     context = parsed.data;
@@ -209,6 +210,7 @@ export class SessionBridge {
   }
 
   publishObservation(input: unknown): boolean {
+    if (this.closed) return false;
     const parsed = observationSchema.safeParse(input);
     if (!parsed.success || !this.acceptsContext(parsed.data.context)) return false;
     const bytes = Buffer.byteLength(JSON.stringify(parsed.data), 'utf8');
@@ -245,6 +247,7 @@ export class SessionBridge {
   }
 
   submit(input: unknown): boolean {
+    if (this.closed) return false;
     const parsed = candidateSchema.safeParse(input);
     if (!parsed.success) return false;
     const candidate = parsed.data;
@@ -283,6 +286,7 @@ export class SessionBridge {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.sessionPredictor.invalidate([]);
     for (const socket of this.sockets) socket.destroy();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
     if (this.directory) rmSync(this.directory, { recursive: true, force: true });

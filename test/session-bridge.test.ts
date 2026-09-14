@@ -247,6 +247,34 @@ describe('SessionBridge bounds and event seam', () => {
     expect(seen[0]).toBe('reset');
   });
 
+  it('clears predictor state on close and rejects later observations', async () => {
+    const bridge = await start();
+    const connection = await owner(bridge, 'files');
+    const [route] = await connection.register([localRoute]);
+    const observation = {
+      context,
+      eventId: 'before-close',
+      observedAt: 1,
+      kind: 'tool-complete' as const,
+      routeId: route!.routeId,
+      args: { path: '/a' },
+      parsed: null,
+      latencyMs: 4,
+      ordered: true,
+    };
+    expect(bridge.publishObservation(observation)).toBe(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    const predictor = (bridge as unknown as {
+      sessionPredictor: { conversations: Map<string, unknown> };
+    }).sessionPredictor;
+    expect(predictor.conversations.size).toBe(1);
+
+    await bridge.close();
+
+    expect(predictor.conversations.size).toBe(0);
+    expect(bridge.publishObservation({ ...observation, eventId: 'after-close' })).toBe(false);
+  });
+
   it('publishes owner route invalidation as a reset observation', async () => {
     const bridge = await start(() => 100);
     const connection = await owner(bridge, 'files');
