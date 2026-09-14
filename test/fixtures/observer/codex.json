@@ -65,7 +65,8 @@
           "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"id\":\"fc_fixture_003\",\"type\":\"function_call\",\"call_id\":\"call_fixture_003\",\"name\":\"mcp__issues__get_comments\",\"arguments\":\"{\\\"number\\\":7}\",\"status\":\"completed\"}}\n\n",
           "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture_002\",\"object\":\"response\",\"status\":\"completed\"}}\n\n"
         ],
-        "byte_split_note": "The UTF-8 bytes for é are intentionally split between writes by the harness consumer."
+        "utf8_split_chunks_base64": ["ZXZlbnQ6IGRlbHRhCmRhdGE6IHsidGV4dCI6ImNhZsM=", "qSJ9Cgo="],
+        "byte_split_note": "Decoded concatenation is one SSE event; the boundary divides the two UTF-8 bytes for é."
       }
     },
     {

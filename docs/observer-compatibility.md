@@ -42,7 +42,7 @@ Each `createObserverHarness()` instance owns its servers, response queues, monot
 
 ## Baseline evidence
 
-`npx vitest run test/observer-baseline.test.ts` passed 4 tests. The provider cases proved exact request/response buffers, ordered SSE writes, and downstream cancellation before a later provider write. The MCP case proved literal result equality, a completed ready hit, an in-flight join, and write-triggered invalidation through the real proxy protocol.
+`npm test -- test/observer-baseline.test.ts test/integration.test.ts` passed 2 files and 17 tests in 24.44 seconds. The provider cases proved exact request/response buffers, ordered SSE writes, and downstream cancellation before a later provider write. The MCP case proved literal result equality, a completed ready hit, an in-flight join, and write-triggered invalidation through the real proxy protocol. A standalone strict typecheck of the new helper and test also passed.
 
 The pre-change full suite passed 43 files and 1,015 tests with 8 skipped in 85.53 seconds. The coordinator ran that suite before these fixtures were added; it is baseline evidence, not post-change verification.
 

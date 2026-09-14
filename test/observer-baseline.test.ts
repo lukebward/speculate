@@ -28,7 +28,11 @@ describe('observer compatibility fixtures', () => {
       const value = fixture(agent) as {
         version: number;
         agent: string;
-        cases: Array<{ id: string; features: string[] }>;
+        cases: Array<{
+          id: string;
+          features: string[];
+          response?: { utf8_split_chunks_base64?: string[] };
+        }>;
       };
       expect(value.version).toBe(1);
       expect(value.agent).toBe(agent);
@@ -44,6 +48,11 @@ describe('observer compatibility fixtures', () => {
           'cancellation',
           'hooks',
         ]),
+      );
+      const split = value.cases.find((entry) => entry.features.includes('sse_byte_splits'))
+        ?.response?.utf8_split_chunks_base64;
+      expect(Buffer.concat(split!.map((part) => Buffer.from(part, 'base64'))).toString()).toBe(
+        'event: delta\ndata: {"text":"café"}\n\n',
       );
     }
   });
