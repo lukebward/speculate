@@ -310,6 +310,35 @@ describe('observer attribution validation', () => {
       issueId: 'local-1', specDispatchAt: 10,
     }]);
   });
+
+  it('contains asynchronous callback failures and continues accounting', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const metrics = new Metrics({
+        mode: 'strict', log: 'off', now: () => 20,
+        onObserverLifecycle: async () => {
+          throw new Error('async observer failed');
+        },
+      });
+      metrics.record({
+        type: 'speculated', server: 'server', tool: 'tool', ruleId: 'observer:claude:intent',
+        observerAttribution: {
+          client: 'claude', source: 'intent', routeId: 'route', generation: 1, candidateCreatedAt: 5,
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      metrics.record({ type: 'real_call', server: 'server', tool: 'tool' });
+
+      expect(unhandled).toEqual([]);
+      expect(metrics.statsSnapshot()).toMatchObject({ realCalls: 1, speculativeCalls: 1 });
+      expect(metrics.ruleFeedback('observer:claude:intent')).toMatchObject({ speculated: 1 });
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });
 
 describe('route-scoped observer retention', () => {

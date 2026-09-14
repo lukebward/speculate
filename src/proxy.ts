@@ -137,7 +137,7 @@ export class SpeculateProxy {
       stateScope?: string;
       usageRecorder?: UsageRecorder | null;
       session?: ProxySessionConfig;
-      onObserverLifecycle?: (event: ObserverLifecycleEvent) => void;
+      onObserverLifecycle?: (event: ObserverLifecycleEvent) => void | Promise<void>;
     } = {},
   ) {
     this.config = config;

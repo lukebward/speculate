@@ -123,7 +123,9 @@ export class Metrics {
   private readonly onUsage:
     | ((counters: UsageCounters, breakdown: UsageBreakdown) => void)
     | undefined;
-  private readonly onObserverLifecycle: ((event: ObserverLifecycleEvent) => void) | undefined;
+  private readonly onObserverLifecycle:
+    | ((event: ObserverLifecycleEvent) => void | Promise<void>)
+    | undefined;
   private readonly startedAt: number;
 
   private realCalls = 0;
@@ -190,7 +192,7 @@ export class Metrics {
     log: 'stderr' | 'off';
     now?: () => number;
     onUsage?: (counters: UsageCounters, breakdown: UsageBreakdown) => void;
-    onObserverLifecycle?: (event: ObserverLifecycleEvent) => void;
+    onObserverLifecycle?: (event: ObserverLifecycleEvent) => void | Promise<void>;
   }) {
     this.mode = opts.mode;
     this.log = opts.log;
@@ -398,7 +400,10 @@ export class Metrics {
     }
     const lifecycle = observerLifecycle(event);
     if (lifecycle) {
-      try { this.onObserverLifecycle?.(lifecycle); } catch {}
+      try {
+        const result = this.onObserverLifecycle?.(lifecycle);
+        void result?.catch(() => {});
+      } catch {}
     }
   }
 
