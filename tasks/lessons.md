@@ -12,3 +12,5 @@
   main as canonical — keep theirs, port only what doesn't exist upstream.
 
 - Treat Codex and Claude Code as first-class peers in setup, transport, authentication, recovery, testing, and release criteria.
+
+- Run long baseline benchmarks from a fixed source/build snapshot. This project deletes dist during each build, so a benchmark sharing the active implementation tree can lose its target CLI mid-run.
