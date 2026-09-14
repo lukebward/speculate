@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "agent": "claude",
+  "protocol": "anthropic-messages",
+  "cases": [
+    {
+      "id": "messages-full-tool-definition",
+      "features": ["full_request", "tool_definitions", "aliases"],
+      "transport": "http",
+      "request": {
+        "method": "POST",
+        "path": "/v1/messages",
+        "headers": {
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "interleaved-thinking-2025-05-14",
+          "x-api-key": "synthetic-api-key",
+          "x-fixture-trace": "claude-full"
+        },
+        "body": {
+          "model": "claude-synthetic-1",
+          "max_tokens": 256,
+          "system": "Use tools only when their definitions match.",
+          "messages": [{"role": "user", "content": "Read /workspace/notes.txt"}],
+          "tools": [
+            {
+              "name": "mcp__workspace__read_file",
+              "description": "Read one workspace file.",
+              "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false
+              }
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {"content-type": "application/json", "request-id": "req_fixture_claude_001"},
+        "body": {
+          "id": "msg_fixture_001",
+          "type": "message",
+          "role": "assistant",
+          "model": "claude-synthetic-1",
+          "content": [
+            {"type": "tool_use", "id": "toolu_fixture_001", "name": "mcp__workspace__read_file", "input": {"path": "/workspace/notes.txt"}}
+          ],
+          "stop_reason": "tool_use",
+          "stop_sequence": null,
+          "usage": {"input_tokens": 42, "output_tokens": 18}
+        }
+      }
+    },
+    {
+      "id": "messages-continuation-sse-split",
+      "features": ["incremental_request", "partial_arguments", "multiple_calls", "sse_byte_splits", "opaque_reasoning"],
+      "transport": "sse",
+      "request": {
+        "method": "POST",
+        "path": "/v1/messages",
+        "headers": {"anthropic-version": "2023-06-01", "x-api-key": "synthetic-api-key"},
+        "body": {
+          "model": "claude-synthetic-1",
+          "max_tokens": 256,
+          "stream": true,
+          "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_fixture_previous", "name": "mcp__issues__get_issue", "input": {"number": 7}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_fixture_previous", "content": "{\"number\":7,\"state\":\"open\"}"}]}
+          ],
+          "tools": [
+            {"name": "mcp__workspace__read_file", "description": "Read one file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+            {"name": "mcp__issues__get_comments", "description": "Read comments.", "input_schema": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}}
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {"content-type": "text/event-stream"},
+        "chunks": [
+          "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture_002\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-synthetic-1\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":51,\"output_tokens\":1}}}\n\n",
+          "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"opaque-fixture-signature\"}}\n\n",
+          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"opaque\"}}\n\n",
+          "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_fixture_002\",\"name\":\"mcp__workspace__read_file\",\"input\":{}}}\n\n",
+          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/workspace/caf\"}}\n\n",
+          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"é.txt\\\"}\"}}\n\n",
+          "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_fixture_003\",\"name\":\"mcp__issues__get_comments\",\"input\":{}}}\n\n",
+          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"number\\\":7}\"}}\n\n",
+          "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":34}}\n\n",
+          "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ],
+        "byte_split_note": "The UTF-8 bytes for é are intentionally split between writes by the harness consumer."
+      }
+    },
+    {
+      "id": "messages-deferred-tool",
+      "features": ["deferred_tools", "tool_definitions"],
+      "transport": "sse",
+      "request": {
+        "method": "POST",
+        "path": "/v1/messages",
+        "body": {
+          "model": "claude-synthetic-1",
+          "max_tokens": 128,
+          "messages": [{"role": "user", "content": "Find a repository tool, then read the issue."}],
+          "tools": [
+            {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+            {"name": "mcp__issues__get_issue", "description": "Read an issue.", "defer_loading": true, "input_schema": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}}
+          ]
+        }
+      }
+    },
+    {
+      "id": "messages-auxiliary-count",
+      "features": ["auxiliary_endpoint"],
+      "transport": "http",
+      "request": {"method": "POST", "path": "/v1/messages/count_tokens", "body": {"model": "claude-synthetic-1", "messages": [{"role": "user", "content": "Count this."}]}},
+      "response": {"status": 200, "headers": {"content-type": "application/json"}, "body": {"input_tokens": 4}}
+    },
+    {
+      "id": "messages-error-and-cancel",
+      "features": ["error", "cancellation"],
+      "transport": "sse",
+      "request": {"method": "POST", "path": "/v1/messages", "cancel_after_chunks": 1},
+      "response": {"status": 429, "headers": {"content-type": "application/json", "retry-after": "1"}, "chunks": ["{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"synthetic limit\"}}"]}
+    },
+    {
+      "id": "claude-hook-subagent",
+      "features": ["hooks", "subagent"],
+      "transport": "hook-json",
+      "events": [
+        {"hook_event_name": "PreToolUse", "session_id": "session_fixture_claude", "tool_use_id": "toolu_fixture_hook", "tool_name": "Task", "tool_input": {"subagent_type": "Explore", "prompt": "Inspect synthetic files."}},
+        {"hook_event_name": "PostToolUse", "session_id": "session_fixture_claude", "tool_use_id": "toolu_fixture_hook", "tool_name": "Task", "tool_input": {"subagent_type": "Explore", "prompt": "Inspect synthetic files."}, "tool_response": {"status": "completed"}}
+      ]
+    }
+  ]
+}

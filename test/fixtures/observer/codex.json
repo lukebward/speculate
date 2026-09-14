@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "agent": "codex",
+  "protocol": "openai-responses",
+  "cases": [
+    {
+      "id": "responses-full-tool-definition",
+      "features": ["full_request", "tool_definitions", "aliases"],
+      "transport": "http",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "headers": {"authorization": "Bearer synthetic-api-key", "openai-beta": "responses=v1", "x-fixture-trace": "codex-full"},
+        "body": {
+          "model": "gpt-synthetic-1",
+          "store": false,
+          "stream": false,
+          "input": [{"role": "user", "content": [{"type": "input_text", "text": "Read /workspace/notes.txt"}]}],
+          "tools": [
+            {"type": "function", "name": "mcp__workspace__read_file", "description": "Read one workspace file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false}, "strict": true}
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {"content-type": "application/json", "x-request-id": "req_fixture_codex_001"},
+        "body": {
+          "id": "resp_fixture_001",
+          "object": "response",
+          "status": "completed",
+          "model": "gpt-synthetic-1",
+          "output": [{"id": "fc_fixture_001", "type": "function_call", "call_id": "call_fixture_001", "name": "mcp__workspace__read_file", "arguments": "{\"path\":\"/workspace/notes.txt\"}", "status": "completed"}],
+          "usage": {"input_tokens": 42, "output_tokens": 12, "total_tokens": 54}
+        }
+      }
+    },
+    {
+      "id": "responses-continuation-sse-split",
+      "features": ["incremental_request", "continuation", "partial_arguments", "multiple_calls", "sse_byte_splits", "opaque_reasoning"],
+      "transport": "sse",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "body": {
+          "model": "gpt-synthetic-1",
+          "previous_response_id": "resp_fixture_previous",
+          "stream": true,
+          "input": [{"type": "function_call_output", "call_id": "call_fixture_previous", "output": "{\"number\":7,\"state\":\"open\"}"}],
+          "tools": [
+            {"type": "function", "name": "mcp__workspace__read_file", "description": "Read one file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+            {"type": "function", "name": "mcp__issues__get_comments", "description": "Read comments.", "parameters": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}}
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {"content-type": "text/event-stream"},
+        "chunks": [
+          "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture_002\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+          "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_fixture_001\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque-fixture-reasoning\",\"summary\":[]}}\n\n",
+          "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"fc_fixture_002\",\"type\":\"function_call\",\"call_id\":\"call_fixture_002\",\"name\":\"mcp__workspace__read_file\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+          "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_fixture_002\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"/workspace/caf\"}\n\n",
+          "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_fixture_002\",\"output_index\":1,\"delta\":\"é.txt\\\"}\"}\n\n",
+          "event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_fixture_002\",\"output_index\":1,\"arguments\":\"{\\\"path\\\":\\\"/workspace/café.txt\\\"}\"}\n\n",
+          "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"id\":\"fc_fixture_003\",\"type\":\"function_call\",\"call_id\":\"call_fixture_003\",\"name\":\"mcp__issues__get_comments\",\"arguments\":\"{\\\"number\\\":7}\",\"status\":\"completed\"}}\n\n",
+          "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture_002\",\"object\":\"response\",\"status\":\"completed\"}}\n\n"
+        ],
+        "byte_split_note": "The UTF-8 bytes for é are intentionally split between writes by the harness consumer."
+      }
+    },
+    {
+      "id": "responses-deferred-tool",
+      "features": ["deferred_tools", "tool_definitions"],
+      "transport": "http",
+      "request": {
+        "method": "POST",
+        "path": "/v1/responses",
+        "body": {
+          "model": "gpt-synthetic-1",
+          "input": "Find a tool, then inspect issue 7.",
+          "tools": [
+            {"type": "function", "name": "mcp__issues__get_issue", "description": "Read an issue.", "parameters": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}, "defer_loading": true},
+            {"type": "function", "name": "tool_search", "description": "Load a deferred tool definition.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
+          ]
+        }
+      }
+    },
+    {
+      "id": "responses-custom-code",
+      "features": ["opaque_code", "tool_definitions"],
+      "transport": "sse",
+      "request": {"method": "POST", "path": "/v1/responses", "body": {"model": "gpt-synthetic-1", "stream": true, "input": "Evaluate the sample.", "tools": [{"type": "custom", "name": "python", "description": "Execute opaque code."}]}},
+      "response": {"status": 200, "headers": {"content-type": "text/event-stream"}, "chunks": ["event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"ct_fixture_001\",\"type\":\"custom_tool_call\",\"call_id\":\"call_fixture_code\",\"name\":\"python\",\"input\":\"print(6 * 7)\"}}\n\n"]}
+    },
+    {
+      "id": "responses-websocket-continuation",
+      "features": ["websocket", "continuation", "multiple_calls"],
+      "transport": "websocket",
+      "path": "/v1/responses",
+      "client_messages": [
+        {"type": "response.create", "model": "gpt-synthetic-1", "input": "Inspect issue 7.", "tools": [{"type": "function", "name": "mcp__issues__get_issue", "parameters": {"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}}]},
+        {"type": "response.create", "previous_response_id": "resp_fixture_ws_001", "input": [{"type": "function_call_output", "call_id": "call_fixture_ws_001", "output": "{\"number\":7}"}]}
+      ],
+      "server_messages": [
+        {"type": "response.output_item.done", "output_index": 0, "item": {"id": "fc_fixture_ws_001", "type": "function_call", "call_id": "call_fixture_ws_001", "name": "mcp__issues__get_issue", "arguments": "{\"number\":7}", "status": "completed"}},
+        {"type": "response.completed", "response": {"id": "resp_fixture_ws_001", "status": "completed"}},
+        {"type": "response.completed", "response": {"id": "resp_fixture_ws_002", "status": "completed"}}
+      ]
+    },
+    {
+      "id": "responses-auxiliary-models",
+      "features": ["auxiliary_endpoint"],
+      "transport": "http",
+      "request": {"method": "GET", "path": "/v1/models"},
+      "response": {"status": 200, "headers": {"content-type": "application/json"}, "body": {"object": "list", "data": [{"id": "gpt-synthetic-1", "object": "model", "created": 0, "owned_by": "fixture"}]}}
+    },
+    {
+      "id": "responses-error-and-cancel",
+      "features": ["error", "cancellation"],
+      "transport": "sse",
+      "request": {"method": "POST", "path": "/v1/responses", "cancel_after_chunks": 1},
+      "response": {"status": 500, "headers": {"content-type": "application/json"}, "chunks": ["{\"error\":{\"type\":\"server_error\",\"message\":\"synthetic failure\"}}"]}
+    },
+    {
+      "id": "codex-hook-subagent",
+      "features": ["hooks", "subagent"],
+      "transport": "hook-json",
+      "events": [
+        {"type": "agent-turn-start", "thread_id": "thread_fixture_codex", "turn_id": "turn_fixture_parent"},
+        {"type": "subagent-start", "thread_id": "thread_fixture_codex", "turn_id": "turn_fixture_parent", "agent_id": "agent_fixture_child"},
+        {"type": "after-tool-use", "thread_id": "thread_fixture_codex", "turn_id": "turn_fixture_child", "agent_id": "agent_fixture_child", "tool_name": "mcp__workspace__read_file", "arguments": {"path": "/workspace/notes.txt"}}
+      ]
+    }
+  ]
+}
