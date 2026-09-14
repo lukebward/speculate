@@ -108,3 +108,54 @@ export interface HostPermissionGate {
     permissionContext: string;
   }): HostPermissionDecision;
 }
+
+export type LlmTransport = 'http' | 'websocket';
+
+export type LlmHeaders = Readonly<Record<string, string | string[] | undefined>>;
+
+export interface AgentAdapterRequest {
+  transport: LlmTransport;
+  method: string;
+  path: string;
+  headers: LlmHeaders;
+}
+
+export interface AgentAdapterResponse {
+  status: number;
+  headers: LlmHeaders;
+}
+
+export interface AgentAdapterRequestObserver {
+  observeRequestBody(body: Uint8Array): readonly Observation[];
+  observeResponseStart(response: AgentAdapterResponse): readonly Observation[];
+  observeResponseChunk(chunk: Uint8Array): readonly Observation[];
+  observeResponseEnd(): readonly Observation[];
+  abort(): void;
+}
+
+export interface AgentAdapterConnection {
+  startRequest(request: AgentAdapterRequest): AgentAdapterRequestObserver | null;
+  close(): void;
+}
+
+export interface AgentAdapter {
+  readonly agent: AgentKind;
+  createConnection(): AgentAdapterConnection;
+  normalizeHook(payload: unknown): readonly Observation[];
+}
+
+export interface AgentAdapterEnvironment {
+  contextForConversation(conversationId: string): SessionContext | null;
+  routes(): readonly RegisteredRoute[];
+  now?(): number;
+  eventId?(kind: Observation['kind'], stableId: string): string;
+}
+
+export interface LaunchPlan {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  upstreamBaseUrl: string;
+  transport: 'messages' | 'responses';
+  cleanup(): Promise<void>;
+}
