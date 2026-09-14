@@ -123,3 +123,18 @@ A separate isolated Claude 2.1.268 startup probe verified `claude --print --mcp-
 The temporary duplicate therefore owns the launch route while unrelated inherited aliases remain present. The fake provider returned HTTP 400 after recording only synthetic tool names; no model inference occurred. The probe used temporary configuration, a synthetic API sentinel, and loopback endpoints, then removed its scratch files. This verifies registration precedence, not tool preauthorization or every plugin/connector source.
 
 `claude mcp list` did not apply the launch table and was unsuitable for this check. The actual `--print` startup provided the evidence above.
+
+## Codex execution window
+
+A separate Codex 0.154.0 native-account invocation through the production relay completed one synthetic local MCP lookup and returned the expected final `OK`. The process exited 0 after 9.36 seconds and emitted `turn.completed`. Authentication, model, and effort remained native; the probe used an ephemeral read-only session and disabled hooks.
+
+| Relative time | Boundary |
+| --- | --- |
+| 6,905 ms | Completed provider `custom_tool_call` named `exec` |
+| 6,957 ms | Its provider response completed |
+| 7,187–7,264 ms | Actual local MCP call |
+| 7,278 ms | Next `response.create`, referencing the completed response |
+
+The completed-response to linked-continuation window enclosed the entire MCP call. One verified thread and the response chain supplied context; no `stream_id` appeared. Native CLI MCP lifecycle events bracketed the local call within 1–2 ms. Provider events alone exposed neither the nested route nor its actual execution interval.
+
+This establishes an ordinary execution window, not safe correlation for arbitrary parallel or subagent activity. Production correlation still requires wrapper-authoritative route, arguments, and timing, full interval containment, and unambiguous context tracking. Missing boundaries or overlapping possible contexts must abstain. The probe did not inspect or retain the opaque program, prompts, arguments, results, credentials, or response text; only the final equality check and sanitized lifecycle evidence were retained.

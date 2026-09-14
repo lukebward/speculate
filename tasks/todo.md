@@ -146,7 +146,7 @@ covers the CLI daemon).
 - [x] Task 2: Live route bridge and candidate ingress (Sol review approved after permission/state corrections)
 - [x] Task 3: Session cross-server learner (Sol review approved after retained-state/close corrections)
 - [x] Task 4: Claude transparent model transport (Sol review approved after lifecycle fixes; 47 focused tests)
-- [ ] Task 5: Codex Responses and WebSocket transport
+- [x] Task 5: Codex Responses and WebSocket transport (Sol review approved; 72 focused tests; native relay smoke passed both)
 - [ ] Task 6: Intent and completed-stream prediction
 - [ ] Task 7: Symmetric session launch and diagnostics
 - [ ] Task 8: Both clients consume existing registered MCP results
