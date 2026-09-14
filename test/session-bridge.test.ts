@@ -129,6 +129,26 @@ describe('SessionBridge route ownership', () => {
     await connection.close();
     expect(bridge.listRoutes()).toEqual([]);
   });
+
+  it('publishes resets for route replacement and owner disconnect', async () => {
+    const bridge = await start(() => 100);
+    const connection = await owner(bridge, 'files');
+    const [oldRoute] = await connection.register([localRoute]);
+    const seen: import('../src/observerTypes.js').Observation[] = [];
+    bridge.subscribe((event) => seen.push(event));
+    const [freshRoute] = await connection.register([localRoute]);
+    await connection.close();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(seen).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'invalidate', routeIds: [oldRoute!.routeId], reason: 'routes-replaced',
+      }),
+      expect.objectContaining({
+        kind: 'invalidate', routeIds: [freshRoute!.routeId], reason: 'disconnect',
+      }),
+    ]));
+  });
 });
 
 describe('SessionBridge bounds and event seam', () => {
@@ -175,6 +195,24 @@ describe('SessionBridge bounds and event seam', () => {
     expect(bridge.publishObservation({ ...base, eventId: 'unknown', context: { ...context, conversationId: 'subagent' } })).toBe(false);
     await new Promise((resolve) => setImmediate(resolve));
     expect(seen).toEqual(['known']);
+  });
+
+  it('requires owner-bound completion ingress for wrapper tool results', async () => {
+    const bridge = await start();
+    const connection = await owner(bridge, 'files');
+    const [route] = await connection.register([localRoute]);
+
+    expect(await connection.publishObservation({
+      context,
+      eventId: 'unbound-completion',
+      observedAt: 1,
+      kind: 'tool-complete',
+      routeId: route!.routeId,
+      args: { path: '/a' },
+      parsed: null,
+      latencyMs: 4,
+      ordered: true,
+    })).toBe(false);
   });
 
   it('bounds conversation registration', async () => {
@@ -232,6 +270,7 @@ class FakeRuntime implements ProxySessionRuntime {
   private generation = 0;
   private handler: (candidates: unknown) => void = () => {};
   routes: RegisteredRoute[] = [];
+  completions: import('../src/proxy.js').ProxySessionEvent[] = [];
 
   constructor(private readonly hostClient: 'claude' | 'codex', private readonly hostServerAlias: string) {}
 
@@ -261,7 +300,10 @@ class FakeRuntime implements ProxySessionRuntime {
     this.handler([candidate]);
   }
 
-  publishCompleted(): void {}
+  async publishCompleted(event: import('../src/proxy.js').ProxySessionEvent): Promise<boolean> {
+    this.completions.push(event);
+    return true;
+  }
   async close(): Promise<void> {}
 }
 
@@ -269,6 +311,7 @@ function proxyHarness(
   hostClient: 'claude' | 'codex',
   decision: () => HostPermissionDecision,
   mode: 'strict' | 'annotated' | 'off' = 'strict',
+  now: () => number = () => 100,
 ) {
   const runtime = new FakeRuntime(hostClient, 'files');
   const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
@@ -281,7 +324,7 @@ function proxyHarness(
     log: 'off',
     servers: { upstream: { allowTools: ['read'] } },
   }, {
-    now: () => 100,
+    now,
     session: {
       launchId: 'launch',
       hostClient,
@@ -405,6 +448,33 @@ describe('SpeculateProxy observed candidate ingress', () => {
         { host: 'files', client: 'claude', conversationId: null },
         { host: 'files', client: 'claude', conversationId: 'thread' },
       ]);
+  });
+
+  it('timestamps a cache-hit completion from the actual host call interval', async () => {
+    let clock = 100;
+    const h = proxyHarness('claude', () => 'allowed', 'strict', () => clock);
+    const route = await readyRuntime(h.runtime);
+    h.proxy.upstreams.get('upstream')!.callTool = async () => {
+      clock = 500;
+      return { content: [{ type: 'text', text: 'cached' }] };
+    };
+    h.runtime.deliver(candidate(route.routeId, route.generation));
+    await new Promise((resolve) => setImmediate(resolve));
+    clock = 1_000;
+
+    await (h.proxy as any).handleToolCall(
+      { server: 'upstream', tool: { name: 'read' }, exposed: 'read' },
+      { path: '/a' },
+      {},
+    );
+
+    expect(h.runtime.completions.at(-1)).toMatchObject({
+      routeId: route.routeId,
+      generation: route.generation,
+      latencyMs: 400,
+      startedAt: 1_000,
+      completedAt: 1_000,
+    });
   });
 
   it('defaults to deny when no permission context can be verified', async () => {

@@ -61,6 +61,7 @@ export interface ProxySessionRuntime {
   replaceRoutes(routes: readonly LocalRouteDescriptor[]): Promise<readonly RegisteredRoute[]>;
   invalidateServer(upstreamServer?: string, reason?: string): Promise<void>;
   publishObservation?(observation: Observation): Promise<boolean>;
+  publishCompleted?(event: ProxySessionEvent): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -71,12 +72,15 @@ export interface ProxySessionEvent {
   hostServerAlias: string;
   conversationId: string | null;
   eventId: string;
+  routeId: string;
+  generation: number;
   exposedTool: string;
   upstreamServer: string;
   upstreamTool: string;
   args: Record<string, unknown>;
   result: CallToolResult;
   latencyMs: number;
+  startedAt: number;
   completedAt: number;
 }
 
@@ -700,6 +704,7 @@ export class SpeculateProxy {
     args: Record<string, unknown>,
     opts: { onprogress?: (p: { progress: number; total?: number; message?: string }) => void },
   ): Promise<CallToolResult> {
+    const startedAt = this.now();
     const { server } = route;
     const tool = route.tool.name;
     const upstream = this.upstreams.get(server);
@@ -826,7 +831,7 @@ export class SpeculateProxy {
     // learning, no state persistence. Off means off (§13.7): a disabled
     // proxy must not accumulate learned argument data on disk.
     const finalResult = result;
-    if (!finalResult.isError) this.publishCompletedRouteCall(route, args, finalResult, latencyMs);
+    if (!finalResult.isError) this.publishCompletedRouteCall(route, args, finalResult, latencyMs, startedAt);
     if (!finalResult.isError && this.config.mode !== 'off') {
       setImmediate(() => {
         try {
@@ -994,8 +999,20 @@ export class SpeculateProxy {
     for (const server of servers) this.cache.invalidateServer(server);
   }
 
-  private publishCompletedRouteCall(route: Route, args: Record<string, unknown>, result: CallToolResult, latencyMs: number): void {
+  private publishCompletedRouteCall(
+    route: Route,
+    args: Record<string, unknown>,
+    result: CallToolResult,
+    latencyMs: number,
+    startedAt: number,
+  ): void {
     if (!this.session) return;
+    const registered = [...this.observedRoutes.values()].find(({ route: candidate }) =>
+      candidate.exposedTool === route.exposed &&
+      candidate.upstreamServer === route.server &&
+      candidate.upstreamTool === route.tool.name,
+    )?.route;
+    if (!registered) return;
     let conversationId: string | null = null;
     try {
       conversationId = this.session.conversationIdForCall?.({
@@ -1005,6 +1022,7 @@ export class SpeculateProxy {
         args,
       }) ?? null;
     } catch {}
+    const completedAt = this.now();
     const event: ProxySessionEvent = {
       kind: 'tool-complete',
       launchId: this.session.launchId,
@@ -1012,14 +1030,20 @@ export class SpeculateProxy {
       hostServerAlias: this.session.hostServerAlias,
       conversationId,
       eventId: `${this.session.hostServerAlias}:${++this.sessionEventSequence}`,
+      routeId: registered.routeId,
+      generation: registered.generation,
       exposedTool: route.exposed,
       upstreamServer: route.server,
       upstreamTool: route.tool.name,
       args,
       result,
       latencyMs,
-      completedAt: this.now(),
+      startedAt,
+      completedAt,
     };
     try { this.session.onEvent?.(event); } catch {}
+    try {
+      void this.session.runtime.publishCompleted?.(event).catch(() => {});
+    } catch {}
   }
 }

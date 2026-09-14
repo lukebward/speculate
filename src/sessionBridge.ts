@@ -14,6 +14,9 @@ import {
   type RegisteredRoute,
   type SessionContext,
 } from './observerTypes.js';
+import { parseResult } from './predictor.js';
+import { SessionPredictor } from './sessionPredictor.js';
+import type { ProxySessionEvent } from './proxy.js';
 
 const MAX_LINE_BYTES = 2 * 1024 * 1024 + 4096;
 const MAX_CANDIDATES_PER_EVENT = 3;
@@ -44,7 +47,7 @@ interface OwnerState {
 }
 
 interface ClientMessage {
-  type: 'hello' | 'register' | 'invalidate' | 'observation';
+  type: 'hello' | 'register' | 'invalidate' | 'observation' | 'completed';
   requestId?: number;
   capability?: string;
   launchId?: string;
@@ -54,6 +57,7 @@ interface ClientMessage {
   upstreamServer?: string;
   reason?: string;
   observation?: Observation;
+  completion?: ProxySessionEvent;
 }
 
 type ServerMessage =
@@ -118,8 +122,11 @@ export class SessionBridge {
   private readonly replay = new Map<string, number>();
   private readonly eventCounts = new Map<string, { count: number; at: number }>();
   private readonly observationQueue: Array<{ observation: Observation; bytes: number }> = [];
+  private readonly sessionPredictor: SessionPredictor;
+  private readonly lastCompletionByConversation = new Map<string, { startedAt: number; completedAt: number }>();
   private observationQueueBytes = 0;
   private observationScheduled = false;
+  private invalidationSequence = 0;
   private closed = false;
 
   private constructor(
@@ -127,25 +134,34 @@ export class SessionBridge {
     private readonly server: Server,
     private readonly directory: string | null,
     private readonly now: () => number,
+    private readonly correlateCompletion: CompletionCorrelator | null,
     coordinates: SessionBridgeCoordinates,
   ) {
     this.coordinates = coordinates;
     this.conversations.add(context.conversationId);
+    this.sessionPredictor = new SessionPredictor({ routes: () => this.listRoutes(), now });
   }
 
   static async start(
     context: SessionContext,
-    opts: { now?: () => number } = {},
+    opts: { now?: () => number; correlateCompletion?: CompletionCorrelator } = {},
   ): Promise<SessionBridge> {
     const parsedContext = sessionContextSchema.parse(context);
     const address = localAddress();
     const capability = randomBytes(32).toString('base64url');
     const server = createServer();
-    const bridge = new SessionBridge(parsedContext, server, address.directory, opts.now ?? Date.now, {
+    const bridge = new SessionBridge(
+      parsedContext,
+      server,
+      address.directory,
+      opts.now ?? Date.now,
+      opts.correlateCompletion ?? null,
+      {
       socketPath: address.socketPath,
       capability,
       launchId: context.launchId,
-    });
+      },
+    );
     server.on('connection', (socket) => bridge.accept(socket));
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);
@@ -274,6 +290,7 @@ export class SessionBridge {
     this.listeners.clear();
     this.observationQueue.length = 0;
     this.observationQueueBytes = 0;
+    this.lastCompletionByConversation.clear();
   }
 
   private acceptsContext(context: SessionContext): boolean {
@@ -297,6 +314,7 @@ export class SessionBridge {
     const queued = this.observationQueue.splice(0);
     this.observationQueueBytes = 0;
     for (const { observation } of queued) {
+      for (const candidate of this.sessionPredictor.observe(observation)) this.submit(candidate);
       for (const listener of this.listeners) {
         try { listener(observation); } catch {}
       }
@@ -317,7 +335,11 @@ export class SessionBridge {
     socket.on('close', () => {
       clearTimeout(handshakeTimer);
       this.sockets.delete(socket);
-      if (owner) this.owners.delete(owner.ownerId);
+      if (owner) {
+        const routeIds = owner.routes.map((route) => route.routeId);
+        this.owners.delete(owner.ownerId);
+        if (!this.closed && routeIds.length > 0) this.publishRouteInvalidation(owner, routeIds, 'disconnect');
+      }
     });
     readLines(socket, (raw) => {
       if (raw === null || typeof raw !== 'object') return socket.destroy();
@@ -362,6 +384,7 @@ export class SessionBridge {
         this.respond(owner, { type: 'response', requestId, ok: false, error: 'invalid route registration' });
         return;
       }
+      const replacedRouteIds = owner.routes.map((route) => route.routeId);
       owner.routes = [];
       owner.generation++;
       owner.routes = message.routes.map((route) => ({
@@ -372,6 +395,7 @@ export class SessionBridge {
         hostClient: owner.hostClient,
         hostServerAlias: owner.hostServerAlias,
       }));
+      if (replacedRouteIds.length > 0) this.publishRouteInvalidation(owner, replacedRouteIds, 'routes-replaced');
       this.respond(owner, { type: 'response', requestId, ok: true, value: owner.routes });
       return;
     }
@@ -383,21 +407,24 @@ export class SessionBridge {
         ? owner.routes.filter((route) => route.upstreamServer !== message.upstreamServer)
         : [];
       owner.generation++;
-      this.publishObservation({
-        context: this.context,
-        kind: 'invalidate',
-        eventId: `invalidate:${owner.ownerId}:${owner.generation}`,
-        observedAt: this.now(),
-        routeIds: removedRouteIds,
-        reason: typeof message.reason === 'string' && message.reason.length > 0 && message.reason.length <= 512
+      this.publishRouteInvalidation(
+        owner,
+        removedRouteIds,
+        typeof message.reason === 'string' && message.reason.length > 0 && message.reason.length <= 512
           ? message.reason
           : 'route-invalidated',
-      });
+      );
       this.respond(owner, { type: 'response', requestId, ok: true });
       return;
     }
     if (message.type === 'observation') {
-      const accepted = this.publishObservation(message.observation);
+      const accepted = message.observation?.kind !== 'tool-complete' &&
+        this.publishObservation(message.observation);
+      this.respond(owner, { type: 'response', requestId, ok: true, value: accepted });
+      return;
+    }
+    if (message.type === 'completed') {
+      const accepted = this.publishCompleted(owner, message.completion);
       this.respond(owner, { type: 'response', requestId, ok: true, value: accepted });
       return;
     }
@@ -407,6 +434,100 @@ export class SessionBridge {
   private respond(owner: OwnerState, message: ServerMessage): void {
     if (!send(owner.socket, message)) owner.socket.destroy();
   }
+
+  private publishRouteInvalidation(owner: OwnerState, routeIds: string[], reason: string): void {
+    this.publishObservation({
+      context: this.context,
+      kind: 'invalidate',
+      eventId: `invalidate:${owner.ownerId}:${++this.invalidationSequence}`,
+      observedAt: this.now(),
+      routeIds,
+      reason,
+    });
+  }
+
+  private publishCompleted(owner: OwnerState, input: unknown): boolean {
+    if (!this.correlateCompletion || !validCompletion(input)) return false;
+    const event = input;
+    const route = owner.routes.find((candidate) =>
+      candidate.routeId === event.routeId &&
+      candidate.generation === event.generation &&
+      candidate.exposedTool === event.exposedTool &&
+      candidate.upstreamServer === event.upstreamServer &&
+      candidate.upstreamTool === event.upstreamTool,
+    );
+    if (
+      !route ||
+      event.launchId !== this.context.launchId ||
+      event.hostClient !== owner.hostClient ||
+      event.hostServerAlias !== owner.hostServerAlias
+    ) return false;
+    let correlation: CompletionCorrelation | null = null;
+    try { correlation = this.correlateCompletion(event); } catch {}
+    if (!correlation || !validId(correlation.conversationId) || !this.conversations.has(correlation.conversationId)) {
+      return false;
+    }
+    const eventId = correlation.eventId ?? event.eventId;
+    if (!validId(eventId)) return false;
+    const previous = this.lastCompletionByConversation.get(correlation.conversationId);
+    const ordered = correlation.ordered !== false && (
+      previous === undefined ||
+      (event.startedAt >= previous.completedAt && event.completedAt >= previous.completedAt)
+    );
+    if (previous === undefined || event.completedAt >= previous.completedAt) {
+      this.lastCompletionByConversation.set(correlation.conversationId, {
+        startedAt: event.startedAt,
+        completedAt: event.completedAt,
+      });
+    }
+    const accepted = this.publishObservation({
+      context: { ...this.context, conversationId: correlation.conversationId },
+      kind: 'tool-complete',
+      eventId,
+      observedAt: event.completedAt,
+      routeId: route.routeId,
+      args: event.args,
+      parsed: parseResult(event.result),
+      latencyMs: event.completedAt - event.startedAt,
+      ordered,
+    });
+    if (!accepted) this.sessionPredictor.invalidate([]);
+    return accepted;
+  }
+}
+
+export interface CompletionCorrelation {
+  conversationId: string;
+  eventId?: string;
+  ordered?: boolean;
+}
+
+export type CompletionCorrelator = (event: Readonly<ProxySessionEvent>) => CompletionCorrelation | null;
+
+function validId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 512;
+}
+
+function validCompletion(value: unknown): value is ProxySessionEvent {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const event = value as Partial<ProxySessionEvent>;
+  return event.kind === 'tool-complete' &&
+    validId(event.launchId) &&
+    (event.hostClient === 'claude' || event.hostClient === 'codex') &&
+    validId(event.hostServerAlias) &&
+    (event.conversationId === null || validId(event.conversationId)) &&
+    validId(event.eventId) &&
+    validId(event.routeId) &&
+    typeof event.generation === 'number' && Number.isInteger(event.generation) && event.generation > 0 &&
+    validId(event.exposedTool) &&
+    validId(event.upstreamServer) &&
+    validId(event.upstreamTool) &&
+    event.args !== null && typeof event.args === 'object' && !Array.isArray(event.args) &&
+    event.result !== null && typeof event.result === 'object' && !Array.isArray(event.result) &&
+    typeof event.latencyMs === 'number' && Number.isFinite(event.latencyMs) && event.latencyMs >= 0 &&
+    typeof event.startedAt === 'number' && Number.isFinite(event.startedAt) && event.startedAt >= 0 &&
+    typeof event.completedAt === 'number' && Number.isFinite(event.completedAt) &&
+    event.completedAt >= event.startedAt;
 }
 
 function validLocalRoute(value: unknown): value is LocalRouteDescriptor {
@@ -520,6 +641,10 @@ export class SessionBridgeOwner {
 
   async publishObservation(observation: Observation): Promise<boolean> {
     return await this.request({ type: 'observation', observation }) as boolean;
+  }
+
+  async publishCompleted(event: ProxySessionEvent): Promise<boolean> {
+    return await this.request({ type: 'completed', completion: event }) as boolean;
   }
 
   async close(): Promise<void> {
