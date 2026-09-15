@@ -83,3 +83,9 @@ Conclusion: for the built-in OpenAI provider under a native ChatGPT account, a s
 Codex 0.154.0's stable generated app-server schema supports `account/read` with `{ "refreshToken": false }`. Its nullable `account` has a `type` discriminator of `apiKey`, `chatgpt`, or `amazonBedrock`. The launcher can reuse its configuration-reader connection and retain only this discriminator for built-in upstream selection. Null, unsupported, or malformed results leave account routing unverified.
 
 A bounded native query verified the existing initialization contract and returned the sanitized discriminator `chatgpt`. No tokens were requested, no login or refresh flow was invoked, and no model request was made. The full account response and its personal metadata were discarded; temporary generated schemas and helper files were removed. This verifies the account-query seam, while live API-key forwarding remains a separate unverified gate.
+
+## Codex launch override ordering
+
+Two isolated Codex 0.154.0 parser probes verified that `exec` accepts a final global `-c` override after its positional prompt, or immediately before a native `--` sentinel. The later value for the same scalar key won in both cases. Original arguments can therefore retain their order while generated launch controls occupy the final configuration position.
+
+Both probes selected nonexistent synthetic providers and stopped during local startup, before authentication, model discovery, inference, or MCP requests. They establish scalar ordering for these `exec` forms; they do not establish table-conflict behavior or compatibility with every native subcommand. Per-run permissions must still come from the original effective configuration before transport and wrapper controls are added.
