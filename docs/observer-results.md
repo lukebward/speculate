@@ -36,7 +36,7 @@ Proxy and stream value must be measured incrementally against hook mode. For ins
 | Gate | Current status |
 | --- | --- |
 | Native wrapper ownership, result correctness, one upstream call | Passed for both clients in B/C/D |
-| Zero correctness, consent, and isolation failures across the final suite | Pending final Task 9/10 verification |
+| Production recovery and regression suite | Passed: 1,300 tests, 8 skipped at `3755e34`; benchmark correctness remains pending |
 | No extra predictor model calls | Pending benchmark report |
 | Relay overhead at most 5 ms p95 | Pending |
 | At least 10% median improvement over B per client, 95% interval excluding zero | Pending |
@@ -57,6 +57,6 @@ Claude exposes flat MCP names and schemas to the model transport. Codex's instal
 
 Speculation requires the host's exact permission and a read-only tool annotation. Unsupported policy, hook trust, configuration precedence, provider routing, or Codex alias encoding causes the affected capability to abstain or fall back; it never grants permission. Reports remain aggregate and omit raw session material.
 
-Failure handling is conservative: provider/client retry remains native, partially forwarded model requests are not automatically replayed, and a fresh launch creates fresh temporary routing state. Task 9 recovery fixes and verification are still in progress, so recovery is not marked passed here.
+Failure handling is conservative: provider/client retry remains native, partially forwarded model requests are not automatically replayed, and a fresh launch creates fresh temporary routing state. Detected tracking loss also revokes owner routes, queued work, in-flight publication, and ready cache results until a fresh launch. The recovery changes passed independent review and the 1,300-test production suite; see the [verification artifact](observer-verification-results.json).
 
 Supporting evidence: [native routing](observer-native-routing.md), [native tool shapes](observer-native-tool-shapes.md), [native transfer results](observer-native-transfer-results.json), and [compatibility](observer-compatibility.md).

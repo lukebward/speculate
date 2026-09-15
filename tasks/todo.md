@@ -150,10 +150,16 @@ covers the CLI daemon).
 - [x] Task 6: Intent and completed-stream prediction (Sol review approved; 227 focused tests plus 77 callback-fix tests)
 - [x] Task 7: Symmetric session launch and diagnostics (Sol review approved; native routing and wrapper startup verified)
 - [x] Task 8: Both clients consume existing registered MCP results (Sol review approved; paired ready-hit/invalidation/permission tests pass)
-- [ ] Task 9: Recovery/isolation verification
+- [x] Task 9: Recovery/isolation verification (Sol review approved; 1,300 tests pass after owner invalidation fix)
 - [ ] Task 10: Benchmarks, documentation, final review and push main
 
 ## Context-aware review evidence
 
 - Tasks 1–6 core snapshot `9fa3064`: build passed; full suite passed 1,197 tests with 8 skipped (84.05s). Launcher and final branch verification remain pending.
-- Task 7 snapshot `f65e38f`: build passed; full suite passed 1,257 tests with 8 skipped (84.69s). Actual Claude and Codex native-account launcher smoke passed expected final response, completed turn, active proxy mode, and zero relay failures. Review found two configuration-parsing/ownership issues; fixes and scoped rereview are underway. MCP consumption and performance gates remain pending.
+- Task 7 snapshot `f65e38f`: build passed; full suite passed 1,257 tests with 8 skipped (84.69s). Actual Claude and Codex native-account launcher smoke passed expected final response, completed turn, active proxy mode, and zero relay failures. Configuration-parsing and ownership findings were fixed and approved through `d3391a7`. Native MCP transfer passed both clients in all three modes; observer performance remains pending.
+
+- Task 8 snapshot `1514c8d`: 10 paired real MCP consumption tests passed; focused gate passed 176 tests and build. Independent review approved.
+- Task 9 snapshot `b39ced7`: build passed; full suite passed 1,298 tests, skipped 8, and failed one permission-classification assertion. Recovery review also requires actual owner queue/inflight/cache revocation after tracking loss; both findings are assigned and Task 9 remains incomplete.
+- Task 10: existing repeated core benchmark completed with historical issue/use/miss counts preserved. Experimental documentation is drafted; new observer benchmark and final integration remain pending.
+
+- Task 9 final snapshot `3755e34`: independent review approved; build and TypeScript checks passed; full suite passed 1,300 tests with 8 skipped (84.31s). Tracking loss revokes queued, in-flight, and ready owner work; permission fixtures are isolated from ambient managed settings.

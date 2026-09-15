@@ -24,7 +24,7 @@ Native-account routing and MCP transfer both require a completed native response
 
 The launcher forwards native arguments and inherits the existing environment. It does not select a model, effort, provider, account, approval policy, sandbox, or transport. Proxy mode changes only the launched process's active base URL and forwards request and response bytes and end-to-end headers. Native account probes confirmed this path for Claude's current account route and Codex's built-in ChatGPT route without extracting or replacing credentials.
 
-Model/provider discovery, retries, and inference remain client-owned. The relay does not automatically replay a partially forwarded request. A failed relay preflight falls back to hook mode; unsupported provider routing also remains hook-only. A later fresh launch constructs new temporary endpoints rather than reusing a failed launch's override. Task 9 recovery verification is still in progress, so these are conservative operating rules rather than a completed recovery gate.
+Model/provider discovery, retries, and inference remain client-owned. The relay does not automatically replay a partially forwarded request. A failed relay preflight falls back to hook mode; unsupported provider routing also remains hook-only. A later fresh launch constructs new temporary endpoints rather than reusing a failed launch's override. Recovery tests verify fresh-launch isolation, native retry boundaries, temporary-file cleanup, and revocation of queued, in-flight, and ready speculative work after detected tracking loss. The production snapshot `3755e34` passed all 1,300 tests with 8 skipped; see the [verification artifact](observer-verification-results.json).
 
 ## Permission and configuration boundaries
 
@@ -52,7 +52,7 @@ Prediction remains local and does not make an additional model call. Existing
 cache lifetime, concurrency, rate, retained-byte, and observation-size limits
 remain in force for observer-triggered work.
 
-The new observer remains experimental. Correct native transfer is verified, while deterministic observer benefit, relay p95 overhead, mixed-task regression, settled waste, live API-key routing, and recovery gates remain pending. See [observer results](observer-results.md), [native routing](observer-native-routing.md), [native tool shapes](observer-native-tool-shapes.md), and the [sanitized transfer results](observer-native-transfer-results.json).
+The new observer remains experimental. Correct native transfer is verified, while deterministic observer benefit, relay p95 overhead, mixed-task regression, settled waste, and live API-key routing remain pending. See [observer results](observer-results.md), [native routing](observer-native-routing.md), [native tool shapes](observer-native-tool-shapes.md), and the [sanitized transfer results](observer-native-transfer-results.json).
 
 Official client contracts:
 

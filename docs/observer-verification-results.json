@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "3755e34",
+  "scope": "production-through-recovery",
+  "checks": {
+    "build": "passed",
+    "typescriptNoEmit": "passed",
+    "fullSuite": {
+      "passed": 1300,
+      "skipped": 8,
+      "failed": 0,
+      "durationSeconds": 84.31
+    },
+    "recoveryScopedReview": "approved",
+    "strictDocumentationBuild": {
+      "status": "passed",
+      "sourceCommit": "15f8b18"
+    }
+  },
+  "pending": [
+    "observer-benchmark-integration",
+    "new-observer-performance-gates",
+    "final-production-review",
+    "main-push"
+  ],
+  "unverified": [
+    "live-api-key-routing",
+    "native-hook-delivery",
+    "native-observer-speedup"
+  ]
+}

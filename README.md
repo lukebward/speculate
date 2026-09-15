@@ -34,7 +34,7 @@ speculate on --client claude   # turn on only Claude Code
 ### Experimental session observer
 
 The context-aware session launcher is currently available only from a source
-build. It is experimental while its performance and recovery gates are still
+build. It is experimental while its incremental performance benefit is still
 being measured:
 
 ```bash
