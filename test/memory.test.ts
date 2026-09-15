@@ -3,7 +3,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  advanceMemoryGeneration,
   inventoryMemory,
   parseMemoryArgs,
   runMemory,
@@ -11,7 +10,7 @@ import {
   usageMemoryLockPath,
   withUsageMemoryLock,
 } from '../src/memory.js';
-import { StateStore } from '../src/persistence.js';
+import { clearPersistedState, StateStore } from '../src/persistence.js';
 import { isCanonicalDirectoryIdentity } from '../src/persistence.js';
 
 const roots: string[] = [];
@@ -84,7 +83,7 @@ describe('memory command', () => {
     const store = new StateStore(path, () => 100);
     expect(store.save({ learner: { transitions: [] }, ruleFeedback: {} })).toBe(true);
     store.load();
-    advanceMemoryGeneration(path);
+    expect(clearPersistedState(path)).toMatchObject({ cleared: true });
     expect(store.save({ learner: { transitions: [{ server: 's' }] }, ruleFeedback: {} })).toBe(true);
     expect(existsSync(path)).toBe(false);
     expect(store.diagnostics.staleGenerationSaves).toBe(1);

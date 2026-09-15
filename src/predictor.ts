@@ -3,7 +3,7 @@
  * ranked, validated, feedback-weighted batch of predicted next calls.
  *
  * Pipeline per observed call: parse result (§5.1, fail closed) → run matching
- * profile rules (§5.2, contained) → validate/normalize predictions → per-rule
+ * rules (§5.2, contained) → validate/normalize predictions → per-rule
  * feedback scoring (§5.6) → batch dedupe on canonical key → rank and cap.
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -125,15 +125,7 @@ export class Predictor {
     // §5.1 result access: structuredContent first, then generic JSON-in-text
     // sniffing (most servers serialize JSON into a text block), fail closed
     // to null. A parse failure costs a prefetch, never correctness.
-    const { parsed, parserMiss } = parseResultDetail(call.result);
-    if (parserMiss) {
-      this.metrics.record({
-        type: 'parser_miss',
-        server: call.server,
-        tool: call.tool,
-        timestamp: call.timestamp,
-      });
-    }
+    const parsed = parseResult(call.result);
 
     const observed: ObservedCall = {
       server: call.server,
@@ -461,31 +453,12 @@ interface PendingCandidateEvaluation {
 
 /**
  * §5.1 structured result access, exported for tests: `structuredContent`
- * when present and non-null; else the profile parser's output (null on
- * throw/null, i.e. fail closed); null when neither source exists.
+ * when present and non-null; otherwise generic JSON-in-text parsing.
  */
 export function parseResult(result: CallToolResult): unknown | null {
-  return parseResultDetail(result).parsed;
-}
-
-/**
- * Server-agnostic by construction. Hand-written per-server parsers used to
- * sit between these two branches, but every one of them did exactly what the
- * generic fallback does, so removing them cost nothing and removed a thing
- * that could rot when a server changed its envelope.
- *
- * `parserMiss` survives for config-declared parsing failures elsewhere; this
- * path treats a non-JSON result as ordinary, not as a miss.
- */
-function parseResultDetail(result: CallToolResult): {
-  parsed: unknown | null;
-  parserMiss: boolean;
-} {
   const structured: unknown = result.structuredContent;
-  if (structured !== undefined && structured !== null) {
-    return { parsed: structured, parserMiss: false };
-  }
-  return { parsed: genericJsonText(result), parserMiss: false };
+  if (structured !== undefined && structured !== null) return structured;
+  return genericJsonText(result);
 }
 
 /** Best-effort JSON extraction from text/resource blocks; null otherwise. */

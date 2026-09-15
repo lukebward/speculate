@@ -1,6 +1,6 @@
 /**
  * Predictor pipeline tests (DESIGN.md §5, §5.1, §5.6) against a small fake
- * profile and an in-memory metrics recorder.
+ * rule set and an in-memory metrics recorder.
  */
 import { describe, expect, it } from 'vitest';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -10,13 +10,12 @@ import { CandidateCalibrator } from '../src/calibration.js';
 import type {
   DecisionEvent,
   Prediction,
-  ResultParser,
   Rule,
 } from '../src/types.js';
 
 // --- fixtures ---------------------------------------------------------------
 
-/** Server label (the config name) — deliberately distinct from profile.name. */
+/** Server label from the config. */
 const SERVER = 'srv';
 
 function textResult(text: string): CallToolResult {
@@ -27,22 +26,8 @@ function jsonResult(value: unknown): CallToolResult {
   return textResult(JSON.stringify(value));
 }
 
-/** JSON-in-first-text-block parser, null on failure (like real profiles). */
-const jsonTextParser: ResultParser = (result) => {
-  const block = result.content.find((b) => b.type === 'text');
-  if (!block || block.type !== 'text') return null;
-  try {
-    return JSON.parse(block.text) as unknown;
-  } catch {
-    return null;
-  }
-};
-
 /**
- * Rules for one server. Was a full `ServerProfile`; profiles are gone, and
- * declarative config rules are the only hand-written prediction source left,
- * so a rule list is the whole fixture. `parsers` and `canonicalizers` used to
- * be settable here too and no longer exist anywhere.
+ * Rules for one server. A rule list is the whole fixture.
  */
 function makeProfile(overrides: { rules?: Rule[] }): Rule[] {
   return overrides.rules ?? [];
@@ -189,8 +174,6 @@ describe('Predictor.observe', () => {
 
     observe('list', {}, textResult('{"valid":"json"}'));
 
-    // No vetted parser: the server-agnostic JSON-in-text fallback applies
-    // (and a genuinely non-JSON result is normal, so still no parser_miss).
     expect(seen).toEqual([{ valid: 'json' }]);
     expect(metrics.events).toHaveLength(0);
   });

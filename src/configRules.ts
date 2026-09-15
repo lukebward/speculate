@@ -1,12 +1,12 @@
 /**
  * Declarative, user-authored prediction rules (DESIGN.md §5.2).
  *
- * Vetted profiles ship hand-written Tier-1 rules in TypeScript; this module
- * gives config authors the same power for ANY upstream MCP server without
- * writing code: a server entry in `speculate.config.json` embeds an array of
+ * This module lets config authors define rules for any upstream MCP server
+ * without writing code: a server entry in `speculate.config.json` embeds an
+ * array of
  * rule specs (validated by `configRuleSpecSchema`, embedded into config.ts's
  * server schema by the maintainer), and `compileConfigRules` turns each spec
- * into ordinary `Rule` objects the predictor runs alongside profile rules.
+ * into ordinary `Rule` objects for the predictor.
  *
  * A spec names a trigger tool and the follow-up calls to prefetch, with
  * argument templates filled in from the observed trigger call:

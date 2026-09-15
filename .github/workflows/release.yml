@@ -61,7 +61,9 @@ jobs:
 
       - run: npx tsc
 
-      - run: npm test
+      - run: npm test -- --exclude test/scenarios.test.ts
+      - name: Check timed scenarios without competing test processes
+        run: npm run test:scenarios
 
       # prepublishOnly would re-run build+test; already done above.
       - if: steps.published.outputs.skip != 'true'

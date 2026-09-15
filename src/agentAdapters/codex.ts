@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
-import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
 import { HookBoundaryTracker } from '../hookBoundaries.js';
 import type { ObservationBudget } from '../observationBudget.js';
 import { codexSubcommand, resolveCodexBin, type CodexConfigRead } from '../codexClient.js';
 import { isStdioEntry, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
+import { sessionObserverHookPath } from '../packageResources.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -1031,8 +1031,8 @@ export interface CodexLaunchContext extends AgentLaunchContext {
   nativeGlobalArgs?: readonly string[];
 }
 
-function hookCommand(): string {
-  const script = fileURLToPath(new URL('../../plugin/hooks/session-observer.mjs', import.meta.url));
+export function codexObserverHookCommand(): string {
+  const script = sessionObserverHookPath();
   const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
   return `${quote(process.execPath)} ${quote(script)}`;
 }
@@ -1062,7 +1062,7 @@ function nativeKeySegment(value: string): string | null {
 function codexHookConfig(existing: unknown): Record<string, unknown> | null {
   if (existing !== undefined && !record(existing)) return null;
   const hooks = structuredClone((existing as Record<string, unknown> | undefined) ?? {});
-  const handler = { type: 'command', command: hookCommand(), async: true, timeout: 1 };
+  const handler = { type: 'command', command: codexObserverHookCommand(), async: true, timeout: 1 };
   for (const event of [
     'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse',
     'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'SessionEnd',

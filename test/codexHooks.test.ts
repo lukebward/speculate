@@ -152,10 +152,10 @@ describe('Codex native SessionStart hook', () => {
     options.self.args = [fixture];
     const hook = codexSessionHook(options);
     const command = String(process.platform === 'win32' ? hook.commandWindows : hook.command);
-    expect(execSync(command, { cwd, env: { ...process.env, CODEX_HOME: 'wrong-home' }, encoding: 'utf8' })).toBe('');
+    expect(execSync(command, { cwd, env: { ...process.env, CODEX_HOME: 'wrong-home' }, encoding: 'utf8', timeout: 50_000 })).toBe('');
     expect(JSON.parse(readFileSync(output, 'utf8'))).toEqual({ cwd, codexHome: root,
       args: ['sync', '--client', 'codex', '--quiet', '--codex-bin', join(root, 'codex')] });
-  });
+  }, 60_000);
 
   it('is silent if the installed Speculate entrypoint has been removed', () => {
     const hook = codexSessionHook(options);

@@ -5,7 +5,7 @@
  * the proxy core, executor, predictor, cache, policy, and budgets all
  * meet here.
  */
-import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { AgentKind, SignalKind } from './observerTypes.js';
 
 // ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ export interface ObservedCall {
   result: CallToolResult;
   /**
    * Structured view of `result`: `result.structuredContent` when present,
-   * else the profile parser's output, else null (parse failure or no parser).
+   * otherwise generic JSON-in-text parsing, else null.
    * Rules must treat null as "no result access" and fail closed (§5.1).
    */
   parsed: unknown | null;
@@ -106,12 +106,6 @@ export interface Rule {
   predict(call: ObservedCall): Prediction[];
 }
 
-/**
- * Parses a tool result into a structured value for rules to consume.
- * Return null on any parse failure (fail closed, §5.1). Must not throw.
- */
-export type ResultParser = (result: CallToolResult) => unknown | null;
-
 // ---------------------------------------------------------------------------
 // Cache (DESIGN.md §6)
 // ---------------------------------------------------------------------------
@@ -175,7 +169,7 @@ export type DecisionEventType =
   | 'invalidated' // entry dropped by mutation/flush
   | 'abandoned' // entry was still unused when the proxy session ended
   | 'spec_error' // speculative call failed upstream (incl. a failed join)
-  | 'parser_miss' // profile parser failed on a result (§5.1)
+  | 'parser_miss' // compatibility event retained after per-server parsers were removed
   | 'stdio_delay' // a real call waited behind an in-flight speculative call
   | 'prediction_evaluated' // ranked candidates compared with the next real read
   | 'candidate_evaluated' // one shadow candidate received a binary next-call outcome
@@ -451,10 +445,3 @@ export interface SpeculateConfig {
     maxBytes?: number;
   };
 }
-
-/** Annotations subset Speculate reads (untrusted hints — §4). */
-export interface ToolAnnotationsView {
-  readOnlyHint?: boolean;
-}
-
-export type UpstreamTool = Tool;

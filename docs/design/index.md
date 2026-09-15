@@ -10,6 +10,16 @@ methods and scoped results live in the [benchmark guide](local-learning-benchmar
 
 Speculate is a transparent MCP proxy that reduces perceived agent latency by *speculatively prefetching read-only tool calls* — predicting what the agent will ask for next and having the answer cached (or already in flight) before it asks.
 
+!!! info "Current architecture amendment"
+
+    Managed setup now places one Speculate wrapper in front of each supported
+    MCP registration, preserving that registration's exposed tools and native
+    ownership. Experimental `speculate run` adds a bounded session bridge that
+    coordinates context observations across those wrappers. Each wrapper still
+    owns execution and its cache; the model relay observes traffic and does not
+    execute MCP calls or make additional model requests. The diagram and
+    multi-upstream discussion below preserve the original design history.
+
 ---
 
 ## 1. Problem
@@ -110,17 +120,21 @@ A tool is **eligible** only if both conditions hold:
 
 1. **Annotation check.** The tool's declared annotations include `readOnlyHint: true`. Tools with no annotations, or with `readOnlyHint` absent/false, are ineligible. (Annotations are formally *untrusted hints* per the MCP spec — the official guidance is explicit about this — which is why this check alone is insufficient; hence condition 2.)
 2. **Operator policy**, one of three modes:
-   - `strict` (default): the tool must **also** be on an explicit operator allowlist.
-   - `annotated`: annotation alone suffices unless the tool is denylisted. For servers the operator trusts to annotate honestly. (Caveat: in this mode a *falsely* annotated tool is doubly dangerous — it becomes speculation-eligible *and* stops triggering cache invalidation (§6.2). This compounding is why `strict` is the default.)
+   - `strict` (default in an explicit config file): the tool must **also** be on an explicit operator allowlist.
+   - `annotated` (default for managed `on` and `wrap` setup): annotation alone suffices unless the tool is denylisted. For servers the operator trusts to annotate honestly. (Caveat: in this mode a *falsely* annotated tool is doubly dangerous — it becomes speculation-eligible *and* stops triggering cache invalidation (§6.2).)
    - `off`: no speculation; pure pass-through proxy.
 
-To make `strict` usable out of the box, Speculate ships **vetted profiles** — reviewed allowlists + rules + TTLs for popular servers (GitHub first; filesystem, Slack, web-search to follow). Profile contributions follow a documented reviewer checklist.
+Vetted per-server profiles were removed after their hand-written tool mappings
+silently drifted and the generic learner supplied most of their measured value.
+Managed zero-config setup uses `annotated` mode and server-agnostic learning.
+An explicit config defaults to `strict`, where operators provide `allowTools`;
+optional declarative rules remain available in configuration.
 
 Hard rules, regardless of mode:
 
 - **Real calls are never blocked, transformed, or reordered** — including mutations. Speculate is a proxy first. (Transport-level queuing on serial stdio upstreams is bounded and mitigated per §3.1 — this is the one qualified exception, and it is a delay bound, not a semantic change.)
 - **Speculative results are never fabricated or merged.** A cache hit returns exactly the bytes the upstream server returned earlier; a miss goes upstream. Speculate never synthesizes tool output.
-- **Tool-side effects we can't see:** even a "read" can have side effects (audit-log entries, read receipts, usage-based billing, rate-limit consumption). This is exactly why `strict` mode requires human allowlisting and why per-server budgets exist. Vetted profiles must exclude reads with user-visible side effects (e.g. anything that marks messages as read). Gmail's own prefetching produces 1–6% "false opens" in email analytics — the cautionary example.
+- **Tool-side effects we can't see:** even a "read" can have side effects (audit-log entries, read receipts, usage-based billing, rate-limit consumption). This is exactly why `strict` mode requires human allowlisting and why per-server budgets exist. Operators should exclude reads with user-visible side effects (e.g. anything that marks messages as read). Gmail's own prefetching produces 1–6% "false opens" in email analytics — the cautionary example.
 - **Speculation reveals intent.** A speculative call discloses to the upstream service — before the agent commits to anything — what the user is *probably* about to do. "Read-only" bounds state mutation, not information disclosure; recent work formalizes this as issue-time privacy leakage ([Ghost Tool Calls, 2026](https://arxiv.org/abs/2606.02483)). Speculate's position: speculation only targets servers the session is already sending real traffic to (never a server the agent hasn't touched), and privacy-sensitive deployments should use per-server denylists or `off`. Documented, not solved.
 - **Auth errors suspend, successes reset.** A speculative call failing with an auth/permission error is dropped (not cached) and that tool is suspended from speculation — **until a subsequent real call to the same tool succeeds**, which resets the breaker. (Permanent suspension would let one expired token during an idle window disable speculation for the rest of the session, even though the very next real call would have triggered a routine re-auth.)
 - **Server→client requests from speculative calls are aborted, never surfaced** (§3.4), and the tool is suspended from speculation for the session — a tool that needs user interaction is by definition not prefetchable.
@@ -131,17 +145,28 @@ Predictions must name a tool **and concrete arguments** — "the agent will prob
 
 ### 5.1 Result access — the prerequisite nobody else states
 
-The most powerful rules derive arguments from the *result* of the trigger call ("the PR numbers that came back"). But MCP `tools/call` results are content blocks — overwhelmingly free-form text whose shape is server- and version-specific. Structured access cannot be assumed; it must be engineered:
+The most powerful rules derive arguments from the *result* of the trigger call
+("the PR numbers that came back"). MCP `tools/call` results are content blocks,
+so structured access cannot be assumed. The current generic path is:
 
 1. **`structuredContent` first.** Where a server declares `outputSchema` and returns `structuredContent` (in the spec since 2025-06), rules consume it directly. This is the durable path and will grow with server adoption.
-2. **Profile parsers otherwise.** For servers that return text (including JSON-serialized-as-text, the GitHub MCP server's common shape), the vetted profile ships **per-tool result parsers**, pinned to upstream server versions and covered by contract tests in CI (parse fixtures recorded from each supported server release; a parser that fails fixtures blocks the profile release).
-3. **Fail closed to "no prediction."** If parsing fails at runtime, result-derived rules simply emit nothing (arg-independent rules still fire); a `parser_miss` metric is logged. A parse failure can cost a prefetch opportunity — never correctness.
+2. **Generic JSON text extraction.** Otherwise, Speculate tries complete JSON
+   objects or arrays in text and text resources, including exact fenced JSON
+   blocks. There are no server-specific parsers.
+3. **Fail closed to "no prediction."** Non-JSON text produces no parsed value,
+   so result-derived rules emit nothing while argument-only learning continues.
+   This ordinary case does not increment `parser_miss`. The `parserMisses`
+   statistics field remains for schema compatibility.
 
-Parser fragility is a top-3 risk (§11 risk 1a): it is the MVP's main maintenance burden and the reason profiles are versioned artifacts, not static config.
+Removing per-server parsers removes their version-drift maintenance burden.
+Generic parsing can still miss useful values, but a miss costs only a prediction,
+never correctness.
 
-### 5.2 Tier 1 — Static co-occurrence rules (MVP)
+### 5.2 Tier 1 — Static co-occurrence rules (historical)
 
-Hand-written, per-profile rules: *"after call X with args A (and parsed result R), predict calls Y₁…Yₙ with args derived from A and R."* Examples from the GitHub profile:
+Early releases shipped hand-written profile rules: *"after call X with args A
+(and parsed result R), predict calls Y₁…Yₙ with args derived from A and R."*
+These profiles were later removed. Historical GitHub examples included:
 
 - `get_issue(owner, repo, n)` → `list_pull_requests(owner, repo, state: open)`, `issue_read(comments)(owner, repo, n)`
 - `list_pull_requests(...)` → `pull_request_read(get)(...)` for the first K PRs in the parsed result
@@ -151,7 +176,7 @@ Deterministic, auditable, zero added latency. Expected to capture the bulk of th
 
 ### 5.2b Tier 1.5 — Declarative config rules (v0.2: implemented)
 
-Tier-1-shaped rules authored by the operator in `speculate.config.json` rather than in code — the "works with any connector" workhorse. A small selector language (`$args.<path>`, `$parsed.<path>`, `$item.<path>` with `forEach` over result arrays, `$$` escaping) maps trigger args and parsed results into predicted args; anything unresolvable fails closed. Compiled into the same `Rule` interface as profile rules and run through the identical validation/feedback/dedupe/cap pipeline.
+Tier-1-shaped rules authored by the operator in `speculate.config.json` rather than in code — the "works with any connector" workhorse. A small selector language (`$args.<path>`, `$parsed.<path>`, `$item.<path>` with `forEach` over result arrays, `$$` escaping) maps trigger args and parsed results into predicted args; anything unresolvable fails closed. They compile into the same `Rule` interface as learned predictions and run through the same validation, feedback, dedupe, and cap pipeline.
 
 ### 5.3 Tier 2 — Learned transition model (v0.2: session-scoped version implemented)
 
@@ -185,7 +210,7 @@ cache key.
 
 ### 6.2 Freshness and invalidation
 
-- **Per-tool TTL** from the server profile, defaulting to **30 s**, capped at a few minutes. The prefetch-to-use gap for intra-turn chains is seconds, so short TTLs retain most of the win while bounding staleness. **The 30 s is an unmeasured guess** — chosen from that gap, never validated against how often a 30 s-old answer is actually wrong; §13.19 records the shadow-validation experiment that would replace it with a number, and why it is deliberately unbuilt.
+- **Per-tool TTL** from server configuration, defaulting to **30 s**. The prefetch-to-use gap for intra-turn chains is seconds, so short TTLs retain most of the win while bounding staleness. **The 30 s is an unmeasured guess** — chosen from that gap, never validated against how often a 30 s-old answer is actually wrong; §13.19 records the shadow-validation experiment that would replace it with a number, and why it is deliberately unbuilt.
 - **Standing predictions are session openers only.** All learned transitions
   predict the next call, including transitions whose arguments are constants.
   Their queued work expires when the real sequence advances. Startup predictions
@@ -203,7 +228,7 @@ cache key.
 
 ### 6.3 Consistency stance (explicit)
 
-Per session, Speculate provides: **read-your-own-writes for writes issued through the proxy** (via mutation invalidation) and **bounded staleness** (≤ TTL) for everything else — external writers *and the agent's own non-MCP side channels* (§6.2). It does not provide cross-session consistency or monotonic reads across tools. This stance is documented user-facing, per server profile.
+Per session, Speculate provides: **read-your-own-writes for writes issued through the proxy** (via mutation invalidation) and **bounded staleness** (≤ TTL) for everything else — external writers *and the agent's own non-MCP side channels* (§6.2). It does not provide cross-session consistency or monotonic reads across tools. This stance is documented user-facing and configurable per server.
 
 ### 6.4 Credentials and cache security
 
@@ -218,7 +243,10 @@ Per transport:
 Speculation spends someone's quota. It must be visibly and configurably bounded:
 
 - **Per-server concurrency cap** for speculative calls (default: 2 for HTTP; hard-fixed at 1, idle-only, for stdio — §3.1) and **per-trigger cap** (default: 3 predictions per observed real call — derivation in §5.6).
-- **Rate-limit awareness where quota is visible; honest fallback where it isn't.** Profiles declare how to read rate-limit state when the server exposes it through MCP responses; when remaining quota falls below a floor (default 20%), speculation for that server stops entirely. **Caveat for the MVP profile: the GitHub MCP server does not currently pass rate-limit state through tool results, so the quota floor is inoperative there** — the operative guard for GitHub is the per-minute budget (default: 30 speculative calls/min per server), plus the waste metrics that make overspend visible.
+- **Rate-limit visibility is not assumed.** The planned profile-specific quota
+  parser was removed with profiles. The operative guards are the per-server
+  concurrency and per-minute budgets, plus waste metrics that make overspend
+  visible.
 - **Cost accounting:** every speculative call is logged as such. Nothing about speculation is silent.
 - **Kill switch:** `off` mode at runtime (config reload or admin endpoint) instantly reverts to pass-through.
 
@@ -245,7 +273,7 @@ Structural notes, stated honestly:
 MVP ships with:
 
 - **Structured log** of every speculative decision: prediction source, confidence, executed or suppressed (and why), outcome (hit / joined-in-flight / expired / invalidated / wasted), and per-hit head start.
-- **Near-miss logging:** on cache misses, key distance to the nearest cached entry (to size fuzzy matching — §6.1). **Parser-miss logging** for §5.1 failures.
+- **Near-miss logging:** on cache misses, key distance to the nearest cached entry (to size fuzzy matching — §6.1). The `parserMisses` field remains in statistics for compatibility; generic non-JSON results are not errors and do not increment it.
 - **Session summary + `speculate__stats`:** current-session hit rate, wasted calls, estimated wall-clock saved (Σ min(gap, L) over hits), speculative quota consumed per server, bounded-delay events on stdio upstreams (§3.1).
 - **Durable `speculate stats`:** cumulative estimated time saved, conservative stdio wait/net, cache hit rate, predictor recall@1/@3, argument near misses, and workspace/server/tool totals. Time/workspace filters and JSON output use the same aggregate records; `--compact` packs old completed sessions without losing filterability.
 - **Standard MCP-level logs** for the proxy function itself.
@@ -253,6 +281,10 @@ MVP ships with:
 The honest metric to watch is **estimated seconds saved per wasted call** — it prices the trade-off directly. Hit rate has no universal target; a 20%-hit rule that saves 2 s per hit at trivial quota cost is worth keeping, and the per-rule feedback loop (§5.6) suppresses rules that don't pay.
 
 ## 10. MVP scope
+
+This section preserves the original v0.1 build checklist. It is not a current
+feature inventory: the profile parsers, bundled GitHub profile, and associated
+`parser_miss` behavior below were later removed as described in §§4–5.1.
 
 **In (v0.1):**
 
@@ -282,12 +314,12 @@ The honest metric to watch is **estimated seconds saved per wasted call** — it
 | # | Risk / question | Current position |
 |---|---|---|
 | 1 | **Low hit rate in the wild** — real usage is less workflow-shaped than benchmarks, **and a protocol-layer proxy sees strictly less than the research systems reporting 40–55% next-action accuracy** (they read model state/plans; Speculate reads only traffic). Expect lower. | Benchmark honestly (incl. adversarial scripts), measure real-world via §9, explicit 30%/40% thresholds in §10. |
-| 1a | **Result-parser fragility** (§5.1) — Tier-1's best rules depend on parsing server-specific text formats that can change under us. | `structuredContent` when available; versioned parsers with contract-test fixtures gating profile releases; runtime fail-closed to no-prediction; `parser_miss` telemetry. Main ongoing maintenance cost — accepted. |
+| 1a | **Structured result availability** (§5.1) — result-derived rules cannot use arbitrary prose. | Prefer `structuredContent`; otherwise parse generic complete JSON or fenced JSON and fail closed to no prediction. No server-specific parser is maintained. |
 | 2 | **Argument mismatch** — agent asks with slightly different args than predicted. | Exact argument matching; near-miss diagnostics to size the fuzzy-matching opportunity before building it. |
 | 3 | **Stale reads mislead the agent** — external writers *and the agent's own non-MCP writes* (shell/`git push`) are invisible to invalidation. | Short TTLs, single-use hits, conservative mutation invalidation, per-tool TTL=0 opt-out, §6.3 documented stance. Bounded, not eliminated. |
-| 4 | **Quota/cost blowup on busy servers** — worsened where rate-limit state is invisible (incl. the MVP GitHub profile, §7). | Default-conservative budgets (3 per trigger), per-minute caps, waste metrics, kill switch. |
-| 5 | **Reads with side effects** (read receipts, audit noise, metered billing). | `strict` mode + vetted profiles exclude them; documented reviewer checklist for profile contributions. |
-| 6 | **Dishonest/wrong `readOnlyHint` annotations** — in `annotated` mode a false annotation both enables speculation *and* silently breaks mutation invalidation (§4, §6.2). | `strict` default requires human allowlisting; `annotated` is opt-in per deployment with the compounding risk documented. |
+| 4 | **Quota/cost blowup on busy servers** — worsened where rate-limit state is invisible (§7). | Default-conservative budgets (3 per trigger), per-minute caps, waste metrics, kill switch. |
+| 5 | **Reads with side effects** (read receipts, audit noise, metered billing). | Use `strict` mode and an operator allowlist; disable sensitive tools and keep budgets conservative. |
+| 6 | **Dishonest/wrong `readOnlyHint` annotations** — in `annotated` mode a false annotation both enables speculation *and* silently breaks mutation invalidation (§4, §6.2). | Managed setup documents its annotated-mode risk; explicit config defaults to `strict` and human allowlisting. |
 | 7 | **Client-visible protocol differences** — cached hits lack progress notifications; tool naming changes under aggregation (§3.4). | Believed benign / inherent to proxying respectively; both verified against real clients (Claude Code, Cursor) in MVP testing and documented in the migration guide. |
 | 8 | **Long idle windows are unharvested in MVP** — no "user is typing" signal exists in MCP; TTLs expire prefetches during minutes-long gaps (§8). | MVP harvests the first TTL-worth of each gap via last-call follow-up rules; quiescence-triggered Tier 2/3 prediction and boundary TTL policies are post-MVP; true typing signals need host cooperation (out of scope). |
 | 9 | **Language/runtime choice** (Go vs TypeScript). | Decide at MVP kickoff; §10 item 1 lists the trade-off. Leaning Go. |

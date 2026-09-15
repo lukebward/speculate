@@ -19,7 +19,7 @@ export const ENV_PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
  *
  * Exported for hostConfig.ts, which must apply the SAME rule before `on`
  * rewrites a remote server into a `wrap --header` invocation, but cannot
- * import this module (zod plus every profile) into the session-start `sync`
+ * import this module and zod into the session-start `sync`
  * path. It keeps its own copy; a test pins the two together.
  */
 export const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -142,23 +142,6 @@ const configSchema = z.object({
     })
     .default({ enabled: true, retentionDays: 30, maxBytes: 8_388_608 }),
 });
-
-/**
- * Vetted per-server profiles were removed entirely: they were hand-written
- * code that rotted silently (GitHub's hosted server renamed its tools and the
- * bundled profile simply stopped matching, with nothing failing), and
- * measurement showed the generic learner delivered the bulk of the benefit
- * without any of it. A config still naming one loads fine; the field is
- * ignored with a warning rather than being a fatal error, because taking a
- * working setup down over a dead field would be the worse failure.
- */
-export const RETIRED_PROFILES: ReadonlySet<string> = new Set([
-  'shell',
-  'github',
-  'filesystem',
-  'slack',
-  'none',
-]);
 
 export function parseConfig(raw: unknown): SpeculateConfig {
   const result = configSchema.safeParse(raw);

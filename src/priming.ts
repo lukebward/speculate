@@ -1,12 +1,10 @@
 /**
  * Pre-loaded transition priors (DESIGN.md §13.9).
  *
- * Two sources feed learner.prime():
- * 1. Vetted profiles ship curated (prev → next) pairs.
- * 2. Tool-name morphology: MCP servers overwhelmingly pair enumeration
- *    tools with detail tools ("list_issues" → "get_issue",
- *    "search_users" → "get_user", "notion-search" → "notion-fetch"-style
- *    stems). Any eligible lister/getter pair sharing a stem is primed.
+ * Tool-name morphology feeds learner.prime(): MCP servers overwhelmingly pair
+ * enumeration tools with detail tools ("list_issues" → "get_issue",
+ * "search_users" → "get_user", "notion-search" → "notion-fetch"-style
+ * stems). Any eligible lister/getter pair sharing a stem is primed.
  *
  * A prime names a plausible transition, not invented arguments. When the
  * getter schema and the lister's real JSON result identify one unambiguous

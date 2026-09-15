@@ -4,14 +4,13 @@
 [![CI](https://github.com/lukebward/speculate/actions/workflows/ci.yml/badge.svg)](https://github.com/lukebward/speculate/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/speculate-mcp)](LICENSE)
 
-Speculate is a local proxy for Model Context Protocol (MCP) servers. It learns
-patterns in a coding agent's tool calls and starts likely read-only calls early.
-When the agent requests one, Speculate can return the buffered result or wait
-for the call already in progress. Other calls go upstream normally.
+Speculate is a local Model Context Protocol (MCP) proxy that reduces tool wait.
+It learns likely read-only calls from your traffic, starts useful calls early,
+and serves only exact upstream results when the agent asks for them.
 
-![Demo: repeated GitHub workflow with prefetched results](demo/speculate-demo.gif)
+![Demo: repeated GitHub workflow with prefetched results](https://raw.githubusercontent.com/lukebward/speculate/main/demo/speculate-demo.gif)
 
-## Setup
+## Quick start
 
 Requires Node.js 18 or later:
 
@@ -20,80 +19,68 @@ npm install -g speculate-mcp
 speculate on
 ```
 
-`on` enables both Claude Code and Codex. It wraps supported MCP servers and
-installs session-start hooks to pick up new ones across projects. Restart your
-clients afterward; in Codex, review and trust the Speculate hook through `/hooks`.
+`speculate on` enables supported MCP servers for both Claude Code and Codex.
+Restart both clients afterward. In Codex, review and trust the Speculate
+registration-sync hook through `/hooks`; Speculate does not approve it for you.
 A newly wrapped server may take another session to load.
 
 ```bash
-speculate off                  # turn off both clients
-speculate off --client codex   # turn off only Codex
-speculate on --client claude   # turn on only Claude Code
+speculate status                  # inspect both clients
+speculate on --client claude      # target only Claude Code
+speculate on --client codex       # target only Codex
+speculate off                     # restore managed registrations for both
 ```
-
-### Experimental session observer
-
-The context-aware session launcher is currently available only from a source
-build. It remains experimental: the 1,000-case replay passed correctness checks
-but failed the speedup and speculative-waste targets:
-
-```bash
-npm install
-npm run build
-
-# Hook observation is the default for both clients.
-node dist/src/cli.js run claude -- --print "Summarize this workspace."
-node dist/src/cli.js run codex -- exec "Summarize this workspace."
-
-# Proxy mode also observes the native model transport.
-node dist/src/cli.js run claude --observe proxy -- --print "Summarize this workspace."
-node dist/src/cli.js run codex --observe proxy -- exec "Summarize this workspace."
-```
-
-Add `--json-report <path>` before the separator for an aggregate session report.
-`--observe off` keeps existing MCP prediction active while disabling the new
-hook and model observers; it is the comparison baseline for this feature.
-
-The launcher uses the existing native account, provider, model, effort,
-permissions, and transport. It does not acquire credentials or add tool
-permissions. Proxy mode changes only the launched process's provider base URL
-and forwards request and response bytes and headers. If the provider route or
-temporary controls cannot be verified, the launcher falls back to hook mode or
-leaves the affected MCP route native.
-
-Claude speculation requires an exact existing allow rule for the MCP tool.
-Codex also keeps its effective per-server tool policy, and its native hook must
-already be trusted. Unsupported Codex configuration arguments and server alias
-segments are handled by abstaining rather than rewriting them.
-
-Native-account smoke tests completed one correct, wrapper-owned MCP read in
-`off`, `hooks`, and `proxy` modes on both clients without duplicate upstream
-calls. This proves transfer and result integrity, not a speed improvement.
-Live API-key runs and native speedup remain unverified. The original replay did not
-establish an improvement over existing Speculate. See the
-[observer results](docs/observer-results.md) and
-[compatibility notes](docs/observer-compatibility.md).
-
-Observer admission learns usefulness separately by client, signal source, and
-tool destination. Repeated unused predictions lose priority through the existing
-adaptive admission policy. See the
-[Headroom-informed design](docs/headroom-informed-speculation.md) for the
-mechanisms, measurement changes, and remaining limits.
-Its focused multi-turn diagnostic reduced warm cross-server task time by about
-40% for both client fixtures, with all 66 speculative calls consumed. This is
-evidence under fixed synthetic timing; daily native performance remains unverified.
 
 Claude Code setup covers user servers and approved servers in known projects.
 Codex setup covers enabled user-level servers on the same host. Built-in tools,
 shell commands, hosted connectors, and unsupported registrations are outside
-MCP wrapping. See the [setup guide](https://lukebward.github.io/speculate/getting-started/)
-for scope, hook setup, and authentication. Turning off preserves stored learning
-and authentication.
+MCP wrapping. See [Getting started](https://lukebward.github.io/speculate/getting-started/)
+for client-specific scope, authentication, restoration, and hook behavior.
+
+## Choose how to use Speculate
+
+### Managed setup for Claude Code and Codex
+
+`on`, `off`, `status`, `sync`, and `auth` support both clients and accept
+`--client claude|codex|both`. The installed registration-sync hooks discover
+new supported MCP registrations; they do not observe conversation context.
+
+### Experimental context-aware sessions
+
+`speculate run` launches a native Claude Code or Codex session with additional
+context signals. Hook observation is the default:
+
+```bash
+speculate run claude -- --print "Summarize this workspace."
+speculate run codex -- exec "Summarize this workspace."
+
+# Also observe supported native model traffic.
+speculate run claude --observe proxy -- --print "Summarize this workspace."
+speculate run codex --observe proxy -- exec "Summarize this workspace."
+```
+
+Add `--json-report <path>` before `--` for an aggregate session report.
+`--observe off` retains ordinary MCP prediction while disabling the session
+observers. Proxy mode falls back to hook mode when the native provider route or
+temporary controls cannot be verified.
+
+The launcher preserves the native account, provider, model, effort, arguments,
+permission policy, and transport selection. For speculative work it requires
+host permission for the specific tool route as well as Speculate's read-only
+policy. Reusing a result separately requires an exact argument match. It never acquires native credentials or adds permissions.
+Codex's native opaque executor does not expose individual streamed MCP calls,
+so prompt and learned-transition signals remain its supported native paths.
+
+The session observer remains experimental. Native MCP transfer and result
+integrity passed for both clients, while native day-to-day speedup, native hook
+delivery, and live API-key routing remain unverified. See the
+[observer results](https://lukebward.github.io/speculate/observer-results/) and
+[compatibility matrix](https://lukebward.github.io/speculate/observer-compatibility/).
 
 ### Other MCP clients
 
-For clients that launch stdio servers, replace the server's command and arguments
-with a wrapper entry:
+For another client that launches stdio servers, replace the server command and
+arguments with a wrapper entry:
 
 ```json
 {
@@ -102,41 +89,58 @@ with a wrapper entry:
 }
 ```
 
-Substitute your server's command and arguments; keep its environment variables
-and other settings. Remote Streamable HTTP servers use `wrap --url`.
-See the [setup guide](https://lukebward.github.io/speculate/getting-started/)
-for remote authentication and [migration from PATH shims or `try`](https://lukebward.github.io/speculate/getting-started/#upgrading-from-retired-launch-paths).
+Keep the server's existing environment and arguments. Remote Streamable HTTP
+servers use `wrap --url`; the [setup guide](https://lukebward.github.io/speculate/getting-started/)
+covers headers, OAuth, and migration from retired launch paths.
 
-## Behavior and limits
+## How it works
 
-Predicted results are held in a short-lived, single-use memory buffer, keyed by
-server, tool, and exact argument values. Calls classified as mutations clear that
-server's buffer.
-Speculate returns upstream results without generating or combining them.
+Speculate learns repeated call sequences per workspace, upstream, and account.
+It can also use explicit prediction rules. A prediction must identify a tool
+and exact arguments. If the result is ready, the real call consumes it from a
+short-lived, single-use memory buffer. If it is still running, the real call
+joins it. A miss goes upstream normally.
 
-Speculative calls require `readOnlyHint: true` from the server. The default mode
-for `on` and `wrap` trusts that hint; `strict` mode also requires an allowlist.
-Incorrect annotations can make unsafe tools eligible, and reads can still
-consume quota or incur charges.
+Calls classified as mutations clear that server's buffer. Speculate never
+generates or combines tool results, and it does not make predictor model calls.
 
-Full tool results stay in memory. Learned patterns persist locally between
-sessions and can include private argument values despite secret filtering.
-Registration backups and OAuth credentials are stored separately. See
-[safety and storage](https://lukebward.github.io/speculate/safety/) for details.
+## Safety and local data
 
-## Check whether it helps
+Speculative calls require `readOnlyHint: true`. Managed `on` and `wrap` setup
+defaults to `annotated` mode, which trusts that server hint; an explicit config
+file defaults to `strict`, which also requires an allowlist. Incorrect
+annotations can make unsafe tools eligible, and reads can still disclose
+intent, consume quota, incur charges, or have service-visible effects.
 
-Run `speculate stats` to inspect useful predictions, wasted calls, and estimated
-time saved. An agent can call `speculate__stats` for the current session.
-Unused predictions add upstream work; fast local tools may be cheaper to call
-directly. The [benchmarks](https://lukebward.github.io/speculate/design/local-learning-benchmark/)
-report measured results and limitations, including the use of simulated latency.
+Full tool results stay in bounded session memory. Learned patterns persist
+locally and can include private argument values despite secret filtering.
+Registration backups and Speculate OAuth credentials are stored separately.
+See [Safety and storage](https://lukebward.github.io/speculate/safety/) before
+enabling speculation on sensitive or metered servers.
+
+## Evidence and status
+
+Measured benefit depends on the workload. The maintained core qualification
+preserved the v0.20 predictor's behavior. A separate 1,000-record observer
+replay passed correctness checks but failed its speedup and speculative-waste
+gates for both clients. A later 60-record synthetic multi-turn diagnostic
+reduced warm cross-server task time by about 40% for both client fixtures, with
+all 66 speculative calls consumed. That diagnostic used fixed synthetic timing
+and is not native performance evidence.
+
+Run `speculate stats` to inspect useful predictions, waste, and estimated time
+saved. Use `speculate doctor --config <path>` to diagnose an explicit wrapper
+configuration, and `speculate status` to inspect managed activation. The
+[benchmark documentation](https://lukebward.github.io/speculate/design/local-learning-benchmark/)
+records methods, historical results, and limitations.
 
 ## Documentation
 
-- [Commands](https://lukebward.github.io/speculate/commands/): status, authentication, diagnostics, and clearing stored learning.
-- [Configuration](https://lukebward.github.io/speculate/configuration/): allowlists, cache lifetimes, request budgets, and prediction rules.
-- [Design](https://lukebward.github.io/speculate/design/): how learning and prefetching work.
-- [Contributing](CONTRIBUTING.md): building, testing, and benchmarks. Development uses AI coding agents; CI covers Linux, macOS, and Windows.
+- [Getting started](https://lukebward.github.io/speculate/getting-started/)
+- [Commands](https://lukebward.github.io/speculate/commands/)
+- [Configuration](https://lukebward.github.io/speculate/configuration/)
+- [Safety](https://lukebward.github.io/speculate/safety/)
+- [Design](https://lukebward.github.io/speculate/design/)
+- [Contributing](CONTRIBUTING.md)
 
 [MIT license](LICENSE)

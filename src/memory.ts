@@ -369,12 +369,6 @@ function clearUsage(directory: string): { cleared: number; skipped: number; fail
   return result;
 }
 
-/** Primarily for tests and exact configured-path clearing. */
-export function advanceMemoryGeneration(path: string): void {
-  const result = clearPersistedState(path);
-  if (!result.cleared) throw new Error(result.error ?? 'could not clear state');
-}
-
 export function runMemory(args: MemoryArgs, options: MemoryRunOptions = {}): number {
   const directory = options.directory ?? defaultStateDirectory();
   const cwd = options.cwd ?? process.cwd();

@@ -36,7 +36,7 @@ The file is JSON with comments (JSONC).
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `mode` | `strict` \| `annotated` \| `off` | `annotated` | Eligibility policy — see [Safety](safety.md#eligibility) |
+| `mode` | `strict` \| `annotated` \| `off` | `strict` | Eligibility policy for an explicit config; managed `on` and `wrap` default to `annotated`. See [Safety](safety.md#eligibility). |
 | `maxPredictionsPerTrigger` | number | `3` | Per-trigger prediction cap |
 | `log` | `stderr` \| `off` | `stderr` | Decision log destination (JSONL) |
 | `servers` | object | — | Upstream servers, keyed by name |

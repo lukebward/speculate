@@ -572,7 +572,7 @@ export function isStdioEntry(entry: McpServerEntry): boolean {
 /**
  * RFC 9110 field-name token, the rule `speculate wrap --header` enforces
  * (config.ts HEADER_NAME, which a test pins this copy to). Duplicated rather
- * than imported: config.ts pulls in zod and every profile, and this module is
+ * than imported: config.ts pulls in zod, and this module is
  * on `sync`'s session-start path, which must stay cheap.
  */
 export const HOST_HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;

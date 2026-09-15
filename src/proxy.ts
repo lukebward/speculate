@@ -618,19 +618,15 @@ export class SpeculateProxy {
 
 
   /**
-   * §13.9 pre-loaded priors: profile-curated pairs plus lister→getter
-   * tool-name morphology, primed only toward speculation-ELIGIBLE targets
+   * §13.9 pre-loaded priors: lister→getter tool-name morphology, primed only
+   * toward speculation-ELIGIBLE targets
    * so a prior can never point at a write.
    */
   private primeLearner(up: Upstream): void {
     const names = up.tools.map((t) => t.name);
     const eligibleTarget = (tool: string): boolean =>
       this.policy.eligibility(up.name, tool).eligible;
-    // Name morphology only. Hand-written per-server primes lived here too;
-    // they are gone with profiles, and this derivation covers the same
-    // list-then-detail shape without any per-server code (it finds
-    // `list_issues -> issue_read` on GitHub's hosted server, which no
-    // hand-written list had).
+    // This finds list-then-detail shapes without per-server code.
     for (const [prev, next] of morphologicalPairs(names)) {
       if (!eligibleTarget(next)) continue;
       const target = up.tools.find((tool) => tool.name === next);

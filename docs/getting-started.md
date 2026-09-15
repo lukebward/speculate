@@ -6,8 +6,9 @@ speculate on
 ```
 
 `on` enables both Claude Code and Codex. It wraps supported MCP servers and
-installs session-start hooks that pick up new registrations. Restart your
-clients afterward. In Codex, review and trust the Speculate hook through
+installs registration-sync hooks that pick up new registrations at session
+start. These hooks do not observe conversation context. Restart your clients
+afterward. In Codex, review and trust the Speculate hook through
 `/hooks` before it can run automatically.
 
 To manage one client, add `--client claude` or `--client codex`:
@@ -119,6 +120,38 @@ as you open them and wraps newly added, approved servers.
 `off --client claude` disables automatic wrapping everywhere and restores
 recorded registrations across projects. Conflicts are reported and retained
 for recovery. Learning and authentication remain.
+
+## Experimental context-aware sessions
+
+Managed wrappers learn from MCP calls without needing model or conversation
+access. To add session context for one native client process, launch it through
+`speculate run`:
+
+```bash
+speculate run claude -- --print "Summarize this workspace."
+speculate run codex -- exec "Summarize this workspace."
+```
+
+Hook observation is the default. `--observe proxy` also observes supported
+native model traffic, while `--observe off` retains ordinary MCP prediction and
+disables the session observers. Put Speculate options before `--` and native
+client arguments after it. `--json-report PATH` writes aggregate diagnostics.
+
+The launcher preserves the native account, provider, model, effort, arguments,
+permission policy, sandbox, and transport selection. It requires the host's
+permission for the specific tool route and Speculate's read-only policy before
+speculative execution and again before publishing a result. Reusing a result
+also requires an exact argument match. It does not acquire native credentials or
+grant tool access. Unsupported provider routes, temporary controls, policy
+forms, or tool-name shapes cause the affected capability to abstain or fall
+back; requested calls continue through the native path.
+
+This mode remains experimental. Native MCP transfer is verified for Claude
+Code and Codex, but native performance, native hook delivery, and live API-key
+routing remain unverified. Installed Codex currently exposes MCP tools through
+an opaque executor, so it does not provide direct native stream-call signals.
+See [Observer compatibility](observer-compatibility.md) and
+[Observer results](observer-results.md) for the tested versions and evidence.
 
 ## Keeping your token out of the file
 

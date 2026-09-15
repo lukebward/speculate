@@ -1,6 +1,9 @@
 # Observer compatibility
 
-Checked 2026-09-14 with Claude Code 2.1.268, Codex CLI 0.154.0, Node 22.14.0, and the unreleased source-built session launcher. Published Speculate 0.22.0 does not include the experimental `run` observer described here.
+Checked 2026-09-14 with Claude Code 2.1.268, Codex CLI 0.154.0, and Node
+22.14.0. Speculate 0.23.0 packages the experimental `run` observer described
+here; the tested client versions identify the evidence and are not general
+minimum-version claims.
 
 Fixtures and reports contain synthetic protocol data or aggregate counters. Raw prompts, tool arguments and results, reasoning, headers, credentials, account identifiers, and transcripts are not written to observer reports.
 
@@ -28,7 +31,7 @@ Model/provider discovery, retries, and inference remain client-owned. The relay 
 
 ## Permission and configuration boundaries
 
-Speculation still requires `readOnlyHint: true` and the host's effective permission for the exact route and arguments.
+Speculation still requires `readOnlyHint: true` and the host's effective permission for the specific tool route. Results are reused only when the requested arguments exactly match the speculative call; argument matching is separate from the host permission check.
 
 For Claude, the launcher accepts only an exact existing MCP allow rule for speculative work. Deny, ask, approval-required, malformed, wildcard, managed-only, or otherwise ambiguous policy causes abstention. Without `--strict-mcp-config`, temporary launch MCP configuration retains inherited sources under their existing ownership and policy. With strict MCP configuration, only explicit per-run sources are considered; ambient servers are excluded. Authorization is checked again before speculative execution and before publishing a result.
 

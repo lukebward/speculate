@@ -11,7 +11,7 @@ import { argsDistance, keyServer, keyTool, parseKeyArgs } from './keys.js';
 import type { CacheEntryMeta, CacheKey, CacheLookup } from './types.js';
 
 /**
- * Last-resort TTL when neither the operator nor a profile says otherwise
+ * Last-resort TTL when the operator does not configure one
  * (DESIGN.md §6.2). Honestly, an UNMEASURED GUESS: it was chosen because the
  * prefetch-to-use gap for intra-turn chains is seconds, not because anyone
  * has measured how often a 30 s-old answer is wrong. See §13.19 for the

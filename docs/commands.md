@@ -9,7 +9,8 @@
 | `speculate auth [server] [--client claude\|codex\|both]` | Authorize remote servers (`--forget` removes Speculate's login) |
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate memory` | Retained learning inventory; `clear --all` removes managed learning and usage records |
-| `speculate doctor` | Why a given tool is or is not eligible for speculation |
+| `speculate doctor --config PATH` | Why a configured tool is or is not eligible for speculation |
+| `speculate run claude\|codex` | Launch one native client session with experimental context observation |
 
 ## `on` and `off`
 
@@ -62,7 +63,8 @@ Codex first restores its managed registrations sharing that URL.
 
 ## `doctor`
 
-The command to reach for when a tool isn't being prefetched. It explains
+Use `speculate doctor --config PATH` when a tool in an explicit wrapper
+configuration is not being prefetched. It explains
 eligibility per tool — the annotation check, the mode, and any allow/denylist
 that applied.
 
@@ -137,6 +139,36 @@ npx -y speculate-mcp wrap --url https://api.githubcopilot.com/mcp/ \
 ```
 
 See [Getting started](getting-started.md) for the surrounding config.
+
+## `run`
+
+`run` launches one native Claude Code or Codex process while preserving its
+arguments, account, provider, model, effort, permission policy, sandbox, and
+transport selection:
+
+```bash
+speculate run claude -- --print "Summarize this workspace."
+speculate run codex -- exec "Summarize this workspace."
+```
+
+Everything after `--` belongs to the native client. The session observer is
+experimental and has three modes:
+
+| Mode | Behavior |
+| --- | --- |
+| `hooks` | Observe supported native hooks; the default |
+| `proxy` | Also observe supported model requests and complete streamed tool calls |
+| `off` | Disable session observers while retaining ordinary MCP prediction |
+
+Select a mode with `--observe off|hooks|proxy`. Add `--json-report PATH` before
+`--` to write aggregate source, cache, relay, and exit counters without raw
+prompts, arguments, results, model text, headers, or credentials.
+
+Proxy mode reports and falls back to hook mode when its provider route or
+temporary controls cannot be verified. The launcher does not grant tool
+permission: speculative work still requires host permission for the specific
+tool route and Speculate's read-only policy. See [Observer compatibility](observer-compatibility.md)
+for native client differences and unverified paths.
 
 ## Retired launch paths
 

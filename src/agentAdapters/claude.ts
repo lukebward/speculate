@@ -4,11 +4,11 @@ import { isDeepStrictEqual } from 'node:util';
 import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
 import { HookBoundaryTracker } from '../hookBoundaries.js';
 import { effectiveServers, readClaudeServers, selfCommand, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import { resolveClaudeBin } from '../manage.js';
+import { sessionObserverHookPath } from '../packageResources.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -545,7 +545,7 @@ export interface ClaudeLaunchContext extends AgentLaunchContext {
 }
 
 export function claudeObserverHookCommand(): string {
-  const script = fileURLToPath(new URL('../../plugin/hooks/session-observer.mjs', import.meta.url));
+  const script = sessionObserverHookPath();
   const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
   return `${quote(process.execPath)} ${quote(script)}`;
 }

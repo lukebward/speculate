@@ -593,3 +593,26 @@ The full local suite passed 1,015 tests with eight skips. Native Claude Code
 and Codex checks covered multiple projects, mode changes, newly added servers,
 independent shutdown, and restoration; stdio/HTTP workflow checks also passed.
 No model/provider calls were made, and no new speedup is claimed.
+
+## v0.23.0 (2026-09-15): experimental context-aware sessions
+
+`speculate run claude|codex` packages the experimental session observer for both
+native clients. Hook mode is the default; proxy mode also observes supported
+model traffic, and off mode retains ordinary MCP prediction. Session context
+feeds the existing permission, admission, execution, and cache path. Observer
+feedback is scoped by client, signal source, and tool route, and actual
+consumption influences future prediction utility.
+
+The cleanup removes unused profile-era types and constants, an unreachable
+parser-miss branch, and a test-only memory wrapper. Existing configuration,
+legacy installation recovery, persisted state, and the `parserMisses` statistics
+field remain compatible. Compiled client adapters now locate the packaged
+observer hook correctly. Installation and command documentation distinguish
+managed setup from experimental session observation.
+
+The observer remains experimental. The original 1,000-record replay failed its
+speedup and waste gates. A later 60-record synthetic diagnostic showed a warm
+cross-server benefit under fixed timing, but neither that result nor this
+package release establishes native day-to-day speedup. See
+[Observer results](../observer-results.md) and
+[Observer compatibility](../observer-compatibility.md) for evidence and limits.

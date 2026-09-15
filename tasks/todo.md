@@ -227,3 +227,50 @@ Delivery `0769f59` was pushed normally to main. CI `34973817927` passed Ubuntu a
 The CI correction changes only the integration-test deadline from 15 to 30 seconds. Independent review approved it; the focused suite passed 6/6 tests in 11.83 seconds. The corrected push and platform CI are pending.
 
 Completed delivery: `f796513` is verified on main. CI [34974445299](https://github.com/lukebward/speculate/actions/runs/34974445299) passed Ubuntu, macOS, and Windows, including full tests, TypeScript, and native Codex checks. Docs [34974445314](https://github.com/lukebward/speculate/actions/runs/34974445314) passed strict build and deployment. The final follow-up only records these results; production and benchmark source remain identical to the measured `d672181` snapshot.
+
+
+# Architecture cleanup and release (2026-09-15)
+
+**Goal:** Remove obsolete code left by the architecture changes, document the released product clearly, and publish the verified release.
+
+**Architecture:** Keep the existing MCP wrapper, per-server predictor, session observer, and authoritative admission/execution/cache path. Remove only paths proven unused or superseded. Claude Code and Codex remain equal supported clients; observer status and performance claims stay evidence-based.
+
+**Execution:** Astra coordinates three GPT-5.6 Sol workers. The user authorized planning, cleanup, documentation, push, and release without another approval step. Reuse the clean isolated checkout; preserve the original checkout and historical benchmark artifacts.
+
+- [x] Audit runtime callsites, public entrypoints, compatibility paths, and candidate removals.
+- [x] Audit tooling, package contents, versioned manifests, and the existing release workflow.
+- [x] Find and apply a technical-writing skill; audit README and current setup/design documentation.
+- [x] Record the concrete removal list and assign disjoint code and documentation edits.
+- [x] Remove proven obsolete code and update affected coverage; keep behavior-preserving changes small.
+- [x] Rewrite README around installation, Claude/Codex usage, architecture, limitations, and links; update release notes and version metadata.
+- [x] Independently review the removals and documentation; run build, TypeScript, full tests, strict docs build, and packed-package smoke checks.
+- [ ] Push main normally and verify platform CI.
+- [ ] Create the version tag and publish through the repository's trusted npm workflow; publish concise GitHub release notes and verify registry/tag/release contents.
+
+## Audit and release constraints
+
+- Audit workers have 15 minutes each to identify evidence-backed changes. A code path is not obsolete merely because it predates the observer: off mode, ordinary per-server learning, native client adapters, and exact permission/cache ownership remain active.
+- Preserve historical benchmark JSON and measured source tags. Do not rerun or tune long performance experiments for a cleanup.
+- Do not delete public compatibility surfaces, migrate persisted state, rename modules, add dependencies, or consolidate large files without evidence that the cleanup requires it.
+- Use the established release workflow and the next appropriate unpublished version, verified against tags and the npm registry. Prepare the exact package and release notes before publishing; never overwrite an existing tag or npm version.
+- Keep experimental capability labeling. A package release does not establish native speedup or override the original release-performance gates.
+- Agents do not commit, push, tag, or publish. The coordinator owns integration and publication after verification.
+
+## Concrete implementation plan
+
+1. Runtime worker removes the unreachable parser-miss wrapper, unused retired-profile constant, three unused profile-era types and fixture, and a test-only memory-generation wrapper. Keep the public stats field and live compatibility loaders.
+2. Packaging worker fixes source/build resource resolution for both native observer adapters and verifies real hook delivery from compiled layouts. No runtime dependency or maintained benchmark/demo removal is supported by the audit.
+3. Documentation worker rewrites README and current setup/command/design pages using the pinned technical-documentation skill, with installed 0.23.0 commands and equal client coverage. Historical evidence remains intact.
+4. Coordinator investigates the demonstrated Windows CI failures, updates all three authoritative version manifests, and verifies the complete package before normal main push and trusted publication.
+
+Windows diagnosis: CI job 104400289236 recorded the literal-argv shell fixture completing after 27.2 seconds against Vitest’s default 5-second deadline, with no functional assertion failure; its native hook has a 50-second contract. The test now bounds the child at 50 seconds and test at 60. S2/S9 timing failures overlapped other subprocess-heavy suites; CI will run the unchanged scenario assertions in a separate step after other tests. This isolation hypothesis still requires the actual Windows run to validate it.
+
+Runtime cleanup removed 87 net lines across its 11 files. All core paths, dependencies, benchmarks, and migration compatibility remain active. Packaging review adds the source/build resource lookup and a real compiled-hook delivery regression for both clients. The complete non-scenario suite passed 1,372 tests with 8 skipped; strict unused-code TypeScript passed. Independent workflow review approved test isolation without threshold or coverage changes. Documentation review corrected managed-versus-explicit-config defaults and removed an unsupported TTL-cap claim.
+
+## Pre-release review
+
+Build and strict unused-code TypeScript passed. The full suite passed 1,384 tests with 8 skipped: 1,372 in the main batch and all 12 timed scenarios separately. Strict MkDocs passed. Independent runtime, package, workflow, and documentation reviews approved after correcting permission wording: host authorization is tool-route scoped; result reuse separately requires exact arguments. Historical benchmark artifacts are unchanged.
+
+The 0.23.0 tarball has 59 files (244,903 bytes packed), contains the runtime and both hook resources, and excludes development/benchmark artifacts. Isolated installed CLI/version/help and real MCP list/call checks passed on Node 18.20.8 and 22.14.0. Both installed observer hooks delivered the exact expected events on Node 18 and 22. The tarball compiled files match the verified build. The packed-root regression initially found only a macOS test path mismatch (`/tmp` versus `/private/tmp`); canonicalizing the test input resolved it, and the exact packed-root regression passed. No runtime change was needed. Tarball SHA-256: `344fa55be7ff70f7204e18ba819854d7f77625e93e78d0e57645d88fab4dd577`.
+
+Main push, platform CI, and registry/GitHub publication remain the delivery gates after this source commit.

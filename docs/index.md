@@ -1,8 +1,9 @@
 # Speculate
 
-**Speculative prefetching for coding agents.** Speculate sits between your MCP
-client and its servers. It learns likely read-only tool calls and runs them early,
-reducing waiting when a prediction is used.
+**Speculative prefetching for coding agents.** Speculate sits between an MCP
+client and its servers, learns likely read-only calls, and starts useful work
+early. A matching real call consumes the exact upstream result or joins the
+call already in progress.
 
 ![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](https://raw.githubusercontent.com/lukebward/speculate/main/demo/speculate-demo.gif)
 
@@ -10,6 +11,9 @@ reducing waiting when a prediction is used.
 npm install -g speculate-mcp
 speculate on
 ```
+
+`speculate on` enables supported MCP servers for Claude Code and Codex. See
+[Getting started](getting-started.md) for each client's scope and hook setup.
 
 !!! quote "On how this was built"
 
@@ -23,7 +27,8 @@ speculate on
 
     ---
 
-    One command for Claude Code, or a config prefix for any other MCP client.
+    One command enables Claude Code and Codex. Explicit `wrap` configuration
+    supports other MCP clients.
 
     [:octicons-arrow-right-24: Install](getting-started.md)
 
@@ -31,8 +36,8 @@ speculate on
 
     ---
 
-    `on`, `off`, `status`, `auth`, `stats`, `memory`, `doctor` — what each one
-    changes and what it leaves alone.
+    Managed setup, experimental context-aware sessions, authentication,
+    diagnostics, and local memory.
 
     [:octicons-arrow-right-24: CLI reference](commands.md)
 
@@ -40,8 +45,8 @@ speculate on
 
     ---
 
-    Why a speculative call can only ever be a read, and what that does and
-    doesn't protect you from.
+    How eligibility is restricted to tools declared read-only, and which risks
+    that restriction does not remove.
 
     [:octicons-arrow-right-24: Safety model](safety.md)
 
@@ -49,55 +54,71 @@ speculate on
 
     ---
 
-    Per-server modes, allow/denylists, TTLs, budgets, and the prediction rule
-    DSL.
+    Per-server modes, allowlists, denylists, TTLs, budgets, and prediction rules.
 
     [:octicons-arrow-right-24: Config reference](configuration.md)
+
+-   :material-flask-outline:{ .lg .middle } **Experimental observer**
+
+    ---
+
+    Context-aware `run` modes for Claude Code and Codex, with measured limits
+    and native compatibility boundaries.
+
+    [:octicons-arrow-right-24: Observer results](observer-results.md)
 
 -   :material-file-document-outline:{ .lg .middle } **Design**
 
     ---
 
-    Architecture, the prediction engine, cache semantics, and the full record
-    of what measurement changed.
+    Architecture, prediction, cache semantics, release history, and benchmark
+    methodology.
 
     [:octicons-arrow-right-24: Design spec](design/index.md)
-
--   :material-history:{ .lg .middle } **Prior art**
-
-    ---
-
-    The MCP gateway landscape, the academic validation, and why the latency
-    lane was unoccupied.
-
-    [:octicons-arrow-right-24: Market survey](design/prior-art.md)
 
 </div>
 
 ## What it does
 
-- **No configuration, nothing per-server.** Speculate learns from your own
-  traffic, so it works the same on a server nobody has heard of.
-- **Read-only, always.** It runs tools the server marks read-only, and nothing
-  else.
-- **Nothing taken away.** Every change goes through your client's own CLI, and
-  `off` puts it all back.
+- **Starts without a config file.** The default learner adapts to supported MCP
+  servers; optional per-server settings control policy, TTLs, and budgets.
+- **Requires a read-only declaration.** Only tools with `readOnlyHint: true` are
+  eligible. Strict mode also requires an explicit allowlist.
+- **Preserves exact results.** Speculate returns an upstream result unchanged,
+  joins an identical call in flight, or sends the real call upstream normally.
+- **Keeps managed setup reversible.** `off` restores registrations that still
+  match Speculate's recorded change and reports conflicts instead of overwriting
+  later edits.
 
-## Measured results
+## Two prediction paths
 
-The [benchmark methodology and results](design/local-learning-benchmark.md)
-explain each maintained instrument and its limits. The v0.19 qualification
-against v0.18 increased useful prefetches from 68.5% to 83.75% and reduced mean
-tool wait by 12.87% across four controlled repeated-workflow fixtures with
-120 ms injected latency. Most additional useful results were joined in flight;
-ready hits and tail latency did not improve.
+Ordinary `speculate on` installs persistent MCP wrappers. They learn repeated
+call sequences and can use explicit rules. The registration-sync hooks installed
+for Claude Code and Codex discover newly added supported servers; they do not
+observe conversation context.
 
-Historical live-server runs measured larger warm-session savings, but repeated
-identical requests and incomplete shutdown-waste accounting limit those
-snapshots. The report preserves their scope and links to their raw history.
-No measured result guarantees zero wasted calls or whole-task speedup.
+Experimental `speculate run claude|codex` launches one native session and adds
+prompt, learned cross-server transition, and supported model-stream signals.
+It preserves the client's native account, model, effort, arguments, permission
+policy, and transport selection. See the [compatibility matrix](observer-compatibility.md)
+for differences between native client surfaces.
+
+## Evidence and limits
+
+The maintained core qualification preserves current predictor behavior. The
+1,000-record observer replay passed correctness checks but failed its speedup
+and speculative-waste gates for both clients. A later synthetic 60-record
+multi-turn diagnostic measured about 40% less warm cross-server task time for
+both client fixtures, but it does not establish native performance.
+
+Native MCP transfer is verified for Claude Code and Codex. Native day-to-day
+speedup remains unverified. The [benchmark guide](design/local-learning-benchmark.md)
+and [observer results](observer-results.md) preserve the methods, historical
+results, failed gates, and limitations.
 
 ## Non-goals
 
-Speculating writes (permanent), brokering anyone else's credentials, general
-response caching, token savings. The win is wall-clock latency.
+Speculating writes, brokering another client's credentials, general response
+caching, and token savings are outside scope. The intended benefit is lower
+wall-clock latency when a prediction is useful; workloads with poor predictions
+can add upstream work.
