@@ -169,3 +169,15 @@ covers the CLI daemon).
 - Final production snapshot `e6bf986`: independent review approved after narrowly scoped permission, strict-source, native-write overlap, analysis-budget, and async supersession fixes. Build and strict TypeScript passed; full suite passed 1,362 tests with 8 skipped in 84.54s. Full 1,000-record benchmark is running on that immutable source snapshot.
 
 - Full observer benchmark completed at `e6bf986`: all 1,000 records, zero correctness/consent/isolation violations and no extra predictor model calls. Relay p95 and mixed-p95 gates passed; median speedup and waste gates failed for both clients. Raw release verdicts remain `remove`; the approved plan permits retaining the source-only implementation as experimental. No thresholds or implementation were tuned on held-out results. Results and compressed aggregate records are documented; final evidence/documentation review and strict documentation build passed. The normal main push was verified at `981a6ce`.
+
+
+## Post-push platform verification
+
+GitHub run `34926910149` passed Linux but exposed one macOS and seven Windows assertions. The source delivery is on main; platform verification is reopened until these are resolved.
+
+- [x] Diagnose and fix the persistent-connection and provider-cancellation test synchronization failures.
+- [x] Diagnose and fix Windows launcher, benchmark-launcher, and hook-recovery failures without weakening coverage.
+- [x] Review the scoped corrections and run the affected tests and build.
+- [ ] Push the corrections normally and verify Linux, macOS, Windows, and docs CI.
+
+- Post-CI corrections at `894a8e3` passed independent scoped review, build, strict TypeScript, and the full suite: 1,365 tests passed, 8 skipped, 84.13s. Native invocation reuses existing platform helpers; timing-sensitive fixtures now synchronize through explicit events. Benchmark timing paths and recorded thresholds are unchanged.

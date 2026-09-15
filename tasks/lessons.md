@@ -24,3 +24,7 @@
 
 - When elapsed work exceeds expectations, check every agent immediately, report remaining gates honestly, and timebox advisory research. Close bounded implementation phases before opening more edge-case investigations; fix demonstrated correctness gaps without extending optional research.
 - A priority invalidation must cross the owner boundary: clearing coordinator learning does not revoke wrapper executor leases or cached results.
+
+- Test network lifecycle completion through explicit events; packet sizes, socket buffering, and short sleeps vary across CI platforms.
+- Normalize the actual native child launch with the same platform helpers used by discovery and configuration probes; use explicit portable script formats in fixtures.
+- Permission fixtures must seed every managed-policy source they intend to verify, including an empty remote-settings file, rather than relying on platform-specific absence behavior.

@@ -70,7 +70,7 @@ Relay measurements used 20 warmups and 200 pairs per client, with byte-identical
 
 The unchanged automatic release evaluator returned **`remove` for all three stages on both clients**, because speedup and waste gates failed. The implementation plan permits retaining failing increments as experimental or removing them. This source-only delivery chooses **retain experimental**, with no npm release or broader enablement. It does not override the measured failed gates or claim that the new observer improves native task performance.
 
-The final production snapshot passed build, strict TypeScript, independent review, and 1,362 tests with 8 skipped. The full benchmark completed in about 65 minutes. See the [verification artifact](observer-verification-results.json).
+The benchmark source snapshot passed build, strict TypeScript, independent review, and 1,362 tests with 8 skipped. Subsequent CI corrections at `894a8e3` normalized final native launcher invocation and made lifecycle fixtures portable; they passed independent review and 1,365 tests with 8 skipped. The timed benchmark paths were unchanged, and the records retain their original `e6bf986` source tag. The full benchmark completed in about 65 minutes. See the [verification artifact](observer-verification-results.json).
 
 ## Reproducibility and reports
 
@@ -95,6 +95,6 @@ Claude exposes flat MCP names and schemas to the model transport. Codex's instal
 
 Speculation requires the host's exact permission and a read-only tool annotation. Unsupported policy, hook trust, configuration precedence, provider routing, or Codex alias encoding causes the affected capability to abstain or fall back; it never grants permission. Reports remain aggregate and omit raw session material.
 
-Failure handling is conservative: provider/client retry remains native, partially forwarded model requests are not automatically replayed, and a fresh launch creates fresh temporary routing state. Detected tracking loss also revokes owner routes, queued work, in-flight publication, and ready cache results until a fresh launch. The final production changes passed independent review and the 1,362-test suite; see the [verification artifact](observer-verification-results.json).
+Failure handling is conservative: provider/client retry remains native, partially forwarded model requests are not automatically replayed, and a fresh launch creates fresh temporary routing state. Detected tracking loss also revokes owner routes, queued work, in-flight publication, and ready cache results until a fresh launch. The final production changes passed independent review and the 1,365-test suite; see the [verification artifact](observer-verification-results.json).
 
 Supporting evidence: [native routing](observer-native-routing.md), [native tool shapes](observer-native-tool-shapes.md), [native transfer results](observer-native-transfer-results.json), and [compatibility](observer-compatibility.md).
