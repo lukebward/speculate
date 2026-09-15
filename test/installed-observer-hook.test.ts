@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, openSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
@@ -72,16 +72,26 @@ async function receiveHook(script: string, hostClient: 'claude' | 'codex') {
     server.once('error', reject);
     server.listen(socketPath, resolve);
   });
-  const child = spawn(process.execPath, [script], {
-    env: {
-      ...process.env,
-      SPECULATE_OBSERVER_SOCKET: socketPath,
-      SPECULATE_OBSERVER_CAPABILITY: 'installed-capability',
-      SPECULATE_OBSERVER_LAUNCH_ID: 'installed-launch',
-      SPECULATE_OBSERVER_CLIENT: hostClient,
-    },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  // Preload stdin before the hook starts its 20 ms deadline.
+  const inputPath = join(directory, 'hook-input.json');
+  writeFileSync(inputPath, JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'installed-session' }));
+  const input = openSync(inputPath, 'r');
+  const child = (() => {
+    try {
+      return spawn(process.execPath, [script], {
+        env: {
+          ...process.env,
+          SPECULATE_OBSERVER_SOCKET: socketPath,
+          SPECULATE_OBSERVER_CAPABILITY: 'installed-capability',
+          SPECULATE_OBSERVER_LAUNCH_ID: 'installed-launch',
+          SPECULATE_OBSERVER_CLIENT: hostClient,
+        },
+        stdio: [input, 'pipe', 'pipe'],
+      });
+    } finally {
+      closeSync(input);
+    }
+  })();
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
@@ -90,7 +100,6 @@ async function receiveHook(script: string, hostClient: 'claude' | 'codex') {
     child.once('error', reject);
     child.once('close', resolve);
   });
-  child.stdin.end(JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'installed-session' }));
   let timeout: NodeJS.Timeout | undefined;
   try {
     const payload = await Promise.race([
