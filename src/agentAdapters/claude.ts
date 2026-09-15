@@ -30,6 +30,7 @@ const MAX_STREAM_ARGUMENT_BYTES = 64 * 1024;
 const MAX_ACTIVE_BLOCKS = 256;
 const MAX_REQUEST_TOOLS = 512;
 const MAX_LAUNCH_CONFIG_BYTES = 8 * 1024 * 1024;
+const GLOBAL_ADAPTER_ANALYSIS_BYTES = 8 * 1024 * 1024;
 const LAUNCH_DIRECTORY_PREFIX = 'speculate-claude-run-';
 const LAUNCH_DIRECTORY_PATTERN = /^speculate-claude-run-[A-Za-z0-9_-]{6}$/;
 const LAUNCH_OWNER_FILE = '.speculate-launch-owner.json';
@@ -129,6 +130,7 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
   private stopped = false;
   private released = false;
   private boundaryAt: number | null = null;
+  private retainedAnalysisBytes = 0;
 
   constructor(
     private readonly context: SessionContext,
@@ -136,7 +138,13 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     private readonly environment: AgentAdapterEnvironment,
     private readonly promptOccurrences: PromptOccurrenceCorrelator,
     private readonly release: () => void,
-  ) {}
+  ) {
+    if (!this.retainAnalysis(512)) this.stopped = true;
+  }
+
+  get isStopped(): boolean {
+    return this.stopped;
+  }
 
   observeRequestBody(body: Uint8Array, observedAt?: number): readonly Observation[] {
     this.boundaryAt = observedAt ?? this.now();
@@ -152,6 +160,10 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
       return [];
     }
     if (!object(parsed)) {
+      this.abort();
+      return [];
+    }
+    if (!this.retainAnalysis(body.byteLength * 4 + 512)) {
       this.abort();
       return [];
     }
@@ -187,7 +199,7 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     this.boundaryAt = observedAt ?? this.now();
     if (this.stopped || this.responseMode === 'none') return [];
     this.responseBytes += chunk.byteLength;
-    if (this.responseBytes > MAX_OBSERVATION_BYTES) {
+    if (this.responseBytes > MAX_OBSERVATION_BYTES || !this.retainAnalysis(chunk.byteLength * 2 + 64)) {
       this.abort();
       return [];
     }
@@ -218,6 +230,8 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     if (this.stopped) return;
     this.stopped = true;
     this.responseMode = 'none';
+    this.environment.analysisBudget?.release(this.retainedAnalysisBytes);
+    this.retainedAnalysisBytes = 0;
     this.responseText = '';
     this.activeBlocks.clear();
     this.routesByName.clear();
@@ -358,16 +372,31 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
   private eventId(kind: Observation['kind'], stableId: string): string {
     return this.environment.eventId?.(kind, stableId) ?? `claude:${kind}:${stableId || randomUUID()}`;
   }
+
+  private retainAnalysis(bytes: number): boolean {
+    if (this.environment.analysisBudget && !this.environment.analysisBudget.reserve(bytes)) return false;
+    this.retainedAnalysisBytes += bytes;
+    return true;
+  }
 }
 
 class ClaudeConnection implements AgentAdapterConnection {
   private readonly requests = new Set<ClaudeRequestObserver>();
   private closed = false;
+  private retainedAnalysisBytes = 0;
 
   constructor(
     private readonly environment: AgentAdapterEnvironment,
     private readonly promptOccurrences: PromptOccurrenceCorrelator,
-  ) {}
+    initiallyClosed = false,
+  ) {
+    if (initiallyClosed) {
+      this.closed = true;
+      return;
+    }
+    if (!environment.analysisBudget || environment.analysisBudget.reserve(512)) this.retainedAnalysisBytes = 512;
+    else this.closed = true;
+  }
 
   startRequest(request: AgentAdapterRequest): AgentAdapterRequestObserver | null {
     if (this.closed || request.transport !== 'http' || request.method.toUpperCase() !== 'POST' || requestPath(request.path) !== '/v1/messages') return null;
@@ -383,6 +412,7 @@ class ClaudeConnection implements AgentAdapterConnection {
       this.promptOccurrences,
       () => this.requests.delete(observer),
     );
+    if (observer.isStopped) return null;
     this.requests.add(observer);
     return observer;
   }
@@ -392,6 +422,8 @@ class ClaudeConnection implements AgentAdapterConnection {
     this.closed = true;
     for (const request of this.requests) request.abort();
     this.requests.clear();
+    this.environment.analysisBudget?.release(this.retainedAnalysisBytes);
+    this.retainedAnalysisBytes = 0;
   }
 
   private context(conversationId: string): SessionContext | null {
@@ -407,10 +439,15 @@ class ClaudeConnection implements AgentAdapterConnection {
 export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapter {
   const promptOccurrences = new PromptOccurrenceCorrelator(() => environment.now?.() ?? Date.now());
   const hookBoundaries = new HookBoundaryTracker();
+  const retainedGlobalAnalysis = environment.analysisBudget?.reserve(GLOBAL_ADAPTER_ANALYSIS_BYTES)
+    ? GLOBAL_ADAPTER_ANALYSIS_BYTES
+    : environment.analysisBudget ? 0 : GLOBAL_ADAPTER_ANALYSIS_BYTES;
+  let closed = retainedGlobalAnalysis === 0;
   return {
     agent: 'claude',
-    createConnection: () => new ClaudeConnection(environment, promptOccurrences),
+    createConnection: () => new ClaudeConnection(environment, promptOccurrences, closed),
     normalizeHook(payload: unknown, boundaryAt?: number): readonly Observation[] {
+      if (closed) return [];
       if (!object(payload) || typeof payload.session_id !== 'string') return [];
       if (payload.session_id.length === 0 || payload.session_id.length > 512 ||
         Buffer.byteLength(payload.session_id, 'utf8') > 512) return [];
@@ -445,17 +482,19 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
           ? 'settled'
           : null;
       if (phase && typeof payload.tool_name === 'string' && typeof payload.tool_use_id === 'string' && object(payload.tool_input)) {
-        if (hookBoundaries.observe({
+        const boundary = hookBoundaries.observeStatus({
           context,
           toolName: payload.tool_name,
           callId: payload.tool_use_id,
           ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
           ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
-        }, phase)) {
+        }, phase);
+        if (boundary.gap) {
           try { environment.onTrackingLoss?.(observedAt); } catch {}
         }
+        if (boundary.duplicate) return [];
         const routes = environment.routes().filter((route) => route.hostClient === 'claude' && modelToolName(route) === payload.tool_name);
-        if (routes.length === 1) {
+        if (routes.length === 1 && routes[0]!.readOnly === true) {
           try {
             environment.onToolCallMarker?.({
               source: 'hook', phase, context, routeId: routes[0]!.routeId,
@@ -465,8 +504,15 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
               ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
             });
           } catch {}
+          return [];
         }
-        return [];
+        const parsed = observationSchema.safeParse({
+          kind: 'invalidate', context,
+          eventId: environment.eventId?.('invalidate', `hook:${payload.tool_use_id}:${phase}`) ??
+            `claude:invalidate:hook:${payload.tool_use_id}:${phase}:${randomUUID()}`,
+          observedAt, routeIds: [], reason: phase === 'started' ? 'native-mutation-start' : 'native-mutation-settle',
+        });
+        return parsed.success ? [parsed.data] : [];
       }
       if (payload.hook_event_name !== 'UserPromptSubmit' || typeof payload.prompt !== 'string') return [];
       const eventId = environment.eventId?.('prompt', `hook:${payload.session_id}:${createHash('sha256').update(payload.prompt).digest('base64url')}`) ??
@@ -480,6 +526,11 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
         text: payload.prompt,
       });
       return parsed.success ? [parsed.data] : [];
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      environment.analysisBudget?.release(retainedGlobalAnalysis);
     },
   };
 }
@@ -558,24 +609,29 @@ function launchMcpSource(cwd: string, clientArgs: readonly string[]): {
   source: Record<string, unknown> | null;
   servers: Record<string, McpServerEntry>;
   clientArgs: string[];
+  strict: boolean;
   reason?: string;
 } {
   const occurrences: Array<{ index: number; count: number; value: string }> = [];
+  let strict = false;
   for (let index = 0; index < clientArgs.length; index++) {
     const arg = clientArgs[index]!;
     if (arg === '--') break;
+    if (arg === '--strict-mcp-config') strict = true;
     if (arg === '--mcp-config') {
       const value = clientArgs[index + 1];
-      if (!value) return { source: null, servers: {}, clientArgs: [...clientArgs], reason: 'owned-mcp:unverifiable-config-source' };
+      if (!value) return { source: null, servers: {}, clientArgs: [...clientArgs], strict, reason: 'owned-mcp:unverifiable-config-source' };
       occurrences.push({ index, count: 2, value });
       index++;
     } else if (arg.startsWith('--mcp-config=')) {
       occurrences.push({ index, count: 1, value: arg.slice('--mcp-config='.length) });
     }
   }
-  if (occurrences.length === 0) return { source: null, servers: {}, clientArgs: [...clientArgs] };
+  if (occurrences.length === 0) return strict
+    ? { source: null, servers: {}, clientArgs: [...clientArgs], strict, reason: 'owned-mcp:strict-without-config-source' }
+    : { source: null, servers: {}, clientArgs: [...clientArgs], strict };
   if (occurrences.length !== 1 || !occurrences[0]!.value) {
-    return { source: null, servers: {}, clientArgs: [...clientArgs], reason: 'owned-mcp:unverifiable-config-source' };
+    return { source: null, servers: {}, clientArgs: [...clientArgs], strict, reason: 'owned-mcp:unverifiable-config-source' };
   }
   const occurrence = occurrences[0]!;
   try {
@@ -596,9 +652,9 @@ function launchMcpSource(cwd: string, clientArgs: readonly string[]): {
     }
     const forwarded = [...clientArgs];
     forwarded.splice(occurrence.index, occurrence.count);
-    return { source: parsed, servers, clientArgs: forwarded };
+    return { source: parsed, servers, clientArgs: forwarded, strict };
   } catch {
-    return { source: null, servers: {}, clientArgs: [...clientArgs], reason: 'owned-mcp:unverifiable-config-source' };
+    return { source: null, servers: {}, clientArgs: [...clientArgs], strict, reason: 'owned-mcp:unverifiable-config-source' };
   }
 }
 
@@ -622,9 +678,11 @@ export async function buildLaunchPlan(context: ClaudeLaunchContext): Promise<Lau
     if (perRun.reason) disabledCapabilities.push(perRun.reason);
     const launchEntries = new Map<string, { entry: McpServerEntry; preserveIfUnowned: boolean }>();
     if (!perRun.reason) {
-      for (const [alias, scoped] of effectiveServers(view.servers)) {
-        if (scoped.scope === 'project' && !view.approvedProjectServers.has(alias)) continue;
-        if (!Object.hasOwn(perRun.servers, alias)) launchEntries.set(alias, { entry: scoped.entry, preserveIfUnowned: false });
+      if (!perRun.strict) {
+        for (const [alias, scoped] of effectiveServers(view.servers)) {
+          if (scoped.scope === 'project' && !view.approvedProjectServers.has(alias)) continue;
+          if (!Object.hasOwn(perRun.servers, alias)) launchEntries.set(alias, { entry: scoped.entry, preserveIfUnowned: false });
+        }
       }
       for (const [alias, entry] of Object.entries(perRun.servers)) {
         launchEntries.set(alias, { entry, preserveIfUnowned: true });

@@ -447,6 +447,11 @@ export class SessionBridge {
         observation.routeIds.length === 0 &&
         observation.reason === 'observer-tracking-gap'
       ) this.revokeOwnersForTrackingLoss(observation.reason);
+      else if (
+        observation.kind === 'invalidate' &&
+        observation.routeIds.length === 0 &&
+        (observation.reason === 'native-mutation-start' || observation.reason === 'native-mutation-settle')
+      ) this.revokeOwnersForNativeMutation(observation.reason);
       for (const candidate of this.sessionPredictor.observe(observation)) this.submit(candidate);
       for (const listener of this.listeners) {
         try { listener(observation); } catch {}
@@ -456,6 +461,15 @@ export class SessionBridge {
 
   private revokeOwnersForTrackingLoss(reason: string): void {
     this.trackingLost = true;
+    for (const owner of this.owners.values()) {
+      owner.routes = [];
+      owner.generation++;
+      if (!send(owner.socket, { type: 'invalidate', routeIds: [], reason })) owner.socket.destroy();
+    }
+  }
+
+  private revokeOwnersForNativeMutation(reason: string): void {
+    if (this.trackingLost) return;
     for (const owner of this.owners.values()) {
       owner.routes = [];
       owner.generation++;
@@ -726,8 +740,9 @@ function validCompletion(value: unknown): value is ProxySessionEvent {
 function validLocalRoute(value: unknown): value is LocalRouteDescriptor {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const route = value as Record<string, unknown>;
-  return Object.keys(route).every((key) => ['exposedTool', 'upstreamServer', 'upstreamTool', 'inputSchema'].includes(key)) &&
+  return Object.keys(route).every((key) => ['exposedTool', 'upstreamServer', 'upstreamTool', 'inputSchema', 'readOnly'].includes(key)) &&
     ['exposedTool', 'upstreamServer', 'upstreamTool'].every((key) => typeof route[key] === 'string' && (route[key] as string).length > 0 && (route[key] as string).length <= 512) &&
+    (route.readOnly === undefined || typeof route.readOnly === 'boolean') &&
     route.inputSchema !== null && typeof route.inputSchema === 'object' && !Array.isArray(route.inputSchema);
 }
 

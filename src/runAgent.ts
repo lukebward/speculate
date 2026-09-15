@@ -12,9 +12,10 @@ import { claudeAdapter, buildLaunchPlan as buildClaudeLaunchPlan, claudeObserver
 import { codexAdapter, buildLaunchPlan as buildCodexLaunchPlan, codexProxyOverrideIsVerifiable } from './agentAdapters/codex.js';
 import { extractCodexConfigInvocation, startCodexClient, type CodexAccountMode, type CodexClient, type CodexConfigRead } from './codexClient.js';
 import { projectCodexPolicy, type CodexPolicyProjection } from './codexPolicy.js';
-import { verifyClaudeMcpPreauthorization } from './claudePermission.js';
+import { projectClaudeMcpPolicy, verifyClaudeMcpPreauthorization } from './claudePermission.js';
 import { selfCommand } from './hostConfig.js';
 import { startLlmProxy, type LlmProxy } from './llmProxy.js';
+import { ObservationBudget } from './observationBudget.js';
 import type { ObserverLifecycleEvent } from './types.js';
 
 export interface RunAgentArgs {
@@ -469,7 +470,15 @@ async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentR
     },
     startupPolicy: args.agent === 'codex' && authority
       ? async (_client, alias) => authority!.startupPolicy(alias)
-      : undefined,
+      : args.agent === 'claude'
+        ? async (_client, alias) => projectClaudeMcpPolicy({
+            cwd,
+            home: env.HOME || homedir(),
+            env,
+            clientArgs: args.clientArgs,
+            observerCommand: claudeObserverHookCommand(),
+          }, alias)
+        : undefined,
     onHook: (client, payload, observedAt) => {
       if (!adapter || client !== args.agent) return;
       disabled.delete('hook-observation:trust-unverified');
@@ -486,19 +495,22 @@ async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentR
     const next = { launchId, conversationId, agent: args.agent, cwd: observedCwd ? resolve(observedCwd) : existing?.cwd ?? nativeCwd };
     return bridge.registerConversation(next) ? bridge.conversationContext(conversationId) : null;
   };
+  const onTrackingLoss = (observedAt: number) => {
+    ledger.markTrackingLoss(observedAt);
+    bridge.publishObservation({
+      kind: 'invalidate', context: initialContext, eventId: `tracking-loss:${randomUUID()}`,
+      observedAt, routeIds: [], reason: 'observer-tracking-gap',
+    });
+  };
+  const analysisBudget = new ObservationBudget(undefined, onTrackingLoss);
   const environment = {
     contextForConversation,
     routes: () => bridge.listRoutes(),
     now: Date.now,
     onToolCallMarker: (marker: ToolCallMarker) => ledger.recordToolCall(marker),
     onExecutionWindow: (event: ExecutionWindowEvent) => ledger.recordWindow(event),
-    onTrackingLoss: (observedAt: number) => {
-      ledger.markTrackingLoss(observedAt);
-      bridge.publishObservation({
-        kind: 'invalidate', context: initialContext, eventId: `tracking-loss:${randomUUID()}`,
-        observedAt, routeIds: [], reason: 'observer-tracking-gap',
-      });
-    },
+    onTrackingLoss,
+    analysisBudget,
   };
   adapter = args.agent === 'claude' ? claudeAdapter(environment) : codexAdapter(environment);
   let relay: LlmProxy | null = null;
@@ -536,6 +548,7 @@ async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentR
         relay = await startLlmProxy({
           upstreamBaseUrl: probePlan.upstreamBaseUrl,
           adapter,
+          analysisBudget,
           onObservation: (observation) => { bridge.publishObservation(observation); },
           onObservationLoss: (observedAt) => environment.onTrackingLoss(observedAt),
         });
@@ -550,6 +563,7 @@ async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentR
     for (const reason of plan.disabledCapabilities ?? []) disabled.add(reason);
   } catch (error) {
     await relay?.close();
+    try { adapter?.close?.(); } catch {}
     await bridge.close();
     await authority?.close();
     throw error;
@@ -573,6 +587,7 @@ async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentR
       closed = true;
       await finalPlan.cleanup();
       await relay?.close();
+      try { adapter?.close?.(); } catch {}
       await bridge.close();
       await authority?.close();
     },

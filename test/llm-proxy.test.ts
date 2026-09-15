@@ -2,6 +2,8 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type Se
 import { AddressInfo, createConnection, createServer as createNetServer, type Server as NetServer } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { startLlmProxy, type LlmProxy } from '../src/llmProxy.js';
+import { claudeAdapter } from '../src/agentAdapters/claude.js';
+import { ObservationBudget } from '../src/observationBudget.js';
 import type {
   AgentAdapter,
   AgentAdapterConnection,
@@ -122,6 +124,49 @@ async function exchange(input: {
 }
 
 describe('LLM HTTP relay', () => {
+  it('bounds analysis across concurrent connections without changing forwarded traffic', async () => {
+    const responseBody = Buffer.from('{"content":[],"stop_reason":"end_turn"}');
+    const upstream = await listen((request, response) => {
+      request.resume();
+      request.on('end', () => setTimeout(() => {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(responseBody);
+      }, 20));
+    });
+    const losses: number[] = [];
+    const budget = new ObservationBudget(8 * 1024 * 1024 + 24 * 1024, (observedAt) => losses.push(observedAt));
+    const analysisAdapter = claudeAdapter({
+      contextForConversation: (conversationId) => ({
+        launchId: 'launch', conversationId, agent: 'claude', cwd: '/work',
+      }),
+      routes: () => [],
+      analysisBudget: budget,
+    });
+    const proxy = await startLlmProxy({
+      upstreamBaseUrl: upstream.baseUrl,
+      adapter: analysisAdapter,
+      analysisBudget: budget,
+      onObservation: () => {},
+    });
+    proxies.push(proxy);
+    const body = Buffer.from(JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(4_096) }], tools: [] }));
+    const results = await Promise.all(Array.from({ length: 8 }, (_, index) => exchange({
+      url: `${proxy.baseUrl}/v1/messages`,
+      headers: {
+        'content-type': 'application/json',
+        'x-claude-code-session-id': `thread-${index}`,
+      },
+      body,
+    })));
+
+    expect(results.every((result) => result.status === 200 && result.body.equals(responseBody))).toBe(true);
+    expect(losses).toHaveLength(1);
+    expect(budget.usedBytes).toBeLessThanOrEqual(8 * 1024 * 1024 + 24 * 1024);
+    await proxy.close();
+    analysisAdapter.close?.();
+    expect(budget.usedBytes).toBe(0);
+  });
+
   it('marks observer tracking lost when a response aborts before its boundary is observed', async () => {
     const upstream = await listen((request, response) => {
       request.resume();

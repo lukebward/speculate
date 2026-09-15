@@ -22,20 +22,24 @@ export class HookBoundaryTracker {
   private retainedBytes = 0;
 
   observe(boundary: HookBoundary, phase: 'started' | 'settled'): boolean {
+    return this.observeStatus(boundary, phase).gap;
+  }
+
+  observeStatus(boundary: HookBoundary, phase: 'started' | 'settled'): { gap: boolean; duplicate: boolean } {
     const key = this.key(boundary);
     if (phase === 'started') {
-      if (this.active.has(key) || this.settled.has(key)) return false;
-      return this.retain(this.active, key, boundary.context.conversationId);
+      if (this.active.has(key) || this.settled.has(key)) return { gap: false, duplicate: true };
+      return { gap: this.retain(this.active, key, boundary.context.conversationId), duplicate: false };
     }
     const active = this.active.get(key);
     if (active) {
       this.active.delete(key);
       this.retainedBytes -= active.bytes;
-      return this.retain(this.settled, key, boundary.context.conversationId);
+      return { gap: this.retain(this.settled, key, boundary.context.conversationId), duplicate: false };
     }
-    if (this.settled.has(key)) return false;
+    if (this.settled.has(key)) return { gap: false, duplicate: true };
     this.retain(this.settled, key, boundary.context.conversationId);
-    return true;
+    return { gap: true, duplicate: false };
   }
 
   endSession(context: SessionContext): boolean {

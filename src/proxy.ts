@@ -38,6 +38,7 @@ import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
 import { candidateSchema, type AgentKind, type AuthorizedCandidate, type Candidate, type HostPermissionGate, type LocalRouteDescriptor, type Observation, type RegisteredRoute } from './observerTypes.js';
+import type { CodexPolicyProjection } from './codexPolicy.js';
 import type { ExecutionLease, ObserverLifecycleEvent, Rule, SpeculateConfig } from './types.js';
 import type { UsageRecorder } from './usage.js';
 
@@ -95,6 +96,7 @@ export interface ProxySessionConfig {
   runtime: ProxySessionRuntime;
   permissionContext?: (conversationId?: string) => string | null;
   permissionGate?: HostPermissionGate;
+  predictionPolicy?: CodexPolicyProjection;
   cwd?: string;
   conversationIdForCall?: (input: { exposedTool: string; upstreamServer: string; upstreamTool: string; args: Readonly<Record<string, unknown>> }) => string | null;
   onEvent?: (event: ProxySessionEvent) => void;
@@ -123,6 +125,7 @@ export class SpeculateProxy {
   private readonly usageRecorder: UsageRecorder | null;
   private readonly session: ProxySessionConfig | null;
   private readonly observedRoutes = new Map<string, { route: RegisteredRoute; validate(args: unknown): { valid: boolean } }>();
+  private nativeMutationDepth = 0;
   private readonly observedReplay = new Map<string, number>();
   private readonly observedEventCounts = new Map<string, { count: number; at: number }>();
   private sessionOps: Promise<void> = Promise.resolve();
@@ -262,6 +265,15 @@ export class SpeculateProxy {
       config,
       now,
       leaseValidator: { isCurrent: (lease) => this.isCurrentObservedLease(lease) },
+      predictionGate: this.session?.predictionPolicy
+        ? {
+            allows: (_server, tool) => {
+              const projection = this.session!.predictionPolicy!;
+              return projection.enabled && !projection.denyTools.includes(tool) &&
+                (projection.allowTools === null || projection.allowTools.includes(tool));
+            },
+          }
+        : undefined,
     });
 
     for (const [name, sc] of Object.entries(config.servers)) {
@@ -995,6 +1007,7 @@ export class SpeculateProxy {
       upstreamServer: server,
       upstreamTool: tool.name,
       inputSchema: tool.inputSchema as Record<string, unknown>,
+      readOnly: this.policy.isAffirmativelyReadOnly(server, tool.name),
     }));
     this.sessionOps = this.sessionOps.then(async () => {
       const registered = await this.session!.runtime.replaceRoutes(descriptors);
@@ -1046,7 +1059,7 @@ export class SpeculateProxy {
     for (const server of servers) this.cache.invalidateServer(server);
   }
 
-  private handleSessionInvalidation(routeIds: readonly string[], _reason: string): void {
+  private handleSessionInvalidation(routeIds: readonly string[], reason: string): void {
     const targets = new Set(routeIds);
     const servers = new Set<string>();
     this.sessionRouteRevision++;
@@ -1055,7 +1068,18 @@ export class SpeculateProxy {
       servers.add(registered.route.upstreamServer);
       this.observedRoutes.delete(routeId);
     }
-    for (const server of servers) this.cache.invalidateServer(server);
+    for (const server of servers) {
+      this.executor.invalidatePending(server);
+      this.cache.invalidateServer(server);
+    }
+    if (reason === 'native-mutation-start') {
+      this.nativeMutationDepth++;
+      return;
+    }
+    if (reason === 'native-mutation-settle') {
+      this.nativeMutationDepth = Math.max(0, this.nativeMutationDepth - 1);
+      if (this.nativeMutationDepth === 0) this.publishSessionRoutes();
+    }
   }
 
   private publishCompletedRouteCall(

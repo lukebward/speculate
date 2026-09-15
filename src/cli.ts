@@ -627,11 +627,10 @@ async function main(): Promise<void> {
           hostServerAlias: metadata.hostServerAlias,
           onCandidates: () => {},
         });
-        if (metadata.hostClient === 'codex') {
-          const projection = await runtime.readStartupPolicy();
-          if (!validCodexProjection(projection)) throw new Error('Codex launch policy could not be verified');
-          applyCodexPolicyProjection(wrapConfig, projection);
-        }
+        const projection = await runtime.readStartupPolicy();
+        if (!validCodexProjection(projection)) throw new Error(`${metadata.hostClient} launch policy could not be verified`);
+        if (metadata.hostClient === 'codex') applyCodexPolicyProjection(wrapConfig, projection);
+        else if (!projection.enabled) wrapConfig.mode = 'off';
         session = {
           launchId: metadata.coordinates.launchId,
           hostClient: metadata.hostClient,
@@ -641,13 +640,14 @@ async function main(): Promise<void> {
             ? runtime.currentPermissionContext(conversationId)
             : null,
           cwd: process.cwd(),
+          predictionPolicy: projection,
         };
       } else {
         await applyCodexPolicy(wrapConfig, wrapArgs);
       }
     } catch (err) {
       process.stderr.write(`[speculate] session observer inactive: ${(err as Error).message}\n`);
-      if (sessionHostClient === 'codex' || wrapArgs.codexServer) wrapConfig.mode = 'off';
+      if (sessionHostClient !== null || wrapArgs.codexServer) wrapConfig.mode = 'off';
     }
     await runProxy(
       wrapConfig,

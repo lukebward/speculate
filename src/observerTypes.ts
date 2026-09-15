@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { ObservationBudget } from './observationBudget.js';
 
 export const MAX_CANDIDATE_BYTES = 64 * 1024;
 export const MAX_OBSERVATION_BYTES = 2 * 1024 * 1024;
@@ -97,6 +98,7 @@ export interface LocalRouteDescriptor {
   upstreamServer: string;
   upstreamTool: string;
   inputSchema: Record<string, unknown>;
+  readOnly?: boolean;
 }
 
 export interface RegisteredRoute extends LocalRouteDescriptor {
@@ -165,6 +167,7 @@ export interface AgentAdapter {
   readonly agent: AgentKind;
   createConnection(): AgentAdapterConnection;
   normalizeHook(payload: unknown, observedAt?: number): readonly Observation[];
+  close?(): void;
 }
 
 export interface AgentAdapterEnvironment {
@@ -175,6 +178,7 @@ export interface AgentAdapterEnvironment {
   onToolCallMarker?(marker: ToolCallMarker): void;
   onExecutionWindow?(event: ExecutionWindowEvent): void;
   onTrackingLoss?(observedAt: number): void;
+  analysisBudget?: ObservationBudget;
 }
 
 export interface ToolCallMarker {

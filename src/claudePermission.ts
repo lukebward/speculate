@@ -186,11 +186,12 @@ function relevantBlockingHook(settings: Record<string, unknown>, canonical: stri
   return false;
 }
 
-export function verifyClaudeMcpPreauthorization(
-  input: ClaudePermissionInput,
-  target: { alias: string; tool: string; requiresUserInteraction?: boolean },
-): ClaudePermissionResult {
-  if (target.requiresUserInteraction) return { decision: 'denied', permissionContext: null, reason: 'user-interaction' };
+interface ClaudePermissionState {
+  sources: Array<SettingsSource & { managed: boolean }>;
+  managedOnly: boolean;
+}
+
+function readClaudePermissionState(input: ClaudePermissionInput): ClaudePermissionState | ClaudePermissionResult {
   const home = input.home ?? homedir();
   const root = projectRoot(input.cwd);
   const configDir = input.env.CLAUDE_CONFIG_DIR || join(home, '.claude');
@@ -234,6 +235,15 @@ export function verifyClaudeMcpPreauthorization(
   if (cli.error) return { decision: 'unverifiable', permissionContext: null, reason: cli.error };
   if (cli.source) sources.push({ ...cli.source, managed: false });
   const managedOnly = sources.some((source) => source.managed && source.value.allowManagedPermissionRulesOnly === true);
+  return { sources, managedOnly };
+}
+
+function evaluateClaudePermission(
+  input: ClaudePermissionInput,
+  target: { alias: string; tool: string },
+  state: ClaudePermissionState,
+): ClaudePermissionResult {
+  const { sources, managedOnly } = state;
   const canonical = `mcp__${target.alias}__${target.tool}`;
   let exactAllow = false;
   for (const source of sources) {
@@ -260,6 +270,39 @@ export function verifyClaudeMcpPreauthorization(
     cwd: resolve(input.cwd), args: input.clientArgs, sources: sources.map((source) => source.digest), canonical,
   })).digest('base64url');
   return { decision: 'allowed', permissionContext };
+}
+
+export function verifyClaudeMcpPreauthorization(
+  input: ClaudePermissionInput,
+  target: { alias: string; tool: string; requiresUserInteraction?: boolean },
+): ClaudePermissionResult {
+  if (target.requiresUserInteraction) return { decision: 'denied', permissionContext: null, reason: 'user-interaction' };
+  const state = readClaudePermissionState(input);
+  return 'decision' in state ? state : evaluateClaudePermission(input, target, state);
+}
+
+export function projectClaudeMcpPolicy(
+  input: ClaudePermissionInput,
+  alias: string,
+): { enabled: boolean; allowTools: string[]; denyTools: string[] } {
+  const state = readClaudePermissionState(input);
+  if ('decision' in state) throw new Error(state.reason ?? 'Claude launch policy could not be verified');
+  const prefix = `mcp__${alias}__`;
+  const candidates = new Set<string>();
+  for (const source of state.sources) {
+    const permissions = source.value.permissions;
+    if (permissions !== undefined && !record(permissions)) throw new Error('Claude launch policy could not be verified');
+    const allow = values(record(permissions) ? permissions.allow : undefined);
+    if (!allow) throw new Error('Claude launch policy could not be verified');
+    for (const rule of allow) {
+      if (!rule.startsWith(prefix) || rule.includes('*') || rule.includes('(') || rule.includes(')')) continue;
+      const tool = rule.slice(prefix.length);
+      if (tool && tool.length <= 512) candidates.add(tool);
+    }
+  }
+  const allowTools = [...candidates].filter((tool) =>
+    evaluateClaudePermission(input, { alias, tool }, state).decision === 'allowed');
+  return { enabled: true, allowTools, denyTools: [] };
 }
 
 function stableValue(value: unknown): string {

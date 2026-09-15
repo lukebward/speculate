@@ -292,6 +292,20 @@ describe('executor drain queue', () => {
     expect(h.metrics.statsSnapshot().suppressed['stale-generation']).toBe(1);
   });
 
+  it('applies the launch permission gate to opener and learned predictions', () => {
+    const h = makeHarness('http');
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.predictionGate = { allows: () => false };
+
+    h.executor.submit([
+      { ...pred('a', 0.9), horizon: 'standing' },
+      { ...pred('b', 0.9), horizon: 'next' },
+    ]);
+
+    expect(h.calls).toEqual([]);
+    expect(h.metrics.statsSnapshot().suppressed['host-permission']).toBe(2);
+  });
+
   it('prevents an issued result from publishing after its route lease changes', async () => {
     const h = makeHarness('http');
     let generation = 1;
@@ -300,6 +314,19 @@ describe('executor drain queue', () => {
     const prediction = { ...pred('a', 0.9), executionLease: { routeId: 'a', generation: 1 } };
     h.executor.submit([prediction]);
     generation = 2;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+
+    expect(h.cache.lookup(canonicalKey('github', 'a', { tool: 'a' })).outcome).toBe('miss');
+  });
+
+  it('prevents an issued result from publishing after launch permission is revoked', async () => {
+    const h = makeHarness('http');
+    let allowed = true;
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.predictionGate = { allows: () => allowed };
+    h.executor.submit([{ ...pred('a', 0.9), horizon: 'standing' }]);
+    allowed = false;
     h.calls[0]!.deferred.resolve();
     await settle();
 

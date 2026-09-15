@@ -7,6 +7,7 @@ import { z } from 'zod';
 
 const cwd = process.cwd();
 const callLog = process.env.SPECULATE_CONSUMPTION_CALL_LOG;
+const latencyMs = Number(process.env.SPECULATE_CONSUMPTION_LATENCY_MS ?? '0');
 
 function pathInWorkspace(path: string): string {
   const absolute = resolve(cwd, path);
@@ -24,6 +25,7 @@ async function record(
   run: () => CallToolResult,
 ): Promise<CallToolResult> {
   if (callLog) appendFileSync(callLog, `${JSON.stringify({ tool, args, cwd })}\n`);
+  if (latencyMs > 0) await new Promise((resolve) => setTimeout(resolve, latencyMs));
   return run();
 }
 

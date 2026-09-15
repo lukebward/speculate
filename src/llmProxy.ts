@@ -20,10 +20,12 @@ import {
   type LlmHeaders,
   type Observation,
 } from './observerTypes.js';
+import { ObservationBudget } from './observationBudget.js';
 
 const MAX_OBSERVATION_QUEUE_ITEMS = 256;
 const MAX_OBSERVATION_QUEUE_BYTES = 8 * 1024 * 1024;
 const MAX_PENDING_OBSERVER_CALLBACKS = 32;
+const ANALYSIS_ENTRY_BYTES = 256;
 const ALWAYS_HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -61,10 +63,12 @@ export interface LlmProxyOptions {
   adapter: AgentAdapter;
   onObservation?: (observation: Observation) => void | Promise<void>;
   onObservationLoss?: (observedAt: number) => void;
+  analysisBudget?: ObservationBudget;
 }
 
 interface ObservationJob {
   bytes: number;
+  analysisBytes: number;
   run(): readonly Observation[];
 }
 
@@ -72,6 +76,11 @@ interface CallbackBudget {
   callbacks: number;
   bytes: number;
   closed: boolean;
+}
+
+interface CallbackReservation {
+  bytes: number;
+  released: boolean;
 }
 
 interface ConnectionState {
@@ -82,6 +91,7 @@ interface ConnectionState {
   webSocketFinished: boolean;
   pendingObservationJobs: number;
   partialRequests: Set<() => void>;
+  releaseAnalysis(): void;
 }
 
 function closeConnection(state: ConnectionState, force = false): void {
@@ -90,6 +100,7 @@ function closeConnection(state: ConnectionState, force = false): void {
   try {
     state.adapter?.close();
   } catch {}
+  state.releaseAnalysis();
 }
 
 function releaseConnectionJob(state: ConnectionState): void {
@@ -97,10 +108,17 @@ function releaseConnectionJob(state: ConnectionState): void {
   if (state.socketClosed) closeConnection(state);
 }
 
-function releaseCallback(budget: CallbackBudget, bytes: number): void {
-  if (budget.closed) return;
+function releaseCallback(
+  budget: CallbackBudget,
+  shared: ObservationBudget,
+  reservation: CallbackReservation,
+): void {
+  if (reservation.released) return;
+  reservation.released = true;
+  const bytes = reservation.bytes;
   budget.callbacks = Math.max(0, budget.callbacks - 1);
   budget.bytes = Math.max(0, budget.bytes - bytes);
+  shared.release(bytes);
 }
 
 class ObservationQueue {
@@ -110,14 +128,20 @@ class ObservationQueue {
   private closed = false;
   private immediate: NodeJS.Immediate | null = null;
   private readonly callbackBudget: CallbackBudget = { callbacks: 0, bytes: 0, closed: false };
+  private readonly callbackReservations = new Set<CallbackReservation>();
 
-  constructor(private readonly callback: ((observation: Observation) => void | Promise<void>) | undefined) {}
+  constructor(
+    private readonly callback: ((observation: Observation) => void | Promise<void>) | undefined,
+    private readonly shared: ObservationBudget,
+  ) {}
 
-  push(job: ObservationJob): boolean {
+  push(job: Omit<ObservationJob, 'analysisBytes'>): boolean {
     if (this.closed || !this.callback) return false;
     if (job.bytes > MAX_OBSERVATION_BYTES || this.jobs.length >= MAX_OBSERVATION_QUEUE_ITEMS ||
       this.bytes + job.bytes > MAX_OBSERVATION_QUEUE_BYTES) return false;
-    this.jobs.push(job);
+    const analysisBytes = job.bytes + ANALYSIS_ENTRY_BYTES;
+    if (!this.shared.reserve(analysisBytes)) return false;
+    this.jobs.push({ ...job, analysisBytes });
     this.bytes += job.bytes;
     if (!this.scheduled) {
       this.scheduled = true;
@@ -128,14 +152,15 @@ class ObservationQueue {
 
   close(): void {
     this.closed = true;
+    for (const job of this.jobs) this.shared.release(job.analysisBytes);
     this.jobs.length = 0;
     this.bytes = 0;
     if (this.immediate) clearImmediate(this.immediate);
     this.immediate = null;
     this.scheduled = false;
     this.callbackBudget.closed = true;
-    this.callbackBudget.callbacks = 0;
-    this.callbackBudget.bytes = 0;
+    for (const reservation of this.callbackReservations) releaseCallback(this.callbackBudget, this.shared, reservation);
+    this.callbackReservations.clear();
   }
 
   private drainOne(): void {
@@ -151,6 +176,8 @@ class ObservationQueue {
       values = job.run();
     } catch {
       values = [];
+    } finally {
+      this.shared.release(job.analysisBytes);
     }
     for (const value of values) {
       const parsed = observationSchema.safeParse(value);
@@ -163,19 +190,29 @@ class ObservationQueue {
       }
       if (bytes > MAX_OBSERVATION_QUEUE_BYTES || this.callbackBudget.callbacks >= MAX_PENDING_OBSERVER_CALLBACKS ||
         this.callbackBudget.bytes + bytes > MAX_OBSERVATION_QUEUE_BYTES) continue;
+      const analysisBytes = bytes + ANALYSIS_ENTRY_BYTES;
+      if (!this.shared.reserve(analysisBytes)) continue;
+      const reservation = { bytes: analysisBytes, released: false };
+      this.callbackReservations.add(reservation);
       let result: void | Promise<void>;
       try {
         result = this.callback!(parsed.data);
       } catch {
+        releaseCallback(this.callbackBudget, this.shared, reservation);
+        this.callbackReservations.delete(reservation);
         continue;
       }
-      if (!result || typeof (result as Promise<void>).then !== 'function') continue;
+      if (!result || typeof (result as Promise<void>).then !== 'function') {
+        releaseCallback(this.callbackBudget, this.shared, reservation);
+        this.callbackReservations.delete(reservation);
+        continue;
+      }
       const budget = this.callbackBudget;
       budget.callbacks++;
-      budget.bytes += bytes;
+      budget.bytes += analysisBytes;
       void Promise.resolve(result).then(
-        () => releaseCallback(budget, bytes),
-        () => releaseCallback(budget, bytes),
+        () => { releaseCallback(budget, this.shared, reservation); this.callbackReservations.delete(reservation); },
+        () => { releaseCallback(budget, this.shared, reservation); this.callbackReservations.delete(reservation); },
       );
     }
     if (this.jobs.length > 0) this.immediate = setImmediate(() => this.drainOne());
@@ -260,7 +297,8 @@ function validUpstream(input: string): URL {
 
 export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy> {
   const upstream = validUpstream(options.upstreamBaseUrl);
-  const observations = new ObservationQueue(options.onObservation);
+  const analysisBudget = options.analysisBudget ?? new ObservationBudget();
+  const observations = new ObservationQueue(options.onObservation, analysisBudget);
   const sockets = new Set<Socket>();
   const upstreamRequests = new Set<ClientRequest>();
   const webSockets = new Set<WebSocket>();
@@ -303,16 +341,21 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
         });
       } catch {}
     }
-    relayRequest({ request, response, upstream, path, observer, observations, upstreamRequests, connectionState,
+    relayRequest({ request, response, upstream, path, observer, observations, upstreamRequests, connectionState, analysisBudget,
       onObservationLoss: options.onObservationLoss, onFailure: () => { failures++; } });
   });
 
   server.on('connection', (socket) => {
     sockets.add(socket);
     let connection: AgentAdapterConnection | null = null;
-    try {
-      connection = options.adapter.createConnection();
-    } catch {}
+    let connectionAnalysisBytes = 0;
+    if (analysisBudget.reserve(ANALYSIS_ENTRY_BYTES)) {
+      connectionAnalysisBytes = ANALYSIS_ENTRY_BYTES;
+      try {
+        connection = options.adapter.createConnection();
+      } catch {}
+    }
+    let analysisReleased = false;
     const state: ConnectionState = {
       adapter: connection,
       closed: false,
@@ -321,6 +364,11 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       webSocketFinished: false,
       pendingObservationJobs: 0,
       partialRequests: new Set(),
+      releaseAnalysis() {
+        if (analysisReleased) return;
+        analysisReleased = true;
+        analysisBudget.release(connectionAnalysisBytes);
+      },
     };
     connections.set(socket, state);
     socket.once('close', () => {
@@ -354,6 +402,7 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       path,
       state,
       observations,
+      analysisBudget,
       onObservation: options.onObservation !== undefined,
       webSocketServer,
       selectedProtocols,
@@ -416,6 +465,7 @@ function relayRequest(input: {
   observations: ObservationQueue;
   upstreamRequests: Set<ClientRequest>;
   connectionState: ConnectionState | null;
+  analysisBudget: ObservationBudget;
   onObservationLoss?: (observedAt: number) => void;
   onFailure?: () => void;
 }): void {
@@ -423,6 +473,7 @@ function relayRequest(input: {
   let observationActive = observer !== null;
   let observedRequestBytes = 0;
   let requestChunks: Buffer[] = [];
+  let requestAnalysisBytes = 0;
   let upstreamResponse: IncomingMessage | null = null;
   let settled = false;
   let uploadPaused = false;
@@ -459,7 +510,11 @@ function relayRequest(input: {
     if (!observationActive) return;
     observationActive = false;
     requestChunks = [];
-    try { onObservationLoss?.(Date.now()); } catch {}
+    input.analysisBudget.release(requestAnalysisBytes);
+    requestAnalysisBytes = 0;
+    if (!input.analysisBudget.isExhausted) {
+      try { onObservationLoss?.(Date.now()); } catch {}
+    }
     try {
       observer?.abort();
     } catch {}
@@ -536,8 +591,11 @@ function relayRequest(input: {
     const forwarded = upstreamRequest.write(chunk);
     if (observationActive) {
       observedRequestBytes += chunk.byteLength;
-      if (observedRequestBytes <= MAX_OBSERVATION_BYTES) requestChunks.push(Buffer.from(chunk));
-      else abortObservation();
+      const analysisBytes = chunk.byteLength + ANALYSIS_ENTRY_BYTES;
+      if (observedRequestBytes <= MAX_OBSERVATION_BYTES && input.analysisBudget.reserve(analysisBytes)) {
+        requestChunks.push(Buffer.from(chunk));
+        requestAnalysisBytes += analysisBytes;
+      } else abortObservation();
     }
     if (!forwarded) {
       uploadPaused = true;
@@ -552,6 +610,8 @@ function relayRequest(input: {
       requestChunks = [];
       const observedAt = Date.now();
       enqueue(body.byteLength, () => observer!.observeRequestBody(body, observedAt));
+      input.analysisBudget.release(requestAnalysisBytes);
+      requestAnalysisBytes = 0;
     }
   });
   request.once('aborted', () => {
@@ -575,6 +635,7 @@ function relayWebSocket(input: {
   path: string;
   state: ConnectionState | null;
   observations: ObservationQueue;
+  analysisBudget: ObservationBudget;
   onObservation: boolean;
   webSocketServer: WebSocketServer;
   selectedProtocols: WeakMap<IncomingMessage, string>;
@@ -614,7 +675,9 @@ function relayWebSocket(input: {
     state?.partialRequests.delete(abortObservation);
     if (!observationActive) return;
     observationActive = false;
-    try { input.onObservationLoss?.(Date.now()); } catch {}
+    if (!input.analysisBudget.isExhausted) {
+      try { input.onObservationLoss?.(Date.now()); } catch {}
+    }
     try {
       observer?.abort();
     } catch {}

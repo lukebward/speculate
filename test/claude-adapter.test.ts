@@ -26,6 +26,7 @@ const routes: RegisteredRoute[] = [
     exposedTool: 'read_file',
     upstreamServer: 'upstream',
     upstreamTool: 'read_file',
+    readOnly: true,
     inputSchema: {
       type: 'object',
       properties: { path: { type: 'string' } },
@@ -41,6 +42,7 @@ const routes: RegisteredRoute[] = [
     exposedTool: 'get_comments',
     upstreamServer: 'upstream',
     upstreamTool: 'get_comments',
+    readOnly: true,
     inputSchema: {
       type: 'object',
       properties: { number: { type: 'integer' } },
@@ -259,7 +261,7 @@ describe('Claude adapter', () => {
     expect(oversizedResponse.observeResponseEnd()).toEqual([]);
   });
 
-  it('normalizes prompt hooks and does not duplicate wrapper-authoritative completions', () => {
+  it('normalizes prompt hooks and treats unregistered wrapper completions as mutation settlement', () => {
     const data = fixture();
     const adapter = makeAdapter();
     const promptEvents = adapter.normalizeHook({
@@ -272,7 +274,28 @@ describe('Claude adapter', () => {
     expect(promptEvents).toEqual([
       expect.objectContaining({ kind: 'prompt', context, text: 'Inspect the current files.' }),
     ]);
-    expect(adapter.normalizeHook(postToolUse)).toEqual([]);
+    expect(adapter.normalizeHook(postToolUse)).toEqual([
+      expect.objectContaining({ kind: 'invalidate', routeIds: [], reason: 'native-mutation-settle' }),
+    ]);
+  });
+
+  it('invalidates speculative state around unknown native tool execution', () => {
+    const adapter = makeAdapter();
+    const base = {
+      session_id: context.conversationId,
+      tool_name: 'native_write',
+      tool_use_id: 'write-1',
+      tool_input: { path: '/work/a' },
+    };
+
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PreToolUse' })).toEqual([
+      expect.objectContaining({ kind: 'invalidate', routeIds: [], reason: 'native-mutation-start' }),
+    ]);
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PreToolUse' })).toEqual([]);
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PostToolUse' })).toEqual([
+      expect.objectContaining({ kind: 'invalidate', routeIds: [], reason: 'native-mutation-settle' }),
+    ]);
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PostToolUse' })).toEqual([]);
   });
 
   it('rejects oversized hook identity and prompt fields before environment work', () => {

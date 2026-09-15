@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
 import { HookBoundaryTracker } from '../hookBoundaries.js';
+import type { ObservationBudget } from '../observationBudget.js';
 import { codexSubcommand, resolveCodexBin, type CodexConfigRead } from '../codexClient.js';
 import { isStdioEntry, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import {
@@ -34,6 +35,7 @@ const MAX_CONNECTION_ANALYSIS_BYTES = 8 * 1024 * 1024;
 const MAX_TOOL_NAME_BYTES = 512;
 const RETAINED_ENTRY_BYTES = 192;
 const RETAINED_TRACKER_BYTES = 512;
+const GLOBAL_ADAPTER_ANALYSIS_BYTES = 8 * 1024 * 1024;
 
 interface ResponseContext {
   complete: boolean;
@@ -55,14 +57,19 @@ interface CompletedResponse {
 class RetainedBudget {
   private used = 0;
 
+  constructor(private readonly shared?: ObservationBudget) {}
+
   reserve(bytes: number): boolean {
     if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > MAX_CONNECTION_ANALYSIS_BYTES - this.used) return false;
+    if (bytes > 0 && this.shared && !this.shared.reserve(bytes)) return false;
     this.used += bytes;
     return true;
   }
 
   release(bytes: number): void {
-    this.used = Math.max(0, this.used - bytes);
+    const released = Math.min(this.used, Math.max(0, bytes));
+    this.used -= released;
+    this.shared?.release(released);
   }
 }
 
@@ -162,13 +169,17 @@ class CodexConnection implements AgentAdapterConnection {
   private readonly requests = new Set<CodexRequestObserver>();
   private readonly sockets = new Set<CodexWebSocketObserver>();
   private readonly completed = new Map<string, CompletedResponse>();
-  private readonly retainedBudget = new RetainedBudget();
+  private readonly retainedBudget: RetainedBudget;
   private closed = false;
 
   constructor(
     private readonly environment: AgentAdapterEnvironment,
     private readonly promptOccurrences: PromptOccurrenceCorrelator,
-  ) {}
+    initiallyClosed = false,
+  ) {
+    this.retainedBudget = new RetainedBudget(environment.analysisBudget);
+    if (initiallyClosed) this.closed = true;
+  }
 
   startRequest(request: AgentAdapterRequest): AgentAdapterRequestObserver | null {
     if (this.closed || request.transport !== 'http' || request.method.toUpperCase() !== 'POST' ||
@@ -895,10 +906,15 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
 export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter {
   const promptOccurrences = new PromptOccurrenceCorrelator(() => environment.now?.() ?? Date.now());
   const hookBoundaries = new HookBoundaryTracker();
+  const retainedGlobalAnalysis = environment.analysisBudget?.reserve(GLOBAL_ADAPTER_ANALYSIS_BYTES)
+    ? GLOBAL_ADAPTER_ANALYSIS_BYTES
+    : environment.analysisBudget ? 0 : GLOBAL_ADAPTER_ANALYSIS_BYTES;
+  let closed = retainedGlobalAnalysis === 0;
   return {
     agent: 'codex',
-    createConnection: () => new CodexConnection(environment, promptOccurrences),
+    createConnection: () => new CodexConnection(environment, promptOccurrences, closed),
     normalizeHook(payload: unknown, boundaryAt?: number): readonly Observation[] {
+      if (closed) return [];
       if (!record(payload)) return [];
       const conversationId = boundedId(payload.thread_id)
         ? payload.thread_id
@@ -932,17 +948,19 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
       const callId = boundedId(payload.tool_use_id) ? payload.tool_use_id : null;
       const args = record(payload.arguments) ? payload.arguments : record(payload.tool_input) ? payload.tool_input : null;
       if (phase && toolName && callId && args) {
-        if (hookBoundaries.observe({
+        const boundary = hookBoundaries.observeStatus({
           context,
           toolName,
           callId,
           ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
           ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
-        }, phase)) {
+        }, phase);
+        if (boundary.gap) {
           try { environment.onTrackingLoss?.(observedAt); } catch {}
         }
+        if (boundary.duplicate) return [];
         const routes = environment.routes().filter((route) => route.hostClient === 'codex' && modelToolName(route) === toolName);
-        if (routes.length === 1) {
+        if (routes.length === 1 && routes[0]!.readOnly === true) {
           try {
             environment.onToolCallMarker?.({
               source: 'hook', phase, context, routeId: routes[0]!.routeId,
@@ -952,8 +970,15 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
               ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
             });
           } catch {}
+          return [];
         }
-        return [];
+        const parsed = observationSchema.safeParse({
+          kind: 'invalidate', context,
+          eventId: environment.eventId?.('invalidate', `hook:${callId}:${phase}`) ??
+            `codex:invalidate:hook:${callId}:${phase}:${randomUUID()}`,
+          observedAt, routeIds: [], reason: phase === 'started' ? 'native-mutation-start' : 'native-mutation-settle',
+        });
+        return parsed.success ? [parsed.data] : [];
       }
       if ((event !== 'user-prompt-submit' && event !== 'UserPromptSubmit') || typeof payload.prompt !== 'string' ||
         Buffer.byteLength(payload.prompt, 'utf8') > MAX_OBSERVATION_BYTES) return [];
@@ -965,6 +990,11 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
         occurrenceId: promptOccurrences.identify(conversationId, payload.prompt, 'hook'),
         text: payload.prompt,
       }];
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      environment.analysisBudget?.release(retainedGlobalAnalysis);
     },
   };
 }

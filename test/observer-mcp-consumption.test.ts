@@ -67,6 +67,12 @@ async function waitFor<T>(read: () => T, accepts: (value: T) => boolean, timeout
 async function startHarness(
   agent: AgentKind,
   authorize: () => HostPermissionDecision = () => 'allowed',
+  startupPolicy: () => { enabled: boolean; allowTools: string[] | null; denyTools: string[] } = () => ({
+    enabled: true,
+    allowTools: ['list_directory', 'read_file', 'git_status'],
+    denyTools: [],
+  }),
+  latencyMs = 0,
 ): Promise<Harness> {
   const directory = mkdtempSync(join(tmpdir(), `speculate-consumption-${agent}-`));
   const workspacePath = join(directory, 'workspace');
@@ -95,11 +101,7 @@ async function startHarness(
         permissionContext: decision === 'allowed' ? `permission-${agent}` : null,
       };
     },
-    startupPolicy: async () => ({
-      enabled: true,
-      allowTools: ['list_directory', 'read_file', 'git_status'],
-      denyTools: [],
-    }),
+    startupPolicy: async () => startupPolicy(),
   });
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -125,6 +127,7 @@ async function startHarness(
       SPECULATE_SESSION_CAPABILITY: bridge.coordinates.capability,
       SPECULATE_SESSION_LAUNCH_ID: bridge.coordinates.launchId,
       SPECULATE_CONSUMPTION_CALL_LOG: callLog,
+      SPECULATE_CONSUMPTION_LATENCY_MS: String(latencyMs),
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -389,5 +392,33 @@ describe.each(['claude', 'codex'] as const)('%s registered MCP consumption', (ag
       content: 'workspace fixture\n',
     });
     expect(harness.calls().map(({ tool }) => tool)).toEqual(['read_file', 'read_file']);
+  }, 30_000);
+});
+
+describe('Claude launch policy projection', () => {
+  it.each([
+    ['allowed', ['list_directory', 'read_file', 'git_status'], true],
+    ['denied-or-ask', [], false],
+  ] as const)('gates learned baseline predictions when exact host policy is %s', async (_label, allowTools, expectsSpeculation) => {
+    const harness = await startHarness('claude', () => 'allowed', () => ({
+      enabled: true, allowTools: [...allowTools], denyTools: [],
+    }), 25);
+    for (let repetition = 0; repetition < 4; repetition++) {
+      await callTool(harness, 'list_directory', { path: harness.workspace });
+      await delay(5);
+      await callTool(harness, 'read_file', { path: 'notes.txt' });
+      await delay(5);
+    }
+    await callTool(harness, 'list_directory', { path: harness.workspace });
+    await delay(100);
+
+    expect(harness.calls().map(({ tool }) => tool)).toEqual([
+      'list_directory', 'read_file', 'list_directory', 'read_file',
+      'list_directory', 'read_file', 'list_directory', 'read_file', 'list_directory',
+      ...(expectsSpeculation ? ['read_file'] : []),
+    ]);
+    const speculativeCalls = (await stats(harness)).speculativeCalls;
+    if (expectsSpeculation) expect(speculativeCalls).toBeGreaterThan(0);
+    else expect(speculativeCalls).toBe(0);
   }, 30_000);
 });

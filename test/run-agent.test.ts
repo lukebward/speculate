@@ -4,13 +4,14 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parseRunArgs, runAgent, SessionMeasurementCollector, type PreparedAgentRun } from '../src/runAgent.js';
+import { parseRunArgs, prepareAgentRun, runAgent, SessionMeasurementCollector, type PreparedAgentRun } from '../src/runAgent.js';
 import { buildLaunchPlan as buildClaudeLaunchPlan } from '../src/agentAdapters/claude.js';
 import { buildLaunchPlan as buildCodexLaunchPlan, codexProxyOverrideIsVerifiable } from '../src/agentAdapters/codex.js';
 import { extractCodexConfigInvocation } from '../src/codexClient.js';
 import { projectCodexPolicy } from '../src/codexPolicy.js';
-import { verifyClaudeMcpPreauthorization } from '../src/claudePermission.js';
+import { projectClaudeMcpPolicy, verifyClaudeMcpPreauthorization } from '../src/claudePermission.js';
 import { wrapLaunchEntry } from '../src/hostConfig.js';
+import { connectSessionBridgeOwner } from '../src/sessionBridge.js';
 
 const directories: string[] = [];
 
@@ -178,6 +179,50 @@ describe('native launch plans', () => {
     expect(config.mcpServers.durableOnly.args).toContain('/bin/durable-only');
     expect(config.mcpServers.remote.args).toContain(source.mcpServers.remote.url);
     expect(plan.args.slice(-2)).toEqual(['--model', 'chosen']);
+    await plan.cleanup();
+  });
+
+  it('keeps strict Claude launches limited to the explicit per-run MCP source', async () => {
+    const root = directory();
+    const home = join(root, 'home');
+    const cwd = join(root, 'work');
+    mkdirSync(home); mkdirSync(cwd);
+    writeFileSync(join(home, '.claude.json'), JSON.stringify({
+      mcpServers: { ambient: { command: '/bin/ambient' } },
+    }));
+    const source = join(root, 'strict-mcp.json');
+    writeFileSync(source, JSON.stringify({ mcpServers: { explicit: { command: '/bin/explicit' } } }));
+
+    const plan = await buildClaudeLaunchPlan({
+      cwd, home, env: { HOME: home }, clientArgs: ['--strict-mcp-config', '--mcp-config', source],
+      observe: 'hooks', relayBaseUrl: null, session, hook,
+      self: { command: '/opt/node', args: ['/opt/cli.js'] }, clientBin: '/opt/claude',
+    });
+    const configFlag = plan.args.find((arg) => arg.startsWith('--mcp-config='))!;
+    const config = JSON.parse(readFileSync(configFlag.slice('--mcp-config='.length), 'utf8'));
+    expect(plan.args).toContain('--strict-mcp-config');
+    expect(config.mcpServers.explicit.args).toContain('/bin/explicit');
+    expect(config.mcpServers.ambient).toBeUndefined();
+    await plan.cleanup();
+  });
+
+  it('preserves strict Claude arguments and adds no ambient source when no MCP source was provided', async () => {
+    const root = directory();
+    const home = join(root, 'home');
+    const cwd = join(root, 'work');
+    mkdirSync(home); mkdirSync(cwd);
+    writeFileSync(join(home, '.claude.json'), JSON.stringify({
+      mcpServers: { ambient: { command: '/bin/ambient' } },
+    }));
+    const clientArgs = ['--strict-mcp-config', '--model', 'chosen'];
+
+    const plan = await buildClaudeLaunchPlan({
+      cwd, home, env: { HOME: home }, clientArgs, observe: 'hooks', relayBaseUrl: null,
+      session, hook, self: { command: '/opt/node', args: ['/opt/cli.js'] }, clientBin: '/opt/claude',
+    });
+    expect(plan.args.slice(-clientArgs.length)).toEqual(clientArgs);
+    expect(plan.args.some((arg) => arg.startsWith('--mcp-config='))).toBe(false);
+    expect(plan.disabledCapabilities).toContain('owned-mcp:strict-without-config-source');
     await plan.cleanup();
   });
 
@@ -476,6 +521,50 @@ describe('native launch plans', () => {
 });
 
 describe('Claude launch permission verification', () => {
+  it.each([
+    ['allowed', { allow: ['mcp__files__read'] }, ['read']],
+    ['denied', { allow: ['mcp__files__read'], deny: ['mcp__files__read'] }, []],
+    ['approval-required', { allow: ['mcp__files__read'], ask: ['mcp__files__read'] }, []],
+  ] as const)('projects exact %s permission onto every launch-owned prediction source', (_label, permissions, expected) => {
+    const root = directory();
+    const home = join(root, 'home');
+    const cwd = join(root, 'work');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    mkdirSync(cwd);
+    writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ permissions }));
+
+    expect(projectClaudeMcpPolicy({
+      cwd, home, env: { HOME: home }, clientArgs: [], observerCommand: '/observer',
+    }, 'files')).toEqual({ enabled: true, allowTools: expected, denyTools: [] });
+  });
+
+  it('serves the exact Claude policy projection to the launch-owned wrapper', async () => {
+    const root = directory();
+    const home = join(root, 'home');
+    const cwd = join(root, 'work');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    mkdirSync(cwd);
+    writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
+    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['mcp__files__read'], ask: ['mcp__files__other'] },
+    }));
+    writeFileSync(join(home, '.claude.json'), JSON.stringify({ mcpServers: { files: { command: process.execPath } } }));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SPECULATE_CLAUDE_BIN', process.execPath);
+    const prepared = await prepareAgentRun({ agent: 'claude', observe: 'off', clientArgs: [], jsonReport: null });
+    const mcpPath = prepared.plan.args.find((arg) => arg.startsWith('--mcp-config='))!.slice('--mcp-config='.length);
+    const mcp = JSON.parse(readFileSync(mcpPath, 'utf8'));
+    const owner = await connectSessionBridgeOwner({
+      socketPath: mcp.mcpServers.files.env.SPECULATE_SESSION_SOCKET,
+      capability: mcp.mcpServers.files.env.SPECULATE_SESSION_CAPABILITY,
+      launchId: mcp.mcpServers.files.env.SPECULATE_SESSION_LAUNCH_ID,
+    }, { hostClient: 'claude', hostServerAlias: 'files', onCandidates: () => {} });
+    expect(await owner.readStartupPolicy()).toEqual({ enabled: true, allowTools: ['read'], denyTools: [] });
+    await owner.close();
+    await prepared.close();
+  });
+
   it('authorizes only an exact allow and changes the context when its source changes', () => {
     const root = directory();
     const home = join(root, 'home');

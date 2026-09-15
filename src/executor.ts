@@ -57,6 +57,7 @@ export class SpeculationExecutor {
       config: SpeculateConfig;
       now?: () => number;
       leaseValidator?: LeaseValidator;
+      predictionGate?: { allows(server: string, tool: string): boolean };
     },
   ) {}
 
@@ -112,6 +113,14 @@ export class SpeculationExecutor {
     return dropped;
   }
 
+  invalidatePending(server: string): number {
+    const queue = this.pending.get(server);
+    if (!queue?.length) return 0;
+    for (const { p } of queue) this.suppress(p, 'cache-invalidation');
+    this.pending.delete(server);
+    return queue.length;
+  }
+
   /**
    * Drain hook: called when a budget slot may have freed (a speculative call
    * settled, or a real call finished on a serial upstream).
@@ -147,6 +156,11 @@ export class SpeculationExecutor {
 
     if (p.executionLease && !this.deps.leaseValidator?.isCurrent(p.executionLease)) {
       this.suppress(p, 'stale-generation');
+      return 'dropped';
+    }
+
+    if (this.deps.predictionGate && !this.deps.predictionGate.allows(p.server, p.tool)) {
+      this.suppress(p, 'host-permission');
       return 'dropped';
     }
 
@@ -239,8 +253,9 @@ export class SpeculationExecutor {
       meta,
       promise,
       ttlMs,
-      p.executionLease
-        ? () => this.deps.leaseValidator?.isCurrent(p.executionLease!) === true
+      p.executionLease || this.deps.predictionGate
+        ? () => (!p.executionLease || this.deps.leaseValidator?.isCurrent(p.executionLease) === true) &&
+          (!this.deps.predictionGate || this.deps.predictionGate.allows(p.server, p.tool))
         : undefined,
     );
     metrics.record({

@@ -28,6 +28,7 @@ const routes: RegisteredRoute[] = [
     exposedTool: 'read_file',
     upstreamServer: 'upstream',
     upstreamTool: 'read_file',
+    readOnly: true,
     inputSchema: {
       type: 'object',
       properties: { path: { type: 'string' } },
@@ -43,6 +44,7 @@ const routes: RegisteredRoute[] = [
     exposedTool: 'get_comments',
     upstreamServer: 'upstream',
     upstreamTool: 'get_comments',
+    readOnly: true,
     inputSchema: {
       type: 'object',
       properties: { number: { type: 'integer' } },
@@ -520,5 +522,24 @@ describe('Codex Responses adapter', () => {
     const adapter = makeAdapter();
 
     expect(hookCase.events.flatMap((event) => adapter.normalizeHook(event))).toEqual([]);
+  });
+
+  it('invalidates speculative state around unknown native tool execution', () => {
+    const adapter = makeAdapter();
+    const base = {
+      thread_id: context.conversationId,
+      tool_name: 'native_write',
+      tool_use_id: 'write-1',
+      tool_input: { path: '/work/a' },
+    };
+
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PreToolUse' })).toEqual([
+      expect.objectContaining({ kind: 'invalidate', routeIds: [], reason: 'native-mutation-start' }),
+    ]);
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PreToolUse' })).toEqual([]);
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PostToolUse' })).toEqual([
+      expect.objectContaining({ kind: 'invalidate', routeIds: [], reason: 'native-mutation-settle' }),
+    ]);
+    expect(adapter.normalizeHook({ ...base, hook_event_name: 'PostToolUse' })).toEqual([]);
   });
 });
