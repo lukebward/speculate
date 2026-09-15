@@ -78,5 +78,25 @@
     "readyHits": 0,
     "settledWaste": 0,
     "initialTimeoutCause": "unreproduced; no cause established"
+  },
+  "ciAttempts": [
+    {
+      "commit": "0769f5934de03ed566938428e5f759deae27e037",
+      "runId": 34973817927,
+      "ubuntu": "passed",
+      "macos": "passed",
+      "windows": "failed",
+      "windowsFailure": "Two new integration tests exceeded the 15-second Vitest deadline; no performance gate was changed.",
+      "docsRunId": 34973817549,
+      "docs": "passed"
+    }
+  ],
+  "ciTimeoutCorrection": {
+    "file": "test/observer-multiturn.test.ts",
+    "deadlineMs": 30000,
+    "testsPassed": 6,
+    "durationSeconds": 11.83,
+    "independentReview": "approved",
+    "assertionsOrMeasuredSourcesChanged": false
   }
 }

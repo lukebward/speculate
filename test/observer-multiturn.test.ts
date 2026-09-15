@@ -83,5 +83,5 @@ describe('multi-turn opportunity diagnostic', () => {
     expect(record.perSource.transition?.issued).toBeGreaterThan(0);
     expect(record.hits + record.joins).toBeGreaterThan(0);
     expect(record.settledWaste).toBeLessThanOrEqual(record.issued);
-  }, 15_000);
+  }, 30_000);
 });
