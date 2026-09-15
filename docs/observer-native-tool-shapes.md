@@ -1,6 +1,6 @@
 # Native MCP tool shape probe
 
-Tested 2026-09-14 with Claude Code 2.1.268 and Codex CLI 0.154.0. The sanitized machine-readable capture is [`native-tool-shapes.json`](../test/fixtures/observer/native-tool-shapes.json).
+Tested 2026-09-14 with Claude Code 2.1.268 and Codex CLI 0.154.0. The sanitized machine-readable capture is [`native-tool-shapes.json`](https://github.com/lukebward/speculate/blob/main/test/fixtures/observer/native-tool-shapes.json).
 
 ## Method and isolation
 

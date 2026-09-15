@@ -482,6 +482,7 @@ describe('Claude launch permission verification', () => {
     const cwd = join(root, 'work');
     mkdirSync(join(home, '.claude'), { recursive: true });
     mkdirSync(cwd);
+    writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
     const path = join(home, '.claude', 'settings.json');
     writeFileSync(path, JSON.stringify({ permissions: { allow: ['mcp__files__read'] } }));
     const input = { cwd, home, env: { HOME: home }, clientArgs: [], observerCommand: '/observer' };
@@ -500,6 +501,7 @@ describe('Claude launch permission verification', () => {
     const cwd = join(root, 'work');
     mkdirSync(join(home, '.claude'), { recursive: true });
     mkdirSync(cwd);
+    writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
     const path = join(home, '.claude', 'settings.json');
     const input = { cwd, home, env: { HOME: home }, clientArgs: [], observerCommand: '/observer' };
     writeFileSync(path, JSON.stringify({ permissions: { allow: ['mcp__files__read'], deny: ['mcp__files__*'] } }));
@@ -521,6 +523,7 @@ describe('Claude launch permission verification', () => {
     const cwd = join(root, 'work');
     mkdirSync(join(home, '.claude'), { recursive: true });
     mkdirSync(join(cwd, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
     const input = { cwd, home, env: { HOME: home }, clientArgs: [], observerCommand: '/observer' };
     writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({ permissions: { allow: ['mcp__files__*'] } }));
     expect(verifyClaudeMcpPreauthorization(input, { alias: 'files', tool: 'read' }).decision).toBe('unverifiable');
@@ -535,6 +538,7 @@ describe('Claude launch permission verification', () => {
     const cwd = join(root, 'work');
     mkdirSync(join(home, '.claude'), { recursive: true });
     mkdirSync(cwd);
+    writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
     const path = join(home, '.claude', 'settings.json');
     writeFileSync(path, JSON.stringify({ permissions: { allow: ['mcp__files__read'] } }));
     chmodSync(path, 0o000);

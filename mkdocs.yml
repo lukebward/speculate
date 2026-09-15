@@ -58,6 +58,11 @@ nav:
   - Commands: commands.md
   - Safety: safety.md
   - Configuration: configuration.md
+  - Experimental observer:
+      - Results: observer-results.md
+      - Compatibility: observer-compatibility.md
+      - Native routing: observer-native-routing.md
+      - Native tool shapes: observer-native-tool-shapes.md
   - Design document:
       - Design spec: design/index.md
       - Implementation notes: design/implementation-notes.md
@@ -67,6 +72,9 @@ nav:
   - Proposals:
       - Host-provided wrapper seam: upstream/mcp-wrapper-seam.md
   - Contributing: https://github.com/lukebward/speculate/blob/main/CONTRIBUTING.md
+
+not_in_nav: |
+  superpowers/
 
 markdown_extensions:
   - abbr
