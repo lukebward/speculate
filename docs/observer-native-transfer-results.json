@@ -1,6 +1,7 @@
 {
   "kind": "native-account-transfer-smoke",
   "performanceEvidence": false,
+  "interpretation": "All three public modes completed one correct MCP fixture call through an owned wrapper on both clients. Native hook delivery and live API-key modes remain unverified. Report registeredRoutes is sampled after native child shutdown and is not proof of route registration history.",
   "rows": [
     {
       "client": "claude",
@@ -34,7 +35,8 @@
       "modelOverridePassed": false,
       "effortOverridePassed": false,
       "correctnessPassed": true,
-      "observationVerified": null
+      "observationVerified": null,
+      "sourceCommit": "bdd4120"
     },
     {
       "client": "claude",
@@ -67,7 +69,8 @@
       "modelOverridePassed": false,
       "effortOverridePassed": false,
       "correctnessPassed": true,
-      "observationVerified": null
+      "observationVerified": null,
+      "sourceCommit": "bdd4120"
     },
     {
       "client": "claude",
@@ -100,8 +103,117 @@
       "modelOverridePassed": false,
       "effortOverridePassed": false,
       "correctnessPassed": true,
-      "observationVerified": true
+      "observationVerified": true,
+      "sourceCommit": "bdd4120"
     },
+    {
+      "client": "codex",
+      "clientVersion": "0.154.0",
+      "requestedMode": "off",
+      "activeMode": "off",
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "spawnFailed": false,
+      "overflow": false,
+      "stderrPresent": true,
+      "completed": true,
+      "finalWasOK": true,
+      "fixtureRouteOwned": true,
+      "fixtureInitializeCount": 1,
+      "fixtureToolCallCount": 1,
+      "fixtureInputMatched": true,
+      "unexpectedToolCallCount": 0,
+      "toolServiceMs": 401.6123046875,
+      "wallMs": 13115.763625,
+      "inputTokens": 40568,
+      "cachedInputTokens": 31616,
+      "outputTokens": 90,
+      "registeredRoutes": 0,
+      "relayRequests": null,
+      "disabledCapabilities": [
+        "hook-observation:off",
+        "model-observation:off"
+      ],
+      "modelOverridePassed": false,
+      "effortOverridePassed": false,
+      "correctnessPassed": true,
+      "observationVerified": null,
+      "sourceCommit": "d3391a7"
+    },
+    {
+      "client": "codex",
+      "clientVersion": "0.154.0",
+      "requestedMode": "hooks",
+      "activeMode": "hooks",
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "spawnFailed": false,
+      "overflow": false,
+      "stderrPresent": true,
+      "completed": true,
+      "finalWasOK": true,
+      "fixtureRouteOwned": true,
+      "fixtureInitializeCount": 1,
+      "fixtureToolCallCount": 1,
+      "fixtureInputMatched": true,
+      "unexpectedToolCallCount": 0,
+      "toolServiceMs": 403.244140625,
+      "wallMs": 11511.949916999998,
+      "inputTokens": 41455,
+      "cachedInputTokens": 32000,
+      "outputTokens": 83,
+      "registeredRoutes": 0,
+      "relayRequests": null,
+      "disabledCapabilities": [
+        "hook-observation:trust-unverified",
+        "model-observation:not-requested"
+      ],
+      "modelOverridePassed": false,
+      "effortOverridePassed": false,
+      "correctnessPassed": true,
+      "observationVerified": null,
+      "sourceCommit": "d3391a7"
+    },
+    {
+      "client": "codex",
+      "clientVersion": "0.154.0",
+      "requestedMode": "proxy",
+      "activeMode": "proxy",
+      "exitCode": 0,
+      "signal": null,
+      "timedOut": false,
+      "spawnFailed": false,
+      "overflow": false,
+      "stderrPresent": true,
+      "completed": true,
+      "finalWasOK": true,
+      "fixtureRouteOwned": true,
+      "fixtureInitializeCount": 1,
+      "fixtureToolCallCount": 1,
+      "fixtureInputMatched": true,
+      "unexpectedToolCallCount": 0,
+      "toolServiceMs": 402.695556640625,
+      "wallMs": 12286.764207999997,
+      "inputTokens": 40568,
+      "cachedInputTokens": 31616,
+      "outputTokens": 86,
+      "registeredRoutes": 0,
+      "relayRequests": 2,
+      "disabledCapabilities": [
+        "completion-correlation:tracking-lost",
+        "hook-observation:trust-unverified",
+        "stream-call-observation:opaque-native-exec"
+      ],
+      "modelOverridePassed": false,
+      "effortOverridePassed": false,
+      "correctnessPassed": true,
+      "observationVerified": true,
+      "sourceCommit": "d3391a7"
+    }
+  ],
+  "supersededCodexRows": [
     {
       "client": "codex",
       "clientVersion": "0.154.0",
@@ -134,7 +246,8 @@
       "modelOverridePassed": false,
       "effortOverridePassed": false,
       "correctnessPassed": false,
-      "observationVerified": null
+      "observationVerified": null,
+      "sourceCommit": "bdd4120"
     },
     {
       "client": "codex",
@@ -168,7 +281,8 @@
       "modelOverridePassed": false,
       "effortOverridePassed": false,
       "correctnessPassed": false,
-      "observationVerified": null
+      "observationVerified": null,
+      "sourceCommit": "bdd4120"
     },
     {
       "client": "codex",
@@ -203,9 +317,49 @@
       "modelOverridePassed": false,
       "effortOverridePassed": false,
       "correctnessPassed": false,
-      "observationVerified": true
+      "observationVerified": true,
+      "sourceCommit": "bdd4120"
     }
   ],
-  "sourceCommit": "bdd4120",
-  "interpretation": "Single native-account transfer samples; no speedup claim. Claude passed all three modes. Codex fixture did not initialize; diagnosis pending. Hook delivery and live API-key modes remain unverified."
+  "repair": "Codex override paths previously created literal quote-bearing aliases; verified bare segments select the original alias. Corrected source was retested in all three Codex modes.",
+  "nativeConfigurationProof": {
+    "kind": "native-config-read-without-inference",
+    "exactlyOneRelatedAlias": true,
+    "plainAliasPresent": true,
+    "quoteBearingAliasAbsent": true,
+    "wrapperCommandSelected": true,
+    "wrapperArgsSelected": true,
+    "enabledPreserved": true,
+    "allowlistPreserved": true,
+    "approvalPreserved": true,
+    "passed": true
+  },
+  "noInferenceStartupProof": {
+    "kind": "native-codex-startup-without-inference",
+    "exitCode": 0,
+    "signal": null,
+    "timedOut": false,
+    "spawnFailed": false,
+    "elapsedMs": 7921.963624999999,
+    "httpRequests": 1,
+    "upgrades": 0,
+    "initialized": 1,
+    "ownedFixture": true,
+    "toolsListCount": 1,
+    "toolCalls": 0,
+    "reportPresent": true,
+    "disabledCapabilities": [
+      "hook-observation:off",
+      "model-observation:off"
+    ],
+    "diagnostics": {
+      "mcpStartupFailure": true,
+      "unrecognizedArgument": false,
+      "permissionDenied": false,
+      "socketFailure": false,
+      "sandboxFailure": false,
+      "initializationTimeout": false
+    },
+    "startupPassed": true
+  }
 }

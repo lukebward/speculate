@@ -100,3 +100,16 @@ The actual `run <client> --observe proxy --json-report <path> -- ...` command at
 | Codex CLI 0.154.0 | proxy | 2 | 0 | yes | 6.550 s |
 
 These are routing and completion checks, not performance comparisons. Both reports had zero registered routes because the smoke intentionally used no MCP tools. Codex reported disabled hook coverage, opaque native exec stream coverage, and lost completion tracking; completion-tracking diagnostics remain under review. Actual MCP consumption, matched task benefit, and live API-key use remain separate verification gates.
+
+## Native MCP transfer verification
+
+Actual native account turns now pass in `off`, `hooks`, and `proxy` modes on both clients. Each requested one synthetic read, received the expected result, completed the turn, and issued exactly one underlying MCP call. The fixture's initialization identified its client as Speculate, proving the request traversed the wrapper. Claude was tested at `bdd4120`; Codex passed after the configuration correction at `d3391a7`.
+
+| Client | off | hooks | proxy | Duplicate fixture calls |
+| --- | --- | --- | --- | ---: |
+| Claude Code 2.1.268 | passed | passed | passed | 0 |
+| Codex CLI 0.154.0 | passed | passed | passed | 0 |
+
+The initial Codex attempt exposed a native key-path difference: quotes in `-c mcp_servers."alias".command=...` become part of the server name. Generated overrides now use verified bare segments and abstain for unsupported segments. A native configuration read confirmed exactly one wrapped alias and unchanged enabled state, tool allowlist, and approval requirement. A separate startup check initialized and listed the owned fixture against a local provider that stopped before inference. The corrected source then passed all three native Codex transfer modes.
+
+The [sanitized results](observer-native-transfer-results.json) retain the earlier failed Codex rows and the corrected results. These single samples prove ownership, result integrity, and duplicate-execution safety; they do not demonstrate prefetch benefit or a speed improvement. Hook delivery remains unverified, including Codex's reported trust restriction. Codex opaque native exec and observed correlation-loss limitations remain visible. Live API-key modes are unverified. The report's `registeredRoutes` value is sampled after child shutdown, so it is not a count of routes registered during the run.
