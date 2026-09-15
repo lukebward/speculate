@@ -46,13 +46,30 @@
     "finalDocumentationReview": "approved",
     "mainDelivery": {
       "status": "pushed",
-      "verifiedCommit": "981a6ce43764d71c734e980c3530ec53001cfcde"
+      "verifiedCommit": "c6a588e51c732d572df87a67a686991a9da180e2"
     },
     "postPushCorrections": {
       "sourceCommit": "894a8e30330749105a36e816b7626c0752686ed4",
       "scope": "native-launch-normalization-and-portable-lifecycle-fixtures",
       "independentReview": "approved",
       "benchmarkTimedPathsChanged": false
+    },
+    "githubCi": {
+      "status": "passed",
+      "sourceCommit": "c6a588e51c732d572df87a67a686991a9da180e2",
+      "platforms": [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest"
+      ],
+      "includesNativeCodexIntegration": true,
+      "url": "https://github.com/lukebward/speculate/actions/runs/34927756544"
+    },
+    "githubDocs": {
+      "status": "passed",
+      "sourceCommit": "c6a588e51c732d572df87a67a686991a9da180e2",
+      "includesDeployment": true,
+      "url": "https://github.com/lukebward/speculate/actions/runs/34927756534"
     }
   },
   "pending": [],

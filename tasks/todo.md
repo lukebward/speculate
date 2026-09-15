@@ -178,6 +178,8 @@ GitHub run `34926910149` passed Linux but exposed one macOS and seven Windows as
 - [x] Diagnose and fix the persistent-connection and provider-cancellation test synchronization failures.
 - [x] Diagnose and fix Windows launcher, benchmark-launcher, and hook-recovery failures without weakening coverage.
 - [x] Review the scoped corrections and run the affected tests and build.
-- [ ] Push the corrections normally and verify Linux, macOS, Windows, and docs CI.
+- [x] Push the corrections normally and verify Linux, macOS, Windows, and docs CI.
 
 - Post-CI corrections at `894a8e3` passed independent scoped review, build, strict TypeScript, and the full suite: 1,365 tests passed, 8 skipped, 84.13s. Native invocation reuses existing platform helpers; timing-sensitive fixtures now synchronize through explicit events. Benchmark timing paths and recorded thresholds are unchanged.
+
+- Final code delivery `c6a588e` is verified on main. GitHub CI run `34927756544` passed Linux, macOS, and Windows, including native Codex integration checks; docs run `34927756534` passed build and deployment.
