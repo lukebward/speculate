@@ -41,11 +41,15 @@
       "rawReleaseDecisions": "remove-all-stages-both-clients",
       "deliveryDecision": "retain-experimental-source-only",
       "report": "observer-benchmark-results.json"
+    },
+    "benchmarkEvidenceReview": "approved",
+    "finalDocumentationReview": "approved",
+    "mainDelivery": {
+      "status": "pushed",
+      "verifiedCommit": "981a6ce43764d71c734e980c3530ec53001cfcde"
     }
   },
-  "pending": [
-    "main-push"
-  ],
+  "pending": [],
   "unverified": [
     "live-api-key-routing",
     "native-hook-delivery",
