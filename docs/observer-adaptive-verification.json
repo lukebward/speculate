@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "d67218121e85bcd9d540304564472aa6fa91fb07",
+  "baselineCommit": "d0d546c1ccd516ee53337cf5e2687850e555a030",
+  "headroomReferenceCommit": "9f32800b86ad277201c2a2ce75192534f8e94b03",
+  "environment": {
+    "platform": "Darwin",
+    "architecture": "arm64",
+    "node": "v22.14.0"
+  },
+  "build": {
+    "command": "npm run build",
+    "exitCode": 0
+  },
+  "typecheck": {
+    "command": "npx tsc -p tsconfig.json --noEmit --pretty false",
+    "exitCode": 0
+  },
+  "focusedProduction": {
+    "testsPassed": 90,
+    "exitCode": 0
+  },
+  "focusedBenchmark": {
+    "testsPassed": 44,
+    "filesPassed": 2,
+    "exitCode": 0
+  },
+  "fullSuite": {
+    "command": "npm test",
+    "exitCode": 0,
+    "testsPassed": 1383,
+    "testsSkipped": 8,
+    "filesPassed": 58,
+    "filesSkipped": 3,
+    "durationSeconds": 84.42
+  },
+  "independentReview": {
+    "production": "approved",
+    "benchmark": "approved"
+  },
+  "unchangedHistoricalArtifacts": {
+    "docs/observer-benchmark-results.json": "8c3f94ff0553e85e37d4ab20534b2f9e5aac0515bfc8f62bee6dc4f78ad3ea9b",
+    "docs/observer-benchmark-records.json.gz": "0ffa408013983c33514065f647b3e82b3556209fd97555570a3a5b1e91c44fc5"
+  },
+  "nativePerformance": "unverified",
+  "releaseQualification": false,
+  "diagnosticAttempts": [
+    {
+      "sourceCommit": "d67218121e85bcd9d540304564472aa6fa91fb07",
+      "status": "failed",
+      "elapsedSeconds": 156.03,
+      "error": "MCP error -32001: Request timed out",
+      "artifactProduced": false
+    },
+    {
+      "sourceCommit": "d67218121e85bcd9d540304564472aa6fa91fb07",
+      "status": "passed",
+      "exitCode": 0,
+      "elapsedSeconds": 164.41,
+      "artifactProduced": true,
+      "interveningProbe": {
+        "recordsCompleted": 60,
+        "recordFailures": 0
+      },
+      "sourceOrParameterChanges": false
+    }
+  ],
+  "diagnostic": {
+    "artifact": "observer-multiturn-results.json",
+    "sha256": "1157325c885ecb5ff1d0443a8f075af2bcc1f1ef3c7cfbf1b7a14b084184392b",
+    "records": 60,
+    "pairedBlocks": 12,
+    "correctnessFailures": 0,
+    "demandedCalls": 150,
+    "physicalCalls": 150,
+    "speculativeIssues": 66,
+    "consumedJoins": 66,
+    "readyHits": 0,
+    "settledWaste": 0,
+    "initialTimeoutCause": "unreproduced; no cause established"
+  }
+}

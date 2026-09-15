@@ -1,0 +1,2453 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "observer-multiturn-opportunity",
+  "evidenceScope": "synthetic-opportunity-diagnostic",
+  "releaseQualification": false,
+  "nativeClientEvidence": false,
+  "sourceCommit": "d67218121e85bcd9d540304564472aa6fa91fb07",
+  "parameters": {
+    "repetitions": 3,
+    "trainingEpisodes": 4,
+    "toolLatencyMs": 120,
+    "trainingToolLatencyMs": 120,
+    "modelLatencyMs": 80,
+    "dispatchLagMs": 8,
+    "experimentSeed": 1836412020,
+    "orderSeed": 1751474532
+  },
+  "armDefinitions": {
+    "A": {
+      "speculate": false,
+      "hooks": false,
+      "requestObserver": false,
+      "signals": {
+        "intent": false,
+        "transition": false,
+        "stream": false
+      }
+    },
+    "B": {
+      "speculate": true,
+      "hooks": false,
+      "requestObserver": false,
+      "signals": {
+        "intent": false,
+        "transition": false,
+        "stream": false
+      }
+    },
+    "C": {
+      "speculate": true,
+      "hooks": true,
+      "requestObserver": false,
+      "signals": {
+        "intent": true,
+        "transition": true,
+        "stream": false
+      }
+    },
+    "D": {
+      "speculate": true,
+      "hooks": true,
+      "requestObserver": true,
+      "signals": {
+        "intent": true,
+        "transition": true,
+        "stream": false
+      }
+    },
+    "E": {
+      "speculate": true,
+      "hooks": true,
+      "requestObserver": true,
+      "signals": {
+        "intent": true,
+        "transition": true,
+        "stream": true
+      }
+    }
+  },
+  "baselineScope": "Arm B runs the production session wrapper, predictor, admission, executor, cache, permission gate, and MCP client. The warm opportunity crosses server owners, outside ordinary per-server transition learning.",
+  "order": [
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "B",
+      "orderIndex": 0
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "C",
+      "orderIndex": 1
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "E",
+      "orderIndex": 2
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "A",
+      "orderIndex": 3
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "D",
+      "orderIndex": 4
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "E",
+      "orderIndex": 5
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "B",
+      "orderIndex": 6
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "D",
+      "orderIndex": 7
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "C",
+      "orderIndex": 8
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "A",
+      "orderIndex": 9
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "B",
+      "orderIndex": 10
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "C",
+      "orderIndex": 11
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "D",
+      "orderIndex": 12
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "A",
+      "orderIndex": 13
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "arm": "E",
+      "orderIndex": 14
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "D",
+      "orderIndex": 15
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "C",
+      "orderIndex": 16
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "B",
+      "orderIndex": 17
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "E",
+      "orderIndex": 18
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "arm": "A",
+      "orderIndex": 19
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "D",
+      "orderIndex": 20
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "B",
+      "orderIndex": 21
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "C",
+      "orderIndex": 22
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "E",
+      "orderIndex": 23
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "A",
+      "orderIndex": 24
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "B",
+      "orderIndex": 25
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "D",
+      "orderIndex": 26
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "E",
+      "orderIndex": 27
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "C",
+      "orderIndex": 28
+    },
+    {
+      "client": "claude",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "A",
+      "orderIndex": 29
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "A",
+      "orderIndex": 30
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "D",
+      "orderIndex": 31
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "E",
+      "orderIndex": 32
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "C",
+      "orderIndex": 33
+    },
+    {
+      "client": "codex",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "arm": "B",
+      "orderIndex": 34
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "C",
+      "orderIndex": 35
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "E",
+      "orderIndex": 36
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "D",
+      "orderIndex": 37
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "B",
+      "orderIndex": 38
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "A",
+      "orderIndex": 39
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "C",
+      "orderIndex": 40
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "B",
+      "orderIndex": 41
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "E",
+      "orderIndex": 42
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "D",
+      "orderIndex": 43
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "arm": "A",
+      "orderIndex": 44
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "B",
+      "orderIndex": 45
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "C",
+      "orderIndex": 46
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "E",
+      "orderIndex": 47
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "D",
+      "orderIndex": 48
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "arm": "A",
+      "orderIndex": 49
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "C",
+      "orderIndex": 50
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "B",
+      "orderIndex": 51
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "E",
+      "orderIndex": 52
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "A",
+      "orderIndex": 53
+    },
+    {
+      "client": "claude",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "D",
+      "orderIndex": 54
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "D",
+      "orderIndex": 55
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "E",
+      "orderIndex": 56
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "C",
+      "orderIndex": 57
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "B",
+      "orderIndex": 58
+    },
+    {
+      "client": "codex",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "arm": "A",
+      "orderIndex": 59
+    }
+  ],
+  "records": [
+    {
+      "client": "codex",
+      "arm": "B",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 497.4169999999999,
+      "toolWaitMs": 289.255615234375,
+      "modelWaitMs": 178.73354099999983,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "932b1f163aa4dc24460bd49f620d47cb3af3bc52cca43f06b2a2fea9d6c378d7",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "C",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 473.3164999999999,
+      "toolWaitMs": 287.783447265625,
+      "modelWaitMs": 167.17458299999998,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "932b1f163aa4dc24460bd49f620d47cb3af3bc52cca43f06b2a2fea9d6c378d7",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "E",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 484.20208399999956,
+      "toolWaitMs": 287.29345703125,
+      "modelWaitMs": 180.37029200000006,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 2,
+      "misses": 0,
+      "issued": 2,
+      "settledWaste": 0,
+      "perSource": {
+        "stream": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "932b1f163aa4dc24460bd49f620d47cb3af3bc52cca43f06b2a2fea9d6c378d7",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "A",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 474.32304099999965,
+      "toolWaitMs": 284.053955078125,
+      "modelWaitMs": 171.46708299999955,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "932b1f163aa4dc24460bd49f620d47cb3af3bc52cca43f06b2a2fea9d6c378d7",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "D",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 459.7081250000001,
+      "toolWaitMs": 275.179931640625,
+      "modelWaitMs": 168.0444580000003,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "932b1f163aa4dc24460bd49f620d47cb3af3bc52cca43f06b2a2fea9d6c378d7",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "E",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 455.8290420000003,
+      "toolWaitMs": 271.91015625,
+      "modelWaitMs": 166.39866600000005,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 2,
+      "misses": 0,
+      "issued": 2,
+      "settledWaste": 0,
+      "perSource": {
+        "stream": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "84f6548e20c17985843b843f026d94887759ae29d0c8f7c528c9076e84b0c2a1",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "B",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 443.5732079999998,
+      "toolWaitMs": 261.529541015625,
+      "modelWaitMs": 164.80545899999925,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "84f6548e20c17985843b843f026d94887759ae29d0c8f7c528c9076e84b0c2a1",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "D",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 445.2282500000001,
+      "toolWaitMs": 261.560546875,
+      "modelWaitMs": 165.9007500000007,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "84f6548e20c17985843b843f026d94887759ae29d0c8f7c528c9076e84b0c2a1",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "C",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 444.76037499999984,
+      "toolWaitMs": 263.108154296875,
+      "modelWaitMs": 163.35591699999895,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "84f6548e20c17985843b843f026d94887759ae29d0c8f7c528c9076e84b0c2a1",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "A",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 439.3771660000002,
+      "toolWaitMs": 258.113037109375,
+      "modelWaitMs": 163.75091600000087,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "84f6548e20c17985843b843f026d94887759ae29d0c8f7c528c9076e84b0c2a1",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "B",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 443.90279199999895,
+      "toolWaitMs": 262.54296875,
+      "modelWaitMs": 164.2152499999993,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "93df9741417d199ed5161697689b90239b5624566edd30f51526369b59514ec8",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "C",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 442.54512500000055,
+      "toolWaitMs": 260.669189453125,
+      "modelWaitMs": 163.60183300000062,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "93df9741417d199ed5161697689b90239b5624566edd30f51526369b59514ec8",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "D",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 446.85245799999757,
+      "toolWaitMs": 263.39453125,
+      "modelWaitMs": 166.0635829999992,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "93df9741417d199ed5161697689b90239b5624566edd30f51526369b59514ec8",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "A",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 440.8894160000018,
+      "toolWaitMs": 258.612548828125,
+      "modelWaitMs": 163.93699899999774,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "93df9741417d199ed5161697689b90239b5624566edd30f51526369b59514ec8",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "E",
+      "workflow": "unpredictable-cold",
+      "repetition": 1,
+      "taskWallMs": 433.3140000000021,
+      "toolWaitMs": 250.4345703125,
+      "modelWaitMs": 165.77479199999652,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 2,
+      "misses": 0,
+      "issued": 2,
+      "settledWaste": 0,
+      "perSource": {
+        "stream": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "93df9741417d199ed5161697689b90239b5624566edd30f51526369b59514ec8",
+      "resultDigest": "340bc1cd48be27516c57f1f787316f8dc6c60b7b2dad671acb324b0265fdf2d0",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "D",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 445.9627499999988,
+      "toolWaitMs": 263.694580078125,
+      "modelWaitMs": 164.51587500000096,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "e006de340c36874d19c7891bb783babbbf9dfc0b25cb99862f85e8033571c1f5",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "C",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 446.74083299999984,
+      "toolWaitMs": 263.938232421875,
+      "modelWaitMs": 164.43170799999643,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "e006de340c36874d19c7891bb783babbbf9dfc0b25cb99862f85e8033571c1f5",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "B",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 443.42649999999776,
+      "toolWaitMs": 261.35546875,
+      "modelWaitMs": 164.06524899999567,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "e006de340c36874d19c7891bb783babbbf9dfc0b25cb99862f85e8033571c1f5",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "E",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 429.5667500000018,
+      "toolWaitMs": 247.6220703125,
+      "modelWaitMs": 165.04808299999786,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 2,
+      "misses": 0,
+      "issued": 2,
+      "settledWaste": 0,
+      "perSource": {
+        "stream": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "e006de340c36874d19c7891bb783babbbf9dfc0b25cb99862f85e8033571c1f5",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "A",
+      "workflow": "unpredictable-cold",
+      "repetition": 2,
+      "taskWallMs": 438.50287500000195,
+      "toolWaitMs": 257.373291015625,
+      "modelWaitMs": 164.14341699999932,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "e006de340c36874d19c7891bb783babbbf9dfc0b25cb99862f85e8033571c1f5",
+      "resultDigest": "07583e68266e0147b25df51dee292bae1e874485dd54aec58f8238ef53f03145",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "D",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 399.67079199999716,
+      "toolWaitMs": 122.412109375,
+      "modelWaitMs": 250.07316699999865,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "172ac50d7bf79f4c2d9fad2dac657163d1345cb7d22db0c268b108f83318891e",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "B",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 675.7827499999985,
+      "toolWaitMs": 404.724609375,
+      "modelWaitMs": 244.27945799999725,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "172ac50d7bf79f4c2d9fad2dac657163d1345cb7d22db0c268b108f83318891e",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "C",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 399.539042000004,
+      "toolWaitMs": 123.137939453125,
+      "modelWaitMs": 249.62916600000608,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "172ac50d7bf79f4c2d9fad2dac657163d1345cb7d22db0c268b108f83318891e",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "E",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 405.1018330000006,
+      "toolWaitMs": 128.71728515625,
+      "modelWaitMs": 248.50512500000332,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "providerDigest": "172ac50d7bf79f4c2d9fad2dac657163d1345cb7d22db0c268b108f83318891e",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "A",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 661.8352909999958,
+      "toolWaitMs": 388.02490234375,
+      "modelWaitMs": 246.09833400000207,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "172ac50d7bf79f4c2d9fad2dac657163d1345cb7d22db0c268b108f83318891e",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "B",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 450.74787500000093,
+      "toolWaitMs": 268.043212890625,
+      "modelWaitMs": 165.32495799999742,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "c06c6defa3b5ec08facfb8e08c7d52a5b7bd739a847b9d4e47641534a53b0e4c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "D",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 460.17520800000057,
+      "toolWaitMs": 274.4560546875,
+      "modelWaitMs": 166.72425100000692,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "c06c6defa3b5ec08facfb8e08c7d52a5b7bd739a847b9d4e47641534a53b0e4c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "E",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 434.9085419999974,
+      "toolWaitMs": 253.159423828125,
+      "modelWaitMs": 164.4158330000064,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 2,
+      "misses": 0,
+      "issued": 2,
+      "settledWaste": 0,
+      "perSource": {
+        "stream": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "c06c6defa3b5ec08facfb8e08c7d52a5b7bd739a847b9d4e47641534a53b0e4c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "C",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 455.3778330000059,
+      "toolWaitMs": 273.78125,
+      "modelWaitMs": 163.5704590000023,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "c06c6defa3b5ec08facfb8e08c7d52a5b7bd739a847b9d4e47641534a53b0e4c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "A",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 441.0698330000014,
+      "toolWaitMs": 258.865478515625,
+      "modelWaitMs": 163.89187500000116,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "c06c6defa3b5ec08facfb8e08c7d52a5b7bd739a847b9d4e47641534a53b0e4c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "A",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 440.27158300000156,
+      "toolWaitMs": 258.552734375,
+      "modelWaitMs": 163.942458000005,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "05499d228cfc2047f1031f0e906cdcc05ca20d0edccfff200462ea1d53c2c07c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "D",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 450.7405829999989,
+      "toolWaitMs": 268.044921875,
+      "modelWaitMs": 165.06200000000536,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "05499d228cfc2047f1031f0e906cdcc05ca20d0edccfff200462ea1d53c2c07c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "E",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 429.3202500000043,
+      "toolWaitMs": 246.6044921875,
+      "modelWaitMs": 164.7292080000043,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 2,
+      "misses": 0,
+      "issued": 2,
+      "settledWaste": 0,
+      "perSource": {
+        "stream": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "05499d228cfc2047f1031f0e906cdcc05ca20d0edccfff200462ea1d53c2c07c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "C",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 444.0138330000045,
+      "toolWaitMs": 261.71728515625,
+      "modelWaitMs": 163.9202510000032,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "05499d228cfc2047f1031f0e906cdcc05ca20d0edccfff200462ea1d53c2c07c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "B",
+      "workflow": "unpredictable-cold",
+      "repetition": 0,
+      "taskWallMs": 444.82683300000645,
+      "toolWaitMs": 263.104248046875,
+      "modelWaitMs": 163.87220899999375,
+      "providerRequests": 2,
+      "demandedCalls": 2,
+      "physicalCalls": 2,
+      "hits": 0,
+      "joins": 0,
+      "misses": 2,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "05499d228cfc2047f1031f0e906cdcc05ca20d0edccfff200462ea1d53c2c07c",
+      "resultDigest": "14678ecb1fae09379df71ddbcb9cc0de30d95882b4d36ca2a2699e9c4f30804c",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "C",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 411.9958329999936,
+      "toolWaitMs": 133.05712890625,
+      "modelWaitMs": 252.2575419999921,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "79199e76080635b0d0e08a9b8a9a5fe506d49959da78ed07b1e7efeb8064158e",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "E",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 406.02774999999383,
+      "toolWaitMs": 133.044921875,
+      "modelWaitMs": 248.17158299998846,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "providerDigest": "79199e76080635b0d0e08a9b8a9a5fe506d49959da78ed07b1e7efeb8064158e",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "D",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 421.1392080000078,
+      "toolWaitMs": 142.5537109375,
+      "modelWaitMs": 252.00500000000466,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "79199e76080635b0d0e08a9b8a9a5fe506d49959da78ed07b1e7efeb8064158e",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "B",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 726.8282080000063,
+      "toolWaitMs": 449.680908203125,
+      "modelWaitMs": 249.83025100002124,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "79199e76080635b0d0e08a9b8a9a5fe506d49959da78ed07b1e7efeb8064158e",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "A",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 712.4294590000063,
+      "toolWaitMs": 436.469482421875,
+      "modelWaitMs": 249.00650000000314,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "79199e76080635b0d0e08a9b8a9a5fe506d49959da78ed07b1e7efeb8064158e",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "C",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 441.24504200000956,
+      "toolWaitMs": 162.71533203125,
+      "modelWaitMs": 250.30212399999436,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "16e650ea970976ae8bb11f28cdaf8e902b1210b6f6df087355da582aeba19312",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "B",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 702.7155000000057,
+      "toolWaitMs": 429.499755859375,
+      "modelWaitMs": 246.81674999999814,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "16e650ea970976ae8bb11f28cdaf8e902b1210b6f6df087355da582aeba19312",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "E",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 416.19541699999536,
+      "toolWaitMs": 138.310791015625,
+      "modelWaitMs": 251.88474999999744,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "providerDigest": "16e650ea970976ae8bb11f28cdaf8e902b1210b6f6df087355da582aeba19312",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "D",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 442.0428749999992,
+      "toolWaitMs": 161.389404296875,
+      "modelWaitMs": 255.38154199998826,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "16e650ea970976ae8bb11f28cdaf8e902b1210b6f6df087355da582aeba19312",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "A",
+      "workflow": "derivable-cross-server",
+      "repetition": 2,
+      "taskWallMs": 697.7766249999986,
+      "toolWaitMs": 423.55224609375,
+      "modelWaitMs": 247.4372929999954,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "16e650ea970976ae8bb11f28cdaf8e902b1210b6f6df087355da582aeba19312",
+      "resultDigest": "387611099f7bf28fa836c2358276f2df62beae4c0545f99425a9c5445b160529",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "B",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 705.3344580000121,
+      "toolWaitMs": 431.049560546875,
+      "modelWaitMs": 246.94466600001033,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "7686a713c03619ab6fb893300252167920fd5701b95f2857e0c69a8e69ce21d2",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "C",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 399.03541699999187,
+      "toolWaitMs": 124.8359375,
+      "modelWaitMs": 246.83179100000416,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "7686a713c03619ab6fb893300252167920fd5701b95f2857e0c69a8e69ce21d2",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "E",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 436.0620829999971,
+      "toolWaitMs": 160.593505859375,
+      "modelWaitMs": 249.1720420000056,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "providerDigest": "7686a713c03619ab6fb893300252167920fd5701b95f2857e0c69a8e69ce21d2",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "D",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 433.27983400000085,
+      "toolWaitMs": 155.5087890625,
+      "modelWaitMs": 250.09749900001043,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "7686a713c03619ab6fb893300252167920fd5701b95f2857e0c69a8e69ce21d2",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "A",
+      "workflow": "derivable-cross-server",
+      "repetition": 1,
+      "taskWallMs": 713.1841660000064,
+      "toolWaitMs": 435.489990234375,
+      "modelWaitMs": 250.41362500000105,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "7686a713c03619ab6fb893300252167920fd5701b95f2857e0c69a8e69ce21d2",
+      "resultDigest": "2d955dfcb382d06914e6f7b87ea82921b80af30809231f8c493dca8fdfd672df",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "C",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 410.518624999997,
+      "toolWaitMs": 137.369873046875,
+      "modelWaitMs": 246.62287399999332,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "6a428c06a274a3157b9285f209f89da8c8fb6df185d1aa2cc515d057c2240d55",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "B",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 690.8107500000042,
+      "toolWaitMs": 417.6845703125,
+      "modelWaitMs": 246.17195899999933,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "6a428c06a274a3157b9285f209f89da8c8fb6df185d1aa2cc515d057c2240d55",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "E",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 404.85437499999534,
+      "toolWaitMs": 130.799072265625,
+      "modelWaitMs": 248.14333399999305,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "providerDigest": "6a428c06a274a3157b9285f209f89da8c8fb6df185d1aa2cc515d057c2240d55",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "A",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 700.4945000000007,
+      "toolWaitMs": 423.537353515625,
+      "modelWaitMs": 248.3255000000063,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "6a428c06a274a3157b9285f209f89da8c8fb6df185d1aa2cc515d057c2240d55",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "claude",
+      "arm": "D",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 412.69437499999185,
+      "toolWaitMs": 136.237548828125,
+      "modelWaitMs": 250.16674999997485,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "6a428c06a274a3157b9285f209f89da8c8fb6df185d1aa2cc515d057c2240d55",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "D",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 392.6868329999852,
+      "toolWaitMs": 119.281494140625,
+      "modelWaitMs": 247.49708300002385,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "5cbc78cdb1b8da039826ba30086925c0bb10a353909f57eb63826ff92beb2da3",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "E",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 405.5494999999937,
+      "toolWaitMs": 125.089599609375,
+      "modelWaitMs": 253.39950100000715,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "providerDigest": "5cbc78cdb1b8da039826ba30086925c0bb10a353909f57eb63826ff92beb2da3",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "C",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 400.0343329999887,
+      "toolWaitMs": 125.96533203125,
+      "modelWaitMs": 246.62779200001387,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 3,
+      "misses": 0,
+      "issued": 3,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 1,
+          "hits": 0,
+          "joins": 1,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 2,
+          "hits": 0,
+          "joins": 2,
+          "waste": 0
+        }
+      },
+      "providerDigest": "5cbc78cdb1b8da039826ba30086925c0bb10a353909f57eb63826ff92beb2da3",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "B",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 680.6809999999823,
+      "toolWaitMs": 406.84423828125,
+      "modelWaitMs": 246.08316499996,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "5cbc78cdb1b8da039826ba30086925c0bb10a353909f57eb63826ff92beb2da3",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    },
+    {
+      "client": "codex",
+      "arm": "A",
+      "workflow": "derivable-cross-server",
+      "repetition": 0,
+      "taskWallMs": 668.4375839999993,
+      "toolWaitMs": 394.78662109375,
+      "modelWaitMs": 246.2197500000184,
+      "providerRequests": 3,
+      "demandedCalls": 3,
+      "physicalCalls": 3,
+      "hits": 0,
+      "joins": 0,
+      "misses": 3,
+      "issued": 0,
+      "settledWaste": 0,
+      "perSource": {},
+      "providerDigest": "5cbc78cdb1b8da039826ba30086925c0bb10a353909f57eb63826ff92beb2da3",
+      "resultDigest": "36643c7e07659730571ac2aece5c2be3324f4646fccb4b0ccea93497b94443c5",
+      "failures": []
+    }
+  ],
+  "summary": [
+    {
+      "client": "claude",
+      "arm": "A",
+      "records": 6,
+      "taskWallMedianMs": 569.423229,
+      "toolWaitMedianMs": 341.201416015625,
+      "issued": 0,
+      "hits": 0,
+      "joins": 0,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "claude",
+      "arm": "B",
+      "records": 6,
+      "taskWallMedianMs": 570.7793125000026,
+      "toolWaitMedianMs": 342.8638916015625,
+      "issued": 0,
+      "hits": 0,
+      "joins": 0,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "claude",
+      "arm": "C",
+      "records": 6,
+      "taskWallMedianMs": 443.0027085000047,
+      "toolWaitMedianMs": 212.9117431640625,
+      "issued": 9,
+      "hits": 0,
+      "joins": 9,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 3,
+          "hits": 0,
+          "joins": 3,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "claude",
+      "arm": "D",
+      "records": 6,
+      "taskWallMedianMs": 443.63556249999965,
+      "toolWaitMedianMs": 211.4749755859375,
+      "issued": 9,
+      "hits": 0,
+      "joins": 9,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 3,
+          "hits": 0,
+          "joins": 3,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "claude",
+      "arm": "E",
+      "records": 6,
+      "taskWallMedianMs": 432.2376459999996,
+      "toolWaitMedianMs": 204.1077880859375,
+      "issued": 15,
+      "hits": 0,
+      "joins": 15,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 3,
+          "hits": 0,
+          "joins": 3,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "codex",
+      "arm": "A",
+      "records": 6,
+      "taskWallMedianMs": 568.0791659999977,
+      "toolWaitMedianMs": 336.0394287109375,
+      "issued": 0,
+      "hits": 0,
+      "joins": 0,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "codex",
+      "arm": "B",
+      "records": 6,
+      "taskWallMedianMs": 586.5998749999992,
+      "toolWaitMedianMs": 346.9901123046875,
+      "issued": 0,
+      "hits": 0,
+      "joins": 0,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "codex",
+      "arm": "C",
+      "records": 6,
+      "taskWallMedianMs": 427.27047899999707,
+      "toolWaitMedianMs": 196.8631591796875,
+      "issued": 9,
+      "hits": 0,
+      "joins": 9,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 3,
+          "hits": 0,
+          "joins": 3,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "codex",
+      "arm": "D",
+      "records": 6,
+      "taskWallMedianMs": 433.9958330000027,
+      "toolWaitMedianMs": 202.97412109375,
+      "issued": 9,
+      "hits": 0,
+      "joins": 9,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 3,
+          "hits": 0,
+          "joins": 3,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 0,
+          "hits": 0,
+          "joins": 0,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    },
+    {
+      "client": "codex",
+      "arm": "E",
+      "records": 6,
+      "taskWallMedianMs": 417.67399999999907,
+      "toolWaitMedianMs": 189.82470703125,
+      "issued": 15,
+      "hits": 0,
+      "joins": 15,
+      "settledWaste": 0,
+      "perSource": {
+        "intent": {
+          "issued": 3,
+          "hits": 0,
+          "joins": 3,
+          "waste": 0
+        },
+        "transition": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        },
+        "stream": {
+          "issued": 6,
+          "hits": 0,
+          "joins": 6,
+          "waste": 0
+        }
+      },
+      "failures": 0
+    }
+  ],
+  "comparisons": [
+    {
+      "client": "claude",
+      "comparison": "B-A",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": -0.008313997327201231,
+      "toolWaitMedianImprovement": -0.013639219129638001
+    },
+    {
+      "client": "claude",
+      "comparison": "C-B",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": 0.18470471319853776,
+      "toolWaitMedianImprovement": 0.307557717154195
+    },
+    {
+      "client": "claude",
+      "comparison": "D-C",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": -0.003554071783146136,
+      "toolWaitMedianImprovement": 0.003402580757748464
+    },
+    {
+      "client": "claude",
+      "comparison": "E-D",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": 0.027881255714811055,
+      "toolWaitMedianImprovement": 0.0504351526046853
+    },
+    {
+      "client": "codex",
+      "comparison": "B-A",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": -0.019263620032214043,
+      "toolWaitMedianImprovement": -0.02429053386208582
+    },
+    {
+      "client": "codex",
+      "comparison": "C-B",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": 0.22861360426722033,
+      "toolWaitMedianImprovement": 0.3487607081195578
+    },
+    {
+      "client": "codex",
+      "comparison": "D-C",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": -0.0050314241640715685,
+      "toolWaitMedianImprovement": -0.002280363541563545
+    },
+    {
+      "client": "codex",
+      "comparison": "E-D",
+      "pairedRecords": 6,
+      "taskWallMedianImprovement": 0.008354296018456542,
+      "toolWaitMedianImprovement": 0.0025916129578604716
+    }
+  ],
+  "limitations": [
+    "Synthetic fixed latency is an opportunity diagnostic, not release or native-client performance evidence.",
+    "The hook input is normalized by the production client adapter without invoking a native client hook process.",
+    "Model reasoning latency benefits intent and prior-result transitions; completed-stream candidates receive only dispatchLagMs.",
+    "The retained 1,000-record observer artifact and its fixed gates are unchanged."
+  ]
+}

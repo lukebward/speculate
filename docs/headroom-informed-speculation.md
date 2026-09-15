@@ -61,4 +61,23 @@ SPECULATE_BENCH_SOURCE_COMMIT=$(git rev-parse HEAD) npm run bench:observer:multi
 
 The source tag is supplied by the caller; use a clean checkout of that commit. Timing varies by machine.
 
+## Measured diagnostic
+
+The complete run at `d67218121e85bcd9d540304564472aa6fa91fb07` finished in 164.41 seconds. All 60 records passed correctness checks, with identical provider request and tool-result digests in all 12 paired blocks. There were 150 demanded and 150 physical MCP calls, 66 speculative issues consumed through in-flight joins, and zero unused speculative calls. No ready hits occurred: these predictions overlapped part of the tool wait.
+
+The warm cross-server chain improved over B, the existing predictor with observers off:
+
+| Client fixture | C: hooks | D: request observation | E: completed-stream observation |
+| --- | ---: | ---: | ---: |
+| Claude | 40.57% | 38.57% | 40.77% |
+| Codex | 41.23% | 42.06% | 40.42% |
+
+Values are the median of three paired task-wall improvement ratios per cell, not ratios of unpaired medians. They are descriptive observations without confidence intervals. Each C/D/E cell consumed three intent predictions and six learned-transition predictions across the three repetitions. The early signals supplied the warm-chain benefit; stream observation added no further issued work there.
+
+In the cold unpredictable case, C and D issued no predictions and had small timing differences around B. E consumed six completed-stream predictions per client, with paired median improvements versus B of 3.13% for Claude and 2.66% for Codex. That small overlap comes from the declared 8 ms dispatch lag. The Codex stream result applies to the flat Responses fixture, not the installed native opaque executor.
+
+The first run stopped after 156.03 seconds on an MCP request timeout before writing an artifact. A coordinate-by-coordinate probe then completed all 60 records, and the unchanged official command succeeded. The timeout did not reproduce; its cause remains unestablished. No source, parameters, or thresholds changed between these attempts.
+
+The [complete diagnostic artifact](observer-multiturn-results.json) preserves every aggregate record, execution order, exact arm definitions, and parameters. Its SHA-256 is `1157325c885ecb5ff1d0443a8f075af2bcc1f1ef3c7cfbf1b7a14b084184392b`. The [verification record](observer-adaptive-verification.json) includes the failed attempt, successful rerun, unchanged historical artifact hashes, and the passing build, TypeScript, review, and 1,383-test suite with 8 skipped.
+
 This diagnostic characterizes an opportunity under declared synthetic timing. It compares observer modes on the updated implementation; it does not isolate the speed effect of the new feedback weighting against the previous commit. Native day-to-day speedup still requires matched tasks across enough independent Claude Code and Codex sessions. No release threshold is changed on the basis of the diagnostic.

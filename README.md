@@ -69,7 +69,7 @@ segments are handled by abstaining rather than rewriting them.
 Native-account smoke tests completed one correct, wrapper-owned MCP read in
 `off`, `hooks`, and `proxy` modes on both clients without duplicate upstream
 calls. This proves transfer and result integrity, not a speed improvement.
-Live API-key runs and native speedup remain unverified. The replay did not
+Live API-key runs and native speedup remain unverified. The original replay did not
 establish an improvement over existing Speculate. See the
 [observer results](docs/observer-results.md) and
 [compatibility notes](docs/observer-compatibility.md).
@@ -79,6 +79,9 @@ tool destination. Repeated unused predictions lose priority through the existing
 adaptive admission policy. See the
 [Headroom-informed design](docs/headroom-informed-speculation.md) for the
 mechanisms, measurement changes, and remaining limits.
+Its focused multi-turn diagnostic reduced warm cross-server task time by about
+40% for both client fixtures, with all 66 speculative calls consumed. This is
+evidence under fixed synthetic timing; daily native performance remains unverified.
 
 Claude Code setup covers user servers and approved servers in known projects.
 Codex setup covers enabled user-level servers on the same host. Built-in tools,
