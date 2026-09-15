@@ -31,6 +31,48 @@ speculate off --client codex   # turn off only Codex
 speculate on --client claude   # turn on only Claude Code
 ```
 
+### Experimental session observer
+
+The context-aware session launcher is currently available only from a source
+build. It is experimental while its performance and recovery gates are still
+being measured:
+
+```bash
+npm install
+npm run build
+
+# Hook observation is the default for both clients.
+node dist/src/cli.js run claude -- --print "Summarize this workspace."
+node dist/src/cli.js run codex -- exec "Summarize this workspace."
+
+# Proxy mode also observes the native model transport.
+node dist/src/cli.js run claude --observe proxy -- --print "Summarize this workspace."
+node dist/src/cli.js run codex --observe proxy -- exec "Summarize this workspace."
+```
+
+Add `--json-report <path>` before the separator for an aggregate session report.
+`--observe off` keeps existing MCP prediction active while disabling the new
+hook and model observers; it is the comparison baseline for this feature.
+
+The launcher uses the existing native account, provider, model, effort,
+permissions, and transport. It does not acquire credentials or add tool
+permissions. Proxy mode changes only the launched process's provider base URL
+and forwards request and response bytes and headers. If the provider route or
+temporary controls cannot be verified, the launcher falls back to hook mode or
+leaves the affected MCP route native.
+
+Claude speculation requires an exact existing allow rule for the MCP tool.
+Codex also keeps its effective per-server tool policy, and its native hook must
+already be trusted. Unsupported Codex configuration arguments and server alias
+segments are handled by abstaining rather than rewriting them.
+
+Native-account smoke tests completed one correct, wrapper-owned MCP read in
+`off`, `hooks`, and `proxy` modes on both clients without duplicate upstream
+calls. This proves transfer and result integrity, not a speed improvement.
+Live API-key runs and the new observer benefit remain unverified. See the
+[observer results](docs/observer-results.md) and
+[compatibility notes](docs/observer-compatibility.md).
+
 Claude Code setup covers user servers and approved servers in known projects.
 Codex setup covers enabled user-level servers on the same host. Built-in tools,
 shell commands, hosted connectors, and unsupported registrations are outside
