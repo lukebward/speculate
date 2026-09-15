@@ -85,6 +85,7 @@ export interface CodexConfigInvocation {
 
 const CODEX_CONFIG_VALUE_FLAGS = new Set(['-c', '--config', '--enable', '--disable', '-p', '--profile', '-C', '--cd']);
 const CODEX_OTHER_VALUE_FLAGS = new Set(['-m', '--model', '-s', '--sandbox', '-a', '--ask-for-approval', '--color']);
+const CODEX_VALUELESS_FLAGS = new Set(['--ephemeral', '--skip-git-repo-check', '--json', '--ignore-rules']);
 const CODEX_EQUAL_CONFIG_FLAGS = ['--config=', '--enable=', '--disable=', '--profile=', '--cd='];
 const CODEX_SUBCOMMANDS = new Set(['exec', 'resume', 'review', 'fork', 'apply', 'cloud', 'mcp', 'features']);
 
@@ -96,6 +97,7 @@ export function codexSubcommand(clientArgs: readonly string[]): string | null {
       index++;
       continue;
     }
+    if (CODEX_VALUELESS_FLAGS.has(arg)) continue;
     if (CODEX_EQUAL_CONFIG_FLAGS.some((prefix) => arg.startsWith(prefix))) continue;
     if (arg.startsWith('-')) return null;
     return CODEX_SUBCOMMANDS.has(arg) ? arg : null;
@@ -131,6 +133,7 @@ export function extractCodexConfigInvocation(clientArgs: readonly string[]): Cod
       index++;
       continue;
     }
+    if (CODEX_VALUELESS_FLAGS.has(arg)) continue;
     if (arg.startsWith('-')) {
       return { globalArgs, verifiable: false, reason: 'unsupported-argument-shape' };
     }

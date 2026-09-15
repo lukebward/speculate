@@ -981,6 +981,10 @@ function override(path: string, value: unknown): string[] {
   return ['-c', `${path}=${toml(value)}`];
 }
 
+function nativeKeySegment(value: string): string | null {
+  return /^[A-Za-z0-9_-]+$/.test(value) ? value : null;
+}
+
 function codexHookConfig(existing: unknown): Record<string, unknown> | null {
   if (existing !== undefined && !record(existing)) return null;
   const hooks = structuredClone((existing as Record<string, unknown> | undefined) ?? {});
@@ -1012,12 +1016,7 @@ function configOverrideTouches(args: readonly string[], root: string): boolean {
 }
 
 function configOverrideAffectsOwnedTransport(args: readonly string[], alias: string): boolean {
-  const roots = [
-    `mcp_servers.${alias}`,
-    `mcp_servers.${JSON.stringify(alias)}`,
-    `"mcp_servers".${alias}`,
-    `"mcp_servers".${JSON.stringify(alias)}`,
-  ];
+  const root = `mcp_servers.${alias}`;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
     const value = arg === '-c' || arg === '--config'
@@ -1026,9 +1025,8 @@ function configOverrideAffectsOwnedTransport(args: readonly string[], alias: str
     if (!value) continue;
     const equalsAt = value.indexOf('=');
     const key = value.slice(0, equalsAt < 0 ? value.length : equalsAt).trim();
-    if (key === 'mcp_servers' || key === '"mcp_servers"') return true;
-    const root = roots.find((candidate) => key === candidate || key.startsWith(`${candidate}.`));
-    if (!root) continue;
+    if (key === 'mcp_servers') return true;
+    if (key !== root && !key.startsWith(`${root}.`)) continue;
     if (key === root) return true;
     const field = key.slice(root.length + 1).split('.', 1)[0]!.replace(/^"|"$/g, '');
     if (field === 'command' || field === 'args' || field === 'env' || field === 'cwd' || field === 'type' || field === 'url') {
@@ -1054,8 +1052,9 @@ export function codexProxyOverrideIsVerifiable(
   nativeGlobalArgs: readonly string[],
   clientArgs: readonly string[] = [],
 ): boolean {
-  if (supportsFinalOverridePlacement(clientArgs)) return true;
   const provider = typeof config.model_provider === 'string' ? config.model_provider : 'openai';
+  if (provider !== 'openai' && nativeKeySegment(provider) === null) return false;
+  if (supportsFinalOverridePlacement(clientArgs)) return true;
   return provider === 'openai'
     ? !configOverrideTouches(nativeGlobalArgs, 'openai_base_url')
     : !configOverrideTouches(nativeGlobalArgs, 'model_providers');
@@ -1090,14 +1089,21 @@ export async function buildLaunchPlan(context: CodexLaunchContext): Promise<Laun
       upstreamBaseUrl = selected.base_url;
     }
     if (context.observe === 'proxy' && context.relayBaseUrl) {
-      generated.push(...override(`model_providers.${JSON.stringify(modelProvider)}.base_url`, context.relayBaseUrl));
+      const providerSegment = nativeKeySegment(modelProvider);
+      if (!providerSegment) throw new Error('selected Codex provider could not be redirected safely');
+      generated.push(...override(`model_providers.${providerSegment}.base_url`, context.relayBaseUrl));
     }
   }
   const servers = record(effective.mcp_servers) ? effective.mcp_servers : {};
   const finalOverrides = supportsFinalOverridePlacement(context.clientArgs);
   for (const [alias, raw] of Object.entries(servers)) {
     if (!record(raw) || raw.enabled === false || !isStdioEntry(raw as McpServerEntry)) continue;
-    if (!finalOverrides && configOverrideAffectsOwnedTransport(context.nativeGlobalArgs ?? [], alias)) {
+    const aliasSegment = nativeKeySegment(alias);
+    if (!aliasSegment) {
+      disabledCapabilities.push('owned-mcp:unsupported-alias');
+      continue;
+    }
+    if (!finalOverrides && configOverrideAffectsOwnedTransport(context.nativeGlobalArgs ?? [], aliasSegment)) {
       disabledCapabilities.push('owned-mcp:config-override-precedence');
       continue;
     }
@@ -1115,7 +1121,7 @@ export async function buildLaunchPlan(context: CodexLaunchContext): Promise<Laun
     try {
       for (const key of ['command', 'args', 'env', 'cwd'] as const) {
         const value = wrapped.entry[key];
-        if (value !== undefined) entryOverrides.push(...override(`mcp_servers.${JSON.stringify(alias)}.${key}`, value));
+        if (value !== undefined) entryOverrides.push(...override(`mcp_servers.${aliasSegment}.${key}`, value));
       }
     } catch {
       disabledCapabilities.push('owned-mcp:unsupported-entry');

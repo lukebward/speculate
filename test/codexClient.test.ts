@@ -76,6 +76,16 @@ describe('Codex configuration transport', () => {
     ])).toEqual({ globalArgs: [], verifiable: false, reason: 'unsupported-argument-shape' });
   });
 
+  it('preserves config verification across verified valueless exec controls', () => {
+    const globalArgs = ['-c', 'mcp_servers.speculate_smoke.command="/bin/native"'];
+    const clientArgs = [
+      ...globalArgs,
+      'exec', '--ephemeral', '--skip-git-repo-check', '--json', '--ignore-rules', 'inspect',
+    ];
+    expect(codexSubcommand(clientArgs)).toBe('exec');
+    expect(extractCodexConfigInvocation(clientArgs)).toEqual({ globalArgs, verifiable: true });
+  });
+
   it('only initializes the config service and preserves raw layer and policy data', async () => {
     const { client, requests, spawner } = await start((request, out) => {
       const response = Buffer.from(`${JSON.stringify({ id: request.id, result: fixtureConfig })}\n`);

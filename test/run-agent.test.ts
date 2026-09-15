@@ -223,7 +223,10 @@ describe('native launch plans', () => {
         model_provider: 'openai',
         model: 'selected',
         mcp_servers: {
-          files: { command: '/bin/files', args: ['--native'], env: { TOKEN: 'kept' }, enabled: true },
+          speculate_smoke: {
+            command: '/bin/files', args: ['--native'], env: { TOKEN: 'kept' }, enabled: true,
+            enabled_tools: ['read'], tools: { read: { approval_mode: 'auto' } },
+          },
           remote: { url: 'https://example.invalid/mcp' },
           collision: { command: '/bin/collision', env: { SPECULATE_SESSION_SOCKET: 'reserved' } },
         },
@@ -233,7 +236,17 @@ describe('native launch plans', () => {
       origins: {},
     };
     const original = structuredClone(config);
-    const clientArgs = ['exec', '--model', 'selected', '-c', 'model_provider="openai"'];
+    const nativeGlobalArgs = [
+      '-c', 'mcp_servers.speculate_smoke.command="/bin/files"',
+      '-c', 'mcp_servers.speculate_smoke.args=["--native"]',
+      '-c', 'mcp_servers.speculate_smoke.enabled=true',
+      '-c', 'mcp_servers.speculate_smoke.enabled_tools=["read"]',
+      '-c', 'mcp_servers.speculate_smoke.tools.read.approval_mode="auto"',
+    ];
+    const clientArgs = [
+      ...nativeGlobalArgs,
+      'exec', '--ephemeral', '--skip-git-repo-check', '--json', '--ignore-rules', 'inspect',
+    ];
     const plan = await buildCodexLaunchPlan({
       cwd: root,
       env: { PATH: process.env.PATH },
@@ -246,13 +259,17 @@ describe('native launch plans', () => {
       clientBin: '/opt/codex',
       nativeConfig: config,
       nativeUpstreamBaseUrl: 'https://chatgpt.com/backend-api/codex',
+      nativeGlobalArgs,
     });
     expect(plan.command).toBe('/opt/codex');
     expect(plan.args.slice(0, clientArgs.length)).toEqual(clientArgs);
     const generated = plan.args.slice(clientArgs.length).join('\n');
-    expect(generated).toContain('mcp_servers."files".command');
-    expect(generated).not.toContain('mcp_servers."remote".command');
-    expect(generated).not.toContain('mcp_servers."collision".command');
+    expect(generated).toContain('mcp_servers.speculate_smoke.command');
+    expect(generated).not.toContain('mcp_servers."speculate_smoke"');
+    expect(generated).not.toContain('mcp_servers.remote.command');
+    expect(generated).not.toContain('mcp_servers.collision.command');
+    expect(generated).not.toContain('enabled_tools');
+    expect(generated).not.toContain('approval_mode');
     expect(generated).toContain('openai_base_url');
     expect(generated).toContain('hooks');
     expect(plan.env).toMatchObject({
@@ -271,6 +288,7 @@ describe('native launch plans', () => {
         model_provider: 'openai',
         mcp_servers: {
           unsupported: { command: '/bin/server', args: ['kept'], env: { VALUE: null } },
+          'unsafe.alias': { command: '/bin/unsafe', args: ['kept'] },
           files: { command: '/bin/files', args: ['--native'] },
         },
       },
@@ -283,9 +301,14 @@ describe('native launch plans', () => {
       nativeConfig: config, nativeUpstreamBaseUrl: 'https://api.openai.com/v1',
     });
     const generated = plan.args.slice(clientArgs.length).join('\n');
-    expect(generated).not.toContain('mcp_servers."unsupported"');
-    expect(generated).toContain('mcp_servers."files".command');
-    expect(plan.disabledCapabilities).toContain('owned-mcp:unsupported-entry');
+    expect(generated).not.toContain('mcp_servers.unsupported');
+    expect(generated).not.toContain('mcp_servers."unsafe.alias"');
+    expect(generated).not.toContain('mcp_servers.unsafe.alias');
+    expect(generated).toContain('mcp_servers.files.command');
+    expect(plan.disabledCapabilities).toEqual(expect.arrayContaining([
+      'owned-mcp:unsupported-entry',
+      'owned-mcp:unsupported-alias',
+    ]));
   });
 
   it('keeps a Codex launch usable when native hook values cannot be projected', async () => {
@@ -326,7 +349,7 @@ describe('native launch plans', () => {
       nativeGlobalArgs: ['-c', 'mcp_servers.files.command="/bin/native"', '-c', 'hooks.SessionStart=[]'],
     });
     const generated = plan.args.slice(0, -clientArgs.length).join('\n');
-    expect(generated).not.toContain('mcp_servers."files"');
+    expect(generated).not.toContain('mcp_servers.files');
     expect(generated).not.toContain('hooks=');
     expect(plan.disabledCapabilities).toEqual(expect.arrayContaining([
       'owned-mcp:config-override-precedence',
@@ -352,7 +375,7 @@ describe('native launch plans', () => {
       nativeUpstreamBaseUrl: 'https://api.openai.com/v1',
       nativeGlobalArgs: ['-c', policy],
     });
-    expect(plan.args.join('\n')).toContain('mcp_servers."files".command');
+    expect(plan.args.join('\n')).toContain('mcp_servers.files.command');
     expect(plan.disabledCapabilities).not.toContain('owned-mcp:config-override-precedence');
     expect(plan.args.slice(0, clientArgs.length)).toEqual(clientArgs);
   });
@@ -389,6 +412,29 @@ describe('native launch plans', () => {
       ['-c', 'openai_base_url="https://native.invalid"'],
       ['exec', 'prompt'],
     )).toBe(true);
+    expect(codexProxyOverrideIsVerifiable(
+      { model_provider: 'custom.provider' },
+      [],
+      ['exec', 'prompt'],
+    )).toBe(false);
+  });
+
+  it('uses the same safe bare key segment for a custom Codex provider relay', async () => {
+    const plan = await buildCodexLaunchPlan({
+      cwd: directory(), env: {}, clientArgs: ['exec'], observe: 'proxy', relayBaseUrl: 'http://127.0.0.1:43123',
+      session, hook, self: { command: '/opt/node', args: ['/opt/cli.js'] }, clientBin: '/opt/codex',
+      nativeConfig: {
+        config: {
+          model_provider: 'custom_provider',
+          model_providers: { custom_provider: { base_url: 'https://native.invalid' } },
+        },
+        layers: [], origins: {},
+      },
+      nativeUpstreamBaseUrl: 'https://native.invalid', nativeGlobalArgs: [],
+    });
+    const generated = plan.args.join('\n');
+    expect(generated).toContain('model_providers.custom_provider.base_url="http://127.0.0.1:43123"');
+    expect(generated).not.toContain('model_providers."custom_provider"');
   });
 
   it.each([
@@ -420,7 +466,7 @@ describe('native launch plans', () => {
       nativeUpstreamBaseUrl: 'https://native.invalid', nativeGlobalArgs,
     });
     const generated = plan.args.slice(0, -clientArgs.length).join('\n');
-    expect(generated).not.toContain('mcp_servers."files"');
+    expect(generated).not.toContain('mcp_servers.files');
     expect(generated).not.toContain('hooks=');
     expect(plan.disabledCapabilities).toEqual(expect.arrayContaining([
       'owned-mcp:config-override-precedence',
@@ -598,7 +644,17 @@ describe('public run command', () => {
     expect(readFileSync(report, 'utf8')).not.toContain('kept');
   });
 
-  it('launches Codex through the same public command and native config reader', () => {
+  it.each([
+    ['an unverified account route', {}, 'model-observation:unverified-account-route'],
+    [
+      'an unsupported custom-provider key',
+      {
+        model_provider: 'custom.provider',
+        model_providers: { 'custom.provider': { base_url: 'https://native.invalid' } },
+      },
+      'model-observation:config-override-precedence',
+    ],
+  ])('launches Codex through the same public command and reports %s', (_case, config, disabledReason) => {
     const root = directory();
     const home = join(root, 'home');
     mkdirSync(home);
@@ -613,7 +669,7 @@ rl.on('line', (line) => {
   const result = message.method === 'initialize'
     ? { codexHome: ${JSON.stringify(home)} }
     : message.method === 'config/read'
-      ? { config: {}, layers: [], origins: {} }
+      ? { config: ${JSON.stringify(config)}, layers: [], origins: {} }
       : {};
   process.stdout.write(JSON.stringify({ id: message.id, result }) + '\\n');
 });
@@ -633,7 +689,7 @@ rl.on('line', (line) => {
     expect(result.stderr).toContain('launching codex (observer: hooks');
     expect(JSON.parse(readFileSync(report, 'utf8'))).toMatchObject({
       schemaVersion: 1, client: 'codex', requestedMode: 'proxy', activeMode: 'hooks', transport: 'responses',
-      disabledCapabilities: expect.arrayContaining(['model-observation:unverified-account-route']),
+      disabledCapabilities: expect.arrayContaining([disabledReason]),
       exit: { code: 6, signal: null },
     });
   });
