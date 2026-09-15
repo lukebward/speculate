@@ -5,9 +5,10 @@ import { claudeAdapter } from '../src/agentAdapters/claude.js';
 import { codexAdapter } from '../src/agentAdapters/codex.js';
 import { SessionPredictor } from '../src/sessionPredictor.js';
 import { SessionBridge, connectSessionBridgeOwner } from '../src/sessionBridge.js';
+import { CandidateCalibrator } from '../src/calibration.js';
 import { Metrics } from '../src/metrics.js';
 import { Predictor } from '../src/predictor.js';
-import { SpeculateProxy, type ProxySessionEvent, type ProxySessionRuntime } from '../src/proxy.js';
+import { observerRuleId, SpeculateProxy, type ProxySessionEvent, type ProxySessionRuntime } from '../src/proxy.js';
 import type { Upstream } from '../src/upstream.js';
 import type { ObserverLifecycleEvent } from '../src/types.js';
 import type {
@@ -417,12 +418,17 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function lifecycleHarness(agent: typeof clients[number], clock: { now: number }, lifecycle: ObserverLifecycleEvent[]) {
+function lifecycleHarness(
+  agent: typeof clients[number],
+  clock: { now: number },
+  lifecycle: ObserverLifecycleEvent[],
+  toolNames: readonly string[] = ['list_directory'],
+) {
   const runtime = new SignalRuntime(agent);
   const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
   const proxy = new SpeculateProxy({
     mode: 'strict', maxPredictionsPerTrigger: 3, log: 'off',
-    servers: { upstream: { allowTools: ['list_directory'], speculation: { defaultTtlMs: 1_000 } } },
+    servers: { upstream: { allowTools: [...toolNames], speculation: { defaultTtlMs: 1_000 } } },
   }, {
     now: () => clock.now,
     onObserverLifecycle: (event) => lifecycle.push(event),
@@ -431,17 +437,17 @@ function lifecycleHarness(agent: typeof clients[number], clock: { now: number },
       permissionContext: () => 'allowed-context', permissionGate: { check: () => 'allowed' },
     },
   });
-  const tool = {
-    name: 'list_directory', inputSchema: listSchema, annotations: { readOnlyHint: true },
-  };
+  const tools = toolNames.map((name) => ({
+    name, inputSchema: listSchema, annotations: { readOnlyHint: true },
+  }));
   proxy.upstreams.set('upstream', {
-    connected: true, transport: 'http', tools: [tool],
+    connected: true, transport: 'http', tools,
     callTool: async (name: string, args: Record<string, unknown>) => {
       calls.push({ tool: name, args });
       return { content: [{ type: 'text' as const, text: 'ok' }] };
     },
   } as unknown as Upstream);
-  proxy.policy.updateTools('upstream', [tool]);
+  proxy.policy.updateTools('upstream', tools);
   (proxy as unknown as { rebuildRoutes(): void }).rebuildRoutes();
   return { proxy, runtime, calls };
 }
@@ -475,6 +481,127 @@ function observedCandidate(
   };
 }
 
+describe.each(clients)('%s observer scoring identity', (agent) => {
+  it('is stable across registrations and changes with each registered route field', () => {
+    const route = routes(agent)[0]!;
+    const otherAgent = agent === 'claude' ? 'codex' : 'claude';
+    const first = observerRuleId(agent, 'intent', route);
+    expect(observerRuleId(agent, 'intent', {
+      ...route,
+      routeId: 'new-random-id',
+      generation: 99,
+      instanceId: 'new-owner',
+    })).toBe(first);
+    expect(first).toMatch(new RegExp(`^observer:${agent}:intent:[A-Za-z0-9_-]{43}$`));
+    expect(first).not.toContain(route.hostServerAlias);
+    expect(first).not.toContain(route.exposedTool);
+    expect(new Set([
+      first,
+      observerRuleId(otherAgent, 'intent', { ...route, hostClient: otherAgent }),
+      observerRuleId(agent, 'stream', route),
+      observerRuleId(agent, 'intent', { ...route, hostServerAlias: 'other' }),
+      observerRuleId(agent, 'intent', { ...route, exposedTool: 'other' }),
+      observerRuleId(agent, 'intent', { ...route, upstreamTool: 'other' }),
+    ])).toHaveLength(6);
+  });
+
+  it('reuses persisted feedback after the same route receives a new registration identity', () => {
+    const original = routes(agent)[0]!;
+    const replacement = { ...original, routeId: 'replacement', generation: 7, instanceId: 'new-owner' };
+    const ruleId = observerRuleId(agent, 'intent', original);
+    const prior = new Metrics({ mode: 'strict', log: 'off', now: () => 10 });
+    for (let index = 0; index < 5; index++) {
+      prior.record({ type: 'speculated', server: 'upstream', tool: original.upstreamTool, ruleId });
+      prior.record({ type: 'invalidated', server: 'upstream', tool: original.upstreamTool, ruleId });
+    }
+    const restored = new Metrics({ mode: 'strict', log: 'off', now: () => 10 });
+    restored.importRuleFeedback(prior.exportRuleFeedback());
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics: restored,
+      calibration: new CandidateCalibrator({ now: () => 10 }),
+      admission: { upstream: { enabled: true, minExpectedSavedMs: 15 } },
+    });
+
+    expect(observerRuleId(agent, 'intent', replacement)).toBe(ruleId);
+    expect(predictor.admitResolved('upstream', [{
+      tool: replacement.upstreamTool,
+      args: { path: '/work' },
+      confidence: 0.95,
+      expectedLatencyMs: 100,
+      candidateId: ruleId,
+      ruleId,
+      observerAttribution: {
+        client: agent, source: 'intent', routeId: replacement.routeId,
+        generation: replacement.generation, candidateCreatedAt: 1,
+      },
+    }], { timestamp: 10, trackNextCall: false })).toEqual([]);
+  });
+
+  it('lets decayed persisted waste recover toward the calibrated prior', () => {
+    const original = routes(agent)[0]!;
+    const replacement = { ...original, routeId: 'replacement', generation: 7, instanceId: 'new-owner' };
+    const ruleId = observerRuleId(agent, 'intent', original);
+    const prior = new Metrics({ mode: 'strict', log: 'off', now: () => 0 });
+    prior.record({ type: 'speculated', server: 'upstream', tool: original.upstreamTool, ruleId });
+    prior.record({ type: 'invalidated', server: 'upstream', tool: original.upstreamTool, ruleId });
+    const persisted = prior.exportRuleFeedback();
+    const candidate = {
+      tool: replacement.upstreamTool,
+      args: { path: '/work' },
+      confidence: 0.95,
+      expectedLatencyMs: 30,
+      candidateId: ruleId,
+      ruleId,
+      observerAttribution: {
+        client: agent, source: 'intent' as const, routeId: replacement.routeId,
+        generation: replacement.generation, candidateCreatedAt: 1,
+      },
+    };
+    const admitAfterRestart = (now: number) => {
+      const metrics = new Metrics({ mode: 'strict', log: 'off', now: () => now });
+      metrics.importRuleFeedback(persisted);
+      return new Predictor({
+        maxPerTrigger: 3,
+        metrics,
+        calibration: new CandidateCalibrator({ now: () => now }),
+        admission: { upstream: { enabled: true, minExpectedSavedMs: 15 } },
+      }).admitResolved('upstream', [candidate], { timestamp: now, trackNextCall: false });
+    };
+
+    expect(observerRuleId(agent, 'intent', replacement)).toBe(ruleId);
+    expect(admitAfterRestart(0)).toEqual([]);
+    expect(admitAfterRestart(14 * 24 * 60 * 60_000)).toHaveLength(1);
+  });
+
+  it('keeps distinct registered destinations separate at owner ingress', async () => {
+    const lifecycle: ObserverLifecycleEvent[] = [];
+    const runtime = lifecycleHarness(
+      agent,
+      { now: 100 },
+      lifecycle,
+      ['list_directory', 'read_file'],
+    ).runtime;
+    await ready(runtime);
+    const [list, read] = runtime.routes;
+    expect(list).toBeDefined();
+    expect(read).toBeDefined();
+
+    runtime.deliver([
+      observedCandidate(agent, list!, 'intent', 90, 'list'),
+      observedCandidate(agent, read!, 'intent', 90, 'read'),
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const issued = lifecycle.filter((event) => event.type === 'speculated');
+    expect(issued.map((event) => event.ruleId)).toEqual([
+      observerRuleId(agent, 'intent', list!),
+      observerRuleId(agent, 'intent', read!),
+    ]);
+    expect(new Set(issued.map((event) => event.ruleId))).toHaveLength(2);
+  });
+});
+
 async function actualCall(proxy: SpeculateProxy, args: Record<string, unknown> = { path: '/work' }): Promise<unknown> {
   return (proxy as unknown as {
     handleToolCall(route: unknown, args: Record<string, unknown>, opts: object): Promise<unknown>;
@@ -494,20 +621,22 @@ describe.each(clients)('%s observer lifecycle', (agent) => {
     await new Promise((resolve) => setImmediate(resolve));
     clock.now = 200;
     await actualCall(h.proxy);
+    const intentRule = observerRuleId(agent, 'intent', route);
+    const streamRule = observerRuleId(agent, 'stream', route);
 
     expect(h.calls).toHaveLength(1);
     expect(lifecycle).toEqual([
       expect.objectContaining({
-        type: 'speculated', ruleId: `observer:${agent}:intent`, timestamp: 130,
+        type: 'speculated', ruleId: intentRule, timestamp: 130,
         issueId: expect.any(String), specDispatchAt: 130,
         observerAttribution: expect.objectContaining({ client: agent, source: 'intent', candidateCreatedAt: 100 }),
       }),
       expect.objectContaining({
-        type: 'suppressed', ruleId: `observer:${agent}:stream`, suppression: 'dedup',
+        type: 'suppressed', ruleId: streamRule, suppression: 'dedup',
         observerAttribution: expect.objectContaining({ client: agent, source: 'stream', candidateCreatedAt: 110 }),
       }),
       expect.objectContaining({
-        type: 'hit', ruleId: `observer:${agent}:intent`, timestamp: 200,
+        type: 'hit', ruleId: intentRule, timestamp: 200,
         issueId: expect.any(String), specDispatchAt: 130, realDemandAt: 200,
       }),
     ]);
@@ -516,7 +645,7 @@ describe.each(clients)('%s observer lifecycle', (agent) => {
     expect(lifecycle[1]).not.toHaveProperty('tool');
     expect(lifecycle[1]).not.toHaveProperty('reason');
     expect(h.proxy.metrics.statsSnapshot().perRule).toEqual(expect.arrayContaining([
-      expect.objectContaining({ ruleId: `observer:${agent}:intent`, speculated: 1, hits: 1, wasted: 0 }),
+      expect.objectContaining({ ruleId: intentRule, speculated: 1, hits: 1, wasted: 0 }),
     ]));
   });
 

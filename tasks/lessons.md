@@ -28,3 +28,7 @@
 - Test network lifecycle completion through explicit events; packet sizes, socket buffering, and short sleeps vary across CI platforms.
 - Normalize the actual native child launch with the same platform helpers used by discovery and configuration probes; use explicit portable script formats in fixtures.
 - Permission fixtures must seed every managed-policy source they intend to verify, including an empty remote-settings file, rather than relying on platform-specific absence behavior.
+
+- When the user names a successful reference project, use its concrete mechanisms as a design guide while preserving the requested product identity. Do not recast an intentional architectural experiment as unwanted work. Separate adoption evidence, measured results, and transferable design hypotheses.
+
+- Honor the requested team roles explicitly: Astra coordinates scope, integration, and delivery; GPT-5.6 Sol workers implement and review bounded tasks. Reuse the existing Sol workers when the user reiterates this structure.

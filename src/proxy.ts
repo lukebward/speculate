@@ -7,6 +7,7 @@
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { createHash } from 'node:crypto';
 import {
   CallToolRequestSchema,
   GetPromptRequestSchema,
@@ -49,6 +50,19 @@ const BUILTIN_TOOLS = new Set([STATS_TOOL]);
 const REAL_CALL_TIMEOUT_MS = 600_000;
 /** How many of a session's leading reads are recorded as openers (§13.15). */
 const OPENER_RECORD_LIMIT = 3;
+
+export function observerRuleId(
+  client: AgentKind,
+  source: Candidate['source'],
+  route: Pick<RegisteredRoute, 'hostServerAlias' | 'exposedTool' | 'upstreamTool'>,
+): string {
+  const digest = createHash('sha256').update(JSON.stringify([
+    route.hostServerAlias,
+    route.exposedTool,
+    route.upstreamTool,
+  ])).digest('base64url');
+  return `observer:${client}:${source}:${digest}`;
+}
 
 interface Route {
   server: string;
@@ -961,7 +975,7 @@ export class SpeculateProxy {
       const admitted = this.predictor.admitResolved(
         server,
         group.map(({ candidate, route }) => {
-          const ruleId = `observer:${this.session!.hostClient}:${candidate.source}`;
+          const ruleId = observerRuleId(this.session!.hostClient, candidate.source, route);
           return {
             tool: route.upstreamTool,
             args: candidate.args,

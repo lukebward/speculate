@@ -469,6 +469,76 @@ describe('Predictor.admitResolved', () => {
     expect(metrics.events).toContainEqual(expect.objectContaining({ type: 'candidate_evaluated', candidateId: 'ordinary', correct: true }));
     expect(metrics.events).not.toContainEqual(expect.objectContaining({ type: 'candidate_evaluated', candidateId: 'external' }));
   });
+
+  it('uses operational outcomes to suppress only the low-value resolved rule', () => {
+    const poor = 'observer:claude:intent:poor';
+    const useful = 'observer:claude:intent:useful';
+    const metrics = makeMetrics({
+      [poor]: { hits: 0, wasted: 5, speculated: 5 },
+    });
+    const latency = new LatencyModel({ now: () => 10 });
+    latency.observe(SERVER, 'poor', 100);
+    latency.observe(SERVER, 'useful', 100);
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      latency,
+      calibration: new CandidateCalibrator({ now: () => 10 }),
+      admission: { [SERVER]: { enabled: true, minExpectedSavedMs: 15 } },
+    });
+
+    const admitted = predictor.admitResolved(SERVER, [
+      {
+        tool: 'poor', args: {}, confidence: 0.95, candidateId: poor, ruleId: poor,
+        observerAttribution: { client: 'claude', source: 'intent', routeId: 'poor', generation: 1, candidateCreatedAt: 1 },
+      },
+      {
+        tool: 'useful', args: {}, confidence: 0.95, candidateId: useful, ruleId: useful,
+        observerAttribution: { client: 'claude', source: 'intent', routeId: 'useful', generation: 1, candidateCreatedAt: 1 },
+      },
+    ], { timestamp: 10, trackNextCall: false });
+
+    expect(admitted.map((prediction) => prediction.ruleId)).toEqual([useful]);
+    expect(metrics.events).toContainEqual(expect.objectContaining({
+      type: 'suppressed', ruleId: poor, reason: 'low-utility',
+    }));
+  });
+
+  it('keeps the calibrated prior until observer feedback has a terminal outcome', () => {
+    const ruleId = 'observer:claude:intent:fresh';
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics: makeMetrics({
+        [ruleId]: { hits: 0, wasted: 0, speculated: 3 },
+      }),
+      calibration: new CandidateCalibrator({ now: () => 10 }),
+      admission: { [SERVER]: { enabled: true, minExpectedSavedMs: 15 } },
+    });
+
+    expect(predictor.admitResolved(SERVER, [{
+      tool: 'read', args: {}, confidence: 0.95, expectedLatencyMs: 30,
+      candidateId: ruleId, ruleId,
+      observerAttribution: { client: 'claude', source: 'intent', routeId: 'read', generation: 1, candidateCreatedAt: 1 },
+    }], { timestamp: 10, trackNextCall: false })).toHaveLength(1);
+  });
+
+  it('applies resolved operational effectiveness only once without a calibrator', () => {
+    const ruleId = 'observer:codex:transition:stable';
+    const metrics = makeMetrics({
+      [ruleId]: { hits: 3, wasted: 1, speculated: 4 },
+    });
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      admission: { [SERVER]: { enabled: true, minExpectedSavedMs: 50 } },
+    });
+
+    expect(predictor.admitResolved(SERVER, [{
+      tool: 'read', args: {}, confidence: 0.9, expectedLatencyMs: 100,
+      candidateId: ruleId, ruleId,
+      observerAttribution: { client: 'codex', source: 'transition', routeId: 'read', generation: 1, candidateCreatedAt: 1 },
+    }], { timestamp: 10, trackNextCall: false })).toHaveLength(1);
+  });
 });
 
 // --- parseResult helper -------------------------------------------------------
@@ -655,6 +725,34 @@ describe('prediction telemetry and adaptive admission', () => {
       rank: 2,
       candidateCount: 2,
     }));
+  });
+
+  it('does not apply resolved operational weighting to ordinary calibrated rules', () => {
+    const metrics = makeMetrics({
+      ordinary: { hits: 0, wasted: 5, speculated: 5 },
+    });
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      calibration: new CandidateCalibrator({ now: () => 1 }),
+      admission: { [SERVER]: { enabled: true, minExpectedSavedMs: 50 } },
+      extraRules: {
+        [SERVER]: [{
+          id: 'ordinary',
+          trigger: 'list',
+          predict: () => [{ ...pred('detail', {}, 0.9, 'ordinary'), expectedLatencyMs: 100 }],
+        }],
+      },
+    });
+
+    expect(predictor.observe({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 10,
+      timestamp: 1,
+    })).toHaveLength(1);
   });
 
   it('uses persisted tool latency ahead of a legacy prediction hint', () => {

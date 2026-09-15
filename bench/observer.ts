@@ -258,7 +258,7 @@ export interface ObserverComparison {
   extraPredictorModelCalls: number;
 }
 
-interface RuntimeStats {
+export interface RuntimeStats {
   realCalls: number;
   speculativeCalls: number;
   hits: number;
@@ -281,7 +281,7 @@ export interface FixtureCall {
   completedAt: number;
 }
 
-interface RuntimeHandle {
+export interface RuntimeHandle {
   context: SessionContext;
   bridge: SessionBridge | null;
   adapter: AgentAdapter | null;
@@ -842,13 +842,14 @@ async function runRecord(
   }
 }
 
-async function startRuntime(
+export async function startRuntime(
   clientKind: ObserverClient,
   arm: typeof OBSERVER_ARMS[ObserverArm],
   workflow: (typeof OBSERVER_WORKFLOWS)[number],
   latencyMs: number,
   stateRoot: string,
   testFault?: 'foreign-result' | 'duplicate-holdout-write' | 'extra-provider-request',
+  toolsByAlias?: Readonly<Record<string, readonly string[]>>,
 ): Promise<RuntimeHandle> {
   const directory = mkdtempSync(join(stateRoot, `run-${clientKind}-`));
   const context: SessionContext = {
@@ -904,7 +905,7 @@ async function startRuntime(
         SPECULATE_OBSERVER_FIXTURE_ALIAS: testFault === 'foreign-result' ? `${alias}-foreign` : alias,
         SPECULATE_OBSERVER_FIXTURE_LATENCY_MS: String(latencyMs),
         SPECULATE_OBSERVER_FIXTURE_CALL_LOG: log,
-        SPECULATE_OBSERVER_FIXTURE_TOOLS: JSON.stringify(allTools),
+        SPECULATE_OBSERVER_FIXTURE_TOOLS: JSON.stringify(toolsByAlias?.[alias] ?? allTools),
       };
       const transport = arm.speculate
         ? new StdioClientTransport({

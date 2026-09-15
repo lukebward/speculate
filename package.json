@@ -18,7 +18,8 @@
     "prepublishOnly": "npm run build && npm test",
     "demo:gif": "node scripts/demo-gif.mjs",
     "bench:mock": "tsx bench/bench.ts",
-    "bench:observer": "tsx bench/observer.ts"
+    "bench:observer": "tsx bench/observer.ts",
+    "bench:observer:multiturn": "tsx bench/observer-multiturn.ts"
   },
   "repository": {
     "type": "git",

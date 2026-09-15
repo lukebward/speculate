@@ -243,7 +243,13 @@ export class Predictor {
     for (const [order, candidate] of resolved.entries()) {
       const prediction = validatePrediction(candidate, server, candidate.ruleId, 'next');
       if (!prediction) continue;
-      const scored = this.scoreCandidate(prediction, candidate.candidateId, order, options.timestamp);
+      const scored = this.scoreCandidate(
+        prediction,
+        candidate.candidateId,
+        order,
+        options.timestamp,
+        prediction.observerAttribution !== undefined,
+      );
       if (scored) candidates.push(scored);
     }
     return this.selectBatch(candidates, server, options.timestamp, options.trackNextCall);
@@ -392,12 +398,13 @@ export class Predictor {
     return candidate.score * latency;
   }
 
-  /** Apply the same operational cutoff and correctness score to every source. */
+  /** Apply the operational cutoff and source-appropriate correctness score. */
   private scoreCandidate(
     prediction: Prediction,
     candidateId: string,
     order: number,
     timestamp?: number,
+    operationallyWeighted = false,
   ): ScoredPrediction | null {
     const feedback = this.metrics.ruleFeedback(prediction.ruleId);
     const operational = effectiveness(feedback);
@@ -410,12 +417,19 @@ export class Predictor {
       this.recordSuppressed(prediction, 'feedback', timestamp);
       return null;
     }
+    const calibrated = this.calibration
+      ? this.calibration.probability(candidateId, prediction.confidence).probability
+      : prediction.confidence;
+    const terminalMass = feedback.hits + feedback.wasted;
+    const operationalWeight = this.calibration
+      ? (operationallyWeighted
+          ? 1 - Math.min(1, terminalMass) * (1 - operational)
+          : 1)
+      : operational;
     return {
       prediction,
       candidateId,
-      score: this.calibration
-        ? this.calibration.probability(candidateId, prediction.confidence).probability
-        : prediction.confidence * operational,
+      score: calibrated * operationalWeight,
       order,
     };
   }

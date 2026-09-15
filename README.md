@@ -74,6 +74,12 @@ establish an improvement over existing Speculate. See the
 [observer results](docs/observer-results.md) and
 [compatibility notes](docs/observer-compatibility.md).
 
+Observer admission learns usefulness separately by client, signal source, and
+tool destination. Repeated unused predictions lose priority through the existing
+adaptive admission policy. See the
+[Headroom-informed design](docs/headroom-informed-speculation.md) for the
+mechanisms, measurement changes, and remaining limits.
+
 Claude Code setup covers user servers and approved servers in known projects.
 Codex setup covers enabled user-level servers on the same host. Built-in tools,
 shell commands, hosted connectors, and unsupported registrations are outside

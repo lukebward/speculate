@@ -60,6 +60,7 @@ nav:
   - Configuration: configuration.md
   - Experimental observer:
       - Results: observer-results.md
+      - Headroom-informed speculation: headroom-informed-speculation.md
       - Compatibility: observer-compatibility.md
       - Native routing: observer-native-routing.md
       - Native tool shapes: observer-native-tool-shapes.md

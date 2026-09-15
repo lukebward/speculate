@@ -2,6 +2,8 @@
 
 Measured 2026-09-14 at source `e6bf9866e636b6d7914e9fab2e73eb27ac0e7b60`. The observer remains experimental: its 1,000-case deterministic replay passed correctness checks but failed the speedup and speculative-waste targets for both clients. Native MCP transfer is verified; native speedup remains unverified.
 
+The subsequent [Headroom-informed adaptation](headroom-informed-speculation.md) adds selective observer feedback and a separate multi-turn diagnostic. It also documents the original replay's missing transition coverage and fixture timing limits. The historical measurements and decisions below are unchanged.
+
 ## What has passed
 
 Native-account smoke tests used Claude Code 2.1.268 and Codex CLI 0.154.0 with their existing account, model, effort, permission, and transport selections. Each client completed the expected model response in all three public modes and made exactly one correct call to a wrapper-owned synthetic read tool.

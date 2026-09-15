@@ -183,3 +183,37 @@ GitHub run `34926910149` passed Linux but exposed one macOS and seven Windows as
 - Post-CI corrections at `894a8e3` passed independent scoped review, build, strict TypeScript, and the full suite: 1,365 tests passed, 8 skipped, 84.13s. Native invocation reuses existing platform helpers; timing-sensitive fixtures now synchronize through explicit events. Benchmark timing paths and recorded thresholds are unchanged.
 
 - Final code delivery `c6a588e` is verified on main. GitHub CI run `34927756544` passed Linux, macOS, and Windows, including native Codex integration checks; docs run `34927756534` passed build and deployment.
+
+
+# Headroom-informed adaptive speculation (2026-09-15)
+
+Goal: adapt Headroom's selective, usage-informed optimization and evaluation practices to useful speculative tool execution, with Claude Code and Codex as equal clients.
+
+- [x] Pin and inspect Headroom's implemented feedback, selectivity, and evaluation mechanisms.
+- [x] Audit current observer admission and the replay's day-to-day representativeness.
+- [x] Record a concrete bounded design, its Headroom sources, and unchanged correctness/permission requirements before implementation.
+- [x] Implement the selected production adjustment and meaningful regression tests.
+- [x] Add a focused multi-turn evaluation that preserves the prior replay and distinguishes synthetic opportunity from native benefit.
+- [ ] Independently review, verify, document measured results, and deliver the changes.
+
+Research is limited to 15 minutes per agent. Reuse existing executors, cache ownership, admission, and client adapters. The original 1,000-record results remain historical evidence; no thresholds will be changed to make those results pass.
+
+
+## Bounded design and implementation plan
+
+Headroom reference: `9f32800b86ad277201c2a2ce75192534f8e94b03`. Its TOIN collector groups downstream retrieval feedback by tool signature, and its measurement separates conversation holdouts from modeled savings. Its Rust dispatcher does not yet consume the published TOIN recommendations. The transferable principle here is selective optimization based on actual consumption; Speculate retains its existing online MCP admission and cache.
+
+1. Production owner: scope internal observer feedback IDs by client, signal source, registered host alias, exposed tool, and upstream tool using a bounded digest. Replay IDs, route generations, prompts, arguments, and results must not enter this identity. Use existing operational hit/waste effectiveness in observer utility scoring, once only; preserve ordinary next-call calibration, permission checks, exact cache identity, and feedback persistence format. Test selective suppression before the hard cutoff, stable identities across registration, persistence, and ordinary predictor isolation.
+2. Evaluation owner: add a separately versioned synthetic multi-turn diagnostic with actual result-derived next arguments and independently generated training/holdout entities. Exercise both client adapters, early intent/transition opportunity, completed-call dispatch lag, and an unpredictable negative. Provider/relay lifecycle stays outside task timing. Predeclare parameters and retain source attribution, correct result verification, and settled waste. This diagnostic does not replace the original replay or qualify a release.
+3. Parent: document the exact adaptation and old replay's demonstrated limitations, then run build, type checks, the relevant/full suite, and the bounded diagnostic on a fixed source snapshot. Independent reviewer checks the production diff and evidence. Commit and push normally to the already-authorized main only after review and verification; check platform CI.
+
+Existing observer defaults remain experimental. Compression, a new offline policy publisher, native transcript collection, and production holdout routing are outside this bounded implementation. Actual lead-time learning remains a documented limitation of the existing count/latency model.
+
+
+Pre-measurement diagnostic parameters: 2 workflows × 3 repetitions × 2 clients × 5 arms = 60 records; warm training has 4 untimed episodes; all actual MCP calls use 120 ms injected latency; model turns use 80 ms and post-complete-arguments dispatch uses 8 ms. Training latency was changed from zero before measurement to avoid teaching the persisted latency model an artificial fast-tool distribution. The harness must use the actual wrapper, admission, executor, and MCP client path. No cache simulation is accepted as production evidence.
+
+Production focused verification: 90 tests passed, including both-client feedback identity/persistence/recovery and owner-ingress tests. Review refined cold behavior to preserve its prior and fractional decayed feedback to recover toward neutral; ordinary prediction scoring and the persistence schema remain unchanged.
+
+Final harness source review approved. Build and 44 focused benchmark tests passed; the harness uses cumulative real-result history, identical paired request schemas, exact response-byte checks, actual MCP owners, and settled source accounting. Full suite and immutable-source timed diagnostic remain pending.
+
+Final pre-measurement verification: strict TypeScript passed; full suite passed 1,383 tests with 8 skipped in 84.42 seconds. Production and harness source reviews approved. The next commit is the immutable source for the supplemental diagnostic.
