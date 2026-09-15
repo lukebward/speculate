@@ -164,6 +164,7 @@ export interface ObserverRunRecord {
     usageSource: 'fixture-reported' | 'provider-reported' | 'unavailable';
     requestsObserved: number;
     streamCallsObserved: number;
+    requestDigests: string[];
   };
   correctness: {
     outputDigest: string;
@@ -206,7 +207,13 @@ export interface ObserverArtifact {
   executionOrder: OrderedRun[];
   records: ObserverRunRecord[];
   comparisons: ObserverComparison[];
-  relay: Array<{
+  relay: ObserverRelayResult[];
+  launcher: Record<ObserverClient, boolean>;
+  summary: ReturnType<typeof summarizeObserverArtifact>;
+  decisions: ObserverDecision[];
+}
+
+export interface ObserverRelayResult {
     client: ObserverClient;
     warmups: number;
     pairs: number;
@@ -215,15 +222,27 @@ export interface ObserverArtifact {
     p95AddedTtfbInterval: Interval;
     payloadsIdentical: boolean;
     releaseEvidence: boolean;
-  }>;
-  launcher: Record<ObserverClient, boolean>;
-  summary: ReturnType<typeof summarizeObserverArtifact>;
-  decisions: Array<{
-    client: ObserverClient;
-    subject: 'hook-stage' | 'request-observation' | 'stream';
-    decision: 'enable' | 'retain-experimental' | 'remove' | 'unverified';
-    reason: string;
-  }>;
+}
+
+export type ObserverSubject = 'hook-stage' | 'request-observation' | 'stream';
+export type ObserverGateStatus = 'pass' | 'fail' | 'unverified';
+export type ObserverGateName = 'correctness' | 'consent' | 'isolation' | 'extra-predictor-model-calls'
+  | 'local-relay-p95' | 'median-improvement-vs-b' | 'mixed-p95-regression' | 'settled-waste'
+  | 'incremental-benefit' | 'native-matched-task';
+
+export interface ObserverGate {
+  gate: ObserverGateName;
+  status: ObserverGateStatus;
+  reason: string;
+}
+
+export interface ObserverDecision {
+  client: ObserverClient;
+  subject: ObserverSubject;
+  gateStatus: ObserverGateStatus;
+  decision: 'enable' | 'retain-experimental' | 'remove' | 'unverified';
+  reason: string;
+  gates: ObserverGate[];
 }
 
 export interface ObserverComparison {
@@ -252,7 +271,7 @@ interface RuntimeStats {
   cache: { ready: number; inFlight: number };
 }
 
-interface FixtureCall {
+export interface FixtureCall {
   alias: string;
   tool: string;
   argsDigest: string;
@@ -384,6 +403,7 @@ export function validatePair(records: readonly ObserverRunRecord[]): void {
     if (record.correctness.unexpectedWrites > 0) throw new Error('unexpected write');
     if (record.correctness.consentBypasses > 0) throw new Error('consent bypass');
     if (record.provider.modelRequests !== control.provider.modelRequests) throw new Error('extra predictor model call');
+    if (stable(record.provider.requestDigests) !== stable(control.provider.requestDigests)) throw new Error('provider request digest mismatch');
   }
 }
 
@@ -422,6 +442,88 @@ export function summarizeObserverArtifact(records: readonly ObserverRunRecord[])
       correctnessFailures: values.reduce((sum, record) => sum + record.correctness.failures.length, 0),
     };
   });
+}
+
+export function evaluateObserverGates(input: {
+  completeMatrix: boolean;
+  clients: readonly ObserverClient[];
+  records: readonly ObserverRunRecord[];
+  comparisons: readonly ObserverComparison[];
+  relay: readonly ObserverRelayResult[];
+}): ObserverDecision[] {
+  const subjects: Array<{ subject: ObserverSubject; arm: ObserverArm; benefit: ObserverComparison['comparison']; increment: ObserverComparison['comparison'] }> = [
+    { subject: 'hook-stage', arm: 'C', benefit: 'C-B', increment: 'C-B' },
+    { subject: 'request-observation', arm: 'D', benefit: 'D-B', increment: 'D-C' },
+    { subject: 'stream', arm: 'E', benefit: 'E-B', increment: 'E-D' },
+  ];
+  return input.clients.flatMap((client) => subjects.map(({ subject, arm, benefit, increment }) => {
+    const records = input.records.filter((record) => record.client === client && record.arm === arm);
+    const benefitComparison = input.comparisons.find((item) => item.client === client && item.comparison === benefit);
+    const incrementComparison = input.comparisons.find((item) => item.client === client && item.comparison === increment);
+    const relay = input.relay.find((item) => item.client === client);
+    const measured = (gate: ObserverGateName, pass: boolean, reason: string): ObserverGate => input.completeMatrix
+      ? { gate, status: pass ? 'pass' : 'fail', reason }
+      : { gate, status: 'unverified', reason: 'Requires the complete 20-workflow, five-repetition matrix.' };
+    const missing = (gate: ObserverGateName, reason: string): ObserverGate => ({ gate, status: 'unverified', reason });
+    const correctnessFailures = records.reduce((sum, record) => sum + record.correctness.failures.length + record.correctness.unexpectedWrites, 0);
+    const consentBypasses = records.reduce((sum, record) => sum + record.correctness.consentBypasses, 0);
+    const isolationFailures = records.reduce((sum, record) => sum + record.correctness.wrongSessionResults, 0);
+    const issued = records.reduce((sum, record) => sum + record.cache.issued, 0);
+    const waste = records.reduce((sum, record) => sum + record.cache.settledWaste, 0);
+    const wasteRate = issued === 0 ? null : waste / issued;
+    const improvement = benefitComparison?.toolHeavyTaskImprovement;
+    const incrementalImprovement = incrementComparison?.toolHeavyTaskImprovement;
+    const gates: ObserverGate[] = [
+      records.length === 0
+        ? missing('correctness', `No ${arm} records exist for ${client}.`)
+        : measured('correctness', correctnessFailures === 0, `Observed ${correctnessFailures} correctness or unexpected-write failures.`),
+      records.length === 0
+        ? missing('consent', `No ${arm} records exist for ${client}.`)
+        : measured('consent', consentBypasses === 0, `Observed ${consentBypasses} consent bypasses.`),
+      records.length === 0
+        ? missing('isolation', `No ${arm} records exist for ${client}.`)
+        : measured('isolation', isolationFailures === 0, `Observed ${isolationFailures} session-isolation failures.`),
+      benefitComparison
+        ? measured('extra-predictor-model-calls', benefitComparison.extraPredictorModelCalls === 0,
+            `Observed ${benefitComparison.extraPredictorModelCalls} extra model calls in ${benefit}.`)
+        : missing('extra-predictor-model-calls', `Comparison ${benefit} is missing for ${client}.`),
+      subject === 'hook-stage'
+        ? { gate: 'local-relay-p95', status: 'pass', reason: 'Hook-stage observation does not use the local model relay.' }
+        : !relay || !relay.releaseEvidence || relay.p95AddedTtfbMs === null
+        ? missing('local-relay-p95', `A release-sized local relay sample is missing for ${client}.`)
+        : measured('local-relay-p95', relay.payloadsIdentical && relay.p95AddedTtfbMs <= 5,
+            `Observed p95 added TTFB ${relay.p95AddedTtfbMs} ms; limit is 5 ms; payload identity is ${relay.payloadsIdentical}.`),
+      !improvement || improvement.point === null || improvement.lower === null
+        ? missing('median-improvement-vs-b', `Task-wall improvement comparison ${benefit} is incomplete for ${client}.`)
+        : measured('median-improvement-vs-b', improvement.point >= 0.1 && improvement.lower > 0,
+            `Observed ${benefit} median task-wall improvement ${improvement.point}; 95% lower bound ${improvement.lower}; minimum is 0.1 with the interval excluding zero.`),
+      !benefitComparison || benefitComparison.mixedP95Regression === null
+        ? missing('mixed-p95-regression', `Mixed-task comparison ${benefit} is incomplete for ${client}.`)
+        : measured('mixed-p95-regression', benefitComparison.mixedP95Regression <= 0.05,
+            `Observed ${benefit} mixed-task p95 regression ${benefitComparison.mixedP95Regression}; limit is 0.05.`),
+      wasteRate === null
+        ? missing('settled-waste', `No speculative issues were measured for ${client} arm ${arm}.`)
+        : measured('settled-waste', wasteRate <= 0.2, `Observed settled waste rate ${wasteRate}; limit is 0.2.`),
+      !incrementalImprovement || incrementalImprovement.point === null || incrementalImprovement.lower === null
+        ? missing('incremental-benefit', `Increment comparison ${increment} is incomplete for ${client}.`)
+        : measured('incremental-benefit', incrementalImprovement.point > 0 && incrementalImprovement.lower > 0,
+            `Observed ${increment} median task-wall improvement ${incrementalImprovement.point}; 95% lower bound ${incrementalImprovement.lower}; both must be positive.`),
+      missing('native-matched-task', `Deterministic replay does not verify native matched-task benefit for ${client}.`),
+    ];
+    const gateStatus: ObserverGateStatus = gates.some((gate) => gate.status === 'fail') ? 'fail'
+      : gates.some((gate) => gate.status === 'unverified') ? 'unverified' : 'pass';
+    const decision: ObserverDecision['decision'] = !input.completeMatrix ? 'unverified'
+      : gateStatus === 'fail' ? 'remove' : gateStatus === 'unverified' ? 'retain-experimental' : 'enable';
+    const unresolved = gates.filter((gate) => gate.status !== 'pass').map((gate) => `${gate.gate}:${gate.status}`);
+    return {
+      client,
+      subject,
+      gateStatus,
+      decision,
+      reason: unresolved.length === 0 ? 'All fixed release gates passed.' : `Unresolved gates: ${unresolved.join(', ')}.`,
+      gates,
+    };
+  }));
 }
 
 export async function runObserverBenchmark(options: ObserverBenchmarkOptions = {}): Promise<ObserverArtifact> {
@@ -463,14 +565,8 @@ export async function runObserverBenchmark(options: ObserverBenchmarkOptions = {
     for (const client of clients) launcher[client] = await verifyLauncherPath(client);
   }
   const fullMatrix = clients.length === 2 && arms.length === 5 && workflows.length === 20 && repetitions === 5;
-  const decisions = clients.flatMap((client) => (['hook-stage', 'request-observation', 'stream'] as const).map((subject) => ({
-    client,
-    subject,
-    decision: fullMatrix ? 'retain-experimental' as const : 'unverified' as const,
-    reason: fullMatrix
-      ? 'Deterministic replay does not establish native-client speedup; live credential and native stream gates remain separate.'
-      : 'The fast smoke matrix is correctness evidence and is not release timing evidence.',
-  })));
+  const comparisons = compareObserverRecords(records, bootstrapReplicates, experimentSeed);
+  const decisions = evaluateObserverGates({ completeMatrix: fullMatrix, clients, records, comparisons, relay });
   const artifact: ObserverArtifact = {
     schemaVersion: 1,
     benchmark: 'observer',
@@ -481,7 +577,7 @@ export async function runObserverBenchmark(options: ObserverBenchmarkOptions = {
     armDefinitions: OBSERVER_ARMS,
     executionOrder,
     records,
-    comparisons: compareObserverRecords(records, bootstrapReplicates, experimentSeed),
+    comparisons,
     relay,
     launcher,
     summary: summarizeObserverArtifact(records),
@@ -589,7 +685,10 @@ async function runRecord(
   const modelTtfbMs: number[] = [];
   const toolWaitSamplesMs: number[] = [];
   const resultDigests: string[] = [];
+  const demandedResults: Array<{ step: MaterializedToolStep; parsed: unknown }> = [];
   let providerPayloadIdentical = true;
+  let providerRequestDigests: string[] = [];
+  let modelRequests = 0;
   let argsCompleteChunkAt: number | undefined;
   let requestsObserved = 0;
   let requestedCalls = 0;
@@ -611,6 +710,8 @@ async function runRecord(
       providerPayloadIdentical = exchange.identical;
       argsCompleteChunkAt = exchange.argsCompleteChunkAt;
       requestsObserved = exchange.requestsObserved;
+      providerRequestDigests = exchange.requestDigests;
+      modelRequests = exchange.modelRequests;
     }
     const permissionBlocked = workflow.id === 'permission-denied' || workflow.id === 'approval-required';
     if (!permissionBlocked) {
@@ -619,7 +720,9 @@ async function runRecord(
         const outcome = await runtime.call(step);
         requestedCalls++;
         toolWaitSamplesMs.push(outcome.elapsedMs);
-        resultDigests.push(digest(callPayload(outcome.result)));
+        const parsed = callPayload(outcome.result);
+        demandedResults.push({ step, parsed });
+        resultDigests.push(digest(parsed));
       }
     } else {
       await delay(materialized.steps[0]?.thinkMs ?? 0);
@@ -642,6 +745,8 @@ async function runRecord(
     });
     const streamObservedAt = runtime.observations.find((observation) => observation.kind === 'stream-call')?.observedAt;
     const source = sourceOutcomes(runtime.lifecycle, runtime.observations);
+    const fixtureCalls = runtime.calls();
+    const provenanceFailures = demandedResults.filter(({ step, parsed }) => !validateToolResultProvenance(step, parsed, fixtureCalls)).length;
     const lifecycleTimings = runtime.lifecycle.filter((event) => event.type === 'speculated' && event.specDispatchAt !== undefined).map((event) =>
       lifecycleTiming({
         candidateCreatedAt: event.observerAttribution.candidateCreatedAt,
@@ -704,22 +809,26 @@ async function runRecord(
         perSource: source,
       },
       provider: {
-        modelRequests: 1,
+        modelRequests,
         inputTokens: null,
         outputTokens: null,
         usageSource: 'unavailable',
         requestsObserved,
         streamCallsObserved: runtime.observations.filter((observation) => observation.kind === 'stream-call').length,
+        requestDigests: providerRequestDigests,
       },
       correctness: {
         outputDigest,
         expectedDigest: outputDigest,
         providerPayloadIdentical,
         toolResultDigestsIdenticalToA: true,
-        unexpectedWrites: Math.max(0, runtime.calls().filter((call) => call.tool === 'write_file').length - workflow.expected.mutationCalls * (episodes + 1)),
-        consentBypasses: permissionBlocked && runtime.calls().length > 0 ? runtime.calls().length : 0,
-        wrongSessionResults: 0,
-        failures: providerPayloadIdentical ? [] : ['provider-payload-mismatch'],
+        unexpectedWrites: Math.max(0, fixtureCalls.filter((call) => call.tool === 'write_file').length - workflow.expected.mutationCalls),
+        consentBypasses: permissionBlocked && fixtureCalls.length > 0 ? fixtureCalls.length : 0,
+        wrongSessionResults: provenanceFailures,
+        failures: [
+          ...(providerPayloadIdentical ? [] : ['provider-payload-mismatch']),
+          ...(provenanceFailures === 0 ? [] : [`tool-result-provenance:${provenanceFailures}`]),
+        ],
       },
     };
   } finally {
@@ -914,12 +1023,20 @@ async function exchangeModel(
   arm: typeof OBSERVER_ARMS[ObserverArm],
   step: MaterializedToolStep,
   workflow: ObserverWorkflowId,
-): Promise<{ ttfbMs: number; identical: boolean; argsCompleteChunkAt: number; requestsObserved: number }> {
-  const route = await runtime.route(step);
+): Promise<{
+  ttfbMs: number;
+  identical: boolean;
+  argsCompleteChunkAt: number;
+  requestsObserved: number;
+  modelRequests: number;
+  requestDigests: string[];
+}> {
+  await runtime.route(step);
   const modelName = `mcp__${step.alias}__${step.tool}`;
+  const inputSchema = fixtureInputSchema(step.tool);
   const requestBody = Buffer.from(JSON.stringify(client === 'claude'
-    ? { messages: [{ role: 'user', content: modelPrompt(step) }], tools: [{ name: modelName, input_schema: route?.inputSchema ?? { type: 'object' } }] }
-    : { input: modelPrompt(step), tools: [{ type: 'function', name: modelName, parameters: route?.inputSchema ?? { type: 'object' } }] }));
+    ? { messages: [{ role: 'user', content: modelPrompt(step) }], tools: [{ name: modelName, input_schema: inputSchema }] }
+    : { input: modelPrompt(step), tools: [{ type: 'function', name: modelName, parameters: inputSchema }] }));
   const responseBody = client === 'claude'
     ? Buffer.from(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'fixture-call', name: modelName, input: {} } })}\n\nevent: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(step.args) } })}\n\nevent: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`)
     : Buffer.from(`data: ${JSON.stringify({ type: 'response.output_item.added', item: { id: 'fixture-item', type: 'function_call', call_id: 'fixture-call', name: modelName, arguments: '' } })}\n\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: 'fixture-item', delta: JSON.stringify(step.args) })}\n\ndata: ${JSON.stringify({ type: 'response.output_item.done', item: { id: 'fixture-item', type: 'function_call', call_id: 'fixture-call', name: modelName } })}\n\n`);
@@ -961,9 +1078,12 @@ async function exchangeModel(
     await delay(2);
     return {
       ttfbMs: exchange.firstByteAt - exchange.startedAt,
-      identical: provider.requestBody.equals(requestBody) && exchange.body.equals(cancelled ? responseChunks[0]! : responseBody),
+      identical: provider.requestCount === 1 && provider.requestBodies.every((body) => body.equals(requestBody)) &&
+        exchange.body.equals(cancelled ? responseChunks[0]! : responseBody),
       argsCompleteChunkAt: provider.responseAt,
       requestsObserved: relay?.debugObservationState().totalRequests ?? 0,
+      modelRequests: provider.requestCount,
+      requestDigests: provider.requestDigests,
     };
   } finally {
     await relay?.close();
@@ -1295,6 +1415,36 @@ function modelPrompt(step: MaterializedToolStep): string {
     : 'Inspect the selected registered tool.';
 }
 
+function fixtureInputSchema(tool: string): Record<string, unknown> {
+  const property = tool === 'list_directory' ? 'path' : 'key';
+  return {
+    type: 'object',
+    properties: { [property]: { type: 'string' } },
+    required: [property],
+    $schema: 'http://json-schema.org/draft-07/schema#',
+  };
+}
+
+export function validateToolResultProvenance(
+  step: MaterializedToolStep,
+  parsed: unknown,
+  calls: readonly FixtureCall[],
+): boolean {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const payload = parsed as Record<string, unknown>;
+  if (payload.alias !== step.alias || payload.tool !== step.tool || payload.ok !== true || !Number.isSafeInteger(payload.revision)) return false;
+  const returnedArgs: Record<string, unknown> = {};
+  for (const key of Object.keys(step.args)) {
+    if (!Object.prototype.hasOwnProperty.call(payload, key)) return false;
+    returnedArgs[key] = payload[key];
+  }
+  const argsDigest = digest(step.args);
+  if (digest(returnedArgs) !== argsDigest) return false;
+  const resultDigest = digest(parsed);
+  return calls.some((call) => call.alias === step.alias && call.tool === step.tool &&
+    call.argsDigest === argsDigest && call.resultDigest === resultDigest);
+}
+
 function callPayload(result: CallToolResult): unknown {
   const block = result.content.find((item) => item.type === 'text');
   if (!block || block.type !== 'text') throw new Error('fixture tool result did not contain text');
@@ -1359,18 +1509,21 @@ async function startProvider(
   chunkDelayMs = 0,
 ): Promise<{
   baseUrl: string;
-  requestBody: Buffer;
+  requestBodies: readonly Buffer[];
+  requestCount: number;
+  requestDigests: string[];
   responseAt: number;
   close(): Promise<void>;
 }> {
-  let requestBody = Buffer.alloc(0);
+  const requestBodies: Buffer[] = [];
   let responseAt = 0;
   let requests = 0;
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     request.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
     await new Promise<void>((resolvePromise) => request.on('end', resolvePromise));
-    requestBody = Buffer.concat(chunks);
+    const requestBody = Buffer.concat(chunks);
+    requestBodies.push(requestBody);
     requests++;
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     responseAt = monotonicNow();
@@ -1391,7 +1544,9 @@ async function startProvider(
   if (!address || typeof address === 'string') throw new Error('fixture provider failed to bind');
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
-    get requestBody() { return requestBody; },
+    get requestBodies() { return requestBodies; },
+    get requestCount() { return requests; },
+    get requestDigests() { return requestBodies.map((body) => createHash('sha256').update(body).digest('hex')); },
     get responseAt() { return responseAt; },
     close: () => closeServer(server),
   };

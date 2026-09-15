@@ -1,17 +1,21 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   OBSERVER_ARMS,
   bootstrapPairedMedian,
+  evaluateObserverGates,
   lifecycleTiming,
   percentile,
   randomizedBlocks,
   runObserverBenchmark,
   settleAccounting,
+  validateToolResultProvenance,
   validateArtifact,
   validatePair,
+  type ObserverComparison,
   type ObserverRunRecord,
 } from '../bench/observer.js';
 import {
@@ -163,9 +167,23 @@ describe('observer accounting and validation', () => {
       { correctness: { ...candidate.correctness, unexpectedWrites: 1 } },
       { correctness: { ...candidate.correctness, consentBypasses: 1 } },
       { provider: { ...candidate.provider, modelRequests: 2 } },
+      { provider: { ...candidate.provider, requestDigests: ['different'] } },
     ]) {
       expect(() => validatePair([control, { ...candidate, ...patch } as ObserverRunRecord])).toThrow();
     }
+  });
+
+  it('requires returned tool identity, arguments, and result digest to match an actual fixture call', () => {
+    const step = { kind: 'tool' as const, alias: 'workspace', tool: 'read_file', args: { key: 'held-out' }, thinkMs: 0 };
+    const parsed = { alias: 'workspace', tool: 'read_file', key: 'held-out', revision: 0, ok: true };
+    const calls = [{
+      alias: 'workspace', tool: 'read_file', argsDigest: digestForTest(step.args), resultDigest: digestForTest(parsed),
+      startedAt: 1, completedAt: 2,
+    }];
+    expect(validateToolResultProvenance(step, parsed, calls)).toBe(true);
+    expect(validateToolResultProvenance(step, { ...parsed, alias: 'other' }, calls)).toBe(false);
+    expect(validateToolResultProvenance(step, { ...parsed, key: 'other' }, calls)).toBe(false);
+    expect(validateToolResultProvenance(step, parsed, [{ ...calls[0]!, resultDigest: 'wrong' }])).toBe(false);
   });
 
   it('rejects missing tags and raw session material anywhere in an artifact', () => {
@@ -174,6 +192,69 @@ describe('observer accounting and validation', () => {
     expect(() => validateArtifact({ ...valid, records: [{ ...record(), model: '' }] })).toThrow(/model/);
     expect(() => validateArtifact({ ...valid, rawPrompt: 'secret' })).toThrow(/raw/i);
     expect(() => validateArtifact({ ...valid, records: [{ ...record(), headers: { authorization: 'secret' } }] })).toThrow(/raw/i);
+  });
+});
+
+describe('observer release gates', () => {
+  it('passes inclusive deterministic thresholds but retains each signal while native evidence is unverified', () => {
+    const decisions = evaluateObserverGates(gateInput());
+    expect(decisions).toHaveLength(3);
+    for (const decision of decisions) {
+      expect(decision.gateStatus).toBe('unverified');
+      expect(decision.decision).toBe('retain-experimental');
+      expect(decision.gates.filter((gate) => gate.gate !== 'native-matched-task').every((gate) => gate.status === 'pass')).toBe(true);
+      expect(decision.gates.find((gate) => gate.gate === 'native-matched-task')).toMatchObject({ status: 'unverified' });
+    }
+  });
+
+  it.each([
+    ['median below ten percent', (input: ReturnType<typeof gateInput>) => {
+      input.comparisons.find((item) => item.comparison === 'C-B')!.toolHeavyTaskImprovement.point = 0.099;
+    }, 'hook-stage', 'median-improvement-vs-b'],
+    ['confidence interval includes zero', (input: ReturnType<typeof gateInput>) => {
+      input.comparisons.find((item) => item.comparison === 'D-B')!.toolHeavyTaskImprovement.lower = 0;
+    }, 'request-observation', 'median-improvement-vs-b'],
+    ['mixed p95 exceeds five percent', (input: ReturnType<typeof gateInput>) => {
+      input.comparisons.find((item) => item.comparison === 'E-B')!.mixedP95Regression = 0.050_001;
+    }, 'stream', 'mixed-p95-regression'],
+    ['relay p95 exceeds five milliseconds', (input: ReturnType<typeof gateInput>) => {
+      input.relay[0]!.p95AddedTtfbMs = 5.001;
+    }, 'request-observation', 'local-relay-p95'],
+    ['settled waste exceeds twenty percent', (input: ReturnType<typeof gateInput>) => {
+      for (const record of input.records.filter((item) => item.arm === 'D')) record.cache.settledWaste = 3;
+    }, 'request-observation', 'settled-waste'],
+    ['increment has no positive interval', (input: ReturnType<typeof gateInput>) => {
+      input.comparisons.find((item) => item.comparison === 'E-D')!.toolHeavyTaskImprovement.lower = 0;
+    }, 'stream', 'incremental-benefit'],
+    ['correctness is nonzero', (input: ReturnType<typeof gateInput>) => {
+      input.records.find((item) => item.arm === 'C')!.correctness.failures.push('fixture-failure');
+    }, 'hook-stage', 'correctness'],
+    ['consent bypass is nonzero', (input: ReturnType<typeof gateInput>) => {
+      input.records.find((item) => item.arm === 'D')!.correctness.consentBypasses = 1;
+    }, 'request-observation', 'consent'],
+    ['isolation failure is nonzero', (input: ReturnType<typeof gateInput>) => {
+      input.records.find((item) => item.arm === 'E')!.correctness.wrongSessionResults = 1;
+    }, 'stream', 'isolation'],
+    ['extra model call is nonzero', (input: ReturnType<typeof gateInput>) => {
+      input.comparisons.find((item) => item.comparison === 'C-B')!.extraPredictorModelCalls = 1;
+    }, 'hook-stage', 'extra-predictor-model-calls'],
+  ] as const)('fails when %s', (_label, mutate, subject, gateName) => {
+    const input = gateInput();
+    mutate(input);
+    const decision = evaluateObserverGates(input).find((item) => item.subject === subject)!;
+    expect(decision).toMatchObject({ gateStatus: 'fail', decision: 'remove' });
+    expect(decision.gates.find((gate) => gate.gate === gateName)).toMatchObject({ status: 'fail' });
+  });
+
+  it('marks an incomplete matrix and insufficient relay sample unverified', () => {
+    const incomplete = gateInput();
+    incomplete.completeMatrix = false;
+    expect(evaluateObserverGates(incomplete).every((decision) => decision.decision === 'unverified')).toBe(true);
+
+    const relay = gateInput();
+    relay.relay[0]!.releaseEvidence = false;
+    const requestDecision = evaluateObserverGates(relay).find((decision) => decision.subject === 'request-observation')!;
+    expect(requestDecision.gates.find((gate) => gate.gate === 'local-relay-p95')).toMatchObject({ status: 'unverified' });
   });
 });
 
@@ -203,6 +284,12 @@ describe('observer real-path smoke', () => {
       expect(artifact.records.filter((item) => item.arm === 'A').every((item) => item.runtimePath === 'bare-mcp')).toBe(true);
       expect(artifact.records.filter((item) => item.arm !== 'A').every((item) => item.runtimePath === 'session-wrapper')).toBe(true);
       expect(artifact.records.filter((item) => item.arm === 'E').every((item) => item.cache.issued === 1)).toBe(true);
+      for (const client of ['claude', 'codex'] as const) {
+        const pair = artifact.records.filter((item) => item.client === client);
+        expect(new Set(pair.map((item) => item.provider.requestDigests.join(','))).size).toBe(1);
+        expect(pair.every((item) => item.provider.modelRequests === 1 && item.provider.requestDigests.length === 1)).toBe(true);
+      }
+      expect(artifact.decisions.every((decision) => decision.decision === 'unverified' && decision.gateStatus === 'unverified')).toBe(true);
       expect(progress).toHaveLength(10);
       expect(progress[0]).toMatch(/^completed 1\/10 client=(claude|codex) arm=[A-E] workflow=early-stream-call elapsedMs=\d+$/);
       expect(existsSync(checkpointPath)).toBe(true);
@@ -290,7 +377,7 @@ function record(overrides: Partial<ObserverRunRecord> = {}): ObserverRunRecord {
     },
     provider: {
       modelRequests: 1, inputTokens: null, outputTokens: null,
-      usageSource: 'unavailable', requestsObserved: 0, streamCallsObserved: 0,
+      usageSource: 'unavailable', requestsObserved: 0, streamCallsObserved: 0, requestDigests: ['request'],
     },
     correctness: {
       outputDigest: 'same', expectedDigest: 'same', providerPayloadIdentical: true,
@@ -299,4 +386,46 @@ function record(overrides: Partial<ObserverRunRecord> = {}): ObserverRunRecord {
     },
     ...overrides,
   };
+}
+
+function interval(point: number, lower = 0.01): ObserverComparison['toolHeavyTaskImprovement'] {
+  return { point, lower, upper: point + 0.02, seed: 1, replicates: 10_000, clusterCount: 10, pairCount: 50 };
+}
+
+function comparison(name: ObserverComparison['comparison']): ObserverComparison {
+  return {
+    client: 'claude', comparison: name, pairedRecords: 100,
+    toolHeavyTaskImprovement: interval(name === 'D-C' || name === 'E-D' ? 0.02 : 0.1),
+    toolHeavyToolWaitImprovement: interval(0.1),
+    mixedP95Regression: 0.05,
+    mixedP95RegressionInterval: interval(0.05),
+    correctnessFailures: 0,
+    extraPredictorModelCalls: 0,
+  };
+}
+
+function gateInput() {
+  const records = (['C', 'D', 'E'] as const).flatMap((arm) => Array.from({ length: 10 }, (_, index) => record({
+    arm,
+    orderIndex: index,
+    cache: { ...record().cache, issued: 1, settledWaste: index < 2 ? 1 : 0 },
+  })));
+  return {
+    completeMatrix: true,
+    clients: ['claude'] as const,
+    records,
+    comparisons: (['C-B', 'D-B', 'E-B', 'D-C', 'E-D'] as const).map(comparison),
+    relay: [{
+      client: 'claude' as const, warmups: 20, pairs: 200, p50AddedTtfbMs: 2, p95AddedTtfbMs: 5,
+      p95AddedTtfbInterval: interval(5), payloadsIdentical: true, releaseEvidence: true,
+    }],
+  };
+}
+
+function digestForTest(value: unknown): string {
+  const stable = (item: unknown): string => Array.isArray(item) ? `[${item.map(stable).join(',')}]`
+    : item !== null && typeof item === 'object' ? `{${Object.entries(item as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right)).map(([key, child]) => `${JSON.stringify(key)}:${stable(child)}`).join(',')}}`
+      : JSON.stringify(item);
+  return createHash('sha256').update(stable(value)).digest('hex');
 }
