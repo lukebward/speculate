@@ -194,6 +194,7 @@ export interface ObserverBenchmarkOptions {
   outputPath?: string;
   checkpointPath?: string;
   onProgress?: (line: string) => void;
+  testFault?: { arm: ObserverArm; kind: 'extra-provider-request' | 'foreign-result' | 'duplicate-holdout-write' };
 }
 
 export interface ObserverArtifact {
@@ -227,8 +228,8 @@ export interface ObserverRelayResult {
 export type ObserverSubject = 'hook-stage' | 'request-observation' | 'stream';
 export type ObserverGateStatus = 'pass' | 'fail' | 'unverified';
 export type ObserverGateName = 'correctness' | 'consent' | 'isolation' | 'extra-predictor-model-calls'
-  | 'local-relay-p95' | 'median-improvement-vs-b' | 'mixed-p95-regression' | 'settled-waste'
-  | 'incremental-benefit' | 'native-matched-task';
+  | 'local-relay-p95' | 'median-improvement-vs-b' | 'mixed-p95-regression-vs-b' | 'settled-waste'
+  | 'incremental-benefit' | 'incremental-mixed-p95-regression' | 'native-matched-task';
 
 export interface ObserverGate {
   gate: ObserverGateName;
@@ -394,16 +395,7 @@ export function validatePair(records: readonly ObserverRunRecord[]): void {
   for (const record of records) {
     if (record.client !== control.client || record.workflow !== control.workflow || record.repetition !== control.repetition ||
       record.holdoutSeed !== control.holdoutSeed || record.thermalState !== control.thermalState) throw new Error('pair coordinates differ');
-    if (record.correctness.outputDigest !== control.correctness.outputDigest || record.correctness.expectedDigest !== control.correctness.expectedDigest) {
-      throw new Error('output digest mismatch');
-    }
-    if (!record.correctness.providerPayloadIdentical) throw new Error('provider payload mismatch');
     if (record.cache.requestedCalls !== control.cache.requestedCalls) throw new Error('requested call count mismatch');
-    if (record.correctness.wrongSessionResults > 0) throw new Error('wrong-session result');
-    if (record.correctness.unexpectedWrites > 0) throw new Error('unexpected write');
-    if (record.correctness.consentBypasses > 0) throw new Error('consent bypass');
-    if (record.provider.modelRequests !== control.provider.modelRequests) throw new Error('extra predictor model call');
-    if (stable(record.provider.requestDigests) !== stable(control.provider.requestDigests)) throw new Error('provider request digest mismatch');
   }
 }
 
@@ -464,6 +456,9 @@ export function evaluateObserverGates(input: {
     const measured = (gate: ObserverGateName, pass: boolean, reason: string): ObserverGate => input.completeMatrix
       ? { gate, status: pass ? 'pass' : 'fail', reason }
       : { gate, status: 'unverified', reason: 'Requires the complete 20-workflow, five-repetition matrix.' };
+    const zeroViolation = (gate: ObserverGateName, count: number, reason: string): ObserverGate => count > 0
+      ? { gate, status: 'fail', reason }
+      : measured(gate, true, reason);
     const missing = (gate: ObserverGateName, reason: string): ObserverGate => ({ gate, status: 'unverified', reason });
     const correctnessFailures = records.reduce((sum, record) => sum + record.correctness.failures.length + record.correctness.unexpectedWrites, 0);
     const consentBypasses = records.reduce((sum, record) => sum + record.correctness.consentBypasses, 0);
@@ -476,15 +471,15 @@ export function evaluateObserverGates(input: {
     const gates: ObserverGate[] = [
       records.length === 0
         ? missing('correctness', `No ${arm} records exist for ${client}.`)
-        : measured('correctness', correctnessFailures === 0, `Observed ${correctnessFailures} correctness or unexpected-write failures.`),
+        : zeroViolation('correctness', correctnessFailures, `Observed ${correctnessFailures} correctness or unexpected-write failures.`),
       records.length === 0
         ? missing('consent', `No ${arm} records exist for ${client}.`)
-        : measured('consent', consentBypasses === 0, `Observed ${consentBypasses} consent bypasses.`),
+        : zeroViolation('consent', consentBypasses, `Observed ${consentBypasses} consent bypasses.`),
       records.length === 0
         ? missing('isolation', `No ${arm} records exist for ${client}.`)
-        : measured('isolation', isolationFailures === 0, `Observed ${isolationFailures} session-isolation failures.`),
+        : zeroViolation('isolation', isolationFailures, `Observed ${isolationFailures} session-isolation failures.`),
       benefitComparison
-        ? measured('extra-predictor-model-calls', benefitComparison.extraPredictorModelCalls === 0,
+        ? zeroViolation('extra-predictor-model-calls', benefitComparison.extraPredictorModelCalls,
             `Observed ${benefitComparison.extraPredictorModelCalls} extra model calls in ${benefit}.`)
         : missing('extra-predictor-model-calls', `Comparison ${benefit} is missing for ${client}.`),
       subject === 'hook-stage'
@@ -498,9 +493,9 @@ export function evaluateObserverGates(input: {
         : measured('median-improvement-vs-b', improvement.point >= 0.1 && improvement.lower > 0,
             `Observed ${benefit} median task-wall improvement ${improvement.point}; 95% lower bound ${improvement.lower}; minimum is 0.1 with the interval excluding zero.`),
       !benefitComparison || benefitComparison.mixedP95Regression === null
-        ? missing('mixed-p95-regression', `Mixed-task comparison ${benefit} is incomplete for ${client}.`)
-        : measured('mixed-p95-regression', benefitComparison.mixedP95Regression <= 0.05,
-            `Observed ${benefit} mixed-task p95 regression ${benefitComparison.mixedP95Regression}; limit is 0.05.`),
+        ? missing('mixed-p95-regression-vs-b', `B-relative mixed-task comparison ${benefit} is incomplete for ${client}.`)
+        : measured('mixed-p95-regression-vs-b', benefitComparison.mixedP95Regression <= 0.05,
+            `Observed B-relative ${benefit} mixed-task p95 regression ${benefitComparison.mixedP95Regression}; limit is 0.05.`),
       wasteRate === null
         ? missing('settled-waste', `No speculative issues were measured for ${client} arm ${arm}.`)
         : measured('settled-waste', wasteRate <= 0.2, `Observed settled waste rate ${wasteRate}; limit is 0.2.`),
@@ -508,12 +503,16 @@ export function evaluateObserverGates(input: {
         ? missing('incremental-benefit', `Increment comparison ${increment} is incomplete for ${client}.`)
         : measured('incremental-benefit', incrementalImprovement.point > 0 && incrementalImprovement.lower > 0,
             `Observed ${increment} median task-wall improvement ${incrementalImprovement.point}; 95% lower bound ${incrementalImprovement.lower}; both must be positive.`),
+      !incrementComparison || incrementComparison.mixedP95Regression === null
+        ? missing('incremental-mixed-p95-regression', `Incremental mixed-task comparison ${increment} is incomplete for ${client}.`)
+        : measured('incremental-mixed-p95-regression', incrementComparison.mixedP95Regression <= 0.05,
+            `Observed incremental ${increment} mixed-task p95 regression ${incrementComparison.mixedP95Regression}; limit is 0.05.`),
       missing('native-matched-task', `Deterministic replay does not verify native matched-task benefit for ${client}.`),
     ];
     const gateStatus: ObserverGateStatus = gates.some((gate) => gate.status === 'fail') ? 'fail'
       : gates.some((gate) => gate.status === 'unverified') ? 'unverified' : 'pass';
-    const decision: ObserverDecision['decision'] = !input.completeMatrix ? 'unverified'
-      : gateStatus === 'fail' ? 'remove' : gateStatus === 'unverified' ? 'retain-experimental' : 'enable';
+    const decision: ObserverDecision['decision'] = gateStatus === 'fail' ? 'remove'
+      : !input.completeMatrix ? 'unverified' : gateStatus === 'unverified' ? 'retain-experimental' : 'enable';
     const unresolved = gates.filter((gate) => gate.status !== 'pass').map((gate) => `${gate.gate}:${gate.status}`);
     return {
       client,
@@ -547,6 +546,7 @@ export async function runObserverBenchmark(options: ObserverBenchmarkOptions = {
       latencyMs,
       trainingEpisodes,
       experimentSeed,
+      testFault: options.testFault?.arm === run.arm ? options.testFault.kind : undefined,
     }));
     const elapsedMs = Math.round(monotonicNow() - startedAt);
     options.onProgress?.(`completed ${index + 1}/${executionOrder.length} client=${run.client} arm=${run.arm} workflow=${run.workflow} elapsedMs=${elapsedMs}`);
@@ -646,7 +646,12 @@ export function compareObserverRecords(
 
 async function runRecord(
   run: OrderedRun,
-  options: { latencyMs: number; trainingEpisodes?: number; experimentSeed: number },
+  options: {
+    latencyMs: number;
+    trainingEpisodes?: number;
+    experimentSeed: number;
+    testFault?: 'extra-provider-request' | 'foreign-result' | 'duplicate-holdout-write';
+  },
 ): Promise<ObserverRunRecord> {
   const arm = OBSERVER_ARMS[run.arm];
   const workflow = OBSERVER_WORKFLOWS.find((item) => item.id === run.workflow)!;
@@ -681,7 +686,7 @@ async function runRecord(
       await trainer.close();
     }
   }
-  const runtime = await startRuntime(run.client, arm, workflow, options.latencyMs, stateRoot);
+  const runtime = await startRuntime(run.client, arm, workflow, options.latencyMs, stateRoot, options.testFault);
   const modelTtfbMs: number[] = [];
   const toolWaitSamplesMs: number[] = [];
   const resultDigests: string[] = [];
@@ -705,7 +710,7 @@ async function runRecord(
       await delay(10);
     }
     if (materialized.steps[0]) {
-      const exchange = await exchangeModel(runtime, run.client, arm, materialized.steps[0], materialized.id);
+      const exchange = await exchangeModel(runtime, run.client, arm, materialized.steps[0], materialized.id, options.testFault);
       modelTtfbMs.push(exchange.ttfbMs);
       providerPayloadIdentical = exchange.identical;
       argsCompleteChunkAt = exchange.argsCompleteChunkAt;
@@ -843,6 +848,7 @@ async function startRuntime(
   workflow: (typeof OBSERVER_WORKFLOWS)[number],
   latencyMs: number,
   stateRoot: string,
+  testFault?: 'foreign-result' | 'duplicate-holdout-write' | 'extra-provider-request',
 ): Promise<RuntimeHandle> {
   const directory = mkdtempSync(join(stateRoot, `run-${clientKind}-`));
   const context: SessionContext = {
@@ -895,7 +901,7 @@ async function startRuntime(
       logs.set(alias, log);
       const fixtureArgs = [tsxCli, fixtureServer];
       const fixtureEnv = {
-        SPECULATE_OBSERVER_FIXTURE_ALIAS: alias,
+        SPECULATE_OBSERVER_FIXTURE_ALIAS: testFault === 'foreign-result' ? `${alias}-foreign` : alias,
         SPECULATE_OBSERVER_FIXTURE_LATENCY_MS: String(latencyMs),
         SPECULATE_OBSERVER_FIXTURE_CALL_LOG: log,
         SPECULATE_OBSERVER_FIXTURE_TOOLS: JSON.stringify(allTools),
@@ -945,6 +951,9 @@ async function startRuntime(
       if (!client) throw new Error(`missing fixture alias ${step.alias}`);
       const started = monotonicNow();
       const result = await client.callTool({ name: step.tool, arguments: step.args }) as CallToolResult;
+      if (testFault === 'duplicate-holdout-write' && step.tool === 'write_file') {
+        await client.callTool({ name: step.tool, arguments: step.args });
+      }
       return { result, elapsedMs: monotonicNow() - started };
     },
     async route(step) {
@@ -1023,6 +1032,7 @@ async function exchangeModel(
   arm: typeof OBSERVER_ARMS[ObserverArm],
   step: MaterializedToolStep,
   workflow: ObserverWorkflowId,
+  testFault?: 'extra-provider-request' | 'foreign-result' | 'duplicate-holdout-write',
 ): Promise<{
   ttfbMs: number;
   identical: boolean;
@@ -1052,7 +1062,7 @@ async function exchangeModel(
           Buffer.from(`data: ${JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: 'fixture-item', delta: '{"key":"partial' })}\n\n`),
         ]
     : [responseBody];
-  const provider = await startProvider(requestBody, responseChunks, 1, cancelled ? 20 : 0);
+  const provider = await startProvider(requestBody, responseChunks, testFault === 'extra-provider-request' ? 2 : 1, cancelled ? 20 : 0);
   let relay: LlmProxy | null = null;
   try {
     let target = provider.baseUrl;
@@ -1075,6 +1085,14 @@ async function exchangeModel(
         ? { 'x-claude-code-session-id': runtime.context.conversationId }
         : { 'thread-id': runtime.context.conversationId }),
     }, cancelled);
+    if (testFault === 'extra-provider-request') {
+      await postStream(`${target}${client === 'claude' ? '/v1/messages' : '/v1/responses'}`, requestBody, {
+        'content-type': 'application/json',
+        ...(client === 'claude'
+          ? { 'x-claude-code-session-id': runtime.context.conversationId }
+          : { 'thread-id': runtime.context.conversationId }),
+      });
+    }
     await delay(2);
     return {
       ttfbMs: exchange.firstByteAt - exchange.startedAt,
@@ -1300,6 +1318,9 @@ function reconcileControls(records: ObserverRunRecord[]): void {
       record.correctness.expectedDigest = control.correctness.outputDigest;
       record.correctness.toolResultDigestsIdenticalToA = record.correctness.outputDigest === control.correctness.outputDigest;
       if (!record.correctness.toolResultDigestsIdenticalToA) record.correctness.failures.push('tool-result-digest-mismatch');
+      if (stable(record.provider.requestDigests) !== stable(control.provider.requestDigests)) {
+        record.correctness.failures.push('provider-request-digest-mismatch');
+      }
     }
   }
 }

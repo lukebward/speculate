@@ -155,21 +155,31 @@ describe('observer accounting and validation', () => {
     })).toMatchObject({ issued: 1, settledWaste: 1 });
   });
 
-  it('rejects mismatched outputs, payloads, call counts, isolation, writes, consent, and extra model calls', () => {
+  it('rejects structurally mismatched pair coordinates and demanded call counts', () => {
     const control = record({ arm: 'A' });
     const candidate = record({ arm: 'E' });
     expect(() => validatePair([control, candidate])).not.toThrow();
     for (const patch of [
+      { holdoutSeed: 2 },
+      { cache: { ...candidate.cache, requestedCalls: 2 } },
+    ]) {
+      expect(() => validatePair([control, { ...candidate, ...patch } as ObserverRunRecord])).toThrow();
+    }
+  });
+
+  it('retains measured pair violations for gate evaluation instead of aborting artifact creation', () => {
+    const control = record({ arm: 'A' });
+    const candidate = record({ arm: 'E' });
+    for (const patch of [
       { correctness: { ...candidate.correctness, outputDigest: 'wrong' } },
       { correctness: { ...candidate.correctness, providerPayloadIdentical: false } },
-      { cache: { ...candidate.cache, requestedCalls: 2 } },
       { correctness: { ...candidate.correctness, wrongSessionResults: 1 } },
       { correctness: { ...candidate.correctness, unexpectedWrites: 1 } },
       { correctness: { ...candidate.correctness, consentBypasses: 1 } },
       { provider: { ...candidate.provider, modelRequests: 2 } },
       { provider: { ...candidate.provider, requestDigests: ['different'] } },
     ]) {
-      expect(() => validatePair([control, { ...candidate, ...patch } as ObserverRunRecord])).toThrow();
+      expect(() => validatePair([control, { ...candidate, ...patch } as ObserverRunRecord])).not.toThrow();
     }
   });
 
@@ -216,7 +226,13 @@ describe('observer release gates', () => {
     }, 'request-observation', 'median-improvement-vs-b'],
     ['mixed p95 exceeds five percent', (input: ReturnType<typeof gateInput>) => {
       input.comparisons.find((item) => item.comparison === 'E-B')!.mixedP95Regression = 0.050_001;
-    }, 'stream', 'mixed-p95-regression'],
+    }, 'stream', 'mixed-p95-regression-vs-b'],
+    ['D-C mixed p95 exceeds five percent', (input: ReturnType<typeof gateInput>) => {
+      input.comparisons.find((item) => item.comparison === 'D-C')!.mixedP95Regression = 0.050_001;
+    }, 'request-observation', 'incremental-mixed-p95-regression'],
+    ['E-D mixed p95 exceeds five percent', (input: ReturnType<typeof gateInput>) => {
+      input.comparisons.find((item) => item.comparison === 'E-D')!.mixedP95Regression = 0.050_001;
+    }, 'stream', 'incremental-mixed-p95-regression'],
     ['relay p95 exceeds five milliseconds', (input: ReturnType<typeof gateInput>) => {
       input.relay[0]!.p95AddedTtfbMs = 5.001;
     }, 'request-observation', 'local-relay-p95'],
@@ -255,6 +271,15 @@ describe('observer release gates', () => {
     relay.relay[0]!.releaseEvidence = false;
     const requestDecision = evaluateObserverGates(relay).find((decision) => decision.subject === 'request-observation')!;
     expect(requestDecision.gates.find((gate) => gate.gate === 'local-relay-p95')).toMatchObject({ status: 'unverified' });
+  });
+
+  it('does not erase an observed failure when the matrix is incomplete', () => {
+    const input = gateInput();
+    input.completeMatrix = false;
+    input.records.find((item) => item.arm === 'C')!.correctness.wrongSessionResults = 1;
+    expect(evaluateObserverGates(input).find((item) => item.subject === 'hook-stage')).toMatchObject({
+      gateStatus: 'fail', decision: 'remove',
+    });
   });
 });
 
@@ -335,6 +360,36 @@ describe('observer real-path smoke', () => {
     const observed = artifact.records.find((item) => item.arm === 'E')!;
     expect(observed.provider.streamCallsObserved).toBe(0);
     expect(observed.cache.issued).toBe(0);
+  }, 30_000);
+
+  it.each([
+    ['extra-provider-request', 'early-stream-call', 'extra-predictor-model-calls'],
+    ['foreign-result', 'early-stream-call', 'isolation'],
+    ['duplicate-holdout-write', 'mutation-invalidation', 'correctness'],
+  ] as const)('reports the injected %s fault as an explicit failed gate', async (kind, workflow, gate) => {
+    const artifact = await runObserverBenchmark({
+      clients: ['claude'],
+      arms: ['A', 'B', 'C'],
+      workflows: [workflow],
+      repetitions: 1,
+      latencyMs: 1,
+      trainingEpisodes: 0,
+      relayPairs: 1,
+      relayWarmups: 0,
+      verifyLauncher: false,
+      bootstrapReplicates: 16,
+      testFault: { arm: 'C', kind },
+    });
+    const candidate = artifact.records.find((item) => item.arm === 'C')!;
+    const decision = artifact.decisions.find((item) => item.subject === 'hook-stage')!;
+    expect(decision).toMatchObject({ gateStatus: 'fail', decision: 'remove' });
+    expect(decision.gates.find((item) => item.gate === gate)).toMatchObject({ status: 'fail' });
+    if (kind === 'extra-provider-request') {
+      expect(candidate.provider.modelRequests).toBe(2);
+      expect(candidate.correctness.failures).toContain('provider-request-digest-mismatch');
+    }
+    if (kind === 'foreign-result') expect(candidate.correctness.wrongSessionResults).toBeGreaterThan(0);
+    if (kind === 'duplicate-holdout-write') expect(candidate.correctness.unexpectedWrites).toBe(1);
   }, 30_000);
 });
 
