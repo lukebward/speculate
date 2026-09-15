@@ -34,8 +34,8 @@ speculate on --client claude   # turn on only Claude Code
 ### Experimental session observer
 
 The context-aware session launcher is currently available only from a source
-build. It is experimental while its incremental performance benefit is still
-being measured:
+build. It remains experimental: the 1,000-case replay passed correctness checks
+but failed the speedup and speculative-waste targets:
 
 ```bash
 npm install
@@ -69,7 +69,8 @@ segments are handled by abstaining rather than rewriting them.
 Native-account smoke tests completed one correct, wrapper-owned MCP read in
 `off`, `hooks`, and `proxy` modes on both clients without duplicate upstream
 calls. This proves transfer and result integrity, not a speed improvement.
-Live API-key runs and the new observer benefit remain unverified. See the
+Live API-key runs and native speedup remain unverified. The replay did not
+establish an improvement over existing Speculate. See the
 [observer results](docs/observer-results.md) and
 [compatibility notes](docs/observer-compatibility.md).
 

@@ -11,7 +11,7 @@ The production relay at commit `93e7ae0` passed native account smoke checks on 2
 
 Claude also requested `HEAD /api/hello`; Codex requested `/models` before its WebSocket upgrade. The real adapters emitted prompt observations for both clients. The checks used temporary empty working directories and a prompt requesting no tool use. Reports retained only endpoint/status counts and completion booleans, and scratch working directories were removed.
 
-This verifies native account routing and actual response completion through the implementation. It does not establish tool-consumption speedups, every provider variant, or live API-key compatibility. Neither `OPENAI_API_KEY` nor `ANTHROPIC_API_KEY` was available; synthetic API-key fixtures cover forwarding, while live API-key checks remain unverified. The new observer remains experimental pending the full correctness and performance gates.
+This verifies native account routing and actual response completion through the implementation. It does not establish tool-consumption speedups, every provider variant, or live API-key compatibility. Neither `OPENAI_API_KEY` nor `ANTHROPIC_API_KEY` was available; synthetic API-key fixtures cover forwarding, while live API-key checks remain unverified. The new observer remains experimental because the deterministic replay failed its speedup and settled-waste gates; native speedup remains unverified.
 
 ## Earlier scratch routing probe
 
@@ -99,7 +99,7 @@ The actual `run <client> --observe proxy --json-report <path> -- ...` command at
 | Claude Code 2.1.268 | proxy | 3 | 0 | yes | 3.147 s |
 | Codex CLI 0.154.0 | proxy | 2 | 0 | yes | 6.550 s |
 
-These are routing and completion checks, not performance comparisons. Both reports had zero registered routes because the smoke intentionally used no MCP tools. Codex reported disabled hook coverage, opaque native exec stream coverage, and lost completion tracking; completion-tracking diagnostics remain under review. Actual MCP consumption, matched task benefit, and live API-key use remain separate verification gates.
+These are routing and completion checks, not performance comparisons. Both reports had zero registered routes because the smoke intentionally used no MCP tools. Codex reported disabled hook coverage, opaque native exec stream coverage, and lost completion tracking. Detected tracking loss disables correlated prediction for that launch while native forwarding continues. Actual MCP transfer is verified below; native matched-task benefit and live API-key use remain unverified.
 
 ## Native MCP transfer verification
 
@@ -113,3 +113,7 @@ Actual native account turns now pass in `off`, `hooks`, and `proxy` modes on bot
 The initial Codex attempt exposed a native key-path difference: quotes in `-c mcp_servers."alias".command=...` become part of the server name. Generated overrides now use verified bare segments and abstain for unsupported segments. A native configuration read confirmed exactly one wrapped alias and unchanged enabled state, tool allowlist, and approval requirement. A separate startup check initialized and listed the owned fixture against a local provider that stopped before inference. The corrected source then passed all three native Codex transfer modes.
 
 The [sanitized results](observer-native-transfer-results.json) retain the earlier failed Codex rows and the corrected results. These single samples prove ownership, result integrity, and duplicate-execution safety; they do not demonstrate prefetch benefit or a speed improvement. Hook delivery remains unverified, including Codex's reported trust restriction. Codex opaque native exec and observed correlation-loss limitations remain visible. Live API-key modes are unverified. The report's `registeredRoutes` value is sampled after child shutdown, so it is not a count of routes registered during the run.
+
+## Post-review source verification
+
+At `02e951e`, Claude 2.1.268 completed a native-account proxy-mode transfer with `--strict-mcp-config`, and Codex 0.154.0 completed a native-account proxy-mode transfer through its native transport. Both produced the expected final response and exactly one correct wrapper-owned MCP call. The strict-source regression tests separately verify that ambient registrations are excluded. These single samples are correctness evidence, not performance comparisons; see the [sanitized final native results](observer-final-native-results.json).

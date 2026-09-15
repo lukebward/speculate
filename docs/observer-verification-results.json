@@ -1,26 +1,49 @@
 {
   "schemaVersion": 1,
-  "sourceCommit": "3755e34",
-  "scope": "production-through-recovery",
+  "sourceCommit": "e6bf9866e636b6d7914e9fab2e73eb27ac0e7b60",
+  "scope": "final-production-and-benchmark-implementation",
   "checks": {
     "build": "passed",
     "typescriptNoEmit": "passed",
     "fullSuite": {
-      "passed": 1300,
+      "passed": 1362,
       "skipped": 8,
       "failed": 0,
-      "durationSeconds": 84.31
+      "durationSeconds": 84.54
     },
     "recoveryScopedReview": "approved",
     "strictDocumentationBuild": {
       "status": "passed",
-      "sourceCommit": "15f8b18"
+      "scope": "final-results-documentation",
+      "productionSourceCommit": "e6bf9866e636b6d7914e9fab2e73eb27ac0e7b60"
+    },
+    "finalProductionReview": "approved",
+    "benchmarkImplementationReview": {
+      "status": "approved",
+      "sourceCommit": "2f05766"
+    },
+    "scenarios": {
+      "passed": 12,
+      "failed": 0,
+      "sourceCommit": "02e951e",
+      "includedInFinalFullSuite": true
+    },
+    "observerBenchmark": {
+      "status": "completed",
+      "records": 1000,
+      "sourceCommit": "e6bf9866e636b6d7914e9fab2e73eb27ac0e7b60",
+      "correctnessConsentIsolation": "passed",
+      "extraPredictorModelCalls": "passed",
+      "relayP95": "passed",
+      "mixedP95": "passed",
+      "medianSpeedup": "failed",
+      "settledWaste": "failed",
+      "rawReleaseDecisions": "remove-all-stages-both-clients",
+      "deliveryDecision": "retain-experimental-source-only",
+      "report": "observer-benchmark-results.json"
     }
   },
   "pending": [
-    "observer-benchmark-integration",
-    "new-observer-performance-gates",
-    "final-production-review",
     "main-push"
   ],
   "unverified": [

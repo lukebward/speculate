@@ -150,7 +150,7 @@ covers the CLI daemon).
 - [x] Task 6: Intent and completed-stream prediction (Sol review approved; 227 focused tests plus 77 callback-fix tests)
 - [x] Task 7: Symmetric session launch and diagnostics (Sol review approved; native routing and wrapper startup verified)
 - [x] Task 8: Both clients consume existing registered MCP results (Sol review approved; paired ready-hit/invalidation/permission tests pass)
-- [x] Task 9: Recovery/isolation verification (Sol review approved; 1,300 tests pass after owner invalidation fix)
+- [x] Task 9: Recovery/isolation verification (final production review approved at e6bf986; 1,362 tests passed, 8 skipped)
 - [ ] Task 10: Benchmarks, documentation, final review and push main
 
 ## Context-aware review evidence
@@ -163,3 +163,9 @@ covers the CLI daemon).
 - Task 10: existing repeated core benchmark completed with historical issue/use/miss counts preserved. Experimental documentation is drafted; new observer benchmark and final integration remain pending.
 
 - Task 9 final snapshot `3755e34`: independent review approved; build and TypeScript checks passed; full suite passed 1,300 tests with 8 skipped (84.31s). Tracking loss revokes queued, in-flight, and ready owner work; permission fixtures are isolated from ambient managed settings.
+
+- Final production review reopened three paths: Claude ordinary prediction authorization, strict MCP source isolation, and cache invalidation for received native/unknown writes. Scoped fixes and regression coverage are required before push.
+
+- Final production snapshot `e6bf986`: independent review approved after narrowly scoped permission, strict-source, native-write overlap, analysis-budget, and async supersession fixes. Build and strict TypeScript passed; full suite passed 1,362 tests with 8 skipped in 84.54s. Full 1,000-record benchmark is running on that immutable source snapshot.
+
+- Full observer benchmark completed at `e6bf986`: all 1,000 records, zero correctness/consent/isolation violations and no extra predictor model calls. Relay p95 and mixed-p95 gates passed; median speedup and waste gates failed for both clients. Raw release verdicts remain `remove`; the approved plan permits retaining the source-only implementation as experimental. No thresholds or implementation were tuned on held-out results. Results and compressed aggregate records are documented; final documentation verification and normal main push remain.

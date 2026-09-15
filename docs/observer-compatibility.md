@@ -16,7 +16,7 @@ Fixtures and reports contain synthetic protocol data or aggregate counters. Raw 
 | Native hooks | Temporary configuration supported; live delivery gate pending | Temporary configuration supported only when already trusted; live delivery gate pending |
 | Live API-key forwarding | Unverified; no key was available | Unverified; no key was available |
 | Provider variants | Bedrock, Vertex, Foundry, and custom gateways unverified | Custom providers and non-ChatGPT account routes unverified |
-| Observer performance benefit | Pending | Pending |
+| Observer performance benefit | Replay speedup/waste gates failed; native speedup unverified | Replay speedup/waste gates failed; native speedup unverified |
 
 Native-account routing and MCP transfer both require a completed native response and the expected final output; process exit zero alone is insufficient. The transfer smoke passed all three public modes for both clients and observed no duplicate MCP execution. Its `registeredRoutes` field was sampled after child shutdown, so a zero there is not route-ownership history. Ownership was instead established by the fixture's wrapper initialization.
 
@@ -24,13 +24,13 @@ Native-account routing and MCP transfer both require a completed native response
 
 The launcher forwards native arguments and inherits the existing environment. It does not select a model, effort, provider, account, approval policy, sandbox, or transport. Proxy mode changes only the launched process's active base URL and forwards request and response bytes and end-to-end headers. Native account probes confirmed this path for Claude's current account route and Codex's built-in ChatGPT route without extracting or replacing credentials.
 
-Model/provider discovery, retries, and inference remain client-owned. The relay does not automatically replay a partially forwarded request. A failed relay preflight falls back to hook mode; unsupported provider routing also remains hook-only. A later fresh launch constructs new temporary endpoints rather than reusing a failed launch's override. Recovery tests verify fresh-launch isolation, native retry boundaries, temporary-file cleanup, and revocation of queued, in-flight, and ready speculative work after detected tracking loss. The production snapshot `3755e34` passed all 1,300 tests with 8 skipped; see the [verification artifact](observer-verification-results.json).
+Model/provider discovery, retries, and inference remain client-owned. The relay does not automatically replay a partially forwarded request. A failed relay preflight falls back to hook mode; unsupported provider routing also remains hook-only. A later fresh launch constructs new temporary endpoints rather than reusing a failed launch's override. Recovery tests verify fresh-launch isolation, native retry boundaries, temporary-file cleanup, and revocation of queued, in-flight, and ready speculative work after detected tracking loss. The final production snapshot `e6bf986` passed all 1,362 tests with 8 skipped; see the [verification artifact](observer-verification-results.json).
 
 ## Permission and configuration boundaries
 
 Speculation still requires `readOnlyHint: true` and the host's effective permission for the exact route and arguments.
 
-For Claude, the launcher accepts only an exact existing MCP allow rule for speculative work. Deny, ask, approval-required, malformed, wildcard, managed-only, or otherwise ambiguous policy causes abstention. Temporary launch MCP configuration is merged without `--strict-mcp-config`, so unrelated inherited tools remain under Claude's existing ownership and policy.
+For Claude, the launcher accepts only an exact existing MCP allow rule for speculative work. Deny, ask, approval-required, malformed, wildcard, managed-only, or otherwise ambiguous policy causes abstention. Without `--strict-mcp-config`, temporary launch MCP configuration retains inherited sources under their existing ownership and policy. With strict MCP configuration, only explicit per-run sources are considered; ambient servers are excluded. Authorization is checked again before speculative execution and before publishing a result.
 
 For Codex, enabled/disabled tool lists and per-tool approval modes are read from native effective configuration. Prompted or denied tools are not speculated. Temporary hooks require native trust; the launcher does not bypass it. Config forms whose precedence cannot be verified are forwarded unchanged while the affected observer capability abstains.
 
@@ -52,7 +52,7 @@ Prediction remains local and does not make an additional model call. Existing
 cache lifetime, concurrency, rate, retained-byte, and observation-size limits
 remain in force for observer-triggered work.
 
-The new observer remains experimental. Correct native transfer is verified, while deterministic observer benefit, relay p95 overhead, mixed-task regression, settled waste, and live API-key routing remain pending. See [observer results](observer-results.md), [native routing](observer-native-routing.md), [native tool shapes](observer-native-tool-shapes.md), and the [sanitized transfer results](observer-native-transfer-results.json).
+The new observer remains experimental. The full replay passed correctness, no-extra-model-call, relay-overhead, and mixed-p95 gates for both clients, but failed median speedup and settled-waste gates. Native transfer is verified; native speedup, live API-key routing, and native hook delivery remain unverified. See [observer results](observer-results.md), [native routing](observer-native-routing.md), [native tool shapes](observer-native-tool-shapes.md), and the [sanitized transfer results](observer-native-transfer-results.json).
 
 Official client contracts:
 
