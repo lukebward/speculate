@@ -89,3 +89,14 @@ A bounded native query verified the existing initialization contract and returne
 Two isolated Codex 0.154.0 parser probes verified that `exec` accepts a final global `-c` override after its positional prompt, or immediately before a native `--` sentinel. The later value for the same scalar key won in both cases. Original arguments can therefore retain their order while generated launch controls occupy the final configuration position.
 
 Both probes selected nonexistent synthetic providers and stopped during local startup, before authentication, model discovery, inference, or MCP requests. They establish scalar ordering for these `exec` forms; they do not establish table-conflict behavior or compatibility with every native subcommand. Per-run permissions must still come from the original effective configuration before transport and wrapper controls are added.
+
+## Source-built session launcher smoke
+
+The actual `run <client> --observe proxy --json-report <path> -- ...` command at `f65e38f` completed a minimal no-tool model turn on both installed clients, using their existing native accounts and original model/effort settings. Each run asserted the expected final response and a completed turn independently of process exit.
+
+| Client | Active report mode | Relay requests | Relay failures | Completed expected response | Elapsed |
+| --- | --- | ---: | ---: | --- | ---: |
+| Claude Code 2.1.268 | proxy | 3 | 0 | yes | 3.147 s |
+| Codex CLI 0.154.0 | proxy | 2 | 0 | yes | 6.550 s |
+
+These are routing and completion checks, not performance comparisons. Both reports had zero registered routes because the smoke intentionally used no MCP tools. Codex reported disabled hook coverage, opaque native exec stream coverage, and lost completion tracking; completion-tracking diagnostics remain under review. Actual MCP consumption, matched task benefit, and live API-key use remain separate verification gates.

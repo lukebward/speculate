@@ -19,3 +19,5 @@
 
 - Wait for the worker final response before committing its review snapshot; a stable progress update can still precede final self-review edits.
 - Verify launch-only native configuration at actual session startup. A management subcommand can ignore launch overrides and cannot establish their precedence.
+
+- A lifecycle window can contain several events. Deduplicate individual event identities; do not consume the entire window or remove it from later ambiguity checks after its first match.
