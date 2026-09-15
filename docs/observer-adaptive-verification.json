@@ -89,6 +89,16 @@
       "windowsFailure": "Two new integration tests exceeded the 15-second Vitest deadline; no performance gate was changed.",
       "docsRunId": 34973817549,
       "docs": "passed"
+    },
+    {
+      "commit": "f796513e3ec4e57d4d6cccf47a421812f2fdb3fe",
+      "runId": 34974445299,
+      "ubuntu": "passed",
+      "macos": "passed",
+      "windows": "passed",
+      "nativeCodexChecks": "passed on all three platforms",
+      "docsRunId": 34974445314,
+      "docs": "passed"
     }
   ],
   "ciTimeoutCorrection": {

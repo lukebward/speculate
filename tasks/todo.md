@@ -194,7 +194,7 @@ Goal: adapt Headroom's selective, usage-informed optimization and evaluation pra
 - [x] Record a concrete bounded design, its Headroom sources, and unchanged correctness/permission requirements before implementation.
 - [x] Implement the selected production adjustment and meaningful regression tests.
 - [x] Add a focused multi-turn evaluation that preserves the prior replay and distinguishes synthetic opportunity from native benefit.
-- [ ] Independently review, verify, document measured results, and deliver the changes.
+- [x] Independently review, verify, document measured results, and deliver the changes.
 
 Research is limited to 15 minutes per agent. Reuse existing executors, cache ownership, admission, and client adapters. The original 1,000-record results remain historical evidence; no thresholds will be changed to make those results pass.
 
@@ -225,3 +225,5 @@ The unchanged diagnostic completed at `d672181` in 164.41 seconds: 60/60 records
 Delivery `0769f59` was pushed normally to main. CI `34973817927` passed Ubuntu and macOS, including native Codex checks; docs `34973817549` passed build/deployment. Windows hit the two new integration tests' 15-second Vitest deadline. A scoped test-only increase to 30 seconds is being verified; measured code, workloads, assertions, and release thresholds remain unchanged.
 
 The CI correction changes only the integration-test deadline from 15 to 30 seconds. Independent review approved it; the focused suite passed 6/6 tests in 11.83 seconds. The corrected push and platform CI are pending.
+
+Completed delivery: `f796513` is verified on main. CI [34974445299](https://github.com/lukebward/speculate/actions/runs/34974445299) passed Ubuntu, macOS, and Windows, including full tests, TypeScript, and native Codex checks. Docs [34974445314](https://github.com/lukebward/speculate/actions/runs/34974445314) passed strict build and deployment. The final follow-up only records these results; production and benchmark source remain identical to the measured `d672181` snapshot.
