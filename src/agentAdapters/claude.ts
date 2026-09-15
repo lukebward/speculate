@@ -482,23 +482,28 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
           ? 'settled'
           : null;
       if (phase && typeof payload.tool_name === 'string' && typeof payload.tool_use_id === 'string' && object(payload.tool_input)) {
+        const routes = environment.routes().filter((route) => route.hostClient === 'claude' && modelToolName(route) === payload.tool_name);
+        const startClassification = phase === 'started'
+          ? routes.length === 1 && routes[0]!.readOnly === true
+            ? { kind: 'read' as const, routeId: routes[0]!.routeId, generation: routes[0]!.generation }
+            : { kind: 'mutation' as const }
+          : undefined;
         const boundary = hookBoundaries.observeStatus({
           context,
           toolName: payload.tool_name,
           callId: payload.tool_use_id,
           ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
           ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
-        }, phase);
+        }, phase, startClassification);
         if (boundary.gap) {
           try { environment.onTrackingLoss?.(observedAt); } catch {}
         }
         if (boundary.duplicate) return [];
-        const routes = environment.routes().filter((route) => route.hostClient === 'claude' && modelToolName(route) === payload.tool_name);
-        if (routes.length === 1 && routes[0]!.readOnly === true) {
+        if (boundary.classification?.kind === 'read') {
           try {
             environment.onToolCallMarker?.({
-              source: 'hook', phase, context, routeId: routes[0]!.routeId,
-              generation: routes[0]!.generation, callId: payload.tool_use_id,
+              source: 'hook', phase, context, routeId: boundary.classification.routeId,
+              generation: boundary.classification.generation, callId: payload.tool_use_id,
               args: payload.tool_input, observedAt,
               ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
               ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),

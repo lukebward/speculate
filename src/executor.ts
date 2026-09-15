@@ -45,6 +45,9 @@ function isToolUnavailable(err: McpError): boolean {
 
 export class SpeculationExecutor {
   private readonly pending = new Map<string, QueuedPrediction[]>();
+  private readonly draining = new Set<string>();
+  private readonly invalidationRevisions = new Map<string, number>();
+  private lifecycleRevision = 0;
   private observerIssueSequence = 0;
 
   constructor(
@@ -57,13 +60,20 @@ export class SpeculationExecutor {
       config: SpeculateConfig;
       now?: () => number;
       leaseValidator?: LeaseValidator;
-      predictionGate?: { allows(server: string, tool: string): boolean };
+      predictionGate?: {
+        allows(server: string, tool: string): boolean;
+        authorize?(server: string, tool: string): Promise<boolean>;
+      };
     },
   ) {}
 
   /** Fire-and-forget: never throws, never blocks the caller. */
   submit(predictions: Prediction[], opts: { queueOnBusy?: boolean } = {}): void {
     for (const p of predictions) {
+      if (this.deps.predictionGate?.authorize) {
+        void this.authorizeAndIssue(p, { queueOnBusy: opts.queueOnBusy !== false });
+        continue;
+      }
       try {
         this.tryIssue(p, { queueOnBusy: opts.queueOnBusy !== false });
       } catch (err) {
@@ -102,6 +112,7 @@ export class SpeculationExecutor {
    * rule for work the budget deliberately prevented.
    */
   abandonPending(): number {
+    this.lifecycleRevision++;
     let dropped = 0;
     for (const queue of this.pending.values()) {
       for (const { p } of queue) {
@@ -114,6 +125,7 @@ export class SpeculationExecutor {
   }
 
   invalidatePending(server: string): number {
+    this.invalidationRevisions.set(server, (this.invalidationRevisions.get(server) ?? 0) + 1);
     const queue = this.pending.get(server);
     if (!queue?.length) return 0;
     for (const { p } of queue) this.suppress(p, 'cache-invalidation');
@@ -126,6 +138,10 @@ export class SpeculationExecutor {
    * settled, or a real call finished on a serial upstream).
    */
   drainServer(server: string): void {
+    if (this.deps.predictionGate?.authorize) {
+      if (!this.draining.has(server)) void this.drainServerAuthorized(server);
+      return;
+    }
     const queue = this.pending.get(server);
     if (!queue?.length) return;
     const now = this.deps.now ?? Date.now;
@@ -150,6 +166,7 @@ export class SpeculationExecutor {
   private tryIssue(
     p: Prediction,
     opts: { queueOnBusy: boolean },
+    hostAuthorized = false,
   ): 'issued' | 'dropped' | 'busy' {
     const { cache, policy, budget, metrics, upstreams } = this.deps;
     const now = this.deps.now ?? Date.now;
@@ -159,7 +176,7 @@ export class SpeculationExecutor {
       return 'dropped';
     }
 
-    if (this.deps.predictionGate && !this.deps.predictionGate.allows(p.server, p.tool)) {
+    if (!hostAuthorized && this.deps.predictionGate && !this.deps.predictionGate.allows(p.server, p.tool)) {
       this.suppress(p, 'host-permission');
       return 'dropped';
     }
@@ -218,9 +235,10 @@ export class SpeculationExecutor {
       observerIssue,
     };
 
+    let publicationAllowed = true;
     const promise = upstream
       .callTool(p.tool, p.args, { timeoutMs: SPECULATIVE_CALL_TIMEOUT_MS })
-      .then((result) => {
+      .then(async (result) => {
         if (result.isError) {
           // §4/§6: error results are never cached speculatively.
           const text = resultText(result);
@@ -228,6 +246,9 @@ export class SpeculationExecutor {
             policy.suspend(p.server, p.tool, 'auth');
           }
           throw new Error(`upstream error result: ${text.slice(0, 200)}`);
+        }
+        if (this.deps.predictionGate?.authorize) {
+          publicationAllowed = await this.authorize(p);
         }
         return result;
       })
@@ -255,7 +276,9 @@ export class SpeculationExecutor {
       ttlMs,
       p.executionLease || this.deps.predictionGate
         ? () => (!p.executionLease || this.deps.leaseValidator?.isCurrent(p.executionLease) === true) &&
-          (!this.deps.predictionGate || this.deps.predictionGate.allows(p.server, p.tool))
+          publicationAllowed && (!this.deps.predictionGate?.authorize && this.deps.predictionGate
+            ? this.deps.predictionGate.allows(p.server, p.tool)
+            : true)
         : undefined,
     );
     metrics.record({
@@ -268,6 +291,63 @@ export class SpeculationExecutor {
       observerIssue,
     });
     return 'issued';
+  }
+
+  private async authorizeAndIssue(p: Prediction, opts: { queueOnBusy: boolean }): Promise<void> {
+    const lifecycleRevision = this.lifecycleRevision;
+    const invalidationRevision = this.invalidationRevisions.get(p.server) ?? 0;
+    const allowed = await this.authorize(p);
+    if (lifecycleRevision !== this.lifecycleRevision || invalidationRevision !== (this.invalidationRevisions.get(p.server) ?? 0)) {
+      this.suppress(p, 'cache-invalidation');
+      return;
+    }
+    if (!allowed) {
+      this.suppress(p, 'host-permission');
+      return;
+    }
+    try {
+      this.tryIssue(p, opts, true);
+    } catch (err) {
+      this.suppress(p, `executor-error: ${(err as Error).message}`);
+    }
+  }
+
+  private async authorize(p: Prediction): Promise<boolean> {
+    try {
+      return await this.deps.predictionGate!.authorize!(p.server, p.tool);
+    } catch {
+      return false;
+    }
+  }
+
+  private async drainServerAuthorized(server: string): Promise<void> {
+    this.draining.add(server);
+    try {
+      const queue = this.pending.get(server);
+      if (!queue?.length) return;
+      const now = this.deps.now ?? Date.now;
+      while (queue.length > 0) {
+        const head = queue[0]!;
+        if (now() - head.queuedAt > QUEUE_MAX_AGE_MS) {
+          queue.shift();
+          this.suppress(head.p, 'queue-expired');
+          continue;
+        }
+        const allowed = await this.authorize(head.p);
+        if (this.pending.get(server) !== queue || queue[0] !== head) return;
+        if (!allowed) {
+          queue.shift();
+          this.suppress(head.p, 'host-permission');
+          continue;
+        }
+        const outcome = this.tryIssue(head.p, { queueOnBusy: false }, true);
+        if (outcome === 'busy') return;
+        queue.shift();
+      }
+      this.pending.delete(server);
+    } finally {
+      this.draining.delete(server);
+    }
   }
 
   private enqueue(p: Prediction): void {

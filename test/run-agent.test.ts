@@ -546,7 +546,8 @@ describe('Claude launch permission verification', () => {
     mkdirSync(join(home, '.claude'), { recursive: true });
     mkdirSync(cwd);
     writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
-    writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
+    const settingsPath = join(home, '.claude', 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify({
       permissions: { allow: ['mcp__files__read'], ask: ['mcp__files__other'] },
     }));
     writeFileSync(join(home, '.claude.json'), JSON.stringify({ mcpServers: { files: { command: process.execPath } } }));
@@ -561,6 +562,10 @@ describe('Claude launch permission verification', () => {
       launchId: mcp.mcpServers.files.env.SPECULATE_SESSION_LAUNCH_ID,
     }, { hostClient: 'claude', hostServerAlias: 'files', onCandidates: () => {} });
     expect(await owner.readStartupPolicy()).toEqual({ enabled: true, allowTools: ['read'], denyTools: [] });
+    writeFileSync(settingsPath, JSON.stringify({
+      permissions: { allow: ['mcp__files__read'], ask: ['mcp__files__read'] },
+    }));
+    expect(await owner.readStartupPolicy()).toEqual({ enabled: true, allowTools: [], denyTools: [] });
     await owner.close();
     await prepared.close();
   });

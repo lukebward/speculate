@@ -96,7 +96,9 @@ export interface ProxySessionConfig {
   runtime: ProxySessionRuntime;
   permissionContext?: (conversationId?: string) => string | null;
   permissionGate?: HostPermissionGate;
-  predictionPolicy?: CodexPolicyProjection;
+  predictionPolicy?: CodexPolicyProjection & {
+    authorize?(server: string, tool: string): Promise<boolean>;
+  };
   cwd?: string;
   conversationIdForCall?: (input: { exposedTool: string; upstreamServer: string; upstreamTool: string; args: Readonly<Record<string, unknown>> }) => string | null;
   onEvent?: (event: ProxySessionEvent) => void;
@@ -272,6 +274,9 @@ export class SpeculateProxy {
               return projection.enabled && !projection.denyTools.includes(tool) &&
                 (projection.allowTools === null || projection.allowTools.includes(tool));
             },
+            ...(this.session.predictionPolicy.authorize
+              ? { authorize: (server: string, tool: string) => this.session!.predictionPolicy!.authorize!(server, tool) }
+              : {}),
           }
         : undefined,
     });

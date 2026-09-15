@@ -14,7 +14,12 @@ interface HookBoundary {
 interface RetainedBoundary {
   conversationId: string;
   bytes: number;
+  classification?: HookBoundaryClassification;
 }
+
+export type HookBoundaryClassification =
+  | { kind: 'read'; routeId: string; generation: number }
+  | { kind: 'mutation' };
 
 export class HookBoundaryTracker {
   private readonly active = new Map<string, RetainedBoundary>();
@@ -25,21 +30,35 @@ export class HookBoundaryTracker {
     return this.observeStatus(boundary, phase).gap;
   }
 
-  observeStatus(boundary: HookBoundary, phase: 'started' | 'settled'): { gap: boolean; duplicate: boolean } {
+  observeStatus(
+    boundary: HookBoundary,
+    phase: 'started' | 'settled',
+    classification?: HookBoundaryClassification,
+  ): { gap: boolean; duplicate: boolean; classification?: HookBoundaryClassification } {
     const key = this.key(boundary);
     if (phase === 'started') {
-      if (this.active.has(key) || this.settled.has(key)) return { gap: false, duplicate: true };
-      return { gap: this.retain(this.active, key, boundary.context.conversationId), duplicate: false };
+      const prior = this.active.get(key) ?? this.settled.get(key);
+      if (prior) return { gap: false, duplicate: true, classification: prior.classification };
+      return {
+        gap: this.retain(this.active, key, boundary.context.conversationId, classification),
+        duplicate: false,
+        classification,
+      };
     }
     const active = this.active.get(key);
     if (active) {
       this.active.delete(key);
       this.retainedBytes -= active.bytes;
-      return { gap: this.retain(this.settled, key, boundary.context.conversationId), duplicate: false };
+      return {
+        gap: this.retain(this.settled, key, boundary.context.conversationId, active.classification),
+        duplicate: false,
+        classification: active.classification,
+      };
     }
-    if (this.settled.has(key)) return { gap: false, duplicate: true };
-    this.retain(this.settled, key, boundary.context.conversationId);
-    return { gap: true, duplicate: false };
+    const settled = this.settled.get(key);
+    if (settled) return { gap: false, duplicate: true, classification: settled.classification };
+    this.retain(this.settled, key, boundary.context.conversationId, classification);
+    return { gap: true, duplicate: false, classification };
   }
 
   endSession(context: SessionContext): boolean {
@@ -58,8 +77,14 @@ export class HookBoundaryTracker {
     return missing;
   }
 
-  private retain(target: Map<string, RetainedBoundary>, key: string, conversationId: string): boolean {
-    const bytes = Buffer.byteLength(key, 'utf8') + 64;
+  private retain(
+    target: Map<string, RetainedBoundary>,
+    key: string,
+    conversationId: string,
+    classification?: HookBoundaryClassification,
+  ): boolean {
+    const bytes = Buffer.byteLength(key, 'utf8') +
+      (classification?.kind === 'read' ? Buffer.byteLength(classification.routeId, 'utf8') : 0) + 128;
     if (this.active.size + this.settled.size >= MAX_HOOK_BOUNDARIES ||
       this.retainedBytes + bytes > MAX_HOOK_BOUNDARY_BYTES) {
       this.active.clear();
@@ -67,7 +92,7 @@ export class HookBoundaryTracker {
       this.retainedBytes = 0;
       return true;
     }
-    target.set(key, { conversationId, bytes });
+    target.set(key, { conversationId, bytes, classification });
     this.retainedBytes += bytes;
     return false;
   }

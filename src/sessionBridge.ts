@@ -868,7 +868,7 @@ export class SessionBridgeOwner {
   }
 
   async readStartupPolicy(): Promise<unknown> {
-    return await this.request({ type: 'startup-policy' });
+    return await this.request({ type: 'startup-policy' }, 1_000);
   }
 
   setDisconnectHandler(handler: () => void): void {
@@ -910,13 +910,26 @@ export class SessionBridgeOwner {
     });
   }
 
-  private request(message: ClientMessage): Promise<unknown> {
+  private request(message: ClientMessage, timeoutMs?: number): Promise<unknown> {
     if (this.closed) return Promise.reject(new Error('session bridge owner is closed'));
     const requestId = this.requestId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
+      let timer: NodeJS.Timeout | null = null;
+      const settle = (callback: (value: unknown) => void) => (value: unknown) => {
+        if (timer) clearTimeout(timer);
+        callback(value);
+      };
+      this.pending.set(requestId, { resolve: settle(resolve), reject: settle(reject) as (error: Error) => void });
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          if (!this.pending.delete(requestId)) return;
+          reject(new Error('session bridge request timed out'));
+        }, timeoutMs);
+        timer.unref();
+      }
       if (!send(this.socket, { ...message, requestId })) {
         this.pending.delete(requestId);
+        if (timer) clearTimeout(timer);
         reject(new Error('session bridge connection is unavailable'));
       }
     });

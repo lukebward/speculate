@@ -611,13 +611,14 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
   private requestReady = false;
   private stopped = false;
   private released = false;
+  private retainedResponseBytes = 0;
 
   constructor(
     context: SessionContext,
     private readonly request: AgentAdapterRequest,
     environment: AgentAdapterEnvironment,
     promptOccurrences: PromptOccurrenceCorrelator,
-    retainedBudget: RetainedBudget,
+    private readonly retainedBudget: RetainedBudget,
     remember: (responseId: string, responseContext: ResponseContext) => void,
     previous: (responseId: string) => ResponseContext | null,
     private readonly release: () => void,
@@ -656,6 +657,7 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
     if (contentType === 'text/event-stream') this.responseMode = 'sse';
     else if (contentType === 'application/json') this.responseMode = 'json';
     else this.abort();
+    if (this.responseMode !== 'none' && !this.replaceResponseText('')) this.abort();
     return [];
   }
 
@@ -666,7 +668,10 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
       this.abort();
       return [];
     }
-    this.responseText += this.decoder.write(Buffer.from(chunk));
+    if (!this.replaceResponseText(this.responseText + this.decoder.write(Buffer.from(chunk)))) {
+      this.abort();
+      return [];
+    }
     const observations = this.responseMode === 'sse' ? this.readSse(false, observedAt) : [];
     if (this.tracker.isStopped) this.abort();
     return observations;
@@ -674,7 +679,10 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
 
   observeResponseEnd(observedAt?: number): readonly Observation[] {
     if (this.stopped || this.responseMode === 'none') return [];
-    this.responseText += this.decoder.end();
+    if (!this.replaceResponseText(this.responseText + this.decoder.end())) {
+      this.abort();
+      return [];
+    }
     let observations: Observation[];
     if (this.responseMode === 'sse') observations = this.readSse(true, observedAt);
     else {
@@ -702,11 +710,11 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
       const match = /\r?\n\r?\n/.exec(this.responseText);
       if (!match) break;
       const block = this.responseText.slice(0, match.index);
-      this.responseText = this.responseText.slice(match.index + match[0].length);
+      this.replaceResponseText(this.responseText.slice(match.index + match[0].length));
       out.push(...this.readSseBlock(block, observedAt));
     }
     if (ended && this.responseText.trim()) out.push(...this.readSseBlock(this.responseText, observedAt));
-    if (ended) this.responseText = '';
+    if (ended) this.replaceResponseText('');
     return out;
   }
 
@@ -729,10 +737,23 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
     this.stopped = true;
     this.responseMode = 'none';
     this.responseText = '';
+    this.retainedBudget.release(this.retainedResponseBytes);
+    this.retainedResponseBytes = 0;
     if (!this.released) {
       this.released = true;
       this.release();
     }
+  }
+
+  private replaceResponseText(value: string): boolean {
+    const nextBytes = 256 + value.length * 4;
+    if (nextBytes > this.retainedResponseBytes && !this.retainedBudget.reserve(nextBytes - this.retainedResponseBytes)) {
+      return false;
+    }
+    if (nextBytes < this.retainedResponseBytes) this.retainedBudget.release(this.retainedResponseBytes - nextBytes);
+    this.retainedResponseBytes = nextBytes;
+    this.responseText = value;
+    return true;
   }
 }
 
@@ -948,23 +969,28 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
       const callId = boundedId(payload.tool_use_id) ? payload.tool_use_id : null;
       const args = record(payload.arguments) ? payload.arguments : record(payload.tool_input) ? payload.tool_input : null;
       if (phase && toolName && callId && args) {
+        const routes = environment.routes().filter((route) => route.hostClient === 'codex' && modelToolName(route) === toolName);
+        const startClassification = phase === 'started'
+          ? routes.length === 1 && routes[0]!.readOnly === true
+            ? { kind: 'read' as const, routeId: routes[0]!.routeId, generation: routes[0]!.generation }
+            : { kind: 'mutation' as const }
+          : undefined;
         const boundary = hookBoundaries.observeStatus({
           context,
           toolName,
           callId,
           ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
           ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
-        }, phase);
+        }, phase, startClassification);
         if (boundary.gap) {
           try { environment.onTrackingLoss?.(observedAt); } catch {}
         }
         if (boundary.duplicate) return [];
-        const routes = environment.routes().filter((route) => route.hostClient === 'codex' && modelToolName(route) === toolName);
-        if (routes.length === 1 && routes[0]!.readOnly === true) {
+        if (boundary.classification?.kind === 'read') {
           try {
             environment.onToolCallMarker?.({
-              source: 'hook', phase, context, routeId: routes[0]!.routeId,
-              generation: routes[0]!.generation, callId, args,
+              source: 'hook', phase, context, routeId: boundary.classification.routeId,
+              generation: boundary.classification.generation, callId, args,
               observedAt,
               ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
               ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),

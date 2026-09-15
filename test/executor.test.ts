@@ -333,6 +333,59 @@ describe('executor drain queue', () => {
     expect(h.cache.lookup(canonicalKey('github', 'a', { tool: 'a' })).outcome).toBe('miss');
   });
 
+  it.each(['denied', 'approval-required'] as const)('rechecks %s launch permission before queued issue', async (decision) => {
+    const h = makeHarness('stdio');
+    let current: 'allowed' | typeof decision = 'allowed';
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.predictionGate = {
+      allows: () => true,
+      authorize: async () => current === 'allowed',
+    };
+    h.executor.submit([{ ...pred('a', 0.9), horizon: 'next' }, { ...pred('b', 0.8), horizon: 'next' }]);
+    await settle();
+    expect(h.calls.map((call) => call.tool)).toEqual(['a']);
+    current = decision;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+    await settle();
+
+    expect(h.calls.map((call) => call.tool)).toEqual(['a']);
+    expect(h.metrics.statsSnapshot().suppressed['host-permission']).toBe(1);
+  });
+
+  it.each(['denied', 'approval-required'] as const)('rechecks %s launch permission before publication', async (decision) => {
+    const h = makeHarness('http');
+    let current: 'allowed' | typeof decision = 'allowed';
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.predictionGate = {
+      allows: () => true,
+      authorize: async () => current === 'allowed',
+    };
+    h.executor.submit([{ ...pred('a', 0.9), horizon: 'standing' }]);
+    await settle();
+    current = decision;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+    await settle();
+
+    expect(h.cache.lookup(canonicalKey('github', 'a', { tool: 'a' })).outcome).toBe('miss');
+  });
+
+  it('does not issue after invalidation wins a pending permission check', async () => {
+    const h = makeHarness('http');
+    let resolveAuthorization!: (allowed: boolean) => void;
+    const authorization = new Promise<boolean>((resolve) => { resolveAuthorization = resolve; });
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.predictionGate = { allows: () => true, authorize: () => authorization };
+    h.executor.submit([{ ...pred('a', 0.9), horizon: 'standing' }]);
+    h.executor.invalidatePending('github');
+    resolveAuthorization(true);
+    await settle();
+
+    expect(h.calls).toEqual([]);
+    expect(h.metrics.statsSnapshot().suppressed['cache-invalidation']).toBe(1);
+  });
+
   it('never exceeds the queue cap', async () => {
     const { executor, calls, metrics } = makeHarness('stdio');
     const many = Array.from({ length: 12 }, (_, i) => pred(`a`, 0.9 - i * 0.01));

@@ -298,6 +298,29 @@ describe('Claude adapter', () => {
     expect(adapter.normalizeHook({ ...base, hook_event_name: 'PostToolUse' })).toEqual([]);
   });
 
+  it('keeps routes suspended when a known read settles inside an overlapping native write', () => {
+    let liveRoutes: readonly RegisteredRoute[] = routes;
+    const adapter = makeAdapter(() => liveRoutes);
+    const read = {
+      session_id: context.conversationId, tool_name: 'mcp__workspace__read_file',
+      tool_use_id: 'read-1', tool_input: { path: '/work/a' },
+    };
+    const write = {
+      session_id: context.conversationId, tool_name: 'native_write',
+      tool_use_id: 'write-1', tool_input: { path: '/work/a' },
+    };
+
+    expect(adapter.normalizeHook({ ...read, hook_event_name: 'PreToolUse' })).toEqual([]);
+    expect(adapter.normalizeHook({ ...write, hook_event_name: 'PreToolUse' })).toEqual([
+      expect.objectContaining({ reason: 'native-mutation-start' }),
+    ]);
+    liveRoutes = [];
+    expect(adapter.normalizeHook({ ...read, hook_event_name: 'PostToolUse' })).toEqual([]);
+    expect(adapter.normalizeHook({ ...write, hook_event_name: 'PostToolUse' })).toEqual([
+      expect.objectContaining({ reason: 'native-mutation-settle' }),
+    ]);
+  });
+
   it('rejects oversized hook identity and prompt fields before environment work', () => {
     let contextLookups = 0;
     let eventIds = 0;

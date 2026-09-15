@@ -3,6 +3,7 @@ import { AddressInfo, createConnection, createServer as createNetServer, type Se
 import { afterEach, describe, expect, it } from 'vitest';
 import { startLlmProxy, type LlmProxy } from '../src/llmProxy.js';
 import { claudeAdapter } from '../src/agentAdapters/claude.js';
+import { codexAdapter } from '../src/agentAdapters/codex.js';
 import { ObservationBudget } from '../src/observationBudget.js';
 import type {
   AgentAdapter,
@@ -156,6 +157,46 @@ describe('LLM HTTP relay', () => {
         'content-type': 'application/json',
         'x-claude-code-session-id': `thread-${index}`,
       },
+      body,
+    })));
+
+    expect(results.every((result) => result.status === 200 && result.body.equals(responseBody))).toBe(true);
+    expect(losses).toHaveLength(1);
+    expect(budget.usedBytes).toBeLessThanOrEqual(8 * 1024 * 1024 + 24 * 1024);
+    await proxy.close();
+    analysisAdapter.close?.();
+    expect(budget.usedBytes).toBe(0);
+  });
+
+  it('charges retained Codex HTTP responses to the shared connection aggregate', async () => {
+    const responseBody = Buffer.from(JSON.stringify({ id: 'response', status: 'completed', output: [], padding: 'x'.repeat(4_096) }));
+    const upstream = await listen((request, response) => {
+      request.resume();
+      request.on('end', () => setTimeout(() => {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(responseBody);
+      }, 20));
+    });
+    const losses: number[] = [];
+    const budget = new ObservationBudget(8 * 1024 * 1024 + 24 * 1024, (observedAt) => losses.push(observedAt));
+    const analysisAdapter = codexAdapter({
+      contextForConversation: (conversationId) => ({
+        launchId: 'launch', conversationId, agent: 'codex', cwd: '/work',
+      }),
+      routes: () => [],
+      analysisBudget: budget,
+    });
+    const proxy = await startLlmProxy({
+      upstreamBaseUrl: upstream.baseUrl,
+      adapter: analysisAdapter,
+      analysisBudget: budget,
+      onObservation: () => {},
+    });
+    proxies.push(proxy);
+    const body = Buffer.from(JSON.stringify({ input: 'inspect', tools: [] }));
+    const results = await Promise.all(Array.from({ length: 8 }, (_, index) => exchange({
+      url: `${proxy.baseUrl}/v1/responses`,
+      headers: { 'content-type': 'application/json', 'thread-id': `thread-${index}` },
       body,
     })));
 
