@@ -10,11 +10,19 @@ import { SessionBridge, type CandidateAuthorizationInput, type CandidateAuthoriz
 import type { ProxySessionEvent } from './proxy.js';
 import { claudeAdapter, buildLaunchPlan as buildClaudeLaunchPlan, claudeObserverHookCommand } from './agentAdapters/claude.js';
 import { codexAdapter, buildLaunchPlan as buildCodexLaunchPlan, codexProxyOverrideIsVerifiable } from './agentAdapters/codex.js';
-import { extractCodexConfigInvocation, startCodexClient, type CodexAccountMode, type CodexClient, type CodexConfigRead } from './codexClient.js';
+import {
+  codexInvocation,
+  extractCodexConfigInvocation,
+  startCodexClient,
+  type CodexAccountMode,
+  type CodexClient,
+  type CodexConfigRead,
+} from './codexClient.js';
 import { projectCodexPolicy, type CodexPolicyProjection } from './codexPolicy.js';
 import { projectClaudeMcpPolicy, verifyClaudeMcpPreauthorization } from './claudePermission.js';
 import { selfCommand } from './hostConfig.js';
 import { startLlmProxy, type LlmProxy } from './llmProxy.js';
+import { win32ShimInvocation } from './manage.js';
 import { ObservationBudget } from './observationBudget.js';
 import type { ObserverLifecycleEvent } from './types.js';
 
@@ -202,6 +210,20 @@ export interface RunAgentDependencies {
   log?: (line: string) => void;
 }
 
+export function nativeClientInvocation(
+  agent: RunAgentArgs['agent'],
+  command: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+): { file: string; args: string[]; windowsVerbatimArguments?: true } {
+  if (agent === 'codex') return codexInvocation(command, args, platform);
+  if (/\.[cm]?js$/i.test(command)) return { file: process.execPath, args: [command, ...args] };
+  if (platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
+    return { ...win32ShimInvocation(command, args), windowsVerbatimArguments: true };
+  }
+  return { file: command, args };
+}
+
 export function parseRunArgs(argv: string[]): RunAgentArgs | { error: string } {
   const agent = argv[0];
   if (agent !== 'claude' && agent !== 'codex') return { error: 'expected claude or codex' };
@@ -253,10 +275,12 @@ export async function runAgent(args: RunAgentArgs, dependencies: RunAgentDepende
     log(`[speculate] launching ${args.agent} (observer: ${prepared.mode}, transport: ${prepared.transport})`);
     const outcome = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
       try {
-        child = launch(prepared.plan.command, prepared.plan.args, {
+        const invocation = nativeClientInvocation(args.agent, prepared.plan.command, prepared.plan.args);
+        child = launch(invocation.file, invocation.args, {
           cwd: process.cwd(),
           env: prepared.plan.env,
           stdio: 'inherit',
+          ...(invocation.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
         });
       } catch {
         resolveExit({ code: 127, signal: null });

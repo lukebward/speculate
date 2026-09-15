@@ -180,6 +180,7 @@ describe('detected hook boundary gaps', () => {
     const home = join(testRoot, 'home');
     mkdirSync(join(home, '.claude'), { recursive: true });
     writeFileSync(join(home, '.claude.json'), JSON.stringify({ mcpServers: { files: { command: process.execPath } } }));
+    writeFileSync(join(home, '.claude', 'remote-settings.json'), '{}');
     writeFileSync(join(home, '.claude', 'settings.json'), JSON.stringify({
       permissions: { allow: ['mcp__files__list_directory'] },
     }));

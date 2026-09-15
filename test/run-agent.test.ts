@@ -4,7 +4,14 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parseRunArgs, prepareAgentRun, runAgent, SessionMeasurementCollector, type PreparedAgentRun } from '../src/runAgent.js';
+import {
+  nativeClientInvocation,
+  parseRunArgs,
+  prepareAgentRun,
+  runAgent,
+  SessionMeasurementCollector,
+  type PreparedAgentRun,
+} from '../src/runAgent.js';
 import { buildLaunchPlan as buildClaudeLaunchPlan } from '../src/agentAdapters/claude.js';
 import { buildLaunchPlan as buildCodexLaunchPlan, codexProxyOverrideIsVerifiable } from '../src/agentAdapters/codex.js';
 import { extractCodexConfigInvocation } from '../src/codexClient.js';
@@ -714,7 +721,7 @@ describe('public run command', () => {
     const root = directory();
     const home = join(root, 'home');
     mkdirSync(home);
-    const client = join(root, 'fake-claude');
+    const client = join(root, 'fake-claude.mjs');
     const report = join(root, 'report.json');
     writeFileSync(client, '#!/usr/bin/env node\nprocess.exit(7)\n');
     chmodSync(client, 0o700);
@@ -756,11 +763,12 @@ describe('public run command', () => {
     const root = directory();
     const home = join(root, 'home');
     mkdirSync(home);
-    const client = join(root, 'fake-codex');
+    const client = join(root, 'fake-codex.mjs');
     const report = join(root, 'report.json');
     writeFileSync(client, `#!/usr/bin/env node
+import readline from 'node:readline';
 if (!process.argv.includes('app-server')) process.exit(6);
-const rl = require('node:readline').createInterface({ input: process.stdin });
+const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const message = JSON.parse(line);
   if (message.id === undefined) return;
@@ -790,6 +798,22 @@ rl.on('line', (line) => {
       disabledCapabilities: expect.arrayContaining([disabledReason]),
       exit: { code: 6, signal: null },
     });
+  });
+});
+
+describe('native client invocation', () => {
+  it.each(['claude', 'codex'] as const)('runs a %s Node launcher through the current Node executable', (agent) => {
+    expect(nativeClientInvocation(agent, 'C:\\fixture\\client.mjs', ['--literal'], 'win32')).toEqual({
+      file: process.execPath,
+      args: ['C:\\fixture\\client.mjs', '--literal'],
+    });
+  });
+
+  it('runs a Claude Windows shim through cmd.exe', () => {
+    const invocation = nativeClientInvocation('claude', 'C:\\fixture\\claude.cmd', ['--literal'], 'win32');
+    expect(invocation.file).toBe(process.env.COMSPEC ?? 'cmd.exe');
+    expect(invocation.args.slice(0, 3)).toEqual(['/d', '/s', '/c']);
+    expect(invocation.windowsVerbatimArguments).toBe(true);
   });
 });
 
