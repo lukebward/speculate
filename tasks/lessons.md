@@ -21,3 +21,5 @@
 - Verify launch-only native configuration at actual session startup. A management subcommand can ignore launch overrides and cannot establish their precedence.
 
 - A lifecycle window can contain several events. Deduplicate individual event identities; do not consume the entire window or remove it from later ambiguity checks after its first match.
+
+- When elapsed work exceeds expectations, check every agent immediately, report remaining gates honestly, and timebox advisory research. Close bounded implementation phases before opening more edge-case investigations; fix demonstrated correctness gaps without extending optional research.

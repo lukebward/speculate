@@ -156,3 +156,4 @@ covers the CLI daemon).
 ## Context-aware review evidence
 
 - Tasks 1–6 core snapshot `9fa3064`: build passed; full suite passed 1,197 tests with 8 skipped (84.05s). Launcher and final branch verification remain pending.
+- Task 7 snapshot `f65e38f`: build passed; full suite passed 1,257 tests with 8 skipped (84.69s). Actual Claude and Codex native-account launcher smoke passed expected final response, completed turn, active proxy mode, and zero relay failures. Review found two configuration-parsing/ownership issues; fixes and scoped rereview are underway. MCP consumption and performance gates remain pending.
