@@ -46,7 +46,8 @@ import {
   speculateCodexStatus,
   speculateCodexSync,
 } from './codexManage.js';
-import { applyCodexPolicy } from './codexPolicy.js';
+import { applyCodexPolicy, applyCodexPolicyProjection, type CodexPolicyProjection } from './codexPolicy.js';
+import { parseRunArgs, runAgent } from './runAgent.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
@@ -62,6 +63,8 @@ managed setup (on/off/status/sync/auth accept --client both|claude|codex):
                                            inventory bounded learned/usage memory
   speculate memory clear (--all | --config PATH) [--json]
                                            clear only the explicitly scoped memory records
+  speculate run claude|codex [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
+                                           launch a native client with session-scoped observation
   speculate auth [server]                  authorize Speculate with remote servers that need a
                                            login (no argument: every one that does)
   speculate auth <server> --forget         forget a saved remote-server login
@@ -121,6 +124,7 @@ const STARTER_CONFIG = `{
 interface Args {
   command:
     | 'run'
+    | 'agent-run'
     | 'doctor'
     | 'validate'
     | 'init'
@@ -254,6 +258,9 @@ function parseArgs(argv: string[]): Args {
   let configPath: string | null = null;
   let modeOverride: Args['modeOverride'] = null;
   let i = 0;
+  if (argv[0] === 'run') {
+    return { command: 'agent-run', configPath: '', modeOverride: null, rest: argv.slice(1) };
+  }
   if (
     argv[0] === 'doctor' ||
     argv[0] === 'validate' ||
@@ -384,6 +391,12 @@ async function runCommandPassThrough(execArgs: ExecArgs, label: string): Promise
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
+  if (args.command === 'agent-run') {
+    const runArgs = parseRunArgs(args.rest);
+    if ('error' in runArgs) fail(`run: ${runArgs.error}`);
+    process.exitCode = await runAgent(runArgs);
+    return;
+  }
   let selectedClient: ClientArgs = { client: 'both', rest: args.rest };
   if (['on', 'off', 'status', 'sync', 'auth'].includes(args.command)) {
     // Hooks installed before client selection existed baked only this flag.
@@ -602,27 +615,39 @@ async function main(): Promise<void> {
       process.cwd(),
       oauthScope,
     );
-    await applyCodexPolicy(wrapConfig, wrapArgs);
     let session: ProxySessionConfig | undefined;
+    let sessionHostClient: 'claude' | 'codex' | null = null;
     try {
       const metadata = readWrapSessionMetadata(wrapArgs);
       if (metadata) {
+        sessionHostClient = metadata.hostClient;
         const { connectSessionBridgeOwner } = await import('./sessionBridge.js');
         const runtime = await connectSessionBridgeOwner(metadata.coordinates, {
           hostClient: metadata.hostClient,
           hostServerAlias: metadata.hostServerAlias,
           onCandidates: () => {},
         });
+        if (metadata.hostClient === 'codex') {
+          const projection = await runtime.readStartupPolicy();
+          if (!validCodexProjection(projection)) throw new Error('Codex launch policy could not be verified');
+          applyCodexPolicyProjection(wrapConfig, projection);
+        }
         session = {
           launchId: metadata.coordinates.launchId,
           hostClient: metadata.hostClient,
           hostServerAlias: metadata.hostServerAlias,
           runtime,
+          permissionContext: (conversationId) => conversationId
+            ? runtime.currentPermissionContext(conversationId)
+            : null,
           cwd: process.cwd(),
         };
+      } else {
+        await applyCodexPolicy(wrapConfig, wrapArgs);
       }
     } catch (err) {
       process.stderr.write(`[speculate] session observer inactive: ${(err as Error).message}\n`);
+      if (sessionHostClient === 'codex' || wrapArgs.codexServer) wrapConfig.mode = 'off';
     }
     await runProxy(
       wrapConfig,
@@ -662,6 +687,14 @@ async function main(): Promise<void> {
   }
 
   await runProxy(config, statePath, args.configPath);
+}
+
+function validCodexProjection(value: unknown): value is CodexPolicyProjection {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Partial<CodexPolicyProjection>;
+  return typeof item.enabled === 'boolean' &&
+    (item.allowTools === null || Array.isArray(item.allowTools) && item.allowTools.every((tool) => typeof tool === 'string')) &&
+    Array.isArray(item.denyTools) && item.denyTools.every((tool) => typeof tool === 'string');
 }
 
 /** One y/n question on stderr, so stdout stays clean for real output. */
@@ -730,6 +763,9 @@ async function runProxy(
     stateScope,
     usageRecorder,
     session,
+    onObserverLifecycle: session?.runtime.publishLifecycle
+      ? async (event) => { await session.runtime.publishLifecycle!(event); }
+      : undefined,
   });
   const shutdown = async (): Promise<void> => {
     try {

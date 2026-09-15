@@ -19,6 +19,7 @@ import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { AgentKind } from './observerTypes.js';
 import type { SessionBridgeCoordinates } from './sessionBridge.js';
+import { RESERVED_LAUNCH_ENV } from './hostConfig.js';
 
 export interface WrapArgs {
   mode: SpeculationMode;
@@ -219,7 +220,8 @@ export function buildWrapConfig(
   const ambientCredentialEnv = Object.entries(process.env)
     .filter(
       (entry): entry is [string, string] =>
-        typeof entry[1] === 'string' && /token|api_?key|secret|credential|account|tenant/i.test(entry[0]),
+        typeof entry[1] === 'string' && !RESERVED_LAUNCH_ENV.has(entry[0]) &&
+        /token|api_?key|secret|credential|account|tenant/i.test(entry[0]),
     )
     .sort(([a], [b]) => a.localeCompare(b));
   const credentialScope =
@@ -246,7 +248,7 @@ export function buildWrapConfig(
         // including credentials and server-specific settings.
         env: Object.fromEntries(Object.entries(process.env).filter(
           (entry): entry is [string, string] =>
-            typeof entry[1] === 'string' && !entry[0].startsWith('SPECULATE_SESSION_'),
+            typeof entry[1] === 'string' && !RESERVED_LAUNCH_ENV.has(entry[0]),
         )),
         ...(args.cwd === undefined ? {} : { cwd: resolve(workspace, args.cwd) }),
       };

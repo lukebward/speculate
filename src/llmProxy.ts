@@ -51,6 +51,8 @@ export interface LlmProxy {
     connections: number;
     pendingJobs: number;
     partialRequests: number;
+    totalRequests: number;
+    failures: number;
   };
 }
 
@@ -58,6 +60,7 @@ export interface LlmProxyOptions {
   upstreamBaseUrl: string;
   adapter: AgentAdapter;
   onObservation?: (observation: Observation) => void | Promise<void>;
+  onObservationLoss?: (observedAt: number) => void;
 }
 
 interface ObservationJob {
@@ -264,6 +267,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
   const connections = new Map<Duplex, ConnectionState>();
   const selectedProtocols = new WeakMap<IncomingMessage, string>();
   const upgradeHeaders = new WeakMap<IncomingMessage, string[]>();
+  let totalRequests = 0;
+  let failures = 0;
   const webSocketServer = new WebSocketServer({
     noServer: true,
     allowSynchronousEvents: false,
@@ -277,6 +282,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
   webSocketServer.on('headers', (headers, request) => headers.push(...(upgradeHeaders.get(request) ?? [])));
 
   const server = createServer((request, response) => {
+    totalRequests++;
+    response.once('finish', () => { if (response.statusCode >= 400) failures++; });
     const path = upstreamPath(upstream, request.url ?? '/');
     if (path === null) {
       request.resume();
@@ -296,7 +303,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
         });
       } catch {}
     }
-    relayRequest({ request, response, upstream, path, observer, observations, upstreamRequests, connectionState });
+    relayRequest({ request, response, upstream, path, observer, observations, upstreamRequests, connectionState,
+      onObservationLoss: options.onObservationLoss, onFailure: () => { failures++; } });
   });
 
   server.on('connection', (socket) => {
@@ -330,6 +338,7 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
     socket.end('HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n');
   });
   server.on('upgrade', (request, socket, head) => {
+    totalRequests++;
     const path = upstreamPath(upstream, request.url ?? '/');
     if (path === null) {
       socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
@@ -350,6 +359,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
       selectedProtocols,
       upgradeHeaders,
       webSockets,
+      onObservationLoss: options.onObservationLoss,
+      onFailure: () => { failures++; },
     });
   });
   server.on('clientError', (_error, socket) => {
@@ -376,6 +387,8 @@ export async function startLlmProxy(options: LlmProxyOptions): Promise<LlmProxy>
         connections: states.length,
         pendingJobs: states.reduce((sum, state) => sum + state.pendingObservationJobs, 0),
         partialRequests: states.reduce((sum, state) => sum + state.partialRequests.size, 0),
+        totalRequests,
+        failures,
       };
     },
     close(): Promise<void> {
@@ -403,8 +416,10 @@ function relayRequest(input: {
   observations: ObservationQueue;
   upstreamRequests: Set<ClientRequest>;
   connectionState: ConnectionState | null;
+  onObservationLoss?: (observedAt: number) => void;
+  onFailure?: () => void;
 }): void {
-  const { request, response, upstream, observer, observations, upstreamRequests, connectionState } = input;
+  const { request, response, upstream, observer, observations, upstreamRequests, connectionState, onObservationLoss } = input;
   let observationActive = observer !== null;
   let observedRequestBytes = 0;
   let requestChunks: Buffer[] = [];
@@ -444,6 +459,7 @@ function relayRequest(input: {
     if (!observationActive) return;
     observationActive = false;
     requestChunks = [];
+    try { onObservationLoss?.(Date.now()); } catch {}
     try {
       observer?.abort();
     } catch {}
@@ -453,6 +469,7 @@ function relayRequest(input: {
   const fail = () => {
     if (settled) return;
     settled = true;
+    input.onFailure?.();
     settleUploadBackpressure();
     abortObservation();
     if (!response.headersSent) response.writeHead(502).end();
@@ -484,16 +501,18 @@ function relayRequest(input: {
       return;
     }
     response.writeHead(received.statusCode ?? 502, received.statusMessage ?? '', forwardHeaders(received.rawHeaders, received.headers));
+    const responseObservedAt = Date.now();
     enqueue(0, () => observer!.observeResponseStart({
       status: received.statusCode ?? 502,
       headers: normalizedHeaders(received.headers),
-    }));
+    }, responseObservedAt));
     received.on('data', (chunk: Buffer) => {
       if (settled) return;
       const forwarded = response.write(chunk);
       if (observationActive) {
         const copy = Buffer.from(chunk);
-        enqueue(copy.byteLength, () => observer!.observeResponseChunk(copy));
+        const observedAt = Date.now();
+        enqueue(copy.byteLength, () => observer!.observeResponseChunk(copy, observedAt));
       }
       if (!forwarded) {
         received.pause();
@@ -505,7 +524,8 @@ function relayRequest(input: {
       settled = true;
       connectionState?.partialRequests.delete(abortObservation);
       response.end();
-      enqueue(0, () => observer!.observeResponseEnd());
+      const observedAt = Date.now();
+      enqueue(0, () => observer!.observeResponseEnd(observedAt));
     });
     received.once('aborted', fail);
     received.once('error', fail);
@@ -530,7 +550,8 @@ function relayRequest(input: {
     if (observationActive) {
       const body = Buffer.concat(requestChunks, observedRequestBytes);
       requestChunks = [];
-      enqueue(body.byteLength, () => observer!.observeRequestBody(body));
+      const observedAt = Date.now();
+      enqueue(body.byteLength, () => observer!.observeRequestBody(body, observedAt));
     }
   });
   request.once('aborted', () => {
@@ -559,6 +580,8 @@ function relayWebSocket(input: {
   selectedProtocols: WeakMap<IncomingMessage, string>;
   upgradeHeaders: WeakMap<IncomingMessage, string[]>;
   webSockets: Set<WebSocket>;
+  onObservationLoss?: (observedAt: number) => void;
+  onFailure?: () => void;
 }): void {
   const {
     request,
@@ -591,6 +614,7 @@ function relayWebSocket(input: {
     state?.partialRequests.delete(abortObservation);
     if (!observationActive) return;
     observationActive = false;
+    try { input.onObservationLoss?.(Date.now()); } catch {}
     try {
       observer?.abort();
     } catch {}
@@ -663,6 +687,7 @@ function relayWebSocket(input: {
   let upgradeResponse: IncomingMessage | null = null;
   let downstream: WebSocket | null = null;
   let failureResponse = false;
+  let failureReported = false;
   let upstreamSocket: WebSocket;
   try {
     upstreamSocket = new WebSocket(wsUrl, requestedProtocols, {
@@ -680,6 +705,10 @@ function relayWebSocket(input: {
   webSockets.add(upstreamSocket);
 
   const failBeforeUpgrade = () => {
+    if (!failureReported) {
+      failureReported = true;
+      input.onFailure?.();
+    }
     if (downstream || failureResponse || socket.destroyed) return;
     finishTransport(false);
     socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
@@ -710,19 +739,22 @@ function relayWebSocket(input: {
         downstream = accepted;
         webSockets.add(accepted);
         accepted.once('close', () => webSockets.delete(accepted));
+        const responseObservedAt = Date.now();
         enqueue(0, () => observer!.observeResponseStart({
           status: 101,
           headers: normalizedHeaders(upgradeResponse!.headers),
-        }));
+        }, responseObservedAt));
         bridgeWebSockets(accepted, upstreamSocket, {
           clientMessage(message) {
             if (message.data.byteLength <= MAX_OBSERVATION_BYTES) {
-              enqueue(message.data.byteLength, () => observer!.observeClientMessage(message));
+              const observedAt = Date.now();
+              enqueue(message.data.byteLength, () => observer!.observeClientMessage(message, observedAt));
             } else abortObservation();
           },
           serverMessage(message) {
             if (message.data.byteLength <= MAX_OBSERVATION_BYTES) {
-              enqueue(message.data.byteLength, () => observer!.observeServerMessage(message));
+              const observedAt = Date.now();
+              enqueue(message.data.byteLength, () => observer!.observeServerMessage(message, observedAt));
             } else abortObservation();
           },
           error() {

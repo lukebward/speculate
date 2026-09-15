@@ -61,10 +61,10 @@ export class SpeculationExecutor {
   ) {}
 
   /** Fire-and-forget: never throws, never blocks the caller. */
-  submit(predictions: Prediction[]): void {
+  submit(predictions: Prediction[], opts: { queueOnBusy?: boolean } = {}): void {
     for (const p of predictions) {
       try {
-        this.tryIssue(p, { queueOnBusy: true });
+        this.tryIssue(p, { queueOnBusy: opts.queueOnBusy !== false });
       } catch (err) {
         this.suppress(p, `executor-error: ${(err as Error).message}`);
       }

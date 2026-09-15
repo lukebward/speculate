@@ -80,6 +80,20 @@ describe('Codex configuration transport', () => {
     expect(requests.at(-1)).toMatchObject({ method: 'config/batchWrite', params: update });
   });
 
+  it.each([
+    [{ account: { type: 'chatgpt', email: 'discarded@example.invalid' }, requiresOpenaiAuth: true }, 'chatgpt'],
+    [{ account: { type: 'apiKey' }, requiresOpenaiAuth: true }, 'apiKey'],
+    [{ account: { type: 'amazonBedrock' }, requiresOpenaiAuth: false }, 'amazonBedrock'],
+    [{ account: null, requiresOpenaiAuth: true }, 'none'],
+    [{ account: { type: 'unknown' }, requiresOpenaiAuth: true }, 'unverified'],
+  ] as const)('projects the non-secret account discriminator from account/read %#', async (response, expected) => {
+    const { client, requests } = await start((request, out) => {
+      out.write(`${JSON.stringify({ id: request.id, result: response })}\n`);
+    });
+    expect(await client.readAccountMode()).toBe(expected);
+    expect(requests.at(-1)).toMatchObject({ method: 'account/read', params: { refreshToken: false } });
+  });
+
   it('matches concurrent responses by request id', async () => {
     const held: Request[] = [];
     const { client } = await start((request, out) => {

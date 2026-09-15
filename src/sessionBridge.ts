@@ -8,7 +8,9 @@ import {
   observationSchema,
   sessionContextSchema,
   type AgentKind,
+  type AuthorizedCandidate,
   type Candidate,
+  type HostPermissionDecision,
   type LocalRouteDescriptor,
   type Observation,
   type RegisteredRoute,
@@ -17,6 +19,7 @@ import {
 import { parseResult } from './predictor.js';
 import { SessionPredictor } from './sessionPredictor.js';
 import type { ProxySessionEvent } from './proxy.js';
+import type { ObserverLifecycleEvent } from './types.js';
 
 const MAX_LINE_BYTES = 2 * 1024 * 1024 + 4096;
 const MAX_CANDIDATES_PER_EVENT = 3;
@@ -30,12 +33,30 @@ const MAX_CONVERSATIONS = 256;
 const MAX_SOCKET_BUFFER_BYTES = 256 * 1024;
 const MAX_UNAUTHENTICATED_SOCKETS = 32;
 const HANDSHAKE_TIMEOUT_MS = 1_000;
+const MAX_PENDING_AUTHORIZATIONS = 256;
+const MAX_PENDING_AUTHORIZATION_BYTES = 8 * 1024 * 1024;
 
 export interface SessionBridgeCoordinates {
   socketPath: string;
   capability: string;
   launchId: string;
 }
+
+export interface CandidateAuthorizationInput {
+  candidate: Candidate;
+  context: SessionContext;
+  route: RegisteredRoute;
+}
+
+export interface CandidateAuthorizationResult {
+  decision: HostPermissionDecision;
+  permissionContext: string | null;
+  reason?: string;
+}
+
+export type CandidateAuthorizer = (
+  input: Readonly<CandidateAuthorizationInput>,
+) => Promise<CandidateAuthorizationResult>;
 
 interface OwnerState {
   ownerId: string;
@@ -47,7 +68,7 @@ interface OwnerState {
 }
 
 interface ClientMessage {
-  type: 'hello' | 'register' | 'invalidate' | 'observation' | 'completed';
+  type: 'hello' | 'hook' | 'register' | 'invalidate' | 'observation' | 'completed' | 'lifecycle' | 'startup-policy';
   requestId?: number;
   capability?: string;
   launchId?: string;
@@ -58,12 +79,15 @@ interface ClientMessage {
   reason?: string;
   observation?: Observation;
   completion?: ProxySessionEvent;
+  payload?: unknown;
+  lifecycle?: ObserverLifecycleEvent;
 }
 
 type ServerMessage =
   | { type: 'response'; requestId: number; ok: true; value?: unknown }
   | { type: 'response'; requestId: number; ok: false; error: string }
-  | { type: 'candidates'; candidates: Candidate[] };
+  | { type: 'candidates'; candidates: Array<Candidate | AuthorizedCandidate> }
+  | { type: 'permission-context'; conversationId: string; permissionContext: string | null };
 
 function secureEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
@@ -115,9 +139,10 @@ function localAddress(): { socketPath: string; directory: string | null } {
 
 export class SessionBridge {
   readonly coordinates: SessionBridgeCoordinates;
+  readonly hookCoordinates: SessionBridgeCoordinates;
   private readonly owners = new Map<string, OwnerState>();
   private readonly sockets = new Set<Socket>();
-  private readonly conversations = new Set<string>();
+  private readonly conversations = new Map<string, SessionContext>();
   private readonly listeners = new Set<(observation: Observation) => void>();
   private readonly replay = new Map<string, number>();
   private readonly eventCounts = new Map<string, { count: number; at: number }>();
@@ -128,6 +153,9 @@ export class SessionBridge {
   private observationScheduled = false;
   private invalidationSequence = 0;
   private closed = false;
+  private pendingAuthorizationBytes = 0;
+  private hookEvents = 0;
+  private readonly pendingAuthorizations = new Map<string, number>();
 
   private constructor(
     private readonly context: SessionContext,
@@ -135,20 +163,34 @@ export class SessionBridge {
     private readonly directory: string | null,
     private readonly now: () => number,
     private readonly correlateCompletion: CompletionCorrelator | null,
+    private readonly authorizeCandidate: CandidateAuthorizer | null,
+    private onHook: ((client: AgentKind, payload: unknown, observedAt: number) => void) | null,
+    private readonly startupPolicy: ((hostClient: AgentKind, hostServerAlias: string) => Promise<unknown>) | null,
+    private readonly onLifecycle: ((event: ObserverLifecycleEvent) => void | Promise<void>) | null,
     coordinates: SessionBridgeCoordinates,
+    hookCoordinates: SessionBridgeCoordinates,
   ) {
     this.coordinates = coordinates;
-    this.conversations.add(context.conversationId);
+    this.hookCoordinates = hookCoordinates;
+    this.conversations.set(context.conversationId, context);
     this.sessionPredictor = new SessionPredictor({ routes: () => this.listRoutes(), now });
   }
 
   static async start(
     context: SessionContext,
-    opts: { now?: () => number; correlateCompletion?: CompletionCorrelator } = {},
+    opts: {
+      now?: () => number;
+      correlateCompletion?: CompletionCorrelator;
+      authorizeCandidate?: CandidateAuthorizer;
+      onHook?: (client: AgentKind, payload: unknown, observedAt: number) => void;
+      startupPolicy?: (hostClient: AgentKind, hostServerAlias: string) => Promise<unknown>;
+      onLifecycle?: (event: ObserverLifecycleEvent) => void | Promise<void>;
+    } = {},
   ): Promise<SessionBridge> {
     const parsedContext = sessionContextSchema.parse(context);
     const address = localAddress();
     const capability = randomBytes(32).toString('base64url');
+    const hookCapability = randomBytes(32).toString('base64url');
     const server = createServer();
     const bridge = new SessionBridge(
       parsedContext,
@@ -156,11 +198,16 @@ export class SessionBridge {
       address.directory,
       opts.now ?? Date.now,
       opts.correlateCompletion ?? null,
+      opts.authorizeCandidate ?? null,
+      opts.onHook ?? null,
+      opts.startupPolicy ?? null,
+      opts.onLifecycle ?? null,
       {
-      socketPath: address.socketPath,
-      capability,
-      launchId: context.launchId,
+        socketPath: address.socketPath,
+        capability,
+        launchId: context.launchId,
       },
+      { socketPath: address.socketPath, capability: hookCapability, launchId: context.launchId },
     );
     server.on('connection', (socket) => bridge.accept(socket));
     await new Promise<void>((resolve, reject) => {
@@ -179,6 +226,11 @@ export class SessionBridge {
     return [...this.owners.values()].flatMap((owner) => owner.routes.map((route) => structuredClone(route)));
   }
 
+  conversationContext(conversationId: string): SessionContext | null {
+    const context = this.conversations.get(conversationId);
+    return context ? structuredClone(context) : null;
+  }
+
   resolveObservedTool(hostServerAlias: string, exposedTool: string): RegisteredRoute | 'unknown' | 'ambiguous' {
     const matches = this.listRoutes().filter(
       (route) => route.hostServerAlias === hostServerAlias && route.exposedTool === exposedTool,
@@ -195,13 +247,27 @@ export class SessionBridge {
     context = parsed.data;
     if (
       context.launchId !== this.context.launchId ||
-      context.agent !== this.context.agent ||
-      context.cwd !== this.context.cwd
+      context.agent !== this.context.agent
     ) return false;
-    if (this.conversations.has(context.conversationId)) return true;
+    const existing = this.conversations.get(context.conversationId);
+    if (existing) {
+      if (existing.cwd === context.cwd) return true;
+      this.conversations.set(context.conversationId, context);
+      this.lastCompletionByConversation.delete(context.conversationId);
+      for (const target of this.owners.values()) {
+        if (!send(target.socket, { type: 'permission-context', conversationId: context.conversationId, permissionContext: null })) {
+          target.socket.destroy();
+        }
+      }
+      return true;
+    }
     if (this.conversations.size >= MAX_CONVERSATIONS) return false;
-    this.conversations.add(context.conversationId);
+    this.conversations.set(context.conversationId, context);
     return true;
+  }
+
+  setHookHandler(handler: (client: AgentKind, payload: unknown, observedAt: number) => void): void {
+    this.onHook = handler;
   }
 
   subscribe(listener: (observation: Observation) => void): () => void {
@@ -251,7 +317,8 @@ export class SessionBridge {
     const parsed = candidateSchema.safeParse(input);
     if (!parsed.success) return false;
     const candidate = parsed.data;
-    if (candidate.launchId !== this.context.launchId || !this.conversations.has(candidate.conversationId)) return false;
+    const candidateContext = this.conversations.get(candidate.conversationId);
+    if (candidate.launchId !== this.context.launchId || !candidateContext) return false;
     const now = this.now();
     if (candidate.createdAt > now || now - candidate.createdAt > MAX_CANDIDATE_AGE_MS) return false;
     this.pruneReplay(now);
@@ -264,10 +331,24 @@ export class SessionBridge {
       (route) => route.routeId === candidate.routeId && route.generation === candidate.generation,
     ));
     if (!owner) return false;
+    const authorizationBytes = this.authorizeCandidate
+      ? Buffer.byteLength(JSON.stringify({ candidate, context: candidateContext, route: owner.routes.find((route) =>
+        route.routeId === candidate.routeId && route.generation === candidate.generation) }), 'utf8')
+      : 0;
+    if (this.authorizeCandidate && (
+      this.pendingAuthorizations.size >= MAX_PENDING_AUTHORIZATIONS ||
+      this.pendingAuthorizationBytes + authorizationBytes > MAX_PENDING_AUTHORIZATION_BYTES
+    )) return false;
     this.replay.set(replayKey, now);
     this.eventCounts.set(eventKey, { count: count + 1, at: now });
     while (this.replay.size > MAX_REPLAY_IDS) this.replay.delete(this.replay.keys().next().value!);
     while (this.eventCounts.size > MAX_SOURCE_EVENTS) this.eventCounts.delete(this.eventCounts.keys().next().value!);
+    if (this.authorizeCandidate) {
+      this.pendingAuthorizations.set(replayKey, authorizationBytes);
+      this.pendingAuthorizationBytes += authorizationBytes;
+      void this.authorizeAndDeliver(candidate, candidateContext, owner, replayKey, now);
+      return true;
+    }
     const delivered = send(owner.socket, { type: 'candidates', candidates: [candidate] });
     if (!delivered) owner.socket.destroy();
     return delivered;
@@ -295,13 +376,54 @@ export class SessionBridge {
     this.observationQueue.length = 0;
     this.observationQueueBytes = 0;
     this.lastCompletionByConversation.clear();
+    this.pendingAuthorizations.clear();
+    this.pendingAuthorizationBytes = 0;
   }
 
   private acceptsContext(context: SessionContext): boolean {
     return context.launchId === this.context.launchId &&
       context.agent === this.context.agent &&
-      context.cwd === this.context.cwd &&
-      this.conversations.has(context.conversationId);
+      this.conversations.get(context.conversationId)?.cwd === context.cwd;
+  }
+
+  private async authorizeAndDeliver(
+    candidate: Candidate,
+    context: SessionContext,
+    owner: OwnerState,
+    replayKey: string,
+    reservedAt: number,
+  ): Promise<void> {
+    let result: CandidateAuthorizationResult = { decision: 'unverifiable', permissionContext: null };
+    const route = owner.routes.find((item) => item.routeId === candidate.routeId && item.generation === candidate.generation);
+    try {
+      if (route) result = await this.authorizeCandidate!({ candidate, context, route });
+    } catch {}
+    const bytes = this.pendingAuthorizations.get(replayKey);
+    if (bytes !== undefined) {
+      this.pendingAuthorizations.delete(replayKey);
+      this.pendingAuthorizationBytes -= bytes;
+    }
+    const currentOwner = this.owners.get(owner.ownerId);
+    const currentContext = this.conversations.get(candidate.conversationId);
+    const now = this.now();
+    const currentRoute = currentOwner?.routes.find((item) =>
+      item.routeId === candidate.routeId && item.generation === candidate.generation,
+    );
+    if (this.closed || !currentOwner || !currentRoute || !currentContext ||
+      currentContext.cwd !== context.cwd || this.replay.get(replayKey) !== reservedAt ||
+      candidate.createdAt > now || now - candidate.createdAt > MAX_CANDIDATE_AGE_MS) return;
+    const permissionContext = result.decision === 'allowed' && validId(result.permissionContext)
+      ? result.permissionContext
+      : null;
+    for (const target of this.owners.values()) {
+      if (!send(target.socket, { type: 'permission-context', conversationId: candidate.conversationId, permissionContext })) {
+        target.socket.destroy();
+      }
+    }
+    if (!permissionContext) return;
+    if (!send(currentOwner.socket, { type: 'candidates', candidates: [{ candidate, permissionContext }] })) {
+      currentOwner.socket.destroy();
+    }
   }
 
   private pruneReplay(now: number): void {
@@ -349,6 +471,21 @@ export class SessionBridge {
       if (raw === null || typeof raw !== 'object') return socket.destroy();
       const message = raw as ClientMessage;
       if (!owner) {
+        if (message.type === 'hook') {
+          clearTimeout(handshakeTimer);
+          if (
+            typeof message.capability === 'string' &&
+            message.launchId === this.context.launchId &&
+            message.hostClient === this.context.agent &&
+            secureEqual(message.capability, this.hookCoordinates.capability) &&
+            this.hookEvents < MAX_SOURCE_EVENTS
+          ) {
+            this.hookEvents++;
+            try { this.onHook?.(message.hostClient, message.payload, this.now()); } catch {}
+          }
+          socket.end();
+          return;
+        }
         if (
           message.type !== 'hello' ||
           typeof message.requestId !== 'number' ||
@@ -428,8 +565,23 @@ export class SessionBridge {
       return;
     }
     if (message.type === 'completed') {
-      const accepted = this.publishCompleted(owner, message.completion);
+      const accepted = this.queueCompleted(owner, message.completion);
       this.respond(owner, { type: 'response', requestId, ok: true, value: accepted });
+      return;
+    }
+    if (message.type === 'startup-policy' && this.startupPolicy) {
+      void this.startupPolicy(owner.hostClient, owner.hostServerAlias).then(
+        (value) => this.respond(owner, { type: 'response', requestId, ok: true, value }),
+        () => this.respond(owner, { type: 'response', requestId, ok: true, value: null }),
+      );
+      return;
+    }
+    if (message.type === 'lifecycle' && validLifecycle(message.lifecycle)) {
+      try {
+        const pending = this.onLifecycle?.(message.lifecycle);
+        void pending?.catch(() => {});
+      } catch {}
+      this.respond(owner, { type: 'response', requestId, ok: true, value: true });
       return;
     }
     this.respond(owner, { type: 'response', requestId, ok: false, error: 'unsupported bridge message' });
@@ -450,7 +602,7 @@ export class SessionBridge {
     });
   }
 
-  private publishCompleted(owner: OwnerState, input: unknown): boolean {
+  private queueCompleted(owner: OwnerState, input: unknown): boolean {
     if (!this.correlateCompletion || !validCompletion(input)) return false;
     const event = input;
     const route = owner.routes.find((candidate) =>
@@ -466,13 +618,26 @@ export class SessionBridge {
       event.hostClient !== owner.hostClient ||
       event.hostServerAlias !== owner.hostServerAlias
     ) return false;
+    void this.publishCompleted(owner, route, event);
+    return true;
+  }
+
+  private async publishCompleted(owner: OwnerState, route: RegisteredRoute, event: ProxySessionEvent): Promise<void> {
     let correlation: CompletionCorrelation | null = null;
-    try { correlation = this.correlateCompletion(event); } catch {}
-    if (!correlation || !validId(correlation.conversationId) || !this.conversations.has(correlation.conversationId)) {
-      return false;
+    try { correlation = await this.correlateCompletion!(event); } catch {}
+    const currentOwner = this.owners.get(owner.ownerId);
+    const currentRoute = currentOwner?.routes.find((candidate) =>
+      candidate.routeId === event.routeId && candidate.generation === event.generation,
+    );
+    if (!currentRoute) return;
+    const conversation = correlation && validId(correlation.conversationId)
+      ? this.conversations.get(correlation.conversationId)
+      : null;
+    if (!correlation || !conversation || (correlation.cwd !== undefined && correlation.cwd !== conversation.cwd)) {
+      return;
     }
     const eventId = correlation.eventId ?? event.eventId;
-    if (!validId(eventId)) return false;
+    if (!validId(eventId)) return;
     const previous = this.lastCompletionByConversation.get(correlation.conversationId);
     const ordered = correlation.ordered !== false && (
       previous === undefined ||
@@ -485,7 +650,7 @@ export class SessionBridge {
       });
     }
     const accepted = this.publishObservation({
-      context: { ...this.context, conversationId: correlation.conversationId },
+      context: conversation,
       kind: 'tool-complete',
       eventId,
       observedAt: event.completedAt,
@@ -496,17 +661,19 @@ export class SessionBridge {
       ordered,
     });
     if (!accepted) this.sessionPredictor.invalidate([]);
-    return accepted;
   }
 }
 
 export interface CompletionCorrelation {
   conversationId: string;
+  cwd?: string;
   eventId?: string;
   ordered?: boolean;
 }
 
-export type CompletionCorrelator = (event: Readonly<ProxySessionEvent>) => CompletionCorrelation | null;
+export type CompletionCorrelator = (
+  event: Readonly<ProxySessionEvent>,
+) => CompletionCorrelation | null | Promise<CompletionCorrelation | null>;
 
 function validId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 512;
@@ -542,10 +709,21 @@ function validLocalRoute(value: unknown): value is LocalRouteDescriptor {
     route.inputSchema !== null && typeof route.inputSchema === 'object' && !Array.isArray(route.inputSchema);
 }
 
+function validLifecycle(value: unknown): value is ObserverLifecycleEvent {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const event = value as Partial<ObserverLifecycleEvent>;
+  return ['suppressed', 'speculated', 'hit', 'joined', 'expired', 'invalidated', 'abandoned', 'spec_error'].includes(event.type ?? '') &&
+    typeof event.timestamp === 'number' && Number.isFinite(event.timestamp) &&
+    validId(event.ruleId) && event.observerAttribution !== undefined &&
+    (event.observerAttribution.client === 'claude' || event.observerAttribution.client === 'codex') &&
+    ['intent', 'transition', 'stream'].includes(event.observerAttribution.source) &&
+    validId(event.observerAttribution.routeId) && Number.isInteger(event.observerAttribution.generation);
+}
+
 export interface SessionBridgeOwnerOptions {
   hostClient: AgentKind;
   hostServerAlias: string;
-  onCandidates(candidates: Candidate[]): void;
+  onCandidates(candidates: Array<Candidate | AuthorizedCandidate>): void;
 }
 
 export class SessionBridgeOwner {
@@ -555,12 +733,13 @@ export class SessionBridgeOwner {
   private closed = false;
   private disconnectHandler: (() => void) | null = null;
   private readonly pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
+  private readonly permissionContexts = new Map<string, string>();
 
   private constructor(
     coordinates: SessionBridgeCoordinates,
     ownerId: string,
     private readonly socket: Socket,
-    private onCandidates: (candidates: Candidate[]) => void,
+    private onCandidates: (candidates: Array<Candidate | AuthorizedCandidate>) => void,
   ) {
     this.coordinates = coordinates;
     this.ownerId = ownerId;
@@ -581,6 +760,11 @@ export class SessionBridgeOwner {
       const message = raw as ServerMessage;
       if (message.type === 'candidates') {
         try { instance?.onCandidates(message.candidates); } catch {}
+        return;
+      }
+      if (message.type === 'permission-context') {
+        if (message.permissionContext) instance?.permissionContexts.set(message.conversationId, message.permissionContext);
+        else instance?.permissionContexts.delete(message.conversationId);
         return;
       }
       if (message.type !== 'response') return;
@@ -628,7 +812,15 @@ export class SessionBridgeOwner {
   }
 
   setCandidateHandler(handler: (candidates: unknown) => void): void {
-    this.onCandidates = handler;
+    this.onCandidates = handler as (candidates: Array<Candidate | AuthorizedCandidate>) => void;
+  }
+
+  currentPermissionContext(conversationId: string): string | null {
+    return this.permissionContexts.get(conversationId) ?? null;
+  }
+
+  async readStartupPolicy(): Promise<unknown> {
+    return await this.request({ type: 'startup-policy' });
   }
 
   setDisconnectHandler(handler: () => void): void {
@@ -651,9 +843,14 @@ export class SessionBridgeOwner {
     return await this.request({ type: 'completed', completion: event }) as boolean;
   }
 
+  async publishLifecycle(event: ObserverLifecycleEvent): Promise<boolean> {
+    return await this.request({ type: 'lifecycle', lifecycle: event }) as boolean;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.permissionContexts.clear();
     await new Promise<void>((resolve) => {
       if (this.socket.destroyed) return resolve();
       this.socket.once('close', () => resolve());

@@ -9,6 +9,12 @@ export interface CodexPolicyOptions {
   log?: (message: string) => void;
 }
 
+export interface CodexPolicyProjection {
+  enabled: boolean;
+  allowTools: string[] | null;
+  denyTools: string[];
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -48,6 +54,65 @@ async function readNativeConfig(cwd: string, args: WrapArgs): Promise<Record<str
   }
 }
 
+export function projectCodexPolicy(
+  effective: Record<string, unknown>,
+  serverName: string,
+): CodexPolicyProjection {
+  if (!record(effective.mcp_servers) || !Object.hasOwn(effective.mcp_servers, serverName)) invalidPolicy();
+  const server = effective.mcp_servers[serverName];
+  if (!record(server)) invalidPolicy();
+  if (server.enabled !== undefined && server.enabled !== null && typeof server.enabled !== 'boolean') invalidPolicy();
+  if (server.enabled === false) return { enabled: false, allowTools: [], denyTools: [] };
+  const enabled = toolList(server.enabled_tools);
+  const disabled = toolList(server.disabled_tools) ?? [];
+  const defaultPermitted = permitsSpeculation(server.default_tools_approval_mode, true);
+  const explicitAllowed: string[] = [];
+  const explicitDenied: string[] = [];
+  if (server.tools !== undefined && server.tools !== null) {
+    if (!record(server.tools)) invalidPolicy();
+    for (const [tool, policy] of Object.entries(server.tools)) {
+      if (!tool || !record(policy) || Object.keys(policy).some((key) => key !== 'approval_mode' && key !== 'output_token_limit')) invalidPolicy();
+      if (policy.output_token_limit !== undefined && policy.output_token_limit !== null &&
+        (!Number.isSafeInteger(policy.output_token_limit) || (policy.output_token_limit as number) <= 0)) invalidPolicy();
+      if (permitsSpeculation(policy.approval_mode, defaultPermitted)) explicitAllowed.push(tool);
+      else explicitDenied.push(tool);
+    }
+  }
+  let allowTools: string[] | null = enabled ?? null;
+  if (!defaultPermitted) {
+    const accepted = new Set(explicitAllowed);
+    allowTools = allowTools === null ? [...accepted] : allowTools.filter((tool) => accepted.has(tool));
+  }
+  return {
+    enabled: true,
+    allowTools,
+    denyTools: [...new Set([...disabled, ...explicitDenied])],
+  };
+}
+
+export function applyCodexPolicyProjection(
+  config: SpeculateConfig,
+  projection: CodexPolicyProjection,
+): void {
+  if (!projection.enabled) {
+    config.mode = 'off';
+    return;
+  }
+  const upstream = config.servers.upstream;
+  if (!upstream) invalidPolicy();
+  let allowed = config.mode === 'strict' ? [...(upstream.allowTools ?? [])] : undefined;
+  if (projection.allowTools !== null) {
+    const accepted = new Set(projection.allowTools);
+    allowed = allowed === undefined ? [...accepted] : allowed.filter((tool) => accepted.has(tool));
+  }
+  if (allowed !== undefined) {
+    config.mode = 'strict';
+    upstream.allowTools = allowed;
+  }
+  const denied = [...new Set([...(upstream.denyTools ?? []), ...projection.denyTools])];
+  if (denied.length) upstream.denyTools = denied;
+}
+
 /**
  * Narrow the existing eligibility gate; requested calls continue through the
  * ordinary proxy path. Every startup rereads the host's effective policy so a
@@ -62,54 +127,7 @@ export async function applyCodexPolicy(
   try {
     if (!args.codexBin || !args.codexHome) invalidPolicy();
     const effective = await (options.readConfig ?? readNativeConfig)(process.cwd(), args);
-    if (!record(effective.mcp_servers)) invalidPolicy();
-    if (!Object.hasOwn(effective.mcp_servers, args.codexServer)) invalidPolicy();
-    const server = effective.mcp_servers[args.codexServer];
-    if (!record(server)) invalidPolicy();
-    if (server.enabled !== undefined && server.enabled !== null && typeof server.enabled !== 'boolean') {
-      invalidPolicy();
-    }
-    if (server.enabled === false) {
-      config.mode = 'off';
-      return;
-    }
-
-    const enabled = toolList(server.enabled_tools);
-    const disabled = toolList(server.disabled_tools) ?? [];
-    const defaultPermitted = permitsSpeculation(server.default_tools_approval_mode, true);
-    const explicitAllowed: string[] = [];
-    const explicitDenied: string[] = [];
-    if (server.tools !== undefined && server.tools !== null) {
-      if (!record(server.tools)) invalidPolicy();
-      for (const [tool, policy] of Object.entries(server.tools)) {
-        if (!tool || !record(policy)
-          || Object.keys(policy).some((key) => key !== 'approval_mode' && key !== 'output_token_limit')) {
-          invalidPolicy();
-        }
-        if (policy.output_token_limit !== undefined && policy.output_token_limit !== null
-          && (!Number.isSafeInteger(policy.output_token_limit) || (policy.output_token_limit as number) <= 0)) {
-          invalidPolicy();
-        }
-        if (permitsSpeculation(policy.approval_mode, defaultPermitted)) explicitAllowed.push(tool);
-        else explicitDenied.push(tool);
-      }
-    }
-
-    const upstream = config.servers.upstream;
-    if (!upstream) invalidPolicy();
-    let allowed = config.mode === 'strict' ? [...(upstream.allowTools ?? [])] : undefined;
-    const restrictTo = (tools: string[]): void => {
-      const accepted = new Set(tools);
-      allowed = allowed === undefined ? [...accepted] : allowed.filter((tool) => accepted.has(tool));
-    };
-    if (enabled !== undefined) restrictTo(enabled);
-    if (!defaultPermitted) restrictTo(explicitAllowed);
-    if (allowed !== undefined) {
-      config.mode = 'strict';
-      upstream.allowTools = allowed;
-    }
-    const denied = [...new Set([...(upstream.denyTools ?? []), ...disabled, ...explicitDenied])];
-    if (denied.length) upstream.denyTools = denied;
+    applyCodexPolicyProjection(config, projectCodexPolicy(effective, args.codexServer));
   } catch {
     config.mode = 'off';
     (options.log ?? ((message: string) => process.stderr.write(`${message}\n`)))(

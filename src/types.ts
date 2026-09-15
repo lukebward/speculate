@@ -86,6 +86,7 @@ export interface ExecutionLease {
   routeId: string;
   generation: number;
   permissionContext?: string;
+  conversationId?: string;
 }
 
 export interface LeaseValidator {

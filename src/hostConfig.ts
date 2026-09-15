@@ -34,6 +34,16 @@ export interface McpServerEntry {
   [key: string]: unknown;
 }
 
+export const RESERVED_LAUNCH_ENV = new Set([
+  'SPECULATE_SESSION_SOCKET',
+  'SPECULATE_SESSION_CAPABILITY',
+  'SPECULATE_SESSION_LAUNCH_ID',
+  'SPECULATE_OBSERVER_SOCKET',
+  'SPECULATE_OBSERVER_CAPABILITY',
+  'SPECULATE_OBSERVER_LAUNCH_ID',
+  'SPECULATE_OBSERVER_CLIENT',
+]);
+
 export type ClaudeScope = 'user' | 'project' | 'local';
 
 export interface ScopedServer {
@@ -747,6 +757,59 @@ export function wrapEntry(
     command: self.command,
     ...(sessionEnv ? { env: { ...(entry.env ?? {}), ...sessionEnv } } : {}),
     args: [...self.args, 'wrap', ...modeArgs, ...identityArgs, '--', entry.command!, ...(entry.args ?? [])],
+  };
+}
+
+export type SessionWrapResult =
+  | { entry: McpServerEntry }
+  | { reason: 'reserved-session-env' | 'unsupported-entry' };
+
+export function wrapLaunchEntry(
+  alias: string,
+  original: McpServerEntry,
+  self: { command: string; args: string[] },
+  session: {
+    hostClient: 'claude' | 'codex';
+    socketPath: string;
+    capability: string;
+    launchId: string;
+  },
+): SessionWrapResult {
+  if (Object.keys(original.env ?? {}).some((name) => RESERVED_LAUNCH_ENV.has(name))) {
+    return { reason: 'reserved-session-env' };
+  }
+  if (isWrappedEntry(original)) {
+    const args = original.args ?? [];
+    const wrapAt = args.indexOf('wrap');
+    if (wrapAt < 0) return { reason: 'unsupported-entry' };
+    return {
+      entry: {
+        ...original,
+        command: self.command,
+        env: {
+          ...(original.env ?? {}),
+          SPECULATE_SESSION_SOCKET: session.socketPath,
+          SPECULATE_SESSION_CAPABILITY: session.capability,
+          SPECULATE_SESSION_LAUNCH_ID: session.launchId,
+        },
+        args: [
+          ...self.args,
+          'wrap',
+          '--host-client', session.hostClient,
+          '--host-server', alias,
+          ...args.slice(wrapAt + 1),
+        ],
+      },
+    };
+  }
+  const unwrapped = original;
+  if (!unwrapped || (!isStdioEntry(unwrapped) && !planRemoteWrap(unwrapped)?.wrappable)) {
+    return { reason: 'unsupported-entry' };
+  }
+  return {
+    entry: wrapEntry(unwrapped, self, {
+      session: { ...session, hostServerAlias: alias },
+    }),
   };
 }
 

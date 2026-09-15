@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
+import { resolveCodexBin, type CodexConfigRead } from '../codexClient.js';
+import { isStdioEntry, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -17,6 +20,8 @@ import {
   type RegisteredRoute,
   type SessionContext,
   type WebSocketMessage,
+  type AgentLaunchContext,
+  type LaunchPlan,
 } from '../observerTypes.js';
 
 const MAX_STREAM_ARGUMENT_BYTES = 64 * 1024;
@@ -269,6 +274,8 @@ class ResponseTracker {
   private readonly emitted = new Set<string>();
   private retainedBytes = 0;
   private stopped = false;
+  private boundaryAt: number | null = null;
+  private opaqueExec = false;
 
   constructor(
     private readonly context: SessionContext,
@@ -289,13 +296,20 @@ class ResponseTracker {
     return this.retain(RETAINED_ENTRY_BYTES + retainedStringBytes(lane));
   }
 
-  readRequest(value: Record<string, unknown>, bytes: Uint8Array): Observation[] {
+  readRequest(value: Record<string, unknown>, bytes: Uint8Array, observedAt?: number): Observation[] {
+    this.boundaryAt = observedAt ?? this.now();
     if (this.stopped) return [];
     const hasTools = Object.prototype.hasOwnProperty.call(value, 'tools');
     if (hasTools) {
       this.responseContext.complete = true;
       this.captureRoutes(value.tools);
     } else if (boundedId(value.previous_response_id)) {
+      try {
+        this.environment.onExecutionWindow?.({
+          source: 'model', phase: 'closed', context: this.context,
+          windowId: value.previous_response_id, observedAt: this.boundaryAt,
+        });
+      } catch {}
       const prior = this.previous(value.previous_response_id);
       if (prior?.complete) {
         this.responseContext.complete = true;
@@ -313,15 +327,17 @@ class ResponseTracker {
       kind: 'prompt',
       context: this.context,
       eventId: this.eventId('prompt', stableId),
-      observedAt: this.now(),
+      observedAt: this.boundaryAt,
       occurrenceId: this.promptOccurrences.identify(this.context.conversationId, text, 'proxy', nativeId),
       text,
     });
   }
 
-  readEvent(event: Record<string, unknown>): Observation[] {
+  readEvent(event: Record<string, unknown>, observedAt?: number): Observation[] {
+    this.boundaryAt = observedAt ?? this.now();
     if (this.stopped) return [];
     if (terminalState(event) === 'failed') {
+      try { this.environment.onTrackingLoss?.(this.boundaryAt); } catch {}
       this.abort();
       return [];
     }
@@ -370,13 +386,15 @@ class ResponseTracker {
       const observations = Array.isArray(event.response.output)
         ? event.response.output.flatMap((item) => object(item) ? this.completedItem(item) : [])
         : [];
+      this.openOpaqueWindow();
       this.complete();
       return observations;
     }
     return [];
   }
 
-  readJsonResponse(value: unknown): Observation[] {
+  readJsonResponse(value: unknown, observedAt?: number): Observation[] {
+    this.boundaryAt = observedAt ?? this.now();
     if (!object(value)) return [];
     if (boundedId(value.id)) this.setResponseId(value.id);
     if (value.status !== 'completed') {
@@ -386,6 +404,7 @@ class ResponseTracker {
     const observations = Array.isArray(value.output)
       ? value.output.flatMap((item) => object(item) ? this.completedItem(item) : [])
       : [];
+    this.openOpaqueWindow();
     this.complete();
     return observations;
   }
@@ -462,6 +481,11 @@ class ResponseTracker {
   }
 
   private completedItem(item: Record<string, unknown>): Observation[] {
+    if (item.type === 'custom_tool_call' && item.name === 'exec' &&
+      (boundedId(item.call_id) || boundedId(item.id))) {
+      this.opaqueExec = true;
+      return [];
+    }
     if (item.type !== 'function_call') return [];
     const active = boundedId(item.id) ? this.calls.get(item.id) : undefined;
     const callId = boundedId(item.call_id) ? item.call_id : active?.callId;
@@ -484,11 +508,18 @@ class ResponseTracker {
       return [];
     }
     this.emitted.add(callId);
+    const observedAt = this.boundaryAt ?? this.now();
+    try {
+      this.environment.onToolCallMarker?.({
+        source: 'model', phase: 'selected', context: this.context,
+        routeId: route.routeId, generation: route.generation, callId, args, observedAt,
+      });
+    } catch {}
     return this.observation({
       kind: 'stream-call',
       context: this.context,
       eventId: this.eventId('stream-call', callId),
-      observedAt: this.now(),
+      observedAt,
       routeId: route.routeId,
       callId,
       args,
@@ -547,6 +578,16 @@ class ResponseTracker {
   private eventId(kind: Observation['kind'], stableId: string): string {
     return this.environment.eventId?.(kind, stableId) ?? `codex:${kind}:${stableId || randomUUID()}`;
   }
+
+  private openOpaqueWindow(): void {
+    if (!this.opaqueExec || !this.responseId) return;
+    try {
+      this.environment.onExecutionWindow?.({
+        source: 'model', phase: 'opened', context: this.context,
+        windowId: this.responseId, observedAt: this.boundaryAt ?? this.now(),
+      });
+    } catch {}
+  }
 }
 
 class CodexRequestObserver implements AgentAdapterRequestObserver {
@@ -572,7 +613,7 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
     this.tracker = new ResponseTracker(context, environment, promptOccurrences, retainedBudget, remember, previous);
   }
 
-  observeRequestBody(body: Uint8Array): readonly Observation[] {
+  observeRequestBody(body: Uint8Array, observedAt?: number): readonly Observation[] {
     if (this.stopped || body.byteLength > MAX_OBSERVATION_BYTES || !inspectableEncoding(this.request.headers)) {
       this.abort();
       return [];
@@ -589,12 +630,12 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
       return [];
     }
     this.requestReady = true;
-    const observations = this.tracker.readRequest(parsed, body);
+    const observations = this.tracker.readRequest(parsed, body, observedAt);
     if (this.tracker.isStopped) this.abort();
     return observations;
   }
 
-  observeResponseStart(response: AgentAdapterResponse): readonly Observation[] {
+  observeResponseStart(response: AgentAdapterResponse, _observedAt?: number): readonly Observation[] {
     if (this.stopped || !this.requestReady || response.status < 200 || response.status >= 300 || !inspectableEncoding(response.headers)) {
       this.abort();
       return [];
@@ -606,7 +647,7 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
     return [];
   }
 
-  observeResponseChunk(chunk: Uint8Array): readonly Observation[] {
+  observeResponseChunk(chunk: Uint8Array, observedAt?: number): readonly Observation[] {
     if (this.stopped || this.responseMode === 'none') return [];
     this.responseBytes += chunk.byteLength;
     if (this.responseBytes > MAX_OBSERVATION_BYTES) {
@@ -614,16 +655,16 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
       return [];
     }
     this.responseText += this.decoder.write(Buffer.from(chunk));
-    const observations = this.responseMode === 'sse' ? this.readSse(false) : [];
+    const observations = this.responseMode === 'sse' ? this.readSse(false, observedAt) : [];
     if (this.tracker.isStopped) this.abort();
     return observations;
   }
 
-  observeResponseEnd(): readonly Observation[] {
+  observeResponseEnd(observedAt?: number): readonly Observation[] {
     if (this.stopped || this.responseMode === 'none') return [];
     this.responseText += this.decoder.end();
     let observations: Observation[];
-    if (this.responseMode === 'sse') observations = this.readSse(true);
+    if (this.responseMode === 'sse') observations = this.readSse(true, observedAt);
     else {
       let parsed: unknown;
       try {
@@ -631,7 +672,7 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
       } catch {
         parsed = null;
       }
-      observations = this.tracker.readJsonResponse(parsed);
+      observations = this.tracker.readJsonResponse(parsed, observedAt);
     }
     this.finish();
     return observations;
@@ -643,21 +684,21 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
     this.finish();
   }
 
-  private readSse(ended: boolean): Observation[] {
+  private readSse(ended: boolean, observedAt?: number): Observation[] {
     const out: Observation[] = [];
     for (;;) {
       const match = /\r?\n\r?\n/.exec(this.responseText);
       if (!match) break;
       const block = this.responseText.slice(0, match.index);
       this.responseText = this.responseText.slice(match.index + match[0].length);
-      out.push(...this.readSseBlock(block));
+      out.push(...this.readSseBlock(block, observedAt));
     }
-    if (ended && this.responseText.trim()) out.push(...this.readSseBlock(this.responseText));
+    if (ended && this.responseText.trim()) out.push(...this.readSseBlock(this.responseText, observedAt));
     if (ended) this.responseText = '';
     return out;
   }
 
-  private readSseBlock(block: string): Observation[] {
+  private readSseBlock(block: string, observedAt?: number): Observation[] {
     const data = block.split(/\r?\n/).filter((line) => line.startsWith('data:'))
       .map((line) => line.slice(5).replace(/^ /, '')).join('\n');
     if (!data || data === '[DONE]') return [];
@@ -667,7 +708,7 @@ class CodexRequestObserver implements AgentAdapterRequestObserver {
     } catch {
       return [];
     }
-    return object(event) ? this.tracker.readEvent(event) : [];
+    return object(event) ? this.tracker.readEvent(event, observedAt) : [];
   }
 
   private finish(): void {
@@ -706,7 +747,7 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
     private readonly release: () => void,
   ) {}
 
-  observeResponseStart(response: AgentAdapterResponse): readonly Observation[] {
+  observeResponseStart(response: AgentAdapterResponse, _observedAt?: number): readonly Observation[] {
     if (this.stopped || response.status !== 101) {
       this.abort();
       return [];
@@ -715,7 +756,7 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
     return [];
   }
 
-  observeClientMessage(message: WebSocketMessage): readonly Observation[] {
+  observeClientMessage(message: WebSocketMessage, observedAt?: number): readonly Observation[] {
     if (!this.ready || this.stopped || message.binary || message.data.byteLength > MAX_OBSERVATION_BYTES) return [];
     const parsed = this.parse(message.data);
     if (!parsed || parsed.type !== 'response.create' || this.trackers.size >= MAX_ACTIVE_RESPONSES) return [];
@@ -736,12 +777,12 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
     const pending = this.pendingByLane.get(lane) ?? [];
     pending.push(tracker);
     this.pendingByLane.set(lane, pending);
-    const observations = tracker.readRequest(parsed, message.data);
+    const observations = tracker.readRequest(parsed, message.data, observedAt);
     if (tracker.isStopped) this.releaseTracker(tracker);
     return observations;
   }
 
-  observeServerMessage(message: WebSocketMessage): readonly Observation[] {
+  observeServerMessage(message: WebSocketMessage, observedAt?: number): readonly Observation[] {
     if (!this.ready || this.stopped || message.binary || message.data.byteLength > MAX_OBSERVATION_BYTES) return [];
     const event = this.parse(message.data);
     if (!event) return [];
@@ -751,7 +792,7 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
       const lane = boundedId(event.stream_id) ? event.stream_id : null;
       const tracker = this.takePending(lane);
       if (!tracker) return [];
-      tracker.readEvent(event);
+      tracker.readEvent(event, observedAt);
       if (tracker.isStopped) {
         this.releaseTracker(tracker);
         return [];
@@ -775,7 +816,10 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
       }
       return [];
     }
-    const observations = terminal === 'failed' ? [] : response.tracker.readEvent(event);
+    if (terminal === 'failed') {
+      try { this.environment.onTrackingLoss?.(observedAt ?? Date.now()); } catch {}
+    }
+    const observations = terminal === 'failed' ? [] : response.tracker.readEvent(event, observedAt);
     if (terminal !== null || response.tracker.isStopped) this.releaseResponse(response);
     return observations;
   }
@@ -852,6 +896,264 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
   return {
     agent: 'codex',
     createConnection: () => new CodexConnection(environment, promptOccurrences),
-    normalizeHook: () => [],
+    normalizeHook(payload: unknown, boundaryAt?: number): readonly Observation[] {
+      if (!record(payload)) return [];
+      const conversationId = boundedId(payload.thread_id)
+        ? payload.thread_id
+        : boundedId(payload.session_id) ? payload.session_id : null;
+      if (!conversationId) return [];
+      let context: SessionContext | null = null;
+      try {
+        const parsed = sessionContextSchema.safeParse(environment.contextForConversation(
+          conversationId,
+          typeof payload.cwd === 'string' ? payload.cwd : undefined,
+        ));
+        if (parsed.success && parsed.data.agent === 'codex' && parsed.data.conversationId === conversationId) context = parsed.data;
+      } catch {}
+      if (!context) return [];
+      const event = typeof payload.type === 'string'
+        ? payload.type
+        : typeof payload.hook_event_name === 'string' ? payload.hook_event_name : '';
+      const phase = event === 'before-tool-use' || event === 'PreToolUse'
+        ? 'started'
+        : event === 'after-tool-use' || event === 'tool-use-error' || event === 'PostToolUse' || event === 'PostToolUseFailure'
+          ? 'settled'
+          : null;
+      const toolName = typeof payload.tool_name === 'string' ? payload.tool_name : null;
+      const callId = boundedId(payload.tool_use_id) ? payload.tool_use_id : null;
+      const args = record(payload.arguments) ? payload.arguments : record(payload.tool_input) ? payload.tool_input : null;
+      if (phase && toolName && callId && args) {
+        const routes = environment.routes().filter((route) => route.hostClient === 'codex' && modelToolName(route) === toolName);
+        if (routes.length === 1) {
+          try {
+            environment.onToolCallMarker?.({
+              source: 'hook', phase, context, routeId: routes[0]!.routeId,
+              generation: routes[0]!.generation, callId, args,
+              observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
+              ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
+              ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
+            });
+          } catch {}
+        }
+        return [];
+      }
+      if ((event !== 'user-prompt-submit' && event !== 'UserPromptSubmit') || typeof payload.prompt !== 'string' ||
+        Buffer.byteLength(payload.prompt, 'utf8') > MAX_OBSERVATION_BYTES) return [];
+      const stableId = createHash('sha256').update(conversationId).update('\0').update(payload.prompt).digest('base64url');
+      return [{
+        kind: 'prompt', context,
+        eventId: environment.eventId?.('prompt', `hook:${stableId}`) ?? `codex:prompt:hook:${randomUUID()}`,
+        observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
+        occurrenceId: promptOccurrences.identify(conversationId, payload.prompt, 'hook'),
+        text: payload.prompt,
+      }];
+    },
+  };
+}
+
+export interface CodexLaunchContext extends AgentLaunchContext {
+  nativeConfig: CodexConfigRead;
+  nativeUpstreamBaseUrl?: string | null;
+  nativeGlobalArgs?: readonly string[];
+}
+
+function hookCommand(): string {
+  const script = fileURLToPath(new URL('../../plugin/hooks/session-observer.mjs', import.meta.url));
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  return `${quote(process.execPath)} ${quote(script)}`;
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function toml(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (Array.isArray(value)) return `[${value.map(toml).join(', ')}]`;
+  if (record(value)) {
+    return `{ ${Object.entries(value).map(([key, item]) => `${JSON.stringify(key)} = ${toml(item)}`).join(', ')} }`;
+  }
+  throw new Error('unsupported Codex launch override value');
+}
+
+function override(path: string, value: unknown): string[] {
+  return ['-c', `${path}=${toml(value)}`];
+}
+
+function codexHookConfig(existing: unknown): Record<string, unknown> | null {
+  if (existing !== undefined && !record(existing)) return null;
+  const hooks = structuredClone((existing as Record<string, unknown> | undefined) ?? {});
+  const handler = { type: 'command', command: hookCommand(), async: true, timeout: 1 };
+  for (const event of [
+    'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse',
+    'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'SessionEnd',
+  ]) {
+    const current = hooks[event];
+    if (current !== undefined && !Array.isArray(current)) return null;
+    hooks[event] = [...((current as unknown[] | undefined) ?? []), { hooks: [handler] }];
+  }
+  return hooks;
+}
+
+function configOverrideTouches(args: readonly string[], root: string): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    const value = arg === '-c' || arg === '--config'
+      ? args[++index]
+      : arg.startsWith('--config=') ? arg.slice('--config='.length) : null;
+    if (!value) continue;
+    const equalsAt = value.indexOf('=');
+    const key = value.slice(0, equalsAt < 0 ? value.length : equalsAt).trim();
+    const quotedRoot = JSON.stringify(root);
+    if (key === root || key.startsWith(`${root}.`) || key === quotedRoot || key.startsWith(`${quotedRoot}.`)) return true;
+  }
+  return false;
+}
+
+function configOverrideAffectsOwnedTransport(args: readonly string[], alias: string): boolean {
+  const roots = [
+    `mcp_servers.${alias}`,
+    `mcp_servers.${JSON.stringify(alias)}`,
+    `"mcp_servers".${alias}`,
+    `"mcp_servers".${JSON.stringify(alias)}`,
+  ];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    const value = arg === '-c' || arg === '--config'
+      ? args[++index]
+      : arg.startsWith('--config=') ? arg.slice('--config='.length) : null;
+    if (!value) continue;
+    const equalsAt = value.indexOf('=');
+    const key = value.slice(0, equalsAt < 0 ? value.length : equalsAt).trim();
+    if (key === 'mcp_servers' || key === '"mcp_servers"') return true;
+    const root = roots.find((candidate) => key === candidate || key.startsWith(`${candidate}.`));
+    if (!root) continue;
+    if (key === root) return true;
+    const field = key.slice(root.length + 1).split('.', 1)[0]!.replace(/^"|"$/g, '');
+    if (field === 'command' || field === 'args' || field === 'env' || field === 'cwd' || field === 'type' || field === 'url') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function supportsFinalOverridePlacement(args: readonly string[]): boolean {
+  const sentinel = args.indexOf('--');
+  return args.slice(0, sentinel < 0 ? args.length : sentinel).includes('exec');
+}
+
+function placeGeneratedOverrides(generated: readonly string[], clientArgs: readonly string[]): string[] {
+  if (!supportsFinalOverridePlacement(clientArgs)) return [...generated, ...clientArgs];
+  const sentinel = clientArgs.indexOf('--');
+  if (sentinel < 0) return [...clientArgs, ...generated];
+  return [...clientArgs.slice(0, sentinel), ...generated, ...clientArgs.slice(sentinel)];
+}
+
+export function codexProxyOverrideIsVerifiable(
+  config: Record<string, unknown>,
+  nativeGlobalArgs: readonly string[],
+  clientArgs: readonly string[] = [],
+): boolean {
+  if (supportsFinalOverridePlacement(clientArgs)) return true;
+  const provider = typeof config.model_provider === 'string' ? config.model_provider : 'openai';
+  return provider === 'openai'
+    ? !configOverrideTouches(nativeGlobalArgs, 'openai_base_url')
+    : !configOverrideTouches(nativeGlobalArgs, 'model_providers');
+}
+
+export async function buildLaunchPlan(context: CodexLaunchContext): Promise<LaunchPlan> {
+  const effective = context.nativeConfig.config;
+  const generated: string[] = [];
+  const disabledCapabilities: string[] = [];
+  const modelProvider = typeof effective.model_provider === 'string' ? effective.model_provider : 'openai';
+  if (context.observe === 'proxy' && context.relayBaseUrl &&
+    !codexProxyOverrideIsVerifiable(effective, context.nativeGlobalArgs ?? [], context.clientArgs)) {
+    throw new Error('Codex provider override would bypass proxy observation');
+  }
+  let upstreamBaseUrl: string;
+  if (modelProvider === 'openai') {
+    upstreamBaseUrl = typeof effective.openai_base_url === 'string'
+      ? effective.openai_base_url
+      : context.nativeUpstreamBaseUrl ?? '';
+    if (!upstreamBaseUrl && context.observe === 'proxy') {
+      throw new Error('Codex account route could not be verified for proxy observation');
+    }
+    if (!upstreamBaseUrl) upstreamBaseUrl = 'https://invalid.invalid';
+    if (context.observe === 'proxy' && context.relayBaseUrl) generated.push(...override('openai_base_url', context.relayBaseUrl));
+  } else {
+    const providers = effective.model_providers;
+    const selected = record(providers) ? providers[modelProvider] : null;
+    if (!record(selected) || typeof selected.base_url !== 'string') {
+      if (context.observe === 'proxy') throw new Error('selected Codex provider endpoint could not be verified');
+      upstreamBaseUrl = 'https://invalid.invalid';
+    } else {
+      upstreamBaseUrl = selected.base_url;
+    }
+    if (context.observe === 'proxy' && context.relayBaseUrl) {
+      generated.push(...override(`model_providers.${JSON.stringify(modelProvider)}.base_url`, context.relayBaseUrl));
+    }
+  }
+  const servers = record(effective.mcp_servers) ? effective.mcp_servers : {};
+  const finalOverrides = supportsFinalOverridePlacement(context.clientArgs);
+  for (const [alias, raw] of Object.entries(servers)) {
+    if (!record(raw) || raw.enabled === false || !isStdioEntry(raw as McpServerEntry)) continue;
+    if (!finalOverrides && configOverrideAffectsOwnedTransport(context.nativeGlobalArgs ?? [], alias)) {
+      disabledCapabilities.push('owned-mcp:config-override-precedence');
+      continue;
+    }
+    const wrapped = wrapLaunchEntry(alias, raw as McpServerEntry, context.self, {
+      hostClient: 'codex',
+      socketPath: context.session.socketPath,
+      capability: context.session.capability,
+      launchId: context.session.launchId,
+    });
+    if (!('entry' in wrapped)) {
+      disabledCapabilities.push(`owned-mcp:${wrapped.reason}`);
+      continue;
+    }
+    const entryOverrides: string[] = [];
+    try {
+      for (const key of ['command', 'args', 'env', 'cwd'] as const) {
+        const value = wrapped.entry[key];
+        if (value !== undefined) entryOverrides.push(...override(`mcp_servers.${JSON.stringify(alias)}.${key}`, value));
+      }
+    } catch {
+      disabledCapabilities.push('owned-mcp:unsupported-entry');
+      continue;
+    }
+    generated.push(...entryOverrides);
+  }
+  if (context.observe !== 'off') {
+    const hooks = codexHookConfig(effective.hooks);
+    const features = record(effective.features) ? effective.features : {};
+    const hooksRemainNative = !finalOverrides && configOverrideTouches(context.nativeGlobalArgs ?? [], 'hooks');
+    if (hooksRemainNative) {
+      disabledCapabilities.push('hook-observation:config-override-precedence');
+    } else if (hooks && features.hooks !== false && features.codex_hooks !== false && effective.allow_managed_hooks_only !== true) {
+      try { generated.push(...override('hooks', hooks)); }
+      catch { disabledCapabilities.push('hook-observation:unsupported-settings'); }
+    } else {
+      disabledCapabilities.push('hook-observation:settings-policy');
+    }
+  }
+  const env: NodeJS.ProcessEnv = { ...context.env };
+  if (context.observe !== 'off') {
+    env.SPECULATE_OBSERVER_SOCKET = context.hook.socketPath;
+    env.SPECULATE_OBSERVER_CAPABILITY = context.hook.capability;
+    env.SPECULATE_OBSERVER_LAUNCH_ID = context.hook.launchId;
+    env.SPECULATE_OBSERVER_CLIENT = 'codex';
+  }
+  return {
+    command: context.clientBin ?? resolveCodexBin(context.env.SPECULATE_CODEX_BIN ?? 'codex', {
+      env: context.env,
+      cwd: context.cwd,
+    }),
+    args: placeGeneratedOverrides(generated, context.clientArgs),
+    env,
+    upstreamBaseUrl,
+    transport: 'responses',
+    disabledCapabilities,
+    async cleanup() {},
   };
 }

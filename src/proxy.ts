@@ -37,7 +37,7 @@ import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv
 import { VERSION } from './version.js';
 import { canonicalKey } from './keys.js';
 import { Upstream, friendlySpawnError } from './upstream.js';
-import { candidateSchema, type AgentKind, type Candidate, type HostPermissionGate, type LocalRouteDescriptor, type Observation, type RegisteredRoute } from './observerTypes.js';
+import { candidateSchema, type AgentKind, type AuthorizedCandidate, type Candidate, type HostPermissionGate, type LocalRouteDescriptor, type Observation, type RegisteredRoute } from './observerTypes.js';
 import type { ExecutionLease, ObserverLifecycleEvent, Rule, SpeculateConfig } from './types.js';
 import type { UsageRecorder } from './usage.js';
 
@@ -62,6 +62,9 @@ export interface ProxySessionRuntime {
   invalidateServer(upstreamServer?: string, reason?: string): Promise<void>;
   publishObservation?(observation: Observation): Promise<boolean>;
   publishCompleted?(event: ProxySessionEvent): Promise<boolean>;
+  publishLifecycle?(event: ObserverLifecycleEvent): Promise<boolean>;
+  currentPermissionContext?(conversationId: string): string | null;
+  readStartupPolicy?(): Promise<unknown>;
   close(): Promise<void>;
 }
 
@@ -89,7 +92,7 @@ export interface ProxySessionConfig {
   hostClient: AgentKind;
   hostServerAlias: string;
   runtime: ProxySessionRuntime;
-  permissionContext?: () => string | null;
+  permissionContext?: (conversationId?: string) => string | null;
   permissionGate?: HostPermissionGate;
   cwd?: string;
   conversationIdForCall?: (input: { exposedTool: string; upstreamServer: string; upstreamTool: string; args: Readonly<Record<string, unknown>> }) => string | null;
@@ -879,9 +882,18 @@ export class SpeculateProxy {
     if (!this.session || this.config.mode === 'off' || !Array.isArray(candidates) || candidates.length > 3) return;
     const now = this.now();
     this.pruneObservedReplay(now);
-    const accepted = new Map<string, Array<{ candidate: Candidate; route: RegisteredRoute; permissionContext: string }>>();
+    const accepted = new Map<string, {
+      server: string;
+      authorized: boolean;
+      items: Array<{ candidate: Candidate; route: RegisteredRoute; permissionContext: string }>;
+    }>();
     for (const raw of candidates) {
-      const parsed = candidateSchema.safeParse(raw);
+      const authorized = raw !== null && typeof raw === 'object' && !Array.isArray(raw) &&
+        Object.keys(raw as Record<string, unknown>).every((key) => key === 'candidate' || key === 'permissionContext') &&
+        typeof (raw as Partial<AuthorizedCandidate>).permissionContext === 'string'
+        ? raw as AuthorizedCandidate
+        : null;
+      const parsed = candidateSchema.safeParse(authorized?.candidate ?? raw);
       if (!parsed.success) continue;
       const candidate = parsed.data;
       if (candidate.launchId !== this.session.launchId || candidate.createdAt > now || now - candidate.createdAt > 1_000) continue;
@@ -894,27 +906,39 @@ export class SpeculateProxy {
       const registered = this.observedRoutes.get(candidate.routeId);
       if (!registered || registered.route.generation !== candidate.generation) continue;
       if (!registered.validate(candidate.args).valid) continue;
-      const permissionContext = this.session.permissionContext?.() ?? null;
-      if (!permissionContext || !this.session.permissionGate) continue;
-      let permission: ReturnType<HostPermissionGate['check']> = 'unverifiable';
-      try {
-        permission = this.session.permissionGate.check({
-          hostClient: this.session.hostClient,
-          hostServerAlias: registered.route.hostServerAlias,
-          exposedTool: registered.route.exposedTool,
-          args: candidate.args,
-          permissionContext,
-        });
-      } catch {}
-      if (permission !== 'allowed') continue;
+      let permissionContext: string | null;
+      if (authorized) {
+        permissionContext = authorized.permissionContext;
+        if (!permissionContext || permissionContext.length > 512 ||
+          this.session.runtime.currentPermissionContext?.(candidate.conversationId) !== permissionContext) continue;
+      } else {
+        permissionContext = this.session.permissionContext?.(candidate.conversationId) ?? null;
+        if (!permissionContext || !this.session.permissionGate) continue;
+        let permission: ReturnType<HostPermissionGate['check']> = 'unverifiable';
+        try {
+          permission = this.session.permissionGate.check({
+            hostClient: this.session.hostClient,
+            hostServerAlias: registered.route.hostServerAlias,
+            exposedTool: registered.route.exposedTool,
+            args: candidate.args,
+            permissionContext,
+          });
+        } catch {}
+        if (permission !== 'allowed') continue;
+      }
       this.observedReplay.set(replayKey, now);
-      const group = accepted.get(registered.route.upstreamServer) ?? [];
-      group.push({ candidate, route: registered.route, permissionContext });
-      accepted.set(registered.route.upstreamServer, group);
+      const groupKey = `${registered.route.upstreamServer}\0${authorized ? 'authorized' : 'raw'}`;
+      const group = accepted.get(groupKey) ?? {
+        server: registered.route.upstreamServer,
+        authorized: authorized !== null,
+        items: [],
+      };
+      group.items.push({ candidate, route: registered.route, permissionContext });
+      accepted.set(groupKey, group);
     }
     while (this.observedReplay.size > 4_096) this.observedReplay.delete(this.observedReplay.keys().next().value!);
     while (this.observedEventCounts.size > 4_096) this.observedEventCounts.delete(this.observedEventCounts.keys().next().value!);
-    for (const [server, group] of accepted) {
+    for (const { server, authorized, items: group } of accepted.values()) {
       const admitted = this.predictor.admitResolved(
         server,
         group.map(({ candidate, route }) => {
@@ -943,9 +967,10 @@ export class SpeculateProxy {
           routeId: match.route.routeId,
           generation: match.route.generation,
           permissionContext: match.permissionContext,
+          conversationId: match.candidate.conversationId,
         };
       }
-      this.executor.submit(admitted);
+      this.executor.submit(admitted, { queueOnBusy: !authorized });
     }
   }
 
@@ -993,7 +1018,11 @@ export class SpeculateProxy {
       typeof lease.permissionContext !== 'string'
     ) return false;
     try {
-      return this.session?.permissionContext?.() === lease.permissionContext;
+      const current = lease.conversationId
+        ? this.session?.runtime.currentPermissionContext?.(lease.conversationId) ??
+          this.session?.permissionContext?.(lease.conversationId)
+        : this.session?.permissionContext?.();
+      return current === lease.permissionContext;
     } catch {
       return false;
     }

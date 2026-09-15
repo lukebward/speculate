@@ -49,6 +49,8 @@ export interface CodexMcpServerStatus {
   disabledReason: string | null;
 }
 
+export type CodexAccountMode = 'apiKey' | 'chatgpt' | 'amazonBedrock' | 'none' | 'unverified';
+
 /** Never includes raw Codex errors, stdout, or stderr: these can contain secrets. */
 export class CodexClientError extends Error {
   constructor(message: string, readonly code: string) {
@@ -71,6 +73,49 @@ export interface CodexClientOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   platform?: NodeJS.Platform;
+  globalArgs?: readonly string[];
+}
+
+export interface CodexConfigInvocation {
+  globalArgs: string[];
+  cwd?: string;
+  verifiable: boolean;
+  reason?: string;
+}
+
+export function extractCodexConfigInvocation(clientArgs: readonly string[]): CodexConfigInvocation {
+  const globalArgs: string[] = [];
+  let cwd: string | undefined;
+  const splitFlags = new Set(['-c', '--config', '--enable', '--disable', '-p', '--profile', '-C', '--cd']);
+  const equalFlags = ['--config=', '--enable=', '--disable=', '--profile=', '--cd='];
+  const unrelatedValueFlags = new Set(['-m', '--model', '-s', '--sandbox', '-a', '--ask-for-approval', '--color']);
+  for (let index = 0; index < clientArgs.length; index++) {
+    const arg = clientArgs[index]!;
+    if (arg === '--') break;
+    if (arg === '--ignore-user-config') {
+      return { globalArgs, verifiable: false, reason: 'unsupported-config-source' };
+    }
+    if (splitFlags.has(arg)) {
+      const value = clientArgs[++index];
+      if (!value || value === '--') return { globalArgs, verifiable: false, reason: 'missing-config-value' };
+      globalArgs.push(arg, value);
+      if (arg === '-C' || arg === '--cd') cwd = value;
+      continue;
+    }
+    if (equalFlags.some((prefix) => arg.startsWith(prefix))) {
+      if (arg.endsWith('=')) return { globalArgs, verifiable: false, reason: 'missing-config-value' };
+      globalArgs.push(arg);
+      if (arg.startsWith('--cd=')) cwd = arg.slice('--cd='.length);
+      continue;
+    }
+    if (unrelatedValueFlags.has(arg)) {
+      if (!clientArgs[index + 1]) return { globalArgs, verifiable: false, reason: 'missing-argument-value' };
+      index++;
+      continue;
+    }
+    if (!arg.startsWith('-') && !['exec', 'resume', 'review', 'fork', 'apply', 'cloud', 'mcp', 'features'].includes(arg)) break;
+  }
+  return { globalArgs, ...(cwd !== undefined ? { cwd } : {}), verifiable: true };
 }
 
 /** Resolve to an absolute path so registrations also work in GUI processes. */
@@ -110,7 +155,7 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 /** npm launchers must not depend on a GUI process having `node` on PATH. */
-function codexInvocation(bin: string, args: string[], platform: NodeJS.Platform): {
+export function codexInvocation(bin: string, args: string[], platform: NodeJS.Platform): {
   file: string; args: string[]; windowsVerbatimArguments?: true;
 } {
   let target = bin;
@@ -193,6 +238,15 @@ export class CodexClient {
       throw new CodexClientError('Codex returned an unsupported configuration response. Update Codex and retry.', 'invalidResponse');
     }
     return result as unknown as CodexConfigRead;
+  }
+
+  async readAccountMode(): Promise<CodexAccountMode> {
+    const result = await this.request('account/read', { refreshToken: false });
+    if (!record(result) || typeof result.requiresOpenaiAuth !== 'boolean') return 'unverified';
+    if (result.account === null) return 'none';
+    if (!record(result.account)) return 'unverified';
+    const type = result.account.type;
+    return type === 'apiKey' || type === 'chatgpt' || type === 'amazonBedrock' ? type : 'unverified';
   }
 
   async writeConfig(params: CodexConfigWrite): Promise<CodexConfigWriteResult> {
@@ -314,7 +368,7 @@ export async function startCodexClient(opts: CodexClientOptions = {}): Promise<C
   const env = opts.env ?? process.env;
   const platform = opts.platform ?? process.platform;
   const bin = resolveCodexBin(opts.bin ?? env.SPECULATE_CODEX_BIN ?? 'codex', { platform, env, cwd: opts.cwd });
-  const args = ['app-server', '--stdio'];
+  const args = [...(opts.globalArgs ?? []), 'app-server', '--stdio'];
   const invocation = codexInvocation(bin, args, platform);
   let child: ChildProcessWithoutNullStreams;
   try {

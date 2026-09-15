@@ -87,6 +87,11 @@ export type SessionContext = z.infer<typeof sessionContextSchema>;
 export type Candidate = z.infer<typeof candidateSchema>;
 export type Observation = z.infer<typeof observationSchema>;
 
+export interface AuthorizedCandidate {
+  candidate: Candidate;
+  permissionContext: string;
+}
+
 export interface LocalRouteDescriptor {
   exposedTool: string;
   upstreamServer: string;
@@ -131,10 +136,10 @@ export interface AgentAdapterResponse {
 }
 
 export interface AgentAdapterRequestObserver {
-  observeRequestBody(body: Uint8Array): readonly Observation[];
-  observeResponseStart(response: AgentAdapterResponse): readonly Observation[];
-  observeResponseChunk(chunk: Uint8Array): readonly Observation[];
-  observeResponseEnd(): readonly Observation[];
+  observeRequestBody(body: Uint8Array, observedAt?: number): readonly Observation[];
+  observeResponseStart(response: AgentAdapterResponse, observedAt?: number): readonly Observation[];
+  observeResponseChunk(chunk: Uint8Array, observedAt?: number): readonly Observation[];
+  observeResponseEnd(observedAt?: number): readonly Observation[];
   abort(): void;
 }
 
@@ -144,9 +149,9 @@ export interface WebSocketMessage {
 }
 
 export interface AgentAdapterWebSocketObserver {
-  observeResponseStart(response: AgentAdapterResponse): readonly Observation[];
-  observeClientMessage(message: WebSocketMessage): readonly Observation[];
-  observeServerMessage(message: WebSocketMessage): readonly Observation[];
+  observeResponseStart(response: AgentAdapterResponse, observedAt?: number): readonly Observation[];
+  observeClientMessage(message: WebSocketMessage, observedAt?: number): readonly Observation[];
+  observeServerMessage(message: WebSocketMessage, observedAt?: number): readonly Observation[];
   abort(): void;
 }
 
@@ -159,14 +164,40 @@ export interface AgentAdapterConnection {
 export interface AgentAdapter {
   readonly agent: AgentKind;
   createConnection(): AgentAdapterConnection;
-  normalizeHook(payload: unknown): readonly Observation[];
+  normalizeHook(payload: unknown, observedAt?: number): readonly Observation[];
 }
 
 export interface AgentAdapterEnvironment {
-  contextForConversation(conversationId: string): SessionContext | null;
+  contextForConversation(conversationId: string, cwd?: string): SessionContext | null;
   routes(): readonly RegisteredRoute[];
   now?(): number;
   eventId?(kind: Observation['kind'], stableId: string): string;
+  onToolCallMarker?(marker: ToolCallMarker): void;
+  onExecutionWindow?(event: ExecutionWindowEvent): void;
+  onTrackingLoss?(observedAt: number): void;
+}
+
+export interface ToolCallMarker {
+  source: 'model' | 'hook';
+  phase: 'selected' | 'started' | 'settled';
+  context: SessionContext;
+  routeId: string;
+  generation: number;
+  callId: string;
+  args: Record<string, unknown>;
+  observedAt: number;
+  actorId?: string;
+  turnId?: string;
+}
+
+export interface ExecutionWindowEvent {
+  source: 'model' | 'hook';
+  phase: 'opened' | 'closed';
+  context: SessionContext;
+  windowId: string;
+  observedAt: number;
+  actorId?: string;
+  turnId?: string;
 }
 
 export interface LaunchPlan {
@@ -175,5 +206,24 @@ export interface LaunchPlan {
   env: NodeJS.ProcessEnv;
   upstreamBaseUrl: string;
   transport: 'messages' | 'responses';
+  disabledCapabilities?: string[];
   cleanup(): Promise<void>;
+}
+
+export interface SessionLaunchCoordinates {
+  socketPath: string;
+  capability: string;
+  launchId: string;
+}
+
+export interface AgentLaunchContext {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  clientArgs: readonly string[];
+  observe: ObserverMode;
+  relayBaseUrl: string | null;
+  session: SessionLaunchCoordinates;
+  hook: SessionLaunchCoordinates;
+  self: { command: string; args: string[] };
+  clientBin?: string;
 }

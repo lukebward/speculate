@@ -122,6 +122,28 @@ async function exchange(input: {
 }
 
 describe('LLM HTTP relay', () => {
+  it('marks observer tracking lost when a response aborts before its boundary is observed', async () => {
+    const upstream = await listen((request, response) => {
+      request.resume();
+      request.on('end', () => {
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        response.write('partial');
+        response.destroy();
+      });
+    });
+    const losses: number[] = [];
+    const proxy = await startLlmProxy({
+      upstreamBaseUrl: upstream.baseUrl,
+      adapter: adapter(),
+      onObservation: () => {},
+      onObservationLoss: (observedAt) => losses.push(observedAt),
+    });
+    proxies.push(proxy);
+    expect((await exchange({ url: `${proxy.baseUrl}/v1/messages`, body: Buffer.from('{}') })).status).toBe(502);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(losses.length).toBeGreaterThan(0);
+  });
+
   it('preserves body bytes and end-to-end headers on a fixed base path', async () => {
     const responseBody = Buffer.from([0, 255, 1, 2, 3, 128]);
     const upstream = await listen((request, response) => {

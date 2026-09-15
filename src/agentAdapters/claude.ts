@@ -1,7 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
+import { effectiveServers, readClaudeServers, selfCommand, wrapLaunchEntry } from '../hostConfig.js';
+import { resolveClaudeBin } from '../manage.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -15,6 +21,8 @@ import {
   type Observation,
   type RegisteredRoute,
   type SessionContext,
+  type AgentLaunchContext,
+  type LaunchPlan,
 } from '../observerTypes.js';
 
 const MAX_STREAM_ARGUMENT_BYTES = 64 * 1024;
@@ -81,6 +89,7 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
   private requestReady = false;
   private stopped = false;
   private released = false;
+  private boundaryAt: number | null = null;
 
   constructor(
     private readonly context: SessionContext,
@@ -90,7 +99,8 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     private readonly release: () => void,
   ) {}
 
-  observeRequestBody(body: Uint8Array): readonly Observation[] {
+  observeRequestBody(body: Uint8Array, observedAt?: number): readonly Observation[] {
+    this.boundaryAt = observedAt ?? this.now();
     if (this.stopped || body.byteLength > MAX_OBSERVATION_BYTES || !inspectableEncoding(this.request.headers)) {
       this.abort();
       return [];
@@ -115,13 +125,14 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
       kind: 'prompt',
       context: this.context,
       eventId: this.eventId('prompt', stableId),
-      observedAt: this.now(),
+      observedAt: this.boundaryAt,
       occurrenceId: this.promptOccurrences.identify(this.context.conversationId, current.text, 'proxy', current.nativeId),
       text: current.text,
     });
   }
 
-  observeResponseStart(response: AgentAdapterResponse): readonly Observation[] {
+  observeResponseStart(response: AgentAdapterResponse, observedAt?: number): readonly Observation[] {
+    this.boundaryAt = observedAt ?? this.now();
     if (this.stopped || !this.requestReady || response.status < 200 || response.status >= 300 || !inspectableEncoding(response.headers)) {
       this.abort();
       return [];
@@ -133,7 +144,8 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     return [];
   }
 
-  observeResponseChunk(chunk: Uint8Array): readonly Observation[] {
+  observeResponseChunk(chunk: Uint8Array, observedAt?: number): readonly Observation[] {
+    this.boundaryAt = observedAt ?? this.now();
     if (this.stopped || this.responseMode === 'none') return [];
     this.responseBytes += chunk.byteLength;
     if (this.responseBytes > MAX_OBSERVATION_BYTES) {
@@ -148,7 +160,8 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
     return this.readSse(false);
   }
 
-  observeResponseEnd(): readonly Observation[] {
+  observeResponseEnd(observedAt?: number): readonly Observation[] {
+    this.boundaryAt = observedAt ?? this.now();
     if (this.stopped || this.responseMode === 'none') return [];
     if (this.responseMode === 'json') {
       this.responseText += this.decoder.end();
@@ -276,11 +289,18 @@ class ClaudeRequestObserver implements AgentAdapterRequestObserver {
   private toolObservation(name: string, callId: string, args: unknown): Observation[] {
     const route = this.routesByName.get(name);
     if (!route || !object(args)) return [];
+    const observedAt = this.boundaryAt ?? this.now();
+    try {
+      this.environment.onToolCallMarker?.({
+        source: 'model', phase: 'selected', context: this.context,
+        routeId: route.routeId, generation: route.generation, callId, args, observedAt,
+      });
+    } catch {}
     return this.observation({
       kind: 'stream-call',
       context: this.context,
       eventId: this.eventId('stream-call', callId),
-      observedAt: this.now(),
+      observedAt,
       routeId: route.routeId,
       callId,
       args,
@@ -350,30 +370,192 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
   return {
     agent: 'claude',
     createConnection: () => new ClaudeConnection(environment, promptOccurrences),
-    normalizeHook(payload: unknown): readonly Observation[] {
-      if (!object(payload) || payload.hook_event_name !== 'UserPromptSubmit' || typeof payload.session_id !== 'string' || typeof payload.prompt !== 'string') return [];
+    normalizeHook(payload: unknown, boundaryAt?: number): readonly Observation[] {
+      if (!object(payload) || typeof payload.session_id !== 'string') return [];
       if (payload.session_id.length === 0 || payload.session_id.length > 512 ||
-        Buffer.byteLength(payload.session_id, 'utf8') > 512 || payload.prompt.length > MAX_OBSERVATION_BYTES ||
-        Buffer.byteLength(payload.prompt, 'utf8') > MAX_OBSERVATION_BYTES) return [];
+        Buffer.byteLength(payload.session_id, 'utf8') > 512) return [];
+      const toolEvent = payload.hook_event_name === 'PreToolUse' || payload.hook_event_name === 'PostToolUse' ||
+        payload.hook_event_name === 'PostToolUseFailure';
+      if (payload.hook_event_name === 'UserPromptSubmit' && (typeof payload.prompt !== 'string' ||
+        payload.prompt.length > MAX_OBSERVATION_BYTES || Buffer.byteLength(payload.prompt, 'utf8') > MAX_OBSERVATION_BYTES)) return [];
+      if (toolEvent && (typeof payload.tool_name !== 'string' || payload.tool_name.length > 512 ||
+        typeof payload.tool_use_id !== 'string' || payload.tool_use_id.length === 0 || payload.tool_use_id.length > 512 ||
+        !object(payload.tool_input))) return [];
       let context: SessionContext | null = null;
       try {
-        const parsed = sessionContextSchema.safeParse(environment.contextForConversation(payload.session_id));
+        const parsed = sessionContextSchema.safeParse(environment.contextForConversation(
+          payload.session_id,
+          typeof payload.cwd === 'string' ? payload.cwd : undefined,
+        ));
         if (parsed.success && parsed.data.agent === 'claude' && parsed.data.conversationId === payload.session_id) context = parsed.data;
       } catch {
         return [];
       }
       if (!context) return [];
+      const phase = payload.hook_event_name === 'PreToolUse'
+        ? 'started'
+        : payload.hook_event_name === 'PostToolUse' || payload.hook_event_name === 'PostToolUseFailure'
+          ? 'settled'
+          : null;
+      if (phase && typeof payload.tool_name === 'string' && typeof payload.tool_use_id === 'string' && object(payload.tool_input)) {
+        const routes = environment.routes().filter((route) => route.hostClient === 'claude' && modelToolName(route) === payload.tool_name);
+        if (routes.length === 1) {
+          try {
+            environment.onToolCallMarker?.({
+              source: 'hook', phase, context, routeId: routes[0]!.routeId,
+              generation: routes[0]!.generation, callId: payload.tool_use_id,
+              args: payload.tool_input, observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
+              ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
+              ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
+            });
+          } catch {}
+        }
+        return [];
+      }
+      if (payload.hook_event_name !== 'UserPromptSubmit' || typeof payload.prompt !== 'string') return [];
       const eventId = environment.eventId?.('prompt', `hook:${payload.session_id}:${createHash('sha256').update(payload.prompt).digest('base64url')}`) ??
         `claude:prompt:hook:${payload.session_id}:${randomUUID()}`;
       const parsed = observationSchema.safeParse({
         kind: 'prompt',
         context,
         eventId,
-        observedAt: environment.now?.() ?? Date.now(),
+        observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
         occurrenceId: promptOccurrences.identify(context.conversationId, payload.prompt, 'hook'),
         text: payload.prompt,
       });
       return parsed.success ? [parsed.data] : [];
     },
   };
+}
+
+export interface ClaudeLaunchContext extends AgentLaunchContext {
+  home?: string;
+}
+
+export function claudeObserverHookCommand(): string {
+  const script = fileURLToPath(new URL('../../plugin/hooks/session-observer.mjs', import.meta.url));
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  return `${quote(process.execPath)} ${quote(script)}`;
+}
+
+function hookSettings(existing: Record<string, unknown> = {}): Record<string, unknown> | null {
+  if (existing.disableAllHooks === true || existing.allowManagedHooksOnly === true) return null;
+  const handler = { type: 'command', command: claudeObserverHookCommand(), timeout: 1 };
+  const settings = structuredClone(existing);
+  if (settings.hooks !== undefined && !object(settings.hooks)) return null;
+  const hooks = object(settings.hooks) ? settings.hooks : {};
+  for (const event of [
+    'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse',
+    'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'SessionEnd',
+  ]) {
+    const current = hooks[event];
+    if (current !== undefined && !Array.isArray(current)) return null;
+    hooks[event] = [...((current as unknown[] | undefined) ?? []), { hooks: [handler] }];
+  }
+  settings.hooks = hooks;
+  return settings;
+}
+
+function launchSettings(cwd: string, clientArgs: readonly string[]): {
+  settings: Record<string, unknown> | null;
+  clientArgs: string[];
+  reason?: string;
+} {
+  const occurrences: Array<{ index: number; count: number; value: string }> = [];
+  for (let index = 0; index < clientArgs.length; index++) {
+    if (clientArgs[index] === '--') break;
+    if (clientArgs[index] === '--settings') {
+      const value = clientArgs[index + 1];
+      if (!value) return { settings: null, clientArgs: [...clientArgs], reason: 'hook-observation:invalid-settings' };
+      occurrences.push({ index, count: 2, value });
+      index++;
+    } else if (clientArgs[index]!.startsWith('--settings=')) {
+      occurrences.push({ index, count: 1, value: clientArgs[index]!.slice('--settings='.length) });
+    }
+  }
+  if (occurrences.length > 1) return { settings: null, clientArgs: [...clientArgs], reason: 'hook-observation:ambiguous-settings' };
+  let existing: Record<string, unknown> = {};
+  if (occurrences.length === 1) {
+    const raw = occurrences[0]!.value;
+    try {
+      let parsed: unknown;
+      if (raw.trim().startsWith('{')) parsed = JSON.parse(raw) as unknown;
+      else {
+        const path = resolve(cwd, raw);
+        if (statSync(path).size > 8 * 1024 * 1024) throw new Error('oversized');
+        parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+      }
+      if (!object(parsed)) throw new Error('invalid');
+      existing = parsed;
+    } catch {
+      return { settings: null, clientArgs: [...clientArgs], reason: 'hook-observation:invalid-settings' };
+    }
+  }
+  const settings = hookSettings(existing);
+  if (!settings) return { settings: null, clientArgs: [...clientArgs], reason: 'hook-observation:settings-policy' };
+  const forwarded = [...clientArgs];
+  if (occurrences.length === 1) forwarded.splice(occurrences[0]!.index, occurrences[0]!.count);
+  return { settings, clientArgs: forwarded };
+}
+
+export async function buildLaunchPlan(context: ClaudeLaunchContext): Promise<LaunchPlan> {
+  const home = context.home ?? homedir();
+  const directory = mkdtempSync(join(tmpdir(), 'speculate-claude-run-'));
+  chmodSync(directory, 0o700);
+  const args: string[] = [];
+  const disabledCapabilities: string[] = [];
+  try {
+    const view = readClaudeServers({ home, cwd: context.cwd });
+    const mcpServers: Record<string, unknown> = {};
+    for (const [alias, scoped] of effectiveServers(view.servers)) {
+      if (scoped.scope === 'project' && !view.approvedProjectServers.has(alias)) continue;
+      const wrapped = wrapLaunchEntry(alias, scoped.entry, context.self ?? selfCommand(), {
+        hostClient: 'claude',
+        socketPath: context.session.socketPath,
+        capability: context.session.capability,
+        launchId: context.session.launchId,
+      });
+      if ('entry' in wrapped) mcpServers[alias] = wrapped.entry;
+    }
+    if (Object.keys(mcpServers).length > 0) {
+      const path = join(directory, 'mcp.json');
+      writeFileSync(path, `${JSON.stringify({ mcpServers })}\n`, { mode: 0o600 });
+      args.push(`--mcp-config=${path}`);
+    }
+    if (context.observe !== 'off') {
+      const temporary = launchSettings(context.cwd, context.clientArgs);
+      if (temporary.settings) {
+        const path = join(directory, 'settings.json');
+        writeFileSync(path, `${JSON.stringify(temporary.settings)}\n`, { mode: 0o600 });
+        args.push('--settings', path);
+      } else if (temporary.reason) disabledCapabilities.push(temporary.reason);
+      args.push(...temporary.clientArgs);
+    } else {
+      args.push(...context.clientArgs);
+    }
+    const env: NodeJS.ProcessEnv = { ...context.env };
+    if (context.observe !== 'off') {
+      env.SPECULATE_OBSERVER_SOCKET = context.hook.socketPath;
+      env.SPECULATE_OBSERVER_CAPABILITY = context.hook.capability;
+      env.SPECULATE_OBSERVER_LAUNCH_ID = context.hook.launchId;
+      env.SPECULATE_OBSERVER_CLIENT = 'claude';
+    }
+    if (context.observe === 'proxy' && context.relayBaseUrl) env.ANTHROPIC_BASE_URL = context.relayBaseUrl;
+    const upstreamBaseUrl = context.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+    return {
+      command: context.clientBin ?? resolveClaudeBin(context.env.SPECULATE_CLAUDE_BIN ?? 'claude', {
+        pathEnv: context.env.PATH,
+        home,
+      }),
+      args,
+      env,
+      upstreamBaseUrl,
+      transport: 'messages',
+      disabledCapabilities,
+      async cleanup() { rmSync(directory, { recursive: true, force: true }); },
+    };
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
