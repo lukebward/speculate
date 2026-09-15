@@ -148,7 +148,7 @@ covers the CLI daemon).
 - [x] Task 4: Claude transparent model transport (Sol review approved after lifecycle fixes; 47 focused tests)
 - [x] Task 5: Codex Responses and WebSocket transport (Sol review approved; 72 focused tests; native relay smoke passed both)
 - [x] Task 6: Intent and completed-stream prediction (Sol review approved; 227 focused tests plus 77 callback-fix tests)
-- [ ] Task 7: Symmetric session launch and diagnostics
+- [x] Task 7: Symmetric session launch and diagnostics (Sol review approved; native routing and wrapper startup verified)
 - [ ] Task 8: Both clients consume existing registered MCP results
 - [ ] Task 9: Recovery/isolation verification
 - [ ] Task 10: Benchmarks, documentation, final review and push main
