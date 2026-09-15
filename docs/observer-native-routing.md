@@ -77,3 +77,9 @@ Conclusion: for the built-in OpenAI provider under a native ChatGPT account, a s
 - Codex's upstream base includes `/backend-api/codex`; the relay must prepend that base path when forwarding the relative `/models` and `/responses` requests generated from the loopback `openai_base_url`.
 - Keep hook-only fallback for failed relay health, unsupported providers, or unavailable transport support. Provider-specific Claude cloud routes and Codex custom providers still require their own fixtures.
 - Initial parser-only attempts exited before contacting a model endpoint: Claude's variadic `--tools` consumed a trailing prompt until argument order was corrected, and `codex exec` rejected the top-level-only `--ask-for-approval` flag. Neither attempt made a model request.
+
+## Codex account-mode query
+
+Codex 0.154.0's stable generated app-server schema supports `account/read` with `{ "refreshToken": false }`. Its nullable `account` has a `type` discriminator of `apiKey`, `chatgpt`, or `amazonBedrock`. The launcher can reuse its configuration-reader connection and retain only this discriminator for built-in upstream selection. Null, unsupported, or malformed results leave account routing unverified.
+
+A bounded native query verified the existing initialization contract and returned the sanitized discriminator `chatgpt`. No tokens were requested, no login or refresh flow was invoked, and no model request was made. The full account response and its personal metadata were discarded; temporary generated schemas and helper files were removed. This verifies the account-query seam, while live API-key forwarding remains a separate unverified gate.
