@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
+import { HookBoundaryTracker } from '../hookBoundaries.js';
 import { effectiveServers, readClaudeServers, selfCommand, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import { resolveClaudeBin } from '../manage.js';
 import {
@@ -29,6 +30,9 @@ const MAX_STREAM_ARGUMENT_BYTES = 64 * 1024;
 const MAX_ACTIVE_BLOCKS = 256;
 const MAX_REQUEST_TOOLS = 512;
 const MAX_LAUNCH_CONFIG_BYTES = 8 * 1024 * 1024;
+const LAUNCH_DIRECTORY_PREFIX = 'speculate-claude-run-';
+const LAUNCH_DIRECTORY_PATTERN = /^speculate-claude-run-[A-Za-z0-9_-]{6}$/;
+const LAUNCH_OWNER_FILE = '.speculate-launch-owner.json';
 
 interface ActiveBlock {
   callId: string;
@@ -40,6 +44,40 @@ interface ActiveBlock {
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function staleOwnerProcess(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return object(error) && error.code === 'ESRCH';
+  }
+}
+
+function cleanupStaleLaunchDirectories(root: string): void {
+  if (process.platform === 'win32') return;
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return; }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !LAUNCH_DIRECTORY_PATTERN.test(entry.name)) continue;
+    const directory = join(root, entry.name);
+    const ownerPath = join(directory, LAUNCH_OWNER_FILE);
+    try {
+      const directoryStat = lstatSync(directory);
+      const ownerStat = lstatSync(ownerPath);
+      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o777) !== 0o700 ||
+        !ownerStat.isFile() || ownerStat.isSymbolicLink() || (ownerStat.mode & 0o777) !== 0o600 || ownerStat.size > 1024 ||
+        (uid !== null && (directoryStat.uid !== uid || ownerStat.uid !== uid))) continue;
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as unknown;
+      if (!object(owner) || Object.keys(owner).sort().join(',') !== 'kind,ownerPid,version' ||
+        owner.kind !== 'speculate-claude-launch' || owner.version !== 1 ||
+        !Number.isSafeInteger(owner.ownerPid) || (owner.ownerPid as number) <= 0 ||
+        !staleOwnerProcess(owner.ownerPid as number)) continue;
+      rmSync(directory, { recursive: true, force: true });
+    } catch {}
+  }
 }
 
 function header(headers: Readonly<Record<string, string | string[] | undefined>>, name: string): string | null {
@@ -368,6 +406,7 @@ class ClaudeConnection implements AgentAdapterConnection {
 
 export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapter {
   const promptOccurrences = new PromptOccurrenceCorrelator(() => environment.now?.() ?? Date.now());
+  const hookBoundaries = new HookBoundaryTracker();
   return {
     agent: 'claude',
     createConnection: () => new ClaudeConnection(environment, promptOccurrences),
@@ -393,19 +432,35 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
         return [];
       }
       if (!context) return [];
+      const observedAt = boundaryAt ?? environment.now?.() ?? Date.now();
+      if (payload.hook_event_name === 'SessionEnd') {
+        if (hookBoundaries.endSession(context)) {
+          try { environment.onTrackingLoss?.(observedAt); } catch {}
+        }
+        return [];
+      }
       const phase = payload.hook_event_name === 'PreToolUse'
         ? 'started'
         : payload.hook_event_name === 'PostToolUse' || payload.hook_event_name === 'PostToolUseFailure'
           ? 'settled'
           : null;
       if (phase && typeof payload.tool_name === 'string' && typeof payload.tool_use_id === 'string' && object(payload.tool_input)) {
+        if (hookBoundaries.observe({
+          context,
+          toolName: payload.tool_name,
+          callId: payload.tool_use_id,
+          ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
+          ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
+        }, phase)) {
+          try { environment.onTrackingLoss?.(observedAt); } catch {}
+        }
         const routes = environment.routes().filter((route) => route.hostClient === 'claude' && modelToolName(route) === payload.tool_name);
         if (routes.length === 1) {
           try {
             environment.onToolCallMarker?.({
               source: 'hook', phase, context, routeId: routes[0]!.routeId,
               generation: routes[0]!.generation, callId: payload.tool_use_id,
-              args: payload.tool_input, observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
+              args: payload.tool_input, observedAt,
               ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
               ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
             });
@@ -420,7 +475,7 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
         kind: 'prompt',
         context,
         eventId,
-        observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
+        observedAt,
         occurrenceId: promptOccurrences.identify(context.conversationId, payload.prompt, 'hook'),
         text: payload.prompt,
       });
@@ -549,11 +604,18 @@ function launchMcpSource(cwd: string, clientArgs: readonly string[]): {
 
 export async function buildLaunchPlan(context: ClaudeLaunchContext): Promise<LaunchPlan> {
   const home = context.home ?? homedir();
-  const directory = mkdtempSync(join(tmpdir(), 'speculate-claude-run-'));
-  chmodSync(directory, 0o700);
+  const temporaryRoot = tmpdir();
+  cleanupStaleLaunchDirectories(temporaryRoot);
+  const directory = mkdtempSync(join(temporaryRoot, LAUNCH_DIRECTORY_PREFIX));
   const args: string[] = [];
   const disabledCapabilities: string[] = [];
   try {
+    chmodSync(directory, 0o700);
+    writeFileSync(join(directory, LAUNCH_OWNER_FILE), JSON.stringify({
+      kind: 'speculate-claude-launch',
+      version: 1,
+      ownerPid: process.pid,
+    }), { mode: 0o600 });
     const view = readClaudeServers({ home, cwd: context.cwd });
     const perRun = launchMcpSource(context.cwd, context.clientArgs);
     const mcpServers: Record<string, unknown> = {};

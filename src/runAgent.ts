@@ -303,7 +303,7 @@ function writeReport(path: string, report: unknown): void {
   renameSync(temporary, target);
 }
 
-async function prepareAgentRun(_args: RunAgentArgs): Promise<PreparedAgentRun> {
+export async function prepareAgentRun(_args: RunAgentArgs): Promise<PreparedAgentRun> {
   return prepareNativeAgentRun(_args);
 }
 
@@ -492,7 +492,13 @@ async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentR
     now: Date.now,
     onToolCallMarker: (marker: ToolCallMarker) => ledger.recordToolCall(marker),
     onExecutionWindow: (event: ExecutionWindowEvent) => ledger.recordWindow(event),
-    onTrackingLoss: (observedAt: number) => ledger.markTrackingLoss(observedAt),
+    onTrackingLoss: (observedAt: number) => {
+      ledger.markTrackingLoss(observedAt);
+      bridge.publishObservation({
+        kind: 'invalidate', context: initialContext, eventId: `tracking-loss:${randomUUID()}`,
+        observedAt, routeIds: [], reason: 'observer-tracking-gap',
+      });
+    },
   };
   adapter = args.agent === 'claude' ? claudeAdapter(environment) : codexAdapter(environment);
   let relay: LlmProxy | null = null;
@@ -531,7 +537,7 @@ async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentR
           upstreamBaseUrl: probePlan.upstreamBaseUrl,
           adapter,
           onObservation: (observation) => { bridge.publishObservation(observation); },
-          onObservationLoss: (observedAt) => ledger.markTrackingLoss(observedAt),
+          onObservationLoss: (observedAt) => environment.onTrackingLoss(observedAt),
         });
       } catch {
         mode = 'hooks';

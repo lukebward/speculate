@@ -3,6 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
+import { HookBoundaryTracker } from '../hookBoundaries.js';
 import { codexSubcommand, resolveCodexBin, type CodexConfigRead } from '../codexClient.js';
 import { isStdioEntry, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import {
@@ -893,6 +894,7 @@ class CodexWebSocketObserver implements AgentAdapterWebSocketObserver {
 
 export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter {
   const promptOccurrences = new PromptOccurrenceCorrelator(() => environment.now?.() ?? Date.now());
+  const hookBoundaries = new HookBoundaryTracker();
   return {
     agent: 'codex',
     createConnection: () => new CodexConnection(environment, promptOccurrences),
@@ -914,6 +916,13 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
       const event = typeof payload.type === 'string'
         ? payload.type
         : typeof payload.hook_event_name === 'string' ? payload.hook_event_name : '';
+      const observedAt = boundaryAt ?? environment.now?.() ?? Date.now();
+      if (event === 'session-end' || event === 'SessionEnd') {
+        if (hookBoundaries.endSession(context)) {
+          try { environment.onTrackingLoss?.(observedAt); } catch {}
+        }
+        return [];
+      }
       const phase = event === 'before-tool-use' || event === 'PreToolUse'
         ? 'started'
         : event === 'after-tool-use' || event === 'tool-use-error' || event === 'PostToolUse' || event === 'PostToolUseFailure'
@@ -923,13 +932,22 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
       const callId = boundedId(payload.tool_use_id) ? payload.tool_use_id : null;
       const args = record(payload.arguments) ? payload.arguments : record(payload.tool_input) ? payload.tool_input : null;
       if (phase && toolName && callId && args) {
+        if (hookBoundaries.observe({
+          context,
+          toolName,
+          callId,
+          ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
+          ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
+        }, phase)) {
+          try { environment.onTrackingLoss?.(observedAt); } catch {}
+        }
         const routes = environment.routes().filter((route) => route.hostClient === 'codex' && modelToolName(route) === toolName);
         if (routes.length === 1) {
           try {
             environment.onToolCallMarker?.({
               source: 'hook', phase, context, routeId: routes[0]!.routeId,
               generation: routes[0]!.generation, callId, args,
-              observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
+              observedAt,
               ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
               ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
             });
@@ -943,7 +961,7 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
       return [{
         kind: 'prompt', context,
         eventId: environment.eventId?.('prompt', `hook:${stableId}`) ?? `codex:prompt:hook:${randomUUID()}`,
-        observedAt: boundaryAt ?? environment.now?.() ?? Date.now(),
+        observedAt,
         occurrenceId: promptOccurrences.identify(conversationId, payload.prompt, 'hook'),
         text: payload.prompt,
       }];

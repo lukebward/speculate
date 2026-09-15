@@ -757,7 +757,11 @@ function relayWebSocket(input: {
               enqueue(message.data.byteLength, () => observer!.observeServerMessage(message, observedAt));
             } else abortObservation();
           },
-          error() {
+          error(providerFailure) {
+            if (providerFailure && !failureReported) {
+              failureReported = true;
+              input.onFailure?.();
+            }
             finishTransport(false);
           },
           close() {
@@ -822,21 +826,28 @@ function bridgeWebSockets(
   lifecycle: {
     clientMessage(message: { data: Uint8Array; binary: boolean }): void;
     serverMessage(message: { data: Uint8Array; binary: boolean }): void;
-    error(): void;
+    error(providerFailure: boolean): void;
     close(): void;
   },
 ): void {
   let closed = false;
   let errors = false;
+  let providerFailure: boolean | null = null;
 
-  const fail = () => {
+  const fail = (failedProvider: boolean) => {
     errors = true;
+    if (providerFailure === null) providerFailure = failedProvider;
     client.terminate();
     provider.terminate();
-    lifecycle.error();
+    lifecycle.error(providerFailure);
   };
 
-  const relay = (source: WebSocket, target: WebSocket, observe: (message: { data: Uint8Array; binary: boolean }) => void) => {
+  const relay = (
+    source: WebSocket,
+    target: WebSocket,
+    observe: (message: { data: Uint8Array; binary: boolean }) => void,
+    targetIsProvider: boolean,
+  ) => {
     source.on('message', (value, binary) => {
       const data = rawData(value);
       observe({ data, binary });
@@ -844,7 +855,7 @@ function bridgeWebSockets(
       source.pause();
       target.send(data, { binary }, (error) => {
         if (error) {
-          fail();
+          fail(targetIsProvider);
           return;
         }
         source.resume();
@@ -852,17 +863,17 @@ function bridgeWebSockets(
     });
     source.on('ping', (data) => {
       if (target.readyState === WebSocket.OPEN) target.ping(data, undefined, (error) => {
-        if (error) fail();
+        if (error) fail(targetIsProvider);
       });
     });
     source.on('pong', (data) => {
       if (target.readyState === WebSocket.OPEN) target.pong(data, undefined, (error) => {
-        if (error) fail();
+        if (error) fail(targetIsProvider);
       });
     });
   };
 
-  const closePeer = (source: WebSocket, target: WebSocket, code: number, reason: Buffer) => {
+  const closePeer = (source: WebSocket, target: WebSocket, code: number, reason: Buffer, sourceIsProvider: boolean) => {
     if (target.readyState === WebSocket.OPEN) {
       if (code === 1006) target.terminate();
       else if (code === 1005) target.close();
@@ -870,22 +881,24 @@ function bridgeWebSockets(
     } else if (target.readyState === WebSocket.CONNECTING) target.terminate();
     if (!closed) {
       closed = true;
-      if (errors || code === 1006) lifecycle.error();
+      if (errors || code === 1006) lifecycle.error(providerFailure ?? sourceIsProvider);
       else lifecycle.close();
     }
     source.removeAllListeners('message');
   };
 
-  relay(client, provider, lifecycle.clientMessage);
-  relay(provider, client, lifecycle.serverMessage);
+  relay(client, provider, lifecycle.clientMessage, true);
+  relay(provider, client, lifecycle.serverMessage, false);
   client.once('error', () => {
     errors = true;
+    if (providerFailure === null) providerFailure = false;
     provider.terminate();
   });
   provider.once('error', () => {
     errors = true;
+    if (providerFailure === null) providerFailure = true;
     client.terminate();
   });
-  client.once('close', (code, reason) => closePeer(client, provider, code, reason));
-  provider.once('close', (code, reason) => closePeer(provider, client, code, reason));
+  client.once('close', (code, reason) => closePeer(client, provider, code, reason, false));
+  provider.once('close', (code, reason) => closePeer(provider, client, code, reason, true));
 }
