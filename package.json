@@ -17,7 +17,8 @@
     "prepare": "node scripts/prepare.cjs",
     "prepublishOnly": "npm run build && npm test",
     "demo:gif": "node scripts/demo-gif.mjs",
-    "bench:mock": "tsx bench/bench.ts"
+    "bench:mock": "tsx bench/bench.ts",
+    "bench:observer": "tsx bench/observer.ts"
   },
   "repository": {
     "type": "git",
