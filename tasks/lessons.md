@@ -32,3 +32,5 @@
 - When the user names a successful reference project, use its concrete mechanisms as a design guide while preserving the requested product identity. Do not recast an intentional architectural experiment as unwanted work. Separate adoption evidence, measured results, and transferable design hypotheses.
 
 - Honor the requested team roles explicitly: Astra coordinates scope, integration, and delivery; GPT-5.6 Sol workers implement and review bounded tasks. Reuse the existing Sol workers when the user reiterates this structure.
+
+- Treat context-aware prefetching as Speculate’s established product identity. Assess proxy placement and defaults against that identity; reserve experimental labels for specific unverified capabilities and performance claims.

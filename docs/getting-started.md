@@ -2,22 +2,47 @@
 
 ```bash
 npm install -g speculate-mcp
-speculate on
+speculate run claude
+# or
+speculate run codex
 ```
 
-`on` enables both Claude Code and Codex. It wraps supported MCP servers and
-installs registration-sync hooks that pick up new registrations at session
-start. These hooks do not observe conversation context. Restart your clients
-afterward. In Codex, review and trust the Speculate hook through
-`/hooks` before it can run automatically.
-
-To manage one client, add `--client claude` or `--client codex`:
+`run` starts the native client with context-aware prefetching. At launch it
+requests the model-proxy path, activates it only after verifying the native
+route and temporary controls, and otherwise starts with supported hooks. The
+active mode is reported at startup. Put Speculate options before `--` and
+native client arguments after it:
 
 ```bash
+speculate run claude -- --print "Summarize this workspace."
+speculate run codex -- exec "Summarize this workspace."
+speculate run claude --observe hooks
+speculate run codex --observe off -- exec
+```
+
+`--observe hooks` selects supported native hooks without the model proxy.
+`--observe off` disables session observation while retaining ordinary MCP
+prediction. The launcher preserves the native account, provider, model, effort,
+arguments, permission policy, sandbox, and transport selection.
+
+## Persistent MCP setup
+
+Use `on` when you want supported MCP registrations to remain wrapped across
+ordinary client launches:
+
+```bash
+speculate on                  # enable both clients
+speculate status              # inspect both clients
 speculate off --client codex   # leave Claude Code enabled
 speculate on --client codex
 speculate off                  # disable both
 ```
+
+`on` wraps supported servers and installs registration-sync hooks that pick up
+new registrations at session start. Those hooks synchronize MCP setup; `on`
+alone does not add model or conversation observation. Restart your clients
+afterward. In Codex, review and trust the Speculate hook through `/hooks` before
+it can run automatically.
 
 The command is global after installation. Configuration applies to the local
 client host: it does not reach another machine, hosted connectors, built-in
@@ -121,21 +146,20 @@ as you open them and wraps newly added, approved servers.
 recorded registrations across projects. Conflicts are reported and retained
 for recovery. Learning and authentication remain.
 
-## Experimental context-aware sessions
+## How context-aware launch works
 
 Managed wrappers learn from MCP calls without needing model or conversation
-access. To add session context for one native client process, launch it through
-`speculate run`:
+access. `speculate run` adds session context for one native process:
 
 ```bash
 speculate run claude -- --print "Summarize this workspace."
 speculate run codex -- exec "Summarize this workspace."
 ```
 
-Hook observation is the default. `--observe proxy` also observes supported
-native model traffic, while `--observe off` retains ordinary MCP prediction and
-disables the session observers. Put Speculate options before `--` and native
-client arguments after it. `--json-report PATH` writes aggregate diagnostics.
+The default `--observe proxy` mode observes supported native model traffic. At
+launch it falls back to hook observation when routing cannot be verified. Use
+`--observe hooks` or `--observe off` to select those modes explicitly.
+`--json-report PATH` writes aggregate diagnostics.
 
 The launcher preserves the native account, provider, model, effort, arguments,
 permission policy, sandbox, and transport selection. It requires the host's
@@ -146,12 +170,13 @@ grant tool access. Unsupported provider routes, temporary controls, policy
 forms, or tool-name shapes cause the affected capability to abstain or fall
 back; requested calls continue through the native path.
 
-This mode remains experimental. Native MCP transfer is verified for Claude
-Code and Codex, but native performance, native hook delivery, and live API-key
-routing remain unverified. Installed Codex currently exposes MCP tools through
-an opaque executor, so it does not provide direct native stream-call signals.
-See [Observer compatibility](observer-compatibility.md) and
-[Observer results](observer-results.md) for the tested versions and evidence.
+Context-aware prefetching is Speculate's standard native session path. Its
+observation stages retain measured limits: native MCP transfer is verified for
+Claude Code and Codex, but native performance, native hook delivery, and live
+API-key routing remain unverified. Installed Codex currently exposes MCP tools
+through an opaque executor, so it does not provide direct native stream-call
+signals. See [Observer compatibility](observer-compatibility.md) and [Observer
+results](observer-results.md) for the tested versions and evidence.
 
 ## Keeping your token out of the file
 

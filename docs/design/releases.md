@@ -616,3 +616,31 @@ cross-server benefit under fixed timing, but neither that result nor this
 package release establishes native day-to-day speedup. See
 [Observer results](../observer-results.md) and
 [Observer compatibility](../observer-compatibility.md) for evidence and limits.
+
+## v0.24.0 (2026-09-15): context-aware launch by default
+
+`speculate run claude|codex` now requests the model-proxy route by default and
+activates it only after verification. If the native provider route, temporary
+controls, or preflight cannot be verified before client startup, the launcher
+reports the downgrade and starts with supported native hooks.
+Operators can select `--observe hooks` or `--observe off` explicitly. Off mode
+disables session observation while retaining ordinary MCP prediction.
+
+The launcher continues to preserve native arguments, account, provider, model,
+effort, permission policy, sandbox, and transport. Speculative work requires
+host permission for its specific tool route and Speculate's read-only policy;
+result reuse separately requires an exact argument match. The model relay
+observes traffic and neither executes MCP calls nor adds model requests.
+
+`speculate on` remains the persistent MCP registration choice for Claude Code
+and Codex. Its session-start hooks synchronize supported registrations; `on`
+alone does not add model or conversation observation. Managed `on` and `wrap`
+setup default to annotated policy, while the explicit configuration schema
+continues to default to strict policy.
+
+This release expands default activation by product direction. It does not add
+native performance evidence or change the historical replay gates: the
+1,000-record observer replay still failed its speedup and settled-waste gates,
+and native day-to-day speedup, native hook delivery, and live API-key routing
+remain unverified. The v0.23 hook-default release record and its measured
+artifacts remain unchanged.

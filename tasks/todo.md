@@ -284,3 +284,42 @@ Release source `55070024effd534374246752f76ef7d7a764d79f` is on main and tagged 
 The [trusted publication workflow](https://github.com/lukebward/speculate/actions/runs/34990424843) succeeded. Public npm metadata now reports `speculate-mcp@0.23.0` as `latest`, with the matching source commit and SLSA provenance statement. All 59 files downloaded from the public package exactly match the tested tarball contents, and the registry SHA-512 integrity matches. The [GitHub release](https://github.com/lukebward/speculate/releases/tag/v0.23.0) is published and marked latest. Observer capabilities remain experimental and historical performance gates remain unchanged.
 
 This final follow-up records completed delivery only; release source, tests, documentation, and package contents are unchanged.
+
+# Default model-proxy launch and release (2026-09-15)
+
+**Goal:** Make context-aware prefetching the normal Speculate session experience for Claude Code and Codex, then publish the verified release.
+
+**Approved design:** The user accepted model-proxy mode as the standard native launch path with automatic hook fallback. Keep observation between agent and model; keep authorization, execution, and exact-result reuse at each MCP wrapper. This is a bounded change to the existing launcher, not a new proxy architecture.
+
+**Version:** Target 0.24.0, subject to confirming that it is unpublished. Node >=18, existing dependencies, and both native clients remain supported.
+
+## Implementation plan
+
+- [x] Runtime worker: change `parseRunArgs` to default `observe` to `proxy` for both clients. Keep explicit `--observe hooks` and `--observe off`, native argument forwarding, provider/model/account/effort selection, permissions, and transports intact.
+- [x] Runtime worker: test implicit proxy requests for both clients, explicit overrides, active proxy mode on verified routes, and automatic hook fallback on unsupported/unverifiable routes. Reuse existing fixture clients and production preparation paths. Preserve requested/active mode reporting and add a concise startup fallback reason without raw configuration or credentials if the current output lacks one.
+- [x] Runtime worker: lead CLI help with `speculate run claude|codex`, identify proxy as the default, and retain managed `on` plus manual wrapping as supported choices.
+- [x] Documentation worker: lead README and getting-started with `speculate run claude` and `speculate run codex` after installation. Explain that `on` manages persistent MCP wrappers and does not itself launch model observation. Update commands, landing page, compatibility, and current design wording for the new default and explicit fallback controls.
+- [x] Documentation worker: present context-aware prefetching as the product identity while stating specific unverified integration/performance limits. Preserve historical benchmark artifacts, measured failed gates, and the historical 0.23.0 hook-default release entry. Add a concise 0.24.0 release entry and distinguish broader default enablement from new performance evidence.
+- [x] Review worker: independently audit current fallback, permission, and transport boundaries before implementation finishes; review the final code/docs for both-client parity and unsupported-route abstention. No unrequested refactors, prediction changes, dependency updates, or native credential access.
+- [x] Coordinator: update package.json, package-lock.json, and plugin manifest to the available version. Run build, strict TypeScript, complete tests with scenarios isolated, and strict documentation build. Inspect the tarball and exercise installed default launches plus CLI/MCP/hook checks on Node 18 and 22.
+- [ ] Coordinator: push main normally, verify platform CI and documentation deployment, then create an annotated version tag and use the existing trusted npm workflow. Verify npm latest/source/provenance, public tarball contents, and the GitHub release.
+
+## Ownership and verification
+
+Astra coordinates three existing GPT-5.6 Sol workers. Runtime owns `src/runAgent.ts`, CLI help in `src/cli.ts`, and launcher tests. Documentation owns README and relevant docs. Reviewer is read-only. Coordinator owns tasks, manifests, package/build/full-suite work, commits, pushes, tags, and publication. Workers do not run builds or publish. The existing isolated checkout is reused; the original working checkout is untouched.
+
+Focused checks must establish default selection and real preparation/fallback behavior, not merely update snapshots. Installed launch checks use synthetic native-client fixtures and loopback model endpoints, without accounts, durable user configuration, or paid model calls. Existing relay/MCP fixtures establish forwarding and lifecycle behavior; no long benchmark rerun is needed for a default change. Record any validation failure and its disposition rather than silently retrying until green.
+
+## Implementation review
+
+The bounded runtime change is complete for both clients. Focused launcher checks passed 58/58 after seven expected red-phase failures. Independent review approved default selection, explicit modes, startup-only fallback, native authority/argument/transport preservation, and wrapper permission/cache boundaries. CLI wording was narrowed to avoid promising runtime failover. Documentation now leads with native context-aware launch while preserving historical failed gates and distinguishing persistent `on` setup.
+
+Strict unused-code TypeScript, the 1,376-test main batch (8 skipped), and strict documentation build passed. Built-CLI loopback checks passed all eight client/mode combinations, including exact default-relay request/response forwarding and visible fallback reasons. Timed scenarios and final installed-package checks remain in progress.
+
+## Pre-release verification
+
+All 1,388 tests passed with 8 skipped: 1,376 in the main batch and 12 isolated timed scenarios. Build, strict unused-code TypeScript, strict MkDocs, and diff checks passed. Independent final code/documentation review found no release blocker.
+
+The 0.24.0 package contains 59 files (245,106 bytes packed), all matching the final build/source resources, with no test/benchmark/task artifacts. Installed Node 18.20.8 and 22.14.0 checks passed CLI version/help, real MCP list/call, and both compiled observer hook deliveries. Both runtimes also passed eight actual installed-launch cases (Claude and Codex default, unsupported-route fallback, explicit hooks, explicit off), including byte-identical local-provider requests/responses, native model/argument preservation, report modes, and visible bounded fallback reasons. These are synthetic integration checks, not native account or performance measurements. Tarball SHA-256: `d0d4fe90610a666ebf669fc8dbd5a47a6fabee5d10cfcd683cf6c417f70bf81a`.
+
+Main CI, documentation deployment, and publication remain the delivery gates.

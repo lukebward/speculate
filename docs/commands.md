@@ -2,6 +2,7 @@
 
 | Command | What it does |
 |---|---|
+| `speculate run claude\|codex` | Launch one native client session with context-aware prefetching |
 | `speculate on [--client claude\|codex\|both]` | Wrap supported MCP servers for the selected client |
 | `speculate off [--client claude\|codex\|both]` | Restore registrations changed for the selected client |
 | `speculate status [path] [--client claude\|codex\|both]` | Inspect wrapping and configuration in the selected client |
@@ -10,7 +11,6 @@
 | `speculate stats` | Cumulative time saved, hit rate, and waste (`--json` for scripts) |
 | `speculate memory` | Retained learning inventory; `clear --all` removes managed learning and usage records |
 | `speculate doctor --config PATH` | Why a configured tool is or is not eligible for speculation |
-| `speculate run claude\|codex` | Launch one native client session with experimental context observation |
 
 ## `on` and `off`
 
@@ -38,6 +38,10 @@ client's `off` deletes learned state or OAuth credentials.
 `--mode strict|annotated|off` is available on `on`. The default wrapping mode is
 `annotated`. Add `--codex-bin PATH` to select the Codex executable.
 There is no scope flag for Codex: native writes remain user-level.
+
+The installed session-start hooks synchronize registrations. `on` does not by
+itself add model or conversation observation; use `run` for a context-aware
+native session.
 
 ## `status`, `sync`, and `auth`
 
@@ -151,24 +155,25 @@ speculate run claude -- --print "Summarize this workspace."
 speculate run codex -- exec "Summarize this workspace."
 ```
 
-Everything after `--` belongs to the native client. The session observer is
-experimental and has three modes:
+Everything after `--` belongs to the native client. Context observation has
+three modes:
 
 | Mode | Behavior |
 | --- | --- |
-| `hooks` | Observe supported native hooks; the default |
-| `proxy` | Also observe supported model requests and complete streamed tool calls |
+| `proxy` | Default. At startup, activate the verified model proxy or use hooks |
+| `hooks` | Observe supported native hooks without the model proxy |
 | `off` | Disable session observers while retaining ordinary MCP prediction |
 
 Select a mode with `--observe off|hooks|proxy`. Add `--json-report PATH` before
 `--` to write aggregate source, cache, relay, and exit counters without raw
 prompts, arguments, results, model text, headers, or credentials.
 
-Proxy mode reports and falls back to hook mode when its provider route or
-temporary controls cannot be verified. The launcher does not grant tool
-permission: speculative work still requires host permission for the specific
+The requested and active modes are reported. At launch, proxy mode falls back
+to hook mode when its provider route or temporary controls cannot be verified.
+The launcher does not grant tool permission: speculative work still requires
+host permission for the specific
 tool route and Speculate's read-only policy. See [Observer compatibility](observer-compatibility.md)
-for native client differences and unverified paths.
+for native client differences, measured limits, and unverified paths.
 
 ## Retired launch paths
 

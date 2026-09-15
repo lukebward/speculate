@@ -14,11 +14,15 @@ Speculate is a transparent MCP proxy that reduces perceived agent latency by *sp
 
     Managed setup now places one Speculate wrapper in front of each supported
     MCP registration, preserving that registration's exposed tools and native
-    ownership. Experimental `speculate run` adds a bounded session bridge that
-    coordinates context observations across those wrappers. Each wrapper still
-    owns execution and its cache; the model relay observes traffic and does not
-    execute MCP calls or make additional model requests. The diagram and
-    multi-upstream discussion below preserve the original design history.
+    ownership. In 0.24, `speculate run` is the standard native session path and
+    requests the model proxy by default, activating it after verification or
+    starting with supported hooks. Its bounded session bridge coordinates
+    context observations across those wrappers. Each wrapper still owns
+    execution and its cache; the model relay observes traffic and does not
+    execute MCP calls or make additional
+    model requests. Persistent `on` setup synchronizes registrations but does
+    not add model observation. The diagram and multi-upstream discussion below
+    preserve the original design history.
 
 ---
 

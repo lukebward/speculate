@@ -227,7 +227,7 @@ export function nativeClientInvocation(
 export function parseRunArgs(argv: string[]): RunAgentArgs | { error: string } {
   const agent = argv[0];
   if (agent !== 'claude' && agent !== 'codex') return { error: 'expected claude or codex' };
-  let observe: ObserverMode = 'hooks';
+  let observe: ObserverMode = 'proxy';
   let jsonReport: string | null = null;
   let index = 1;
   for (; index < argv.length; index++) {
@@ -273,6 +273,12 @@ export async function runAgent(args: RunAgentArgs, dependencies: RunAgentDepende
   signals.on('SIGTERM', forwardTerm);
   try {
     log(`[speculate] launching ${args.agent} (observer: ${prepared.mode}, transport: ${prepared.transport})`);
+    if (args.observe === 'proxy' && prepared.mode === 'hooks') {
+      const reason = prepared.disabledCapabilities().find((value) => value.startsWith('model-observation:'));
+      log(reason
+        ? `[speculate] model observation unavailable; using hooks (${reason})`
+        : '[speculate] model observation unavailable; using hooks');
+    }
     const outcome = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
       try {
         const invocation = nativeClientInvocation(args.agent, prepared.plan.command, prepared.plan.args);

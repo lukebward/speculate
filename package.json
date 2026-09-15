@@ -1,6 +1,6 @@
 {
   "name": "speculate-mcp",
-  "version": "0.23.0",
+  "version": "0.24.0",
   "description": "Local learning MCP proxy that prefetches read-only tool calls to reduce waiting",
   "main": "dist/src/cli.js",
   "scripts": {

@@ -4,6 +4,11 @@ Measured 2026-09-14 at source `e6bf9866e636b6d7914e9fab2e73eb27ac0e7b60`. The ob
 
 The subsequent [Headroom-informed adaptation](headroom-informed-speculation.md) adds selective observer feedback and a separate multi-turn diagnostic. It also documents the original replay's missing transition coverage and fixture timing limits. The historical measurements and decisions below are unchanged.
 
+Speculate 0.24 makes context-aware `run` the standard native session path and
+requests proxy observation by default, with startup hook fallback. That
+enablement is a product decision; it does not change these historical gate
+results or provide new native performance evidence.
+
 ## What has passed
 
 Native-account smoke tests used Claude Code 2.1.268 and Codex CLI 0.154.0 with their existing account, model, effort, permission, and transport selections. Each client completed the expected model response in all three public modes and made exactly one correct call to a wrapper-owned synthetic read tool.
@@ -71,6 +76,10 @@ Completed-stream observation improved E relative to D by 1.09% for Claude (95% i
 Relay measurements used 20 warmups and 200 pairs per client, with byte-identical payloads. Their p95 added-TTFB 95% intervals were 0.116–0.144 ms for Claude and 0.120–0.149 ms for Codex. The largest positive mixed-task p95 regression among the tested comparisons was 0.127%, below the 5% threshold.
 
 The unchanged automatic release evaluator returned **`remove` for all three stages on both clients**, because speedup and waste gates failed. The implementation plan permits retaining failing increments as experimental or removing them. At this measured source snapshot, the decision was **retain experimental** without an npm release or broader enablement. Packaging the command in a later release does not override the failed gates or claim that the observer improves native task performance.
+
+That paragraph records the decision at the measured source snapshot. Version
+0.24 later expands default activation by product direction, without rerunning
+or changing the evaluator and without claiming native speedup.
 
 The benchmark source snapshot passed build, strict TypeScript, independent review, and 1,362 tests with 8 skipped. Subsequent CI corrections at `894a8e3` normalized final native launcher invocation and made lifecycle fixtures portable; they passed independent review and 1,365 tests with 8 skipped. The timed benchmark paths were unchanged, and the records retain their original `e6bf986` source tag. The full benchmark completed in about 65 minutes. See the [verification artifact](observer-verification-results.json).
 

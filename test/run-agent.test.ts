@@ -676,10 +676,10 @@ describe('run argument parser', () => {
     });
   });
 
-  it('defaults to hooks and preserves every argument after the separator', () => {
-    expect(parseRunArgs(['codex', '--json-report', '/tmp/report.json', '--', '-c', 'model="chosen"', '--profile', 'work'])).toEqual({
-      agent: 'codex',
-      observe: 'hooks',
+  it.each(['claude', 'codex'] as const)('defaults %s to proxy and preserves every argument after the separator', (agent) => {
+    expect(parseRunArgs([agent, '--json-report', '/tmp/report.json', '--', '-c', 'model="chosen"', '--profile', 'work'])).toEqual({
+      agent,
+      observe: 'proxy',
       clientArgs: ['-c', 'model="chosen"', '--profile', 'work'],
       jsonReport: '/tmp/report.json',
     });
@@ -749,6 +749,56 @@ describe('public run command', () => {
     expect(readFileSync(report, 'utf8')).not.toContain('kept');
   });
 
+  it('uses model proxy observation by default for a supported Claude route', () => {
+    const root = directory();
+    const home = join(root, 'home');
+    mkdirSync(home);
+    const client = join(root, 'fake-claude.mjs');
+    const report = join(root, 'report.json');
+    writeFileSync(client, '#!/usr/bin/env node\nprocess.exit(7)\n');
+    chmodSync(client, 0o700);
+    const result = spawnSync(process.execPath, [
+      join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+      join(process.cwd(), 'src', 'cli.ts'),
+      'run', 'claude', '--json-report', report,
+    ], {
+      cwd: root,
+      env: { ...process.env, HOME: home, SPECULATE_CLAUDE_BIN: client },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(result.status).toBe(7);
+    expect(result.stderr).toContain('launching claude (observer: proxy');
+    expect(JSON.parse(readFileSync(report, 'utf8'))).toMatchObject({
+      client: 'claude', requestedMode: 'proxy', activeMode: 'proxy', transport: 'messages',
+    });
+  });
+
+  it('falls back from implicit Claude proxy observation with a bounded provider reason', () => {
+    const root = directory();
+    const home = join(root, 'home');
+    mkdirSync(home);
+    const client = join(root, 'fake-claude.mjs');
+    const report = join(root, 'report.json');
+    writeFileSync(client, '#!/usr/bin/env node\nprocess.exit(7)\n');
+    chmodSync(client, 0o700);
+    const result = spawnSync(process.execPath, [
+      join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+      join(process.cwd(), 'src', 'cli.ts'),
+      'run', 'claude', '--json-report', report,
+    ], {
+      cwd: root,
+      env: { ...process.env, HOME: home, SPECULATE_CLAUDE_BIN: client, CLAUDE_CODE_USE_BEDROCK: '1' },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(result.status).toBe(7);
+    expect(result.stderr).toContain('model-observation:unsupported-provider');
+    expect(JSON.parse(readFileSync(report, 'utf8'))).toMatchObject({
+      client: 'claude', requestedMode: 'proxy', activeMode: 'hooks',
+    });
+  });
+
   it.each([
     ['an unverified account route', {}, 'model-observation:unverified-account-route'],
     [
@@ -784,7 +834,7 @@ rl.on('line', (line) => {
     const result = spawnSync(process.execPath, [
       join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
       join(process.cwd(), 'src', 'cli.ts'),
-      'run', 'codex', '--observe', 'proxy', '--json-report', report, '--', 'exec', '--model', 'kept',
+      'run', 'codex', '--json-report', report, '--', 'exec', '--model', 'kept',
     ], {
       cwd: root,
       env: { ...process.env, HOME: home, SPECULATE_CODEX_BIN: client },
@@ -793,10 +843,50 @@ rl.on('line', (line) => {
     });
     expect(result.status).toBe(6);
     expect(result.stderr).toContain('launching codex (observer: hooks');
+    expect(result.stderr).toContain(disabledReason);
     expect(JSON.parse(readFileSync(report, 'utf8'))).toMatchObject({
       schemaVersion: 1, client: 'codex', requestedMode: 'proxy', activeMode: 'hooks', transport: 'responses',
       disabledCapabilities: expect.arrayContaining([disabledReason]),
       exit: { code: 6, signal: null },
+    });
+  });
+
+  it('uses model proxy observation by default for a verified Codex upstream', () => {
+    const root = directory();
+    const home = join(root, 'home');
+    mkdirSync(home);
+    const client = join(root, 'fake-codex.mjs');
+    const report = join(root, 'report.json');
+    writeFileSync(client, `#!/usr/bin/env node
+import readline from 'node:readline';
+if (!process.argv.includes('app-server')) process.exit(6);
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const message = JSON.parse(line);
+  if (message.id === undefined) return;
+  const result = message.method === 'initialize'
+    ? { codexHome: ${JSON.stringify(home)} }
+    : message.method === 'config/read'
+      ? { config: { model_provider: 'openai', openai_base_url: 'https://api.openai.com/v1' }, layers: [], origins: {} }
+      : {};
+  process.stdout.write(JSON.stringify({ id: message.id, result }) + '\\n');
+});
+`);
+    chmodSync(client, 0o700);
+    const result = spawnSync(process.execPath, [
+      join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+      join(process.cwd(), 'src', 'cli.ts'),
+      'run', 'codex', '--json-report', report, '--', 'exec', '--model', 'kept',
+    ], {
+      cwd: root,
+      env: { ...process.env, HOME: home, SPECULATE_CODEX_BIN: client },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    expect(result.status).toBe(6);
+    expect(result.stderr).toContain('launching codex (observer: proxy');
+    expect(JSON.parse(readFileSync(report, 'utf8'))).toMatchObject({
+      client: 'codex', requestedMode: 'proxy', activeMode: 'proxy', transport: 'responses',
     });
   });
 });

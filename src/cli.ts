@@ -51,6 +51,11 @@ import { parseRunArgs, runAgent } from './runAgent.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
+native context-aware sessions (model proxy observation is the default):
+  speculate run claude [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
+  speculate run codex [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
+                                           fall back to hooks when the model route or relay setup cannot be verified
+
 managed setup (on/off/status/sync/auth accept --client both|claude|codex):
   speculate on [--mode <mode>]             wrap supported MCP servers for both clients
   speculate off                            restore registrations changed by 'on'
@@ -63,8 +68,6 @@ managed setup (on/off/status/sync/auth accept --client both|claude|codex):
                                            inventory bounded learned/usage memory
   speculate memory clear (--all | --config PATH) [--json]
                                            clear only the explicitly scoped memory records
-  speculate run claude|codex [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
-                                           launch a native client with session-scoped observation
   speculate auth [server]                  authorize Speculate with remote servers that need a
                                            login (no argument: every one that does)
   speculate auth <server> --forget         forget a saved remote-server login

@@ -1,8 +1,10 @@
 # Observer compatibility
 
 Checked 2026-09-14 with Claude Code 2.1.268, Codex CLI 0.154.0, and Node
-22.14.0. Speculate 0.23.0 packages the experimental `run` observer described
-here; the tested client versions identify the evidence and are not general
+22.14.0. Speculate 0.23.0 first packaged the `run` observer described here;
+0.24.0 makes model-proxy mode the default request, activated after verification
+with startup hook fallback. The tested client versions identify the evidence
+and are not general
 minimum-version claims.
 
 Fixtures and reports contain synthetic protocol data or aggregate counters. Raw prompts, tool arguments and results, reasoning, headers, credentials, account identifiers, and transcripts are not written to observer reports.
@@ -11,7 +13,7 @@ Fixtures and reports contain synthetic protocol data or aggregate counters. Raw 
 
 | Capability | Claude Code 2.1.268 | Codex CLI 0.154.0 |
 | --- | --- | --- |
-| Default launch mode | Hook observation | Hook observation |
+| Default request | Model proxy, with hook fallback | Model proxy, with hook fallback |
 | Explicit model proxy | Messages JSON/SSE and native account route passed | Responses JSON/SSE/WebSocket and native ChatGPT account route passed |
 | Registered MCP transfer | One correct wrapper-owned read in off/hooks/proxy; one upstream call | One correct wrapper-owned read in off/hooks/proxy; one upstream call |
 | Native stream-call shape | Flat `mcp__alias__tool` name and inline schema verified | MCP tools deferred behind opaque `functions.exec`; direct native stream-call prediction unavailable |
@@ -47,7 +49,11 @@ Installed Codex 0.154.0 advertises a custom `functions.exec` tool and defers ind
 
 ## Diagnostics and limits
 
-`speculate run` supports `--observe off|hooks|proxy` and an optional `--json-report <path>`. Hook mode is the default. Off mode disables the new observers while retaining existing Speculate prediction; it is not a no-Speculate control. Proxy mode reports an explicit downgrade when its route or preflight cannot be verified.
+`speculate run` supports `--observe off|hooks|proxy` and an optional
+`--json-report <path>`. Proxy is the default requested mode. It reports an
+explicit downgrade to hook mode when its route or preflight cannot be verified.
+Off mode disables session observation while retaining existing Speculate
+prediction; it is not a no-Speculate control.
 
 Reports contain client/version, requested and active mode, transport, aggregate source counts, aggregate relay counts, disabled-capability reasons, and exit status. They do not contain route names, prompts, arguments, results, model text, headers, or credentials. Full results stay in the existing bounded, short-lived in-memory cache.
 
@@ -55,7 +61,15 @@ Prediction remains local and does not make an additional model call. Existing
 cache lifetime, concurrency, rate, retained-byte, and observation-size limits
 remain in force for observer-triggered work.
 
-The new observer remains experimental. The full replay passed correctness, no-extra-model-call, relay-overhead, and mixed-p95 gates for both clients, but failed median speedup and settled-waste gates. Native transfer is verified; native speedup, live API-key routing, and native hook delivery remain unverified. See [observer results](observer-results.md), [native routing](observer-native-routing.md), [native tool shapes](observer-native-tool-shapes.md), and the [sanitized transfer results](observer-native-transfer-results.json).
+Context-aware launch is the standard native path in 0.24. The evidence for its
+observation stages remains qualified: the full replay passed correctness,
+no-extra-model-call, relay-overhead, and mixed-p95 gates for both clients, but
+failed median speedup and settled-waste gates. The default change is a product
+decision, not new performance evidence. Native transfer is verified; native
+speedup, live API-key routing, and native hook delivery remain unverified. See
+[observer results](observer-results.md), [native routing](observer-native-routing.md),
+[native tool shapes](observer-native-tool-shapes.md), and the [sanitized
+transfer results](observer-native-transfer-results.json).
 
 Official client contracts:
 

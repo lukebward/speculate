@@ -9,11 +9,15 @@ call already in progress.
 
 ```bash
 npm install -g speculate-mcp
-speculate on
+speculate run claude
+# or
+speculate run codex
 ```
 
-`speculate on` enables supported MCP servers for Claude Code and Codex. See
-[Getting started](getting-started.md) for each client's scope and hook setup.
+`run` starts the native client with context-aware prefetching. At launch, it
+requests the model-proxy path, activates it only after verification, and
+otherwise starts with supported hooks. See [Getting started](getting-started.md) for native
+arguments, observation controls, and persistent MCP setup.
 
 !!! quote "On how this was built"
 
@@ -27,8 +31,8 @@ speculate on
 
     ---
 
-    One command enables Claude Code and Codex. Explicit `wrap` configuration
-    supports other MCP clients.
+    Launch Claude Code or Codex with context-aware prefetching, or install
+    persistent wrappers for supported MCP servers.
 
     [:octicons-arrow-right-24: Install](getting-started.md)
 
@@ -36,8 +40,8 @@ speculate on
 
     ---
 
-    Managed setup, experimental context-aware sessions, authentication,
-    diagnostics, and local memory.
+    Context-aware launch, persistent setup, authentication, diagnostics, and
+    local memory.
 
     [:octicons-arrow-right-24: CLI reference](commands.md)
 
@@ -58,12 +62,12 @@ speculate on
 
     [:octicons-arrow-right-24: Config reference](configuration.md)
 
--   :material-flask-outline:{ .lg .middle } **Experimental observer**
+-   :material-chart-box-outline:{ .lg .middle } **Observer evidence**
 
     ---
 
-    Context-aware `run` modes for Claude Code and Codex, with measured limits
-    and native compatibility boundaries.
+    Measured limits and native compatibility boundaries for the context signals
+    used by `run`.
 
     [:octicons-arrow-right-24: Observer results](observer-results.md)
 
@@ -90,18 +94,21 @@ speculate on
   match Speculate's recorded change and reports conflicts instead of overwriting
   later edits.
 
-## Two prediction paths
+## Context-aware and persistent operation
 
-Ordinary `speculate on` installs persistent MCP wrappers. They learn repeated
-call sequences and can use explicit rules. The registration-sync hooks installed
-for Claude Code and Codex discover newly added supported servers; they do not
-observe conversation context.
+`speculate run claude|codex` is the standard native session path. It adds prompt,
+learned cross-server transition, and supported model-stream signals. The
+model-proxy path is requested by default and activated only after verification,
+with startup fallback to supported hooks. The launcher preserves the client's
+native account, provider, model, effort, arguments, permission policy, sandbox,
+and transport selection.
+See the [compatibility matrix](observer-compatibility.md) for differences
+between native client surfaces.
 
-Experimental `speculate run claude|codex` launches one native session and adds
-prompt, learned cross-server transition, and supported model-stream signals.
-It preserves the client's native account, model, effort, arguments, permission
-policy, and transport selection. See the [compatibility matrix](observer-compatibility.md)
-for differences between native client surfaces.
+`speculate on` installs persistent MCP wrappers. They learn repeated call
+sequences and can use explicit rules. The registration-sync hooks installed for
+Claude Code and Codex discover newly added supported servers; `on` alone does
+not observe model or conversation context.
 
 ## Evidence and limits
 
@@ -112,7 +119,8 @@ multi-turn diagnostic measured about 40% less warm cross-server task time for
 both client fixtures, but it does not establish native performance.
 
 Native MCP transfer is verified for Claude Code and Codex. Native day-to-day
-speedup remains unverified. The [benchmark guide](design/local-learning-benchmark.md)
+speedup, native hook delivery, and live API-key routing remain unverified. The
+[benchmark guide](design/local-learning-benchmark.md)
 and [observer results](observer-results.md) preserve the methods, historical
 results, failed gates, and limitations.
 
