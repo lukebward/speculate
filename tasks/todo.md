@@ -244,8 +244,8 @@ Completed delivery: `f796513` is verified on main. CI [34974445299](https://gith
 - [x] Remove proven obsolete code and update affected coverage; keep behavior-preserving changes small.
 - [x] Rewrite README around installation, Claude/Codex usage, architecture, limitations, and links; update release notes and version metadata.
 - [x] Independently review the removals and documentation; run build, TypeScript, full tests, strict docs build, and packed-package smoke checks.
-- [ ] Push main normally and verify platform CI.
-- [ ] Create the version tag and publish through the repository's trusted npm workflow; publish concise GitHub release notes and verify registry/tag/release contents.
+- [x] Push main normally and verify platform CI.
+- [x] Create the version tag and publish through the repository's trusted npm workflow; publish concise GitHub release notes and verify registry/tag/release contents.
 
 ## Audit and release constraints
 
@@ -276,3 +276,11 @@ The 0.23.0 tarball has 59 files (244,903 bytes packed), contains the runtime and
 Main push, platform CI, and registry/GitHub publication remain the delivery gates after this source commit.
 
 The first release-candidate CI at `a8421d0` passed Linux and Windows, including isolated scenario and native Codex checks; docs deployed successfully. macOS exposed a race in the new installed-hook test: its parent supplied piped stdin after spawning a hook whose intentional deadline is 20 ms. A controlled 60 ms parent delay reproduced silent expiry; preloading the same payload into inherited stdin resolved it. The test harness now opens its input before spawning. Production files and the verified tarball are unchanged; the corrected packed-root test and focused hook suite passed. A new three-platform run is required before tagging.
+
+## Completed delivery
+
+Release source `55070024effd534374246752f76ef7d7a764d79f` is on main and tagged `v0.23.0`. [Platform CI](https://github.com/lukebward/speculate/actions/runs/34989119096) passed Linux, macOS, and Windows, including full tests, isolated scenarios, and native Codex checks. The unchanged Windows native fixture initially failed after 30 seconds with a locked-directory cleanup error that masked the primary failure; timing suggests a native command timeout, but its underlying cause was not established. One fresh-run retry of the failed job passed without further code changes. This is retained as an intermittent validation limitation, not a claimed production fix. [Documentation deployment](https://github.com/lukebward/speculate/actions/runs/34988400049) passed for the unchanged final docs.
+
+The [trusted publication workflow](https://github.com/lukebward/speculate/actions/runs/34990424843) succeeded. Public npm metadata now reports `speculate-mcp@0.23.0` as `latest`, with the matching source commit and SLSA provenance statement. All 59 files downloaded from the public package exactly match the tested tarball contents, and the registry SHA-512 integrity matches. The [GitHub release](https://github.com/lukebward/speculate/releases/tag/v0.23.0) is published and marked latest. Observer capabilities remain experimental and historical performance gates remain unchanged.
+
+This final follow-up records completed delivery only; release source, tests, documentation, and package contents are unchanged.
