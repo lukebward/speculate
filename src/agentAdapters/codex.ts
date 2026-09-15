@@ -3,7 +3,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
-import { resolveCodexBin, type CodexConfigRead } from '../codexClient.js';
+import { codexSubcommand, resolveCodexBin, type CodexConfigRead } from '../codexClient.js';
 import { isStdioEntry, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import {
   MAX_OBSERVATION_BYTES,
@@ -1039,8 +1039,7 @@ function configOverrideAffectsOwnedTransport(args: readonly string[], alias: str
 }
 
 function supportsFinalOverridePlacement(args: readonly string[]): boolean {
-  const sentinel = args.indexOf('--');
-  return args.slice(0, sentinel < 0 ? args.length : sentinel).includes('exec');
+  return codexSubcommand(args) === 'exec';
 }
 
 function placeGeneratedOverrides(generated: readonly string[], clientArgs: readonly string[]): string[] {

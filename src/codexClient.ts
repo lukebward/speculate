@@ -83,37 +83,58 @@ export interface CodexConfigInvocation {
   reason?: string;
 }
 
+const CODEX_CONFIG_VALUE_FLAGS = new Set(['-c', '--config', '--enable', '--disable', '-p', '--profile', '-C', '--cd']);
+const CODEX_OTHER_VALUE_FLAGS = new Set(['-m', '--model', '-s', '--sandbox', '-a', '--ask-for-approval', '--color']);
+const CODEX_EQUAL_CONFIG_FLAGS = ['--config=', '--enable=', '--disable=', '--profile=', '--cd='];
+const CODEX_SUBCOMMANDS = new Set(['exec', 'resume', 'review', 'fork', 'apply', 'cloud', 'mcp', 'features']);
+
+export function codexSubcommand(clientArgs: readonly string[]): string | null {
+  for (let index = 0; index < clientArgs.length; index++) {
+    const arg = clientArgs[index]!;
+    if (arg === '--') return null;
+    if (CODEX_CONFIG_VALUE_FLAGS.has(arg) || CODEX_OTHER_VALUE_FLAGS.has(arg)) {
+      index++;
+      continue;
+    }
+    if (CODEX_EQUAL_CONFIG_FLAGS.some((prefix) => arg.startsWith(prefix))) continue;
+    if (arg.startsWith('-')) continue;
+    return CODEX_SUBCOMMANDS.has(arg) ? arg : null;
+  }
+  return null;
+}
+
 export function extractCodexConfigInvocation(clientArgs: readonly string[]): CodexConfigInvocation {
   const globalArgs: string[] = [];
   let cwd: string | undefined;
-  const splitFlags = new Set(['-c', '--config', '--enable', '--disable', '-p', '--profile', '-C', '--cd']);
-  const equalFlags = ['--config=', '--enable=', '--disable=', '--profile=', '--cd='];
-  const unrelatedValueFlags = new Set(['-m', '--model', '-s', '--sandbox', '-a', '--ask-for-approval', '--color']);
+  let command: string | null = null;
   for (let index = 0; index < clientArgs.length; index++) {
     const arg = clientArgs[index]!;
     if (arg === '--') break;
     if (arg === '--ignore-user-config') {
       return { globalArgs, verifiable: false, reason: 'unsupported-config-source' };
     }
-    if (splitFlags.has(arg)) {
+    if (CODEX_CONFIG_VALUE_FLAGS.has(arg)) {
       const value = clientArgs[++index];
       if (!value || value === '--') return { globalArgs, verifiable: false, reason: 'missing-config-value' };
       globalArgs.push(arg, value);
       if (arg === '-C' || arg === '--cd') cwd = value;
       continue;
     }
-    if (equalFlags.some((prefix) => arg.startsWith(prefix))) {
+    if (CODEX_EQUAL_CONFIG_FLAGS.some((prefix) => arg.startsWith(prefix))) {
       if (arg.endsWith('=')) return { globalArgs, verifiable: false, reason: 'missing-config-value' };
       globalArgs.push(arg);
       if (arg.startsWith('--cd=')) cwd = arg.slice('--cd='.length);
       continue;
     }
-    if (unrelatedValueFlags.has(arg)) {
+    if (CODEX_OTHER_VALUE_FLAGS.has(arg)) {
       if (!clientArgs[index + 1]) return { globalArgs, verifiable: false, reason: 'missing-argument-value' };
       index++;
       continue;
     }
-    if (!arg.startsWith('-') && !['exec', 'resume', 'review', 'fork', 'apply', 'cloud', 'mcp', 'features'].includes(arg)) break;
+    if (!arg.startsWith('-')) {
+      if (command === null && CODEX_SUBCOMMANDS.has(arg)) command = arg;
+      else break;
+    }
   }
   return { globalArgs, ...(cwd !== undefined ? { cwd } : {}), verifiable: true };
 }

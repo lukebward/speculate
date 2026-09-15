@@ -144,6 +144,61 @@ describe('native launch plans', () => {
     await plan.cleanup();
   });
 
+  it.each(['file', 'inline'] as const)('wraps effective Claude aliases from an exact per-run %s MCP source', async (sourceKind) => {
+    const root = directory();
+    const home = join(root, 'home');
+    const cwd = join(root, 'work');
+    mkdirSync(home); mkdirSync(cwd);
+    writeFileSync(join(home, '.claude.json'), JSON.stringify({
+      mcpServers: {
+        files: { command: '/bin/durable' },
+        durableOnly: { command: '/bin/durable-only' },
+      },
+    }));
+    const source = {
+      mcpServers: {
+        files: { command: '/bin/per-run', args: ['--kept'] },
+        synthetic: { command: '/bin/synthetic' },
+        remote: { type: 'http', url: 'https://example.invalid/mcp' },
+      },
+    };
+    const value = sourceKind === 'inline' ? JSON.stringify(source) : join(root, 'session-mcp.json');
+    if (sourceKind === 'file') writeFileSync(value, JSON.stringify(source));
+    const originalFlag = `--mcp-config=${value}`;
+    const plan = await buildClaudeLaunchPlan({
+      cwd, home, env: { HOME: home }, clientArgs: [originalFlag, '--model', 'chosen'],
+      observe: 'hooks', relayBaseUrl: null, session, hook,
+      self: { command: '/opt/node', args: ['/opt/cli.js'] }, clientBin: '/opt/claude',
+    });
+    expect(plan.args).not.toContain(originalFlag);
+    const configFlag = plan.args.find((arg) => arg.startsWith('--mcp-config='))!;
+    const config = JSON.parse(readFileSync(configFlag.slice('--mcp-config='.length), 'utf8'));
+    expect(config.mcpServers.files.args).toContain('/bin/per-run');
+    expect(config.mcpServers.synthetic.args).toContain('/bin/synthetic');
+    expect(config.mcpServers.durableOnly.args).toContain('/bin/durable-only');
+    expect(config.mcpServers.remote.args).toContain(source.mcpServers.remote.url);
+    expect(plan.args.slice(-2)).toEqual(['--model', 'chosen']);
+    await plan.cleanup();
+  });
+
+  it.each(['unreadable', 'ambiguous'] as const)('leaves native Claude MCP arguments unchanged when their source is %s', async (kind) => {
+    const root = directory();
+    const home = join(root, 'home');
+    const cwd = join(root, 'work');
+    mkdirSync(home); mkdirSync(cwd);
+    writeFileSync(join(home, '.claude.json'), JSON.stringify({ mcpServers: { files: { command: '/bin/durable' } } }));
+    const clientArgs = kind === 'unreadable'
+      ? ['--mcp-config', join(root, 'missing.json'), '--model', 'chosen']
+      : ['--mcp-config', join(root, 'first.json'), '--mcp-config', join(root, 'second.json'), '--model', 'chosen'];
+    const plan = await buildClaudeLaunchPlan({
+      cwd, home, env: { HOME: home }, clientArgs, observe: 'hooks', relayBaseUrl: null,
+      session, hook, self: { command: '/opt/node', args: ['/opt/cli.js'] }, clientBin: '/opt/claude',
+    });
+    expect(plan.args.slice(-clientArgs.length)).toEqual(clientArgs);
+    expect(plan.args.filter((arg) => arg.startsWith('--mcp-config='))).toEqual([]);
+    expect(plan.disabledCapabilities).toContain('owned-mcp:unverifiable-config-source');
+  });
+
   it('replays Codex config arguments in order and preserves native args after generated overrides', () => {
     expect(extractCodexConfigInvocation([
       'exec', '--enable=hooks', '-c', 'model="selected"', '--profile', 'work', '--disable', 'feature_x', '--', 'prompt',
@@ -227,7 +282,7 @@ describe('native launch plans', () => {
       session, hook, self: { command: '/opt/node', args: ['/opt/cli.js'] }, clientBin: '/opt/codex',
       nativeConfig: config, nativeUpstreamBaseUrl: 'https://api.openai.com/v1',
     });
-    const generated = plan.args.slice(0, -clientArgs.length).join('\n');
+    const generated = plan.args.slice(clientArgs.length).join('\n');
     expect(generated).not.toContain('mcp_servers."unsupported"');
     expect(generated).toContain('mcp_servers."files".command');
     expect(plan.disabledCapabilities).toContain('owned-mcp:unsupported-entry');
@@ -334,6 +389,40 @@ describe('native launch plans', () => {
       ['-c', 'openai_base_url="https://native.invalid"'],
       ['exec', 'prompt'],
     )).toBe(true);
+  });
+
+  it('does not treat exec used as an option value as the Codex subcommand', async () => {
+    const clientArgs = [
+      '--model', 'exec',
+      '-c', 'openai_base_url="https://native.invalid"',
+      '-c', 'mcp_servers.files.command="/bin/native"',
+      '-c', 'hooks.SessionStart=[]',
+    ];
+    const nativeGlobalArgs = clientArgs.slice(2);
+    expect(codexProxyOverrideIsVerifiable(
+      { model_provider: 'openai', openai_base_url: 'https://native.invalid' },
+      nativeGlobalArgs,
+      clientArgs,
+    )).toBe(false);
+    const plan = await buildCodexLaunchPlan({
+      cwd: directory(), env: {}, clientArgs, observe: 'hooks', relayBaseUrl: null,
+      session, hook, self: { command: '/opt/node', args: ['/opt/cli.js'] }, clientBin: '/opt/codex',
+      nativeConfig: {
+        config: {
+          model_provider: 'openai', openai_base_url: 'https://native.invalid',
+          mcp_servers: { files: { command: '/bin/native' } }, hooks: {},
+        },
+        layers: [], origins: {},
+      },
+      nativeUpstreamBaseUrl: 'https://native.invalid', nativeGlobalArgs,
+    });
+    const generated = plan.args.slice(0, -clientArgs.length).join('\n');
+    expect(generated).not.toContain('mcp_servers."files"');
+    expect(generated).not.toContain('hooks=');
+    expect(plan.disabledCapabilities).toEqual(expect.arrayContaining([
+      'owned-mcp:config-override-precedence',
+      'hook-observation:config-override-precedence',
+    ]));
   });
 });
 

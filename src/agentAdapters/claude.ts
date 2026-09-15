@@ -6,7 +6,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
-import { effectiveServers, readClaudeServers, selfCommand, wrapLaunchEntry } from '../hostConfig.js';
+import { effectiveServers, readClaudeServers, selfCommand, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import { resolveClaudeBin } from '../manage.js';
 import {
   MAX_OBSERVATION_BYTES,
@@ -28,6 +28,7 @@ import {
 const MAX_STREAM_ARGUMENT_BYTES = 64 * 1024;
 const MAX_ACTIVE_BLOCKS = 256;
 const MAX_REQUEST_TOOLS = 512;
+const MAX_LAUNCH_CONFIG_BYTES = 8 * 1024 * 1024;
 
 interface ActiveBlock {
   callId: string;
@@ -498,6 +499,54 @@ function launchSettings(cwd: string, clientArgs: readonly string[]): {
   return { settings, clientArgs: forwarded };
 }
 
+function launchMcpSource(cwd: string, clientArgs: readonly string[]): {
+  source: Record<string, unknown> | null;
+  servers: Record<string, McpServerEntry>;
+  clientArgs: string[];
+  reason?: string;
+} {
+  const occurrences: Array<{ index: number; count: number; value: string }> = [];
+  for (let index = 0; index < clientArgs.length; index++) {
+    const arg = clientArgs[index]!;
+    if (arg === '--') break;
+    if (arg === '--mcp-config') {
+      const value = clientArgs[index + 1];
+      if (!value) return { source: null, servers: {}, clientArgs: [...clientArgs], reason: 'owned-mcp:unverifiable-config-source' };
+      occurrences.push({ index, count: 2, value });
+      index++;
+    } else if (arg.startsWith('--mcp-config=')) {
+      occurrences.push({ index, count: 1, value: arg.slice('--mcp-config='.length) });
+    }
+  }
+  if (occurrences.length === 0) return { source: null, servers: {}, clientArgs: [...clientArgs] };
+  if (occurrences.length !== 1 || !occurrences[0]!.value) {
+    return { source: null, servers: {}, clientArgs: [...clientArgs], reason: 'owned-mcp:unverifiable-config-source' };
+  }
+  const occurrence = occurrences[0]!;
+  try {
+    let parsed: unknown;
+    if (occurrence.value.trim().startsWith('{')) {
+      if (Buffer.byteLength(occurrence.value, 'utf8') > MAX_LAUNCH_CONFIG_BYTES) throw new Error('oversized');
+      parsed = JSON.parse(occurrence.value) as unknown;
+    } else {
+      const path = resolve(cwd, occurrence.value);
+      if (statSync(path).size > MAX_LAUNCH_CONFIG_BYTES) throw new Error('oversized');
+      parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    }
+    if (!object(parsed) || (parsed.mcpServers !== undefined && !object(parsed.mcpServers))) throw new Error('invalid');
+    const servers: Record<string, McpServerEntry> = {};
+    for (const [alias, entry] of Object.entries(object(parsed.mcpServers) ? parsed.mcpServers : {})) {
+      if (!object(entry)) throw new Error('invalid');
+      servers[alias] = entry as McpServerEntry;
+    }
+    const forwarded = [...clientArgs];
+    forwarded.splice(occurrence.index, occurrence.count);
+    return { source: parsed, servers, clientArgs: forwarded };
+  } catch {
+    return { source: null, servers: {}, clientArgs: [...clientArgs], reason: 'owned-mcp:unverifiable-config-source' };
+  }
+}
+
 export async function buildLaunchPlan(context: ClaudeLaunchContext): Promise<LaunchPlan> {
   const home = context.home ?? homedir();
   const directory = mkdtempSync(join(tmpdir(), 'speculate-claude-run-'));
@@ -506,24 +555,37 @@ export async function buildLaunchPlan(context: ClaudeLaunchContext): Promise<Lau
   const disabledCapabilities: string[] = [];
   try {
     const view = readClaudeServers({ home, cwd: context.cwd });
+    const perRun = launchMcpSource(context.cwd, context.clientArgs);
     const mcpServers: Record<string, unknown> = {};
-    for (const [alias, scoped] of effectiveServers(view.servers)) {
-      if (scoped.scope === 'project' && !view.approvedProjectServers.has(alias)) continue;
-      const wrapped = wrapLaunchEntry(alias, scoped.entry, context.self ?? selfCommand(), {
+    if (perRun.reason) disabledCapabilities.push(perRun.reason);
+    const launchEntries = new Map<string, { entry: McpServerEntry; preserveIfUnowned: boolean }>();
+    if (!perRun.reason) {
+      for (const [alias, scoped] of effectiveServers(view.servers)) {
+        if (scoped.scope === 'project' && !view.approvedProjectServers.has(alias)) continue;
+        if (!Object.hasOwn(perRun.servers, alias)) launchEntries.set(alias, { entry: scoped.entry, preserveIfUnowned: false });
+      }
+      for (const [alias, entry] of Object.entries(perRun.servers)) {
+        launchEntries.set(alias, { entry, preserveIfUnowned: true });
+      }
+    }
+    for (const [alias, item] of launchEntries) {
+      const wrapped = wrapLaunchEntry(alias, item.entry, context.self ?? selfCommand(), {
         hostClient: 'claude',
         socketPath: context.session.socketPath,
         capability: context.session.capability,
         launchId: context.session.launchId,
       });
       if ('entry' in wrapped) mcpServers[alias] = wrapped.entry;
+      else if (item.preserveIfUnowned) mcpServers[alias] = item.entry;
     }
-    if (Object.keys(mcpServers).length > 0) {
+    if (perRun.source || Object.keys(mcpServers).length > 0) {
       const path = join(directory, 'mcp.json');
-      writeFileSync(path, `${JSON.stringify({ mcpServers })}\n`, { mode: 0o600 });
+      writeFileSync(path, `${JSON.stringify({ ...(perRun.source ?? {}), mcpServers })}\n`, { mode: 0o600 });
       args.push(`--mcp-config=${path}`);
     }
+    const forwardedMcpArgs = perRun.reason ? [...context.clientArgs] : perRun.clientArgs;
     if (context.observe !== 'off') {
-      const temporary = launchSettings(context.cwd, context.clientArgs);
+      const temporary = launchSettings(context.cwd, forwardedMcpArgs);
       if (temporary.settings) {
         const path = join(directory, 'settings.json');
         writeFileSync(path, `${JSON.stringify(temporary.settings)}\n`, { mode: 0o600 });
@@ -531,7 +593,7 @@ export async function buildLaunchPlan(context: ClaudeLaunchContext): Promise<Lau
       } else if (temporary.reason) disabledCapabilities.push(temporary.reason);
       args.push(...temporary.clientArgs);
     } else {
-      args.push(...context.clientArgs);
+      args.push(...forwardedMcpArgs);
     }
     const env: NodeJS.ProcessEnv = { ...context.env };
     if (context.observe !== 'off') {

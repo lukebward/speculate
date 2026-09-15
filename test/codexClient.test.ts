@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexClient, readCodexMcpStatus, resolveCodexBin, startCodexClient, type CodexSpawner } from '../src/codexClient.js';
+import { CodexClient, codexSubcommand, readCodexMcpStatus, resolveCodexBin, startCodexClient, type CodexSpawner } from '../src/codexClient.js';
 
 type Request = { id?: number; method: string; params: Record<string, unknown> };
 const fixtureConfig = {
@@ -54,6 +54,12 @@ async function start(respond?: Parameters<typeof fakeProcess>[0], options: { tim
 }
 
 describe('Codex configuration transport', () => {
+  it('finds only a true Codex subcommand after option values', () => {
+    expect(codexSubcommand(['--model', 'exec', '-c', 'model="kept"'])).toBeNull();
+    expect(codexSubcommand(['--model', 'kept', 'exec', 'prompt'])).toBe('exec');
+    expect(codexSubcommand(['-c', 'model="exec"', 'resume', 'thread'])).toBe('resume');
+  });
+
   it('only initializes the config service and preserves raw layer and policy data', async () => {
     const { client, requests, spawner } = await start((request, out) => {
       const response = Buffer.from(`${JSON.stringify({ id: request.id, result: fixtureConfig })}\n`);
