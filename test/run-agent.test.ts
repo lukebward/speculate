@@ -391,9 +391,12 @@ describe('native launch plans', () => {
     )).toBe(true);
   });
 
-  it('does not treat exec used as an option value as the Codex subcommand', async () => {
+  it.each([
+    ['--model', 'exec'],
+    ['--add-dir', 'exec'],
+  ])('does not treat exec used as the %s option value as the Codex subcommand', async (...optionArgs) => {
     const clientArgs = [
-      '--model', 'exec',
+      ...optionArgs,
       '-c', 'openai_base_url="https://native.invalid"',
       '-c', 'mcp_servers.files.command="/bin/native"',
       '-c', 'hooks.SessionStart=[]',

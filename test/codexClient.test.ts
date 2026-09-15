@@ -5,7 +5,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexClient, codexSubcommand, readCodexMcpStatus, resolveCodexBin, startCodexClient, type CodexSpawner } from '../src/codexClient.js';
+import {
+  CodexClient,
+  codexSubcommand,
+  extractCodexConfigInvocation,
+  readCodexMcpStatus,
+  resolveCodexBin,
+  startCodexClient,
+  type CodexSpawner,
+} from '../src/codexClient.js';
 
 type Request = { id?: number; method: string; params: Record<string, unknown> };
 const fixtureConfig = {
@@ -58,6 +66,14 @@ describe('Codex configuration transport', () => {
     expect(codexSubcommand(['--model', 'exec', '-c', 'model="kept"'])).toBeNull();
     expect(codexSubcommand(['--model', 'kept', 'exec', 'prompt'])).toBe('exec');
     expect(codexSubcommand(['-c', 'model="exec"', 'resume', 'thread'])).toBe('resume');
+  });
+
+  it('fails command and config recognition closed for unsupported pre-command options', () => {
+    expect(codexSubcommand(['--add-dir', 'exec', '-c', 'model="kept"'])).toBeNull();
+    expect(codexSubcommand(['--future-option', 'exec', '-c', 'model="hidden"'])).toBeNull();
+    expect(extractCodexConfigInvocation([
+      '--future-option', 'value', 'exec', '-c', 'mcp_servers.files.command="/bin/native"',
+    ])).toEqual({ globalArgs: [], verifiable: false, reason: 'unsupported-argument-shape' });
   });
 
   it('only initializes the config service and preserves raw layer and policy data', async () => {

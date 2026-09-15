@@ -97,7 +97,7 @@ export function codexSubcommand(clientArgs: readonly string[]): string | null {
       continue;
     }
     if (CODEX_EQUAL_CONFIG_FLAGS.some((prefix) => arg.startsWith(prefix))) continue;
-    if (arg.startsWith('-')) continue;
+    if (arg.startsWith('-')) return null;
     return CODEX_SUBCOMMANDS.has(arg) ? arg : null;
   }
   return null;
@@ -130,6 +130,9 @@ export function extractCodexConfigInvocation(clientArgs: readonly string[]): Cod
       if (!clientArgs[index + 1]) return { globalArgs, verifiable: false, reason: 'missing-argument-value' };
       index++;
       continue;
+    }
+    if (arg.startsWith('-')) {
+      return { globalArgs, verifiable: false, reason: 'unsupported-argument-shape' };
     }
     if (!arg.startsWith('-')) {
       if (command === null && CODEX_SUBCOMMANDS.has(arg)) command = arg;
