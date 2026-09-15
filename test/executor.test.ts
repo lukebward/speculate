@@ -386,6 +386,24 @@ describe('executor drain queue', () => {
     expect(h.metrics.statsSnapshot().suppressed['cache-invalidation']).toBe(1);
   });
 
+  it('supersedes a next prediction awaiting permission while preserving a standing prediction', async () => {
+    const h = makeHarness('http');
+    let resolveAuthorization!: (allowed: boolean) => void;
+    const authorization = new Promise<boolean>((resolve) => { resolveAuthorization = resolve; });
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.predictionGate = { allows: () => true, authorize: () => authorization };
+    h.executor.submit([
+      { ...pred('a', 0.9), horizon: 'next' },
+      { ...pred('b', 0.8), horizon: 'standing' },
+    ]);
+    h.executor.supersedePendingNext('github');
+    resolveAuthorization(true);
+    await settle();
+
+    expect(h.calls.map((call) => call.tool)).toEqual(['b']);
+    expect(h.metrics.statsSnapshot().suppressed['superseded-next-call']).toBe(1);
+  });
+
   it('never exceeds the queue cap', async () => {
     const { executor, calls, metrics } = makeHarness('stdio');
     const many = Array.from({ length: 12 }, (_, i) => pred(`a`, 0.9 - i * 0.01));

@@ -47,6 +47,7 @@ export class SpeculationExecutor {
   private readonly pending = new Map<string, QueuedPrediction[]>();
   private readonly draining = new Set<string>();
   private readonly invalidationRevisions = new Map<string, number>();
+  private readonly nextSupersessionRevisions = new Map<string, number>();
   private lifecycleRevision = 0;
   private observerIssueSequence = 0;
 
@@ -88,6 +89,7 @@ export class SpeculationExecutor {
    * standing bets keep their existing lifecycle.
    */
   supersedePendingNext(server: string): number {
+    this.nextSupersessionRevisions.set(server, (this.nextSupersessionRevisions.get(server) ?? 0) + 1);
     const queue = this.pending.get(server);
     if (!queue?.length) return 0;
     const standing: QueuedPrediction[] = [];
@@ -296,9 +298,14 @@ export class SpeculationExecutor {
   private async authorizeAndIssue(p: Prediction, opts: { queueOnBusy: boolean }): Promise<void> {
     const lifecycleRevision = this.lifecycleRevision;
     const invalidationRevision = this.invalidationRevisions.get(p.server) ?? 0;
+    const nextSupersessionRevision = this.nextSupersessionRevisions.get(p.server) ?? 0;
     const allowed = await this.authorize(p);
     if (lifecycleRevision !== this.lifecycleRevision || invalidationRevision !== (this.invalidationRevisions.get(p.server) ?? 0)) {
       this.suppress(p, 'cache-invalidation');
+      return;
+    }
+    if (p.horizon !== 'standing' && nextSupersessionRevision !== (this.nextSupersessionRevisions.get(p.server) ?? 0)) {
+      this.suppress(p, 'superseded-next-call');
       return;
     }
     if (!allowed) {
