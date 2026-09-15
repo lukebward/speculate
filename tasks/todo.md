@@ -302,7 +302,7 @@ This final follow-up records completed delivery only; release source, tests, doc
 - [x] Documentation worker: present context-aware prefetching as the product identity while stating specific unverified integration/performance limits. Preserve historical benchmark artifacts, measured failed gates, and the historical 0.23.0 hook-default release entry. Add a concise 0.24.0 release entry and distinguish broader default enablement from new performance evidence.
 - [x] Review worker: independently audit current fallback, permission, and transport boundaries before implementation finishes; review the final code/docs for both-client parity and unsupported-route abstention. No unrequested refactors, prediction changes, dependency updates, or native credential access.
 - [x] Coordinator: update package.json, package-lock.json, and plugin manifest to the available version. Run build, strict TypeScript, complete tests with scenarios isolated, and strict documentation build. Inspect the tarball and exercise installed default launches plus CLI/MCP/hook checks on Node 18 and 22.
-- [ ] Coordinator: push main normally, verify platform CI and documentation deployment, then create an annotated version tag and use the existing trusted npm workflow. Verify npm latest/source/provenance, public tarball contents, and the GitHub release.
+- [x] Coordinator: push main normally, verify platform CI and documentation deployment, then create an annotated version tag and use the existing trusted npm workflow. Verify npm latest/source/provenance, public tarball contents, and the GitHub release.
 
 ## Ownership and verification
 
@@ -323,3 +323,11 @@ All 1,388 tests passed with 8 skipped: 1,376 in the main batch and 12 isolated t
 The 0.24.0 package contains 59 files (245,106 bytes packed), all matching the final build/source resources, with no test/benchmark/task artifacts. Installed Node 18.20.8 and 22.14.0 checks passed CLI version/help, real MCP list/call, and both compiled observer hook deliveries. Both runtimes also passed eight actual installed-launch cases (Claude and Codex default, unsupported-route fallback, explicit hooks, explicit off), including byte-identical local-provider requests/responses, native model/argument preservation, report modes, and visible bounded fallback reasons. These are synthetic integration checks, not native account or performance measurements. Tarball SHA-256: `d0d4fe90610a666ebf669fc8dbd5a47a6fabee5d10cfcd683cf6c417f70bf81a`.
 
 Main CI, documentation deployment, and publication remain the delivery gates.
+
+## Completed 0.24.0 delivery
+
+Release source `49a894cc41ccf3e3de909014145a4d9158b1e998` is on main and tagged `v0.24.0`. [Platform CI](https://github.com/lukebward/speculate/actions/runs/34995066661) passed Linux, macOS, and Windows on the first attempt, including native Codex integration checks. [Documentation deployment](https://github.com/lukebward/speculate/actions/runs/34995066645) and [trusted npm publication](https://github.com/lukebward/speculate/actions/runs/34995691316) succeeded.
+
+npm accepted the package at 16:35:59 UTC and served it publicly as `latest` by 16:43:43 UTC after registry processing. Public metadata names the correct source commit; the downloaded package matches all 59 tested files, its SHA-512 integrity matches, and the SLSA provenance statement names the release source. The [GitHub release](https://github.com/lukebward/speculate/releases/tag/v0.24.0) is published and latest. Context-aware native launch now requests the model proxy by default for both clients, with explicit modes and startup hook fallback preserved. No new native performance claim is made.
+
+This follow-up records delivery only; tested source, documentation, and published package contents remain unchanged.
