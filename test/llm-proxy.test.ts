@@ -1,4 +1,4 @@
-import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from 'node:http';
 import { AddressInfo, createConnection, createServer as createNetServer, type Server as NetServer } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { startLlmProxy, type LlmProxy } from '../src/llmProxy.js';
@@ -478,13 +478,21 @@ describe('LLM HTTP relay', () => {
   });
 
   it('releases rejected observation requests on a persistent connection', async () => {
-    const responses = new Map<number, ServerResponse>();
+    const requestCount = 3;
+    let forwardedCount = 0;
+    let resolveForwarded = (): void => {};
+    const forwarded = new Promise<void>((resolve) => { resolveForwarded = resolve; });
     const upstream = await listen((request, response) => {
       request.resume();
-      const id = Number(new URL(request.url ?? '/', 'http://upstream').searchParams.get('request'));
-      responses.set(id, response);
+      request.on('end', () => {
+        response.end('{}');
+        forwardedCount++;
+        if (forwardedCount === requestCount) resolveForwarded();
+      });
     });
     const aborted = new Set<number>();
+    let resolveRejected = (): void => {};
+    const rejected = new Promise<void>((resolve) => { resolveRejected = resolve; });
     const base = adapter();
     const trackingAdapter: AgentAdapter = {
       ...base,
@@ -500,6 +508,7 @@ describe('LLM HTTP relay', () => {
               ...observer,
               abort() {
                 aborted.add(id);
+                if (aborted.size === requestCount) resolveRejected();
                 observer.abort();
               },
             };
@@ -511,6 +520,7 @@ describe('LLM HTTP relay', () => {
       upstreamBaseUrl: upstream.baseUrl,
       adapter: trackingAdapter,
       onObservation: () => {},
+      analysisBudget: new ObservationBudget(600),
     });
     proxies.push(proxy);
     const { port } = new URL(proxy.baseUrl);
@@ -519,24 +529,15 @@ describe('LLM HTTP relay', () => {
       socket.once('connect', resolve);
       socket.once('error', reject);
     });
-    const requests = Array.from({ length: 300 }, (_, index) =>
+    socket.resume();
+    const requests = Array.from({ length: requestCount }, (_, index) =>
       `POST /v1/messages?request=${index} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}`
     ).join('');
-    socket.write(requests);
+    await new Promise<void>((resolve, reject) => socket.write(requests, (error) => error ? reject(error) : resolve()));
+    await Promise.all([forwarded, rejected]);
 
-    const deadline = Date.now() + 1_000;
-    while ((upstream.calls.length < 300 || aborted.size === 0) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    expect(upstream.calls).toHaveLength(300);
-    expect(aborted.size).toBeGreaterThan(0);
-    for (const [id, response] of responses) {
-      if (!aborted.has(id)) response.end('{}');
-    }
-    const cleanupDeadline = Date.now() + 1_000;
-    while (proxy.debugObservationState().partialRequests > 0 && Date.now() < cleanupDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
+    expect(upstream.calls).toHaveLength(requestCount);
+    expect([...aborted].sort((left, right) => left - right)).toEqual([0, 1, 2]);
     expect(proxy.debugObservationState().partialRequests).toBe(0);
     socket.destroy();
   });

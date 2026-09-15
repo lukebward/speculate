@@ -74,6 +74,9 @@ interface ResponsePlan {
   requestReceived?: number;
   responseChunks: number[];
   providerAbort?: number;
+  holdOpenUntilClientAbort: boolean;
+  clientAborted: Promise<void>;
+  markClientAborted(): void;
   finished: Promise<void>;
   finish(): void;
 }
@@ -180,7 +183,11 @@ export class ObserverHarness {
           response.once('error', settle);
         });
       }
-      response.end();
+      if (plan.holdOpenUntilClientAbort && !response.destroyed) {
+        await plan.clientAborted;
+        if (!response.destroyed) await new Promise<void>((resolve) => response.once('close', resolve));
+      }
+      if (!response.destroyed && !plan.holdOpenUntilClientAbort) response.end();
       plan.finish();
     });
 
@@ -271,6 +278,7 @@ export class ObserverHarness {
     status?: number;
     headers?: Record<string, string>;
     provider?: ProviderHandle;
+    holdOpenUntilClientAbort?: boolean;
   }): Promise<ExchangeResult> {
     const origin = options.provider?.baseUrl ?? new URL(options.request.url).origin;
     const provider = this.providers.find((entry) => entry.handle.baseUrl === origin)
@@ -281,10 +289,18 @@ export class ObserverHarness {
     const finished = new Promise<void>((resolve) => {
       finishPlan = resolve;
     });
+    let markClientAborted = (): void => {};
+    const clientAborted = new Promise<void>((resolve) => { markClientAborted = resolve; });
     const plan: ResponsePlan = {
       status: options.status ?? 200,
       headers: options.headers ?? {},
-      chunks, responseChunks: [], finished, finish: finishPlan,
+      chunks,
+      responseChunks: [],
+      holdOpenUntilClientAbort: options.holdOpenUntilClientAbort ?? false,
+      clientAborted,
+      markClientAborted,
+      finished,
+      finish: finishPlan,
     };
     provider.plans.push(plan);
     const originalPayload = Buffer.concat(chunks.map((chunk) => chunk.body));
@@ -312,6 +328,7 @@ export class ObserverHarness {
           if (options.request.abortAfterChunks === receivedChunks.length) {
             cancelled = true;
             clientAbort = performance.now();
+            plan.markClientAborted();
             response.destroy();
             request.destroy();
           }

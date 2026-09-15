@@ -105,13 +105,14 @@ describe('observer provider harness', () => {
     expect(result.receivedPayload.toString()).toBe('{"error":"synthetic limit"}');
   });
 
-  it('settles cancellation while the provider is waiting for drain', async () => {
+  it('settles provider cancellation while the response is held incomplete', async () => {
     const harness = createObserverHarness();
     harnesses.push(harness);
     const provider = await harness.startProvider({ transport: 'http' });
     const result = await harness.exchange({
       request: { url: provider.baseUrl, body: '{}', abortAfterChunks: 1 },
-      chunks: [Buffer.alloc(8 * 1024 * 1024, 120)],
+      chunks: [Buffer.from('partial')],
+      holdOpenUntilClientAbort: true,
     });
     expect(result.cancelled).toBe(true);
     expect(result.timestamps.providerAbort).toBeDefined();
