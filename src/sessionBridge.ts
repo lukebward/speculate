@@ -87,7 +87,8 @@ type ServerMessage =
   | { type: 'response'; requestId: number; ok: true; value?: unknown }
   | { type: 'response'; requestId: number; ok: false; error: string }
   | { type: 'candidates'; candidates: Array<Candidate | AuthorizedCandidate> }
-  | { type: 'permission-context'; conversationId: string; permissionContext: string | null };
+  | { type: 'permission-context'; conversationId: string; permissionContext: string | null }
+  | { type: 'invalidate'; routeIds: string[]; reason: string };
 
 function secureEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
@@ -155,6 +156,7 @@ export class SessionBridge {
   private closed = false;
   private pendingAuthorizationBytes = 0;
   private hookEvents = 0;
+  private trackingLost = false;
   private readonly pendingAuthorizations = new Map<string, number>();
 
   private constructor(
@@ -440,10 +442,24 @@ export class SessionBridge {
     const queued = this.observationQueue.splice(0);
     this.observationQueueBytes = 0;
     for (const { observation } of queued) {
+      if (
+        observation.kind === 'invalidate' &&
+        observation.routeIds.length === 0 &&
+        observation.reason === 'observer-tracking-gap'
+      ) this.revokeOwnersForTrackingLoss(observation.reason);
       for (const candidate of this.sessionPredictor.observe(observation)) this.submit(candidate);
       for (const listener of this.listeners) {
         try { listener(observation); } catch {}
       }
+    }
+  }
+
+  private revokeOwnersForTrackingLoss(reason: string): void {
+    this.trackingLost = true;
+    for (const owner of this.owners.values()) {
+      owner.routes = [];
+      owner.generation++;
+      if (!send(owner.socket, { type: 'invalidate', routeIds: [], reason })) owner.socket.destroy();
     }
   }
 
@@ -523,6 +539,12 @@ export class SessionBridge {
     if (message.type === 'register' && Array.isArray(message.routes)) {
       if (message.routes.length > 512 || !message.routes.every(validLocalRoute)) {
         this.respond(owner, { type: 'response', requestId, ok: false, error: 'invalid route registration' });
+        return;
+      }
+      if (this.trackingLost) {
+        owner.routes = [];
+        owner.generation++;
+        this.respond(owner, { type: 'response', requestId, ok: true, value: [] });
         return;
       }
       const replacedRouteIds = owner.routes.map((route) => route.routeId);
@@ -732,6 +754,7 @@ export class SessionBridgeOwner {
   private requestId = 1;
   private closed = false;
   private disconnectHandler: (() => void) | null = null;
+  private invalidationHandler: ((routeIds: readonly string[], reason: string) => void) | null = null;
   private readonly pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
   private readonly permissionContexts = new Map<string, string>();
 
@@ -765,6 +788,16 @@ export class SessionBridgeOwner {
       if (message.type === 'permission-context') {
         if (message.permissionContext) instance?.permissionContexts.set(message.conversationId, message.permissionContext);
         else instance?.permissionContexts.delete(message.conversationId);
+        return;
+      }
+      if (
+        message.type === 'invalidate' &&
+        Array.isArray(message.routeIds) &&
+        message.routeIds.length <= 512 &&
+        message.routeIds.every(validId) &&
+        validId(message.reason)
+      ) {
+        try { instance?.invalidationHandler?.(message.routeIds, message.reason); } catch {}
         return;
       }
       if (message.type !== 'response') return;
@@ -825,6 +858,10 @@ export class SessionBridgeOwner {
 
   setDisconnectHandler(handler: () => void): void {
     this.disconnectHandler = handler;
+  }
+
+  setInvalidationHandler(handler: (routeIds: readonly string[], reason: string) => void): void {
+    this.invalidationHandler = handler;
   }
 
   async invalidate(upstreamServer?: string, reason?: string): Promise<void> {

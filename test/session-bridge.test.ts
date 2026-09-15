@@ -439,6 +439,100 @@ describe('SpeculateProxy observed candidate ingress', () => {
     expect(proxy.metrics.statsSnapshot().hits).toBe(1);
   });
 
+  it('revokes queued, in-flight, and ready owner work after a tracking gap', async () => {
+    const bridge = await start(() => 100);
+    const runtime = await owner(bridge, 'files');
+    const proxy = new SpeculateProxy({
+      mode: 'strict', maxPredictionsPerTrigger: 3, log: 'off',
+      servers: {
+        queued: { allowTools: ['queued_read'] },
+        inflight: { allowTools: ['inflight_read'] },
+        ready: { allowTools: ['ready_read'] },
+      },
+    }, {
+      now: () => 100,
+      session: {
+        launchId: 'launch', hostClient: 'claude', hostServerAlias: 'files', runtime,
+        permissionContext: () => 'context', permissionGate: { check: () => 'allowed' },
+      },
+    });
+    const calls = { queued: 0, inflight: 0, ready: 0 };
+    let resolveInflight!: (result: { content: Array<{ type: 'text'; text: string }> }) => void;
+    const pendingInflight = new Promise<{ content: Array<{ type: 'text'; text: string }> }>((resolve) => {
+      resolveInflight = resolve;
+    });
+    for (const server of ['queued', 'inflight', 'ready'] as const) {
+      const tool = {
+        name: `${server}_read`,
+        inputSchema: localRoute.inputSchema,
+        annotations: { readOnlyHint: true },
+      };
+      proxy.upstreams.set(server, {
+        connected: true,
+        transport: 'http',
+        tools: [tool],
+        callTool: async () => {
+          calls[server]++;
+          if (server === 'inflight' && calls.inflight === 1) return pendingInflight;
+          return { content: [{ type: 'text', text: `${server}-result-${calls[server]}` }] };
+        },
+      } as unknown as Upstream);
+      proxy.policy.updateTools(server, [tool]);
+    }
+    (proxy as any).rebuildRoutes();
+    for (let attempt = 0; attempt < 30 && (proxy as any).observedRoutes.size < 3; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const registered = new Map(bridge.listRoutes().map((item) => [item.upstreamServer, item]));
+    expect(proxy.budget.tryAcquire('queued')).toEqual({ ok: true });
+    for (const server of ['queued', 'inflight', 'ready'] as const) {
+      const route = registered.get(server)!;
+      expect(bridge.submit(candidate(route.routeId, route.generation, {
+        candidateId: `${server}-candidate`,
+        sourceEventId: `${server}-event`,
+        args: { path: `/${server}` },
+      }))).toBe(true);
+    }
+    for (let attempt = 0; attempt < 30 && (calls.inflight < 1 || calls.ready < 1); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(calls).toEqual({ queued: 0, inflight: 1, ready: 1 });
+    expect(proxy.cache.size()).toEqual({ ready: 1, inFlight: 1 });
+
+    expect(bridge.publishObservation({
+      context,
+      eventId: 'tracking-gap',
+      observedAt: 100,
+      kind: 'invalidate',
+      routeIds: [],
+      reason: 'observer-tracking-gap',
+    })).toBe(true);
+    for (let attempt = 0; attempt < 30 && (
+      bridge.listRoutes().length > 0 ||
+      proxy.cache.size().ready > 0 ||
+      proxy.cache.size().inFlight > 0
+    ); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    expect(bridge.listRoutes()).toEqual([]);
+    expect(proxy.cache.size()).toEqual({ ready: 0, inFlight: 0 });
+    proxy.budget.release('queued');
+    proxy.executor.drainServer('queued');
+    expect(calls.queued).toBe(0);
+    resolveInflight({ content: [{ type: 'text', text: 'stale-inflight' }] });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(proxy.cache.lookup(canonicalKey('inflight', 'inflight_read', { path: '/inflight' })).outcome).toBe('miss');
+    const readyResult = await (proxy as any).handleToolCall(
+      { server: 'ready', tool: { name: 'ready_read', annotations: { readOnlyHint: true } }, exposed: 'ready_read' },
+      { path: '/ready' },
+      {},
+    );
+    expect(readyResult).toEqual({ content: [{ type: 'text', text: 'ready-result-2' }] });
+    expect(calls.ready).toBe(2);
+    expect(proxy.metrics.statsSnapshot().hits).toBe(0);
+  });
+
   it.each(['claude', 'codex'] as const)('uses %s host authorization and the owner cache', async (hostClient) => {
     const h = proxyHarness(hostClient, () => 'allowed');
     const route = await readyRuntime(h.runtime);

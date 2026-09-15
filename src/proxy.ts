@@ -58,6 +58,7 @@ interface Route {
 export interface ProxySessionRuntime {
   setCandidateHandler(handler: (candidates: unknown) => void): void;
   setDisconnectHandler?(handler: () => void): void;
+  setInvalidationHandler?(handler: (routeIds: readonly string[], reason: string) => void): void;
   replaceRoutes(routes: readonly LocalRouteDescriptor[]): Promise<readonly RegisteredRoute[]>;
   invalidateServer(upstreamServer?: string, reason?: string): Promise<void>;
   publishObservation?(observation: Observation): Promise<boolean>;
@@ -276,6 +277,7 @@ export class SpeculateProxy {
     this.registerHandlers();
     this.session?.runtime.setCandidateHandler((candidates) => this.submitObservedCandidates(candidates));
     this.session?.runtime.setDisconnectHandler?.(() => this.handleSessionDisconnect());
+    this.session?.runtime.setInvalidationHandler?.((routeIds, reason) => this.handleSessionInvalidation(routeIds, reason));
   }
 
   // -------------------------------------------------------------------------
@@ -1041,6 +1043,18 @@ export class SpeculateProxy {
     const servers = new Set([...this.observedRoutes.values()].map(({ route }) => route.upstreamServer));
     this.sessionRouteRevision++;
     this.observedRoutes.clear();
+    for (const server of servers) this.cache.invalidateServer(server);
+  }
+
+  private handleSessionInvalidation(routeIds: readonly string[], _reason: string): void {
+    const targets = new Set(routeIds);
+    const servers = new Set<string>();
+    this.sessionRouteRevision++;
+    for (const [routeId, registered] of this.observedRoutes) {
+      if (targets.size > 0 && !targets.has(routeId)) continue;
+      servers.add(registered.route.upstreamServer);
+      this.observedRoutes.delete(routeId);
+    }
     for (const server of servers) this.cache.invalidateServer(server);
   }
 

@@ -175,7 +175,7 @@ describe('detected hook boundary gaps', () => {
     expect(losses).toBe(1);
   });
 
-  it('clears learned prompt replay through the prepared launch priority path after a detected gap', async () => {
+  it('suspends the prepared launch through the priority path after a detected gap', async () => {
     const testRoot = root();
     const home = join(testRoot, 'home');
     mkdirSync(join(home, '.claude'), { recursive: true });
@@ -199,12 +199,15 @@ describe('detected hook boundary gaps', () => {
       launchId: prepared.plan.env.SPECULATE_OBSERVER_LAUNCH_ID!,
     };
     const received: Candidate[] = [];
+    let resolveInvalidation!: () => void;
+    const invalidated = new Promise<void>((resolve) => { resolveInvalidation = resolve; });
     const owner = await connectSessionBridgeOwner(ownerCoordinates, {
       hostClient: 'claude',
       hostServerAlias: 'files',
       onCandidates: (values) => received.push(...values.map((value) => 'candidate' in value ? value.candidate : value)),
     });
-    const [registered] = await owner.register([{
+    owner.setInvalidationHandler(() => resolveInvalidation());
+    await owner.register([{
       exposedTool: 'list_directory',
       upstreamServer: 'upstream',
       upstreamTool: 'list_directory',
@@ -230,6 +233,7 @@ describe('detected hook boundary gaps', () => {
     for (let attempt = 0; attempt < 30 && !prepared.disabledCapabilities().includes('completion-correlation:tracking-lost'); attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
+    await invalidated;
     expect(prepared.disabledCapabilities()).toContain('completion-correlation:tracking-lost');
     await owner.publishObservation({
       kind: 'prompt',
@@ -239,9 +243,14 @@ describe('detected hook boundary gaps', () => {
       observedAt: Date.now(),
       text: 'list workspace',
     });
-    for (let attempt = 0; attempt < 30 && received.length === 1; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
-    expect(received).toHaveLength(2);
-    expect(received[1]).toMatchObject({ routeId: registered!.routeId, launchId: ownerCoordinates.launchId });
+    expect(await owner.register([{
+      exposedTool: 'list_directory',
+      upstreamServer: 'upstream',
+      upstreamTool: 'list_directory',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    }])).toEqual([]);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(received).toHaveLength(1);
     await owner.close();
     await prepared.close();
   });
