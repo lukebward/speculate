@@ -2,11 +2,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { isDeepStrictEqual } from 'node:util';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
-import { HookBoundaryTracker } from '../hookBoundaries.js';
+import { HookBoundaryTracker, modelToolName, observeHookToolBoundary } from '../hookBoundaries.js';
 import type { ObservationBudget } from '../observationBudget.js';
 import { codexSubcommand, resolveCodexBin, type CodexConfigRead } from '../codexClient.js';
 import { isStdioEntry, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
-import { sessionObserverHookPath } from '../packageResources.js';
+import { mergeObserverHooks, observerEnvironment, observerHookCommand } from './observerLaunch.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -94,10 +94,6 @@ function requestPath(path: string): string | null {
 
 function responsesPath(path: string): boolean {
   return path === '/responses' || path === '/v1/responses';
-}
-
-function modelToolName(route: RegisteredRoute): string {
-  return `mcp__${route.hostServerAlias}__${route.exposedTool}`;
 }
 
 function boundedId(value: unknown): value is string {
@@ -969,42 +965,16 @@ export function codexAdapter(environment: AgentAdapterEnvironment): AgentAdapter
       const callId = boundedId(payload.tool_use_id) ? payload.tool_use_id : null;
       const args = record(payload.arguments) ? payload.arguments : record(payload.tool_input) ? payload.tool_input : null;
       if (phase && toolName && callId && args) {
-        const routes = environment.routes().filter((route) => route.hostClient === 'codex' && modelToolName(route) === toolName);
-        const startClassification = phase === 'started'
-          ? routes.length === 1 && routes[0]!.readOnly === true
-            ? { kind: 'read' as const, routeId: routes[0]!.routeId, generation: routes[0]!.generation }
-            : { kind: 'mutation' as const }
-          : undefined;
-        const boundary = hookBoundaries.observeStatus({
+        return observeHookToolBoundary(hookBoundaries, environment, {
           context,
+          phase,
           toolName,
           callId,
+          args,
+          observedAt,
           ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
           ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
-        }, phase, startClassification);
-        if (boundary.gap) {
-          try { environment.onTrackingLoss?.(observedAt); } catch {}
-        }
-        if (boundary.duplicate) return [];
-        if (boundary.classification?.kind === 'read') {
-          try {
-            environment.onToolCallMarker?.({
-              source: 'hook', phase, context, routeId: boundary.classification.routeId,
-              generation: boundary.classification.generation, callId, args,
-              observedAt,
-              ...(boundedId(payload.agent_id) ? { actorId: payload.agent_id } : {}),
-              ...(boundedId(payload.turn_id) ? { turnId: payload.turn_id } : {}),
-            });
-          } catch {}
-          return [];
-        }
-        const parsed = observationSchema.safeParse({
-          kind: 'invalidate', context,
-          eventId: environment.eventId?.('invalidate', `hook:${callId}:${phase}`) ??
-            `codex:invalidate:hook:${callId}:${phase}:${randomUUID()}`,
-          observedAt, routeIds: [], reason: phase === 'started' ? 'native-mutation-start' : 'native-mutation-settle',
         });
-        return parsed.success ? [parsed.data] : [];
       }
       if ((event !== 'user-prompt-submit' && event !== 'UserPromptSubmit') || typeof payload.prompt !== 'string' ||
         Buffer.byteLength(payload.prompt, 'utf8') > MAX_OBSERVATION_BYTES) return [];
@@ -1032,9 +1002,7 @@ export interface CodexLaunchContext extends AgentLaunchContext {
 }
 
 export function codexObserverHookCommand(): string {
-  const script = sessionObserverHookPath();
-  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
-  return `${quote(process.execPath)} ${quote(script)}`;
+  return observerHookCommand();
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -1060,18 +1028,8 @@ function nativeKeySegment(value: string): string | null {
 }
 
 function codexHookConfig(existing: unknown): Record<string, unknown> | null {
-  if (existing !== undefined && !record(existing)) return null;
-  const hooks = structuredClone((existing as Record<string, unknown> | undefined) ?? {});
   const handler = { type: 'command', command: codexObserverHookCommand(), async: true, timeout: 1 };
-  for (const event of [
-    'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse',
-    'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'SessionEnd',
-  ]) {
-    const current = hooks[event];
-    if (current !== undefined && !Array.isArray(current)) return null;
-    hooks[event] = [...((current as unknown[] | undefined) ?? []), { hooks: [handler] }];
-  }
-  return hooks;
+  return mergeObserverHooks(existing, handler);
 }
 
 function configOverrideTouches(args: readonly string[], root: string): boolean {
@@ -1216,13 +1174,9 @@ export async function buildLaunchPlan(context: CodexLaunchContext): Promise<Laun
       disabledCapabilities.push('hook-observation:settings-policy');
     }
   }
-  const env: NodeJS.ProcessEnv = { ...context.env };
-  if (context.observe !== 'off') {
-    env.SPECULATE_OBSERVER_SOCKET = context.hook.socketPath;
-    env.SPECULATE_OBSERVER_CAPABILITY = context.hook.capability;
-    env.SPECULATE_OBSERVER_LAUNCH_ID = context.hook.launchId;
-    env.SPECULATE_OBSERVER_CLIENT = 'codex';
-  }
+  const env = context.observe === 'off'
+    ? { ...context.env }
+    : observerEnvironment(context.env, context.hook, 'codex');
   return {
     command: context.clientBin ?? resolveCodexBin(context.env.SPECULATE_CODEX_BIN ?? 'codex', {
       env: context.env,

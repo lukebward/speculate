@@ -331,3 +331,48 @@ Release source `49a894cc41ccf3e3de909014145a4d9158b1e998` is on main and tagged 
 npm accepted the package at 16:35:59 UTC and served it publicly as `latest` by 16:43:43 UTC after registry processing. Public metadata names the correct source commit; the downloaded package matches all 59 tested files, its SHA-512 integrity matches, and the SLSA provenance statement names the release source. The [GitHub release](https://github.com/lukebward/speculate/releases/tag/v0.24.0) is published and latest. Context-aware native launch now requests the model proxy by default for both clients, with explicit modes and startup hook fallback preserved. No new native performance claim is made.
 
 This follow-up records delivery only; tested source, documentation, and published package contents remain unchanged.
+
+# Behavior-preserving repository simplification (2026-09-16)
+
+**Goal:** Reduce maintenance complexity while retaining the context-aware architecture and all 0.24 improvements.
+
+**Scope:** Remove demonstrably unused code and duplicate internal logic where one existing implementation can express the same contract. Preserve model-proxy defaults, explicit hooks/off, startup fallback, client/provider/transport semantics, native permissions, exact-result reuse, learning, diagnostics, supported commands and historical evidence. No broad file reshuffle, new dependencies, public option removal, or architecture rewrite.
+
+## Plan
+
+- [x] Audit session/proxy coordination, client adapters/setup, and repository tooling independently with the existing Sol workers; inspect concrete callers and regression coverage.
+- [x] Select bounded simplifications with measurable maintenance benefit; record exact files and contracts before implementation.
+- [x] Implement independent changes with clear file ownership, preserving behavior and meaningful regression coverage.
+- [x] Review each change independently; reject abstractions that add more indirection than they remove.
+- [x] Run build, strict TypeScript, affected tests, complete main test batch and isolated timing scenarios; verify packaged defaults and client compatibility where touched.
+- [x] Record net changes, retained guarantees, and verification results.
+
+**Coordination:** Astra owns scope and integration. Sol workers audit and implement bounded independent tasks. Only the coordinator builds or runs the full suite. Reuse this clean isolated checkout from current origin/main; leave the original working checkout untouched.
+
+## Selected implementation
+
+1. **Shared hook handling:** `src/hookBoundaries.ts`, `src/agentAdapters/claude.ts`, `src/agentAdapters/codex.ts`, and one small shared launch helper if needed. Move the identical normalized tool-boundary transition into the existing hook module. Keep payload parsing, ID validation, permission/config gates, Messages/Responses/WebSocket parsing and budget semantics client-specific. Centralize hook command quoting, hook-event merge and observer environment construction. Preserve both exported adapter command functions and Codex-only asynchronous handlers. Use current adapter/run-agent/recovery/installed-hook coverage plus a focused parity case if existing assertions do not establish the shared contract. Sol documentation/adapter worker owns these files and affected tests.
+2. **Dead runtime surface:** `src/runAgent.ts`, `src/sessionBridge.ts`, `src/llmProxy.ts`. Collapse the private launcher forwarding hop without changing the exported symbol. Remove the unread callback flag and bridge methods with zero production, test, benchmark or documentation callsites (`setHookHandler`, bridge-side `register`/`invalidate`); make the constructor hook callback readonly. Retain used/tested route lookup, owner APIs and proxy interfaces. Sol core worker owns these three files. Validate launcher, bridge, relay and WebSocket suites.
+3. **Repository artifacts:** inspect tracked `.superpowers` scratch output and unreferenced generation paths. Remove only proven disposable scratch or dead tooling, preserving measured benchmark artifacts, user-facing documentation, runtime package resources and reproducibility. Coordinator selects removals after the audit; tooling worker supplies evidence and later reviews runtime changes.
+
+Ruling: Preserve existing serialized key/permission identities and transport-specific state machines; superficially similar implementations differ in ordering, lifecycle or backpressure. Keep all currently used public commands and module entry points. These focused internal consolidations satisfy the requested simplification without redesigning the architecture.
+
+4. **Package layout invariant:** `src/packageResources.ts` and `src/version.ts` will share source/dist package discovery while retaining version fallback and missing-hook failure behavior. The tooling worker owns these files; the coordinator verifies the installed package on Node 18 and 22.
+
+Repository audit found no unused dependency or disposable `.superpowers/archive` content: those files explicitly preserve release decisions. Retain benchmark aliases for compatibility. Remove only the superseded September 14 plan/spec under `docs/superpowers`, which still describe unstarted/opt-in work and have no external inbound references. Current architecture, limits, measured results and release history already live in maintained documentation and remain intact. Remove their now-unused MkDocs navigation exclusion and update the stale observer navigation label to match the current product documentation. Coordinator owns these documentation changes.
+
+## Review progress
+
+The runtime cleanup passed 181 focused launcher/bridge/relay/WebSocket/recovery tests. Package discovery passed six focused checks and independent review. Review caught and corrected a draft regression where a JSON `null` manifest did not fall through; the new temporary-layout test reproduced the failure and verifies the original behavior. Adapter review also caught a draft shell-quoting escape before integration; the original escaping is retained and a regression checks apostrophes. These were refactor-draft issues, not newly discovered defects in the released package.
+
+Strict documentation build passes after removing the superseded plan/spec and their unused navigation exclusion. No references to the deleted files remain. All benchmark evidence, archived release decisions, supported npm scripts and dependencies are retained.
+
+All implementations are stable. Adapter consolidation passed 111 focused tests, including preserved event sets, Codex-only asynchronous handlers and apostrophe quoting. Shared adapter plumbing is +12 production lines while removing 90 lines from the two client adapters; its benefit is a single implementation of duplicated behavior, not a large runtime line reduction. Across the complete cleanup, production code is six lines smaller. The main full-suite batch passes 1,382 tests with 8 skipped; build and strict unused-code TypeScript also pass. Isolated scenarios, final independent review and installed-package checks remain.
+
+## Completed verification
+
+All 1,394 tests passed with 8 skipped: 1,382 in the main batch and 12 isolated timing scenarios. Build, strict unused-code TypeScript, strict MkDocs, diff checks, and independent code/documentation reviews passed. The locally packed package contains 60 files and is 244,771 bytes, with every file matching the final build/resources.
+
+Installed Node 18.20.8 and 22.14.0 checks passed CLI version/help, real MCP list/call, exact loopback relay forwarding and reports for both clients across default/fallback/hooks/off, and both observer hook deliveries. Installation paths included spaces and apostrophes; hook commands executed through a real POSIX shell using the packaged resources. These are synthetic integration checks, not new native performance measurements or a new publication.
+
+The cleanup removes three unused bridge methods, an unread flag and a launcher forwarding hop; shares hook boundary/launch logic and package discovery; and removes 494 lines of superseded implementation instructions. Production source is six lines smaller overall, with substantially less duplicated adapter logic. Current commands, default model observation, fallback behavior, permission checks, exact cache matching, protocol-specific transports, learning and historical evidence are retained. Changes are recorded on the local `simplify-repo` branch from `bcbd582`; package version remains 0.24.0.

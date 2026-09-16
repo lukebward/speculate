@@ -166,7 +166,7 @@ export class SessionBridge {
     private readonly now: () => number,
     private readonly correlateCompletion: CompletionCorrelator | null,
     private readonly authorizeCandidate: CandidateAuthorizer | null,
-    private onHook: ((client: AgentKind, payload: unknown, observedAt: number) => void) | null,
+    private readonly onHook: ((client: AgentKind, payload: unknown, observedAt: number) => void) | null,
     private readonly startupPolicy: ((hostClient: AgentKind, hostServerAlias: string) => Promise<unknown>) | null,
     private readonly onLifecycle: ((event: ObserverLifecycleEvent) => void | Promise<void>) | null,
     coordinates: SessionBridgeCoordinates,
@@ -268,10 +268,6 @@ export class SessionBridge {
     return true;
   }
 
-  setHookHandler(handler: (client: AgentKind, payload: unknown, observedAt: number) => void): void {
-    this.onHook = handler;
-  }
-
   subscribe(listener: (observation: Observation) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -354,16 +350,6 @@ export class SessionBridge {
     const delivered = send(owner.socket, { type: 'candidates', candidates: [candidate] });
     if (!delivered) owner.socket.destroy();
     return delivered;
-  }
-
-  async register(owner: SessionBridgeOwner, routes: readonly LocalRouteDescriptor[]): Promise<readonly RegisteredRoute[]> {
-    if (!(owner instanceof SessionBridgeOwner) || !this.owners.has(owner.ownerId)) throw new Error('owner is not authenticated by this bridge');
-    return owner.register(routes);
-  }
-
-  async invalidate(owner: SessionBridgeOwner, upstreamServer?: string): Promise<void> {
-    if (!(owner instanceof SessionBridgeOwner) || !this.owners.has(owner.ownerId)) throw new Error('owner is not authenticated by this bridge');
-    await owner.invalidate(upstreamServer);
   }
 
   async close(): Promise<void> {

@@ -12,8 +12,15 @@ import {
   SessionMeasurementCollector,
   type PreparedAgentRun,
 } from '../src/runAgent.js';
-import { buildLaunchPlan as buildClaudeLaunchPlan } from '../src/agentAdapters/claude.js';
-import { buildLaunchPlan as buildCodexLaunchPlan, codexProxyOverrideIsVerifiable } from '../src/agentAdapters/codex.js';
+import {
+  buildLaunchPlan as buildClaudeLaunchPlan,
+  claudeObserverHookCommand,
+} from '../src/agentAdapters/claude.js';
+import {
+  buildLaunchPlan as buildCodexLaunchPlan,
+  codexObserverHookCommand,
+  codexProxyOverrideIsVerifiable,
+} from '../src/agentAdapters/codex.js';
 import { extractCodexConfigInvocation } from '../src/codexClient.js';
 import { projectCodexPolicy } from '../src/codexPolicy.js';
 import { projectClaudeMcpPolicy, verifyClaudeMcpPreauthorization } from '../src/claudePermission.js';
@@ -36,6 +43,11 @@ const hook = {
   capability: 'hook-capability',
   launchId: 'launch',
 };
+
+const observerHookEvents = [
+  'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse',
+  'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'SessionEnd',
+];
 
 describe('native launch plans', () => {
   it('preserves every existing wrapper flag and upstream argument while adding launch ownership', () => {
@@ -99,7 +111,10 @@ describe('native launch plans', () => {
       },
     });
     expect(mcp.mcpServers.collision).toBeUndefined();
+    expect(Object.keys(settings.hooks).sort()).toEqual([...observerHookEvents].sort());
     expect(Object.values(settings.hooks).every((groups: any) => groups[0].hooks[0].command === settings.hooks.UserPromptSubmit[0].hooks[0].command)).toBe(true);
+    expect(settings.hooks.UserPromptSubmit[0].hooks[0]).not.toHaveProperty('async');
+    expect(claudeObserverHookCommand()).toBe(codexObserverHookCommand());
     expect(plan.env).toMatchObject({
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:43123',
       SPECULATE_OBSERVER_CAPABILITY: hook.capability,
@@ -324,6 +339,9 @@ describe('native launch plans', () => {
     expect(generated).not.toContain('approval_mode');
     expect(generated).toContain('openai_base_url');
     expect(generated).toContain('hooks');
+    const hookOverride = plan.args.find((arg) => arg.startsWith('hooks='))!;
+    for (const event of observerHookEvents) expect(hookOverride).toContain(`${JSON.stringify(event)} =`);
+    expect(hookOverride).toContain('"async" = true');
     expect(plan.env).toMatchObject({
       SPECULATE_OBSERVER_CAPABILITY: hook.capability,
       SPECULATE_OBSERVER_CLIENT: 'codex',

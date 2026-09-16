@@ -58,7 +58,7 @@ nav:
   - Commands: commands.md
   - Safety: safety.md
   - Configuration: configuration.md
-  - Experimental observer:
+  - Context-aware operation:
       - Results: observer-results.md
       - Headroom-informed speculation: headroom-informed-speculation.md
       - Compatibility: observer-compatibility.md
@@ -73,9 +73,6 @@ nav:
   - Proposals:
       - Host-provided wrapper seam: upstream/mcp-wrapper-seam.md
   - Contributing: https://github.com/lukebward/speculate/blob/main/CONTRIBUTING.md
-
-not_in_nav: |
-  superpowers/
 
 markdown_extensions:
   - abbr

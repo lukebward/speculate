@@ -1,22 +1,9 @@
-/**
- * Runtime package version. Works from both source (tsx: src/version.ts →
- * ../package.json) and build output (node: dist/src/version.js →
- * ../../package.json).
- */
-import { readFileSync } from 'node:fs';
+import { findSpeculatePackage } from './packageResources.js';
 
-export const VERSION: string = (() => {
-  for (const rel of ['../package.json', '../../package.json']) {
-    try {
-      const pkg = JSON.parse(
-        readFileSync(new URL(rel, import.meta.url), 'utf8'),
-      ) as { name?: string; version?: string };
-      if (pkg.name === 'speculate-mcp' && typeof pkg.version === 'string') {
-        return pkg.version;
-      }
-    } catch {
-      // try the next candidate
-    }
-  }
-  return '0.0.0-unknown';
-})();
+const located = findSpeculatePackage(
+  import.meta.url,
+  ({ manifest }) => typeof manifest.version === 'string',
+);
+const packageVersion = located?.manifest.version;
+
+export const VERSION = typeof packageVersion === 'string' ? packageVersion : '0.0.0-unknown';

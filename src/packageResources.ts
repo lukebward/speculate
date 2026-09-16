@@ -1,15 +1,30 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-export function sessionObserverHookPath(): string {
+interface SpeculatePackage {
+  packageJson: URL;
+  manifest: { name?: string; version?: string };
+}
+
+export function findSpeculatePackage(
+  moduleUrl: URL | string,
+  accepts: (located: SpeculatePackage) => boolean = () => true,
+): SpeculatePackage | null {
   for (const relativePackageJson of ['../package.json', '../../package.json']) {
     try {
-      const packageJson = new URL(relativePackageJson, import.meta.url);
-      const parsed = JSON.parse(readFileSync(packageJson, 'utf8')) as { name?: string };
-      if (parsed.name !== 'speculate-mcp') continue;
-      const hook = fileURLToPath(new URL('./plugin/hooks/session-observer.mjs', packageJson));
-      if (existsSync(hook)) return hook;
+      const packageJson = new URL(relativePackageJson, moduleUrl);
+      const manifest = JSON.parse(readFileSync(packageJson, 'utf8')) as SpeculatePackage['manifest'];
+      const located = { packageJson, manifest };
+      if (manifest.name === 'speculate-mcp' && accepts(located)) return located;
     } catch {}
   }
-  throw new Error('session observer hook resource is missing');
+  return null;
+}
+
+export function sessionObserverHookPath(): string {
+  const located = findSpeculatePackage(import.meta.url, ({ packageJson }) => (
+    existsSync(fileURLToPath(new URL('./plugin/hooks/session-observer.mjs', packageJson)))
+  ));
+  if (!located) throw new Error('session observer hook resource is missing');
+  return fileURLToPath(new URL('./plugin/hooks/session-observer.mjs', located.packageJson));
 }

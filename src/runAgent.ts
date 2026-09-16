@@ -334,10 +334,6 @@ function writeReport(path: string, report: unknown): void {
   renameSync(temporary, target);
 }
 
-export async function prepareAgentRun(_args: RunAgentArgs): Promise<PreparedAgentRun> {
-  return prepareNativeAgentRun(_args);
-}
-
 export class SessionMeasurementCollector {
   private readonly sourceCounters = new Map<string, { issued: number; used: number; wasted: number; suppressed: number }>();
   private readonly activeIssues = new Map<string, string>();
@@ -453,7 +449,7 @@ function codexUpstream(config: Record<string, unknown>, accountMode: CodexAccoun
   return null;
 }
 
-async function prepareNativeAgentRun(args: RunAgentArgs): Promise<PreparedAgentRun> {
+export async function prepareAgentRun(args: RunAgentArgs): Promise<PreparedAgentRun> {
   const cwd = process.cwd();
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) {

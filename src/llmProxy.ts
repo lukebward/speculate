@@ -75,7 +75,6 @@ interface ObservationJob {
 interface CallbackBudget {
   callbacks: number;
   bytes: number;
-  closed: boolean;
 }
 
 interface CallbackReservation {
@@ -127,7 +126,7 @@ class ObservationQueue {
   private scheduled = false;
   private closed = false;
   private immediate: NodeJS.Immediate | null = null;
-  private readonly callbackBudget: CallbackBudget = { callbacks: 0, bytes: 0, closed: false };
+  private readonly callbackBudget: CallbackBudget = { callbacks: 0, bytes: 0 };
   private readonly callbackReservations = new Set<CallbackReservation>();
 
   constructor(
@@ -158,7 +157,6 @@ class ObservationQueue {
     if (this.immediate) clearImmediate(this.immediate);
     this.immediate = null;
     this.scheduled = false;
-    this.callbackBudget.closed = true;
     for (const reservation of this.callbackReservations) releaseCallback(this.callbackBudget, this.shared, reservation);
     this.callbackReservations.clear();
   }

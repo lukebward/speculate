@@ -1,4 +1,11 @@
-import type { SessionContext } from './observerTypes.js';
+import { randomUUID } from 'node:crypto';
+import {
+  observationSchema,
+  type AgentAdapterEnvironment,
+  type Observation,
+  type RegisteredRoute,
+  type SessionContext,
+} from './observerTypes.js';
 
 const MAX_HOOK_BOUNDARIES = 1_024;
 const MAX_HOOK_BOUNDARY_BYTES = 1024 * 1024;
@@ -20,6 +27,61 @@ interface RetainedBoundary {
 export type HookBoundaryClassification =
   | { kind: 'read'; routeId: string; generation: number }
   | { kind: 'mutation' };
+
+export function modelToolName(route: RegisteredRoute): string {
+  return `mcp__${route.hostServerAlias}__${route.exposedTool}`;
+}
+
+export function observeHookToolBoundary(
+  tracker: HookBoundaryTracker,
+  environment: AgentAdapterEnvironment,
+  input: HookBoundary & {
+    phase: 'started' | 'settled';
+    args: Record<string, unknown>;
+    observedAt: number;
+  },
+): readonly Observation[] {
+  const routes = environment.routes().filter((route) =>
+    route.hostClient === input.context.agent && modelToolName(route) === input.toolName
+  );
+  const startClassification = input.phase === 'started'
+    ? routes.length === 1 && routes[0]!.readOnly === true
+      ? { kind: 'read' as const, routeId: routes[0]!.routeId, generation: routes[0]!.generation }
+      : { kind: 'mutation' as const }
+    : undefined;
+  const boundary = tracker.observeStatus(input, input.phase, startClassification);
+  if (boundary.gap) {
+    try { environment.onTrackingLoss?.(input.observedAt); } catch {}
+  }
+  if (boundary.duplicate) return [];
+  if (boundary.classification?.kind === 'read') {
+    try {
+      environment.onToolCallMarker?.({
+        source: 'hook',
+        phase: input.phase,
+        context: input.context,
+        routeId: boundary.classification.routeId,
+        generation: boundary.classification.generation,
+        callId: input.callId,
+        args: input.args,
+        observedAt: input.observedAt,
+        ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+        ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
+      });
+    } catch {}
+    return [];
+  }
+  const parsed = observationSchema.safeParse({
+    kind: 'invalidate',
+    context: input.context,
+    eventId: environment.eventId?.('invalidate', `hook:${input.callId}:${input.phase}`) ??
+      `${input.context.agent}:invalidate:hook:${input.callId}:${input.phase}:${randomUUID()}`,
+    observedAt: input.observedAt,
+    routeIds: [],
+    reason: input.phase === 'started' ? 'native-mutation-start' : 'native-mutation-settle',
+  });
+  return parsed.success ? [parsed.data] : [];
+}
 
 export class HookBoundaryTracker {
   private readonly active = new Map<string, RetainedBoundary>();

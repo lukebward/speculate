@@ -5,10 +5,10 @@ import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PromptOccurrenceCorrelator, promptNativeId } from './promptOccurrence.js';
-import { HookBoundaryTracker } from '../hookBoundaries.js';
+import { HookBoundaryTracker, modelToolName, observeHookToolBoundary } from '../hookBoundaries.js';
 import { effectiveServers, readClaudeServers, selfCommand, wrapLaunchEntry, type McpServerEntry } from '../hostConfig.js';
 import { resolveClaudeBin } from '../manage.js';
-import { sessionObserverHookPath } from '../packageResources.js';
+import { mergeObserverHooks, observerEnvironment, observerHookCommand } from './observerLaunch.js';
 import {
   MAX_OBSERVATION_BYTES,
   observationSchema,
@@ -113,10 +113,6 @@ function currentPrompt(body: Record<string, unknown>): { text: string; nativeId:
 function requestPath(path: string): string | null {
   if (!path.startsWith('/') || path.startsWith('//')) return null;
   return path.split('?', 1)[0] ?? null;
-}
-
-function modelToolName(route: RegisteredRoute): string {
-  return `mcp__${route.hostServerAlias}__${route.exposedTool}`;
 }
 
 class ClaudeRequestObserver implements AgentAdapterRequestObserver {
@@ -482,42 +478,16 @@ export function claudeAdapter(environment: AgentAdapterEnvironment): AgentAdapte
           ? 'settled'
           : null;
       if (phase && typeof payload.tool_name === 'string' && typeof payload.tool_use_id === 'string' && object(payload.tool_input)) {
-        const routes = environment.routes().filter((route) => route.hostClient === 'claude' && modelToolName(route) === payload.tool_name);
-        const startClassification = phase === 'started'
-          ? routes.length === 1 && routes[0]!.readOnly === true
-            ? { kind: 'read' as const, routeId: routes[0]!.routeId, generation: routes[0]!.generation }
-            : { kind: 'mutation' as const }
-          : undefined;
-        const boundary = hookBoundaries.observeStatus({
+        return observeHookToolBoundary(hookBoundaries, environment, {
           context,
+          phase,
           toolName: payload.tool_name,
           callId: payload.tool_use_id,
+          args: payload.tool_input,
+          observedAt,
           ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
           ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
-        }, phase, startClassification);
-        if (boundary.gap) {
-          try { environment.onTrackingLoss?.(observedAt); } catch {}
-        }
-        if (boundary.duplicate) return [];
-        if (boundary.classification?.kind === 'read') {
-          try {
-            environment.onToolCallMarker?.({
-              source: 'hook', phase, context, routeId: boundary.classification.routeId,
-              generation: boundary.classification.generation, callId: payload.tool_use_id,
-              args: payload.tool_input, observedAt,
-              ...(typeof payload.agent_id === 'string' ? { actorId: payload.agent_id } : {}),
-              ...(typeof payload.turn_id === 'string' ? { turnId: payload.turn_id } : {}),
-            });
-          } catch {}
-          return [];
-        }
-        const parsed = observationSchema.safeParse({
-          kind: 'invalidate', context,
-          eventId: environment.eventId?.('invalidate', `hook:${payload.tool_use_id}:${phase}`) ??
-            `claude:invalidate:hook:${payload.tool_use_id}:${phase}:${randomUUID()}`,
-          observedAt, routeIds: [], reason: phase === 'started' ? 'native-mutation-start' : 'native-mutation-settle',
         });
-        return parsed.success ? [parsed.data] : [];
       }
       if (payload.hook_event_name !== 'UserPromptSubmit' || typeof payload.prompt !== 'string') return [];
       const eventId = environment.eventId?.('prompt', `hook:${payload.session_id}:${createHash('sha256').update(payload.prompt).digest('base64url')}`) ??
@@ -545,25 +515,15 @@ export interface ClaudeLaunchContext extends AgentLaunchContext {
 }
 
 export function claudeObserverHookCommand(): string {
-  const script = sessionObserverHookPath();
-  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
-  return `${quote(process.execPath)} ${quote(script)}`;
+  return observerHookCommand();
 }
 
 function hookSettings(existing: Record<string, unknown> = {}): Record<string, unknown> | null {
   if (existing.disableAllHooks === true || existing.allowManagedHooksOnly === true) return null;
   const handler = { type: 'command', command: claudeObserverHookCommand(), timeout: 1 };
   const settings = structuredClone(existing);
-  if (settings.hooks !== undefined && !object(settings.hooks)) return null;
-  const hooks = object(settings.hooks) ? settings.hooks : {};
-  for (const event of [
-    'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse',
-    'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'SessionEnd',
-  ]) {
-    const current = hooks[event];
-    if (current !== undefined && !Array.isArray(current)) return null;
-    hooks[event] = [...((current as unknown[] | undefined) ?? []), { hooks: [handler] }];
-  }
+  const hooks = mergeObserverHooks(settings.hooks, handler);
+  if (!hooks) return null;
   settings.hooks = hooks;
   return settings;
 }
@@ -720,13 +680,9 @@ export async function buildLaunchPlan(context: ClaudeLaunchContext): Promise<Lau
     } else {
       args.push(...forwardedMcpArgs);
     }
-    const env: NodeJS.ProcessEnv = { ...context.env };
-    if (context.observe !== 'off') {
-      env.SPECULATE_OBSERVER_SOCKET = context.hook.socketPath;
-      env.SPECULATE_OBSERVER_CAPABILITY = context.hook.capability;
-      env.SPECULATE_OBSERVER_LAUNCH_ID = context.hook.launchId;
-      env.SPECULATE_OBSERVER_CLIENT = 'claude';
-    }
+    const env = context.observe === 'off'
+      ? { ...context.env }
+      : observerEnvironment(context.env, context.hook, 'claude');
     if (context.observe === 'proxy' && context.relayBaseUrl) env.ANTHROPIC_BASE_URL = context.relayBaseUrl;
     const upstreamBaseUrl = context.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
     return {
