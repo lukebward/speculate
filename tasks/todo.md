@@ -421,3 +421,13 @@ The new user flow is install, then bare `speculate`. Automatic session setup reu
 - [ ] Verify public package version, source commit, integrity, contents and provenance; record delivery.
 
 Release candidate verification passed: build, strict unused-code TypeScript, strict MkDocs, 1,403 main tests (8 skipped), 12 isolated scenarios and diff checks. All 61 packed files match the final build/resources. Installed Node 18.20.8 and 22.14.0 each passed eight onboarding cases (including real terminal choice/EOF/Ctrl-C), eight explicit launch cases across both clients and observation modes, CLI version/help, real MCP list/call and both shell observer-hook deliveries from a path containing spaces and apostrophes. No new performance measurement is claimed.
+
+## Release CI correction
+
+The first Windows run failed five onboarding unit assertions before publication. The fixture forced `platform: linux` while using Windows drive-letter PATH entries; splitting those entries with `:` prevented discovery. Production uses the host platform by default. Linux passed the same main suite.
+
+- [x] Make PATH fixtures use their host platform; keep intentionally simulated platform cases explicit. Strengthen no-selection assertions to prove the intended branch is reached.
+- [x] Review the test-only correction independently and run focused onboarding checks.
+- [ ] Push the correction and require fresh all-platform CI before tagging. The packaged runtime is unchanged; retain the previously verified tarball and compare its files against the final published archive.
+
+The correction is confined to onboarding test fixtures and assertions. Windows shim coverage now uses a semicolon-separated PATH with a missing first entry. Independent Sol review approved; 21 onboarding/CLI tests and strict TypeScript passed, followed by 16 focused tests after the final PATH fixture refinement. First-run Linux and macOS CI passed completely. Fresh Windows verification remains required.

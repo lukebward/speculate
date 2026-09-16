@@ -36,7 +36,7 @@ function dependencies(input: {
   return {
     value: {
       env: input.env ?? { PATH: '' },
-      platform: input.platform ?? 'linux' as NodeJS.Platform,
+      platform: input.platform ?? process.platform,
       home: input.home ?? fixture(),
       cwd: process.cwd(),
       isInteractive: () => input.interactive ?? false,
@@ -121,6 +121,7 @@ describe('native client onboarding', () => {
     await expect(runOnboarding(test.value)).resolves.toBe(2);
     expect(test.prompt).not.toHaveBeenCalled();
     expect(test.launch).not.toHaveBeenCalled();
+    expect(test.output.join('')).toContain('Both Claude Code and Codex are installed');
     expect(test.output.join('')).toContain('speculate run claude');
     expect(test.output.join('')).toContain('speculate run codex');
   });
@@ -148,7 +149,9 @@ describe('native client onboarding', () => {
     const test = dependencies({ env: { PATH: root }, interactive: true, answer });
 
     await expect(runOnboarding(test.value)).resolves.toBe(2);
+    expect(test.prompt).toHaveBeenCalledOnce();
     expect(test.launch).not.toHaveBeenCalled();
+    expect(test.output.join('')).toContain('No client selected');
   });
 
   it('closes an interactive prompt on EOF without launching', async () => {
@@ -157,6 +160,9 @@ describe('native client onboarding', () => {
     executable(join(root, 'codex'));
     const input = new PassThrough();
     const output = new PassThrough();
+    let written = '';
+    output.setEncoding('utf8');
+    output.on('data', (chunk: string) => { written += chunk; });
     input.end();
     const launch = vi.fn(async () => 7);
 
@@ -169,13 +175,15 @@ describe('native client onboarding', () => {
       launch,
     })).resolves.toBe(2);
     expect(launch).not.toHaveBeenCalled();
+    expect(written).toContain('Launch with');
+    expect(written).toContain('No client selected');
   });
 
   it('detects Windows command shims without invoking them', async () => {
     const root = fixture();
     executable(join(root, 'claude.cmd'), 0o600);
     const test = dependencies({
-      env: { PATH: root, SPECULATE_CODEX_BIN: join(root, 'missing-codex') },
+      env: { PATH: `${join(root, 'missing-bin')};${root}`, SPECULATE_CODEX_BIN: join(root, 'missing-codex') },
       platform: 'win32',
     });
 
@@ -189,7 +197,7 @@ describe('native client onboarding', () => {
     const home = fixture();
     executable(join(home, '.claude', 'local', 'claude'));
     executable(join(home, '.codex', 'bin', 'codex'));
-    const test = dependencies({ env: { PATH: '' }, home, interactive: true, answer: 'codex' });
+    const test = dependencies({ env: { PATH: '' }, home, platform: 'linux', interactive: true, answer: 'codex' });
 
     await expect(runOnboarding(test.value)).resolves.toBe(7);
     expect(test.launch).toHaveBeenCalledWith({
