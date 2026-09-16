@@ -2,6 +2,7 @@
 
 | Command | What it does |
 |---|---|
+| `speculate` | Detect and launch an installed native client with context-aware prefetching |
 | `speculate run claude\|codex` | Launch one native client session with context-aware prefetching |
 | `speculate on [--client claude\|codex\|both]` | Wrap supported MCP servers for the selected client |
 | `speculate off [--client claude\|codex\|both]` | Restore registrations changed for the selected client |
@@ -144,7 +145,16 @@ npx -y speculate-mcp wrap --url https://api.githubcopilot.com/mcp/ \
 
 See [Getting started](getting-started.md) for the surrounding config.
 
-## `run`
+## `speculate` and `run`
+
+The bare `speculate` command detects installed native clients. It immediately
+launches the only client found, or asks you to choose when both Claude Code and
+Codex are available in an interactive terminal. A non-interactive shell with
+both clients must use `speculate run claude` or `speculate run codex`. If no
+supported client is found, the command prints installation guidance.
+
+Detection only selects a native client. The launch configures its supported MCP
+session, while sign-in, trust, and tool permission remain native.
 
 `run` launches one native Claude Code or Codex process while preserving its
 arguments, account, provider, model, effort, permission policy, sandbox, and

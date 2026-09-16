@@ -16,16 +16,21 @@ Requires Node.js 18 or later:
 
 ```bash
 npm install -g speculate-mcp
-speculate run claude
-# or
-speculate run codex
+speculate
 ```
 
-`speculate run` starts the native client with context-aware prefetching. At
-launch, it requests model-proxy mode, activates it only after verifying the
-native route and temporary controls, and otherwise starts with supported hooks.
-The launcher preserves the native account, provider, model, effort, arguments,
-permission policy, sandbox, and transport selection.
+With one supported native client installed, `speculate` launches it in a
+context-aware session. With both Claude Code and Codex installed, it asks which
+one to launch in an interactive terminal. When both are installed in a
+non-interactive shell, select one explicitly with `speculate run claude` or
+`speculate run codex`. Scripts can also use an explicit command for predictable
+selection. If neither client is available, Speculate prints installation guidance.
+
+The launcher configures the supported MCP session automatically and requests
+model-proxy observation, falling back to supported hooks when startup routing
+cannot be verified. Authentication, sign-in, trust, and tool permission remain
+with the native client. Its account, provider, model, effort, arguments,
+permission policy, sandbox, and transport selection are preserved.
 
 ```bash
 speculate run claude --observe hooks   # require hook observation
@@ -40,7 +45,7 @@ client-specific scope, supported signals, and persistent MCP setup.
 
 ### Context-aware sessions
 
-Use native arguments after `--`:
+Choose a client explicitly or pass native arguments after `--`:
 
 ```bash
 speculate run claude -- --print "Summarize this workspace."

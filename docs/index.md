@@ -9,15 +9,20 @@ call already in progress.
 
 ```bash
 npm install -g speculate-mcp
-speculate run claude
-# or
-speculate run codex
+speculate
 ```
 
-`run` starts the native client with context-aware prefetching. At launch, it
-requests the model-proxy path, activates it only after verification, and
-otherwise starts with supported hooks. See [Getting started](getting-started.md) for native
-arguments, observation controls, and persistent MCP setup.
+With one supported native client installed, `speculate` launches it. With both
+Claude Code and Codex installed, it asks which one to launch in an interactive
+terminal. When both are installed, non-interactive shells must use `speculate
+run claude` or `speculate run codex`; if neither client is available, Speculate
+prints installation guidance.
+
+The selected client starts with context-aware prefetching and automatic MCP
+session setup. Model-proxy observation activates only after startup
+verification and otherwise uses supported hooks. Native sign-in, trust, and
+tool permission remain with the client. See [Getting started](getting-started.md)
+for native arguments, observation controls, and persistent MCP setup.
 
 !!! quote "On how this was built"
 
@@ -96,7 +101,8 @@ arguments, observation controls, and persistent MCP setup.
 
 ## Context-aware and persistent operation
 
-`speculate run claude|codex` is the standard native session path. It adds prompt,
+`speculate` selects the installed native client; `speculate run claude|codex`
+selects one explicitly. The native session path adds prompt,
 learned cross-server transition, and supported model-stream signals. The
 model-proxy path is requested by default and activated only after verification,
 with startup fallback to supported hooks. The launcher preserves the client's

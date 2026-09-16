@@ -48,10 +48,12 @@ import {
 } from './codexManage.js';
 import { applyCodexPolicy, applyCodexPolicyProjection, type CodexPolicyProjection } from './codexPolicy.js';
 import { parseRunArgs, runAgent } from './runAgent.js';
+import { runOnboarding } from './onboarding.js';
 
 const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
 native context-aware sessions (model proxy observation is the default):
+  speculate                                detect and launch Claude Code or Codex
   speculate run claude [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
   speculate run codex [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
                                            fall back to hooks when the model route or relay setup cannot be verified
@@ -393,7 +395,12 @@ async function runCommandPassThrough(execArgs: ExecArgs, label: string): Promise
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv.length === 0) {
+    process.exitCode = await runOnboarding();
+    return;
+  }
+  const args = parseArgs(argv);
   if (args.command === 'agent-run') {
     const runArgs = parseRunArgs(args.rest);
     if ('error' in runArgs) fail(`run: ${runArgs.error}`);

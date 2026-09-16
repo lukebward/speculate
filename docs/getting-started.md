@@ -2,16 +2,22 @@
 
 ```bash
 npm install -g speculate-mcp
-speculate run claude
-# or
-speculate run codex
+speculate
 ```
 
-`run` starts the native client with context-aware prefetching. At launch it
-requests the model-proxy path, activates it only after verifying the native
-route and temporary controls, and otherwise starts with supported hooks. The
-active mode is reported at startup. Put Speculate options before `--` and
-native client arguments after it:
+With one supported native client installed, `speculate` launches it. With both
+Claude Code and Codex installed, it asks you to choose in an interactive
+terminal. When both are installed, scripts and other non-interactive shells
+must select a client with `speculate run claude` or `speculate run codex`. If
+neither is installed, Speculate prints installation guidance instead of
+creating configuration.
+
+The selected client starts with context-aware prefetching and automatic MCP
+session setup. At launch, Speculate requests the model-proxy path, activates it
+only after verifying the native route and temporary controls, and otherwise
+starts with supported hooks. Native sign-in, trust, and tool permission stay
+with the client. The active mode is reported at startup. Put Speculate options
+before `--` and native client arguments after it:
 
 ```bash
 speculate run claude -- --print "Summarize this workspace."

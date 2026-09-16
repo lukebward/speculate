@@ -376,3 +376,34 @@ All 1,394 tests passed with 8 skipped: 1,382 in the main batch and 12 isolated t
 Installed Node 18.20.8 and 22.14.0 checks passed CLI version/help, real MCP list/call, exact loopback relay forwarding and reports for both clients across default/fallback/hooks/off, and both observer hook deliveries. Installation paths included spaces and apostrophes; hook commands executed through a real POSIX shell using the packaged resources. These are synthetic integration checks, not new native performance measurements or a new publication.
 
 The cleanup removes three unused bridge methods, an unread flag and a launcher forwarding hop; shares hook boundary/launch logic and package discovery; and removes 494 lines of superseded implementation instructions. Production source is six lines smaller overall, with substantially less duplicated adapter logic. Current commands, default model observation, fallback behavior, permission checks, exact cache matching, protocol-specific transports, learning and historical evidence are retained. Changes are recorded on the local `simplify-repo` branch from `bcbd582`; package version remains 0.24.0.
+
+# Automatic onboarding (2026-09-16)
+
+**Goal:** Make the standard interactive experience `npm install -g speculate-mcp` followed by `speculate`, retaining first-class Claude/Codex support and all simplified architecture improvements.
+
+**Design:** A bare invocation detects installed native clients without starting either client. One available client launches through the existing context-aware `runAgent` path; two require one explicit terminal choice; zero produce concrete installation instructions. Noninteractive ambiguity never prompts, guesses, or consumes stdin. Every nonempty invocation retains its existing grammar and behavior. Existing native sign-in, permission/trust prompts and MCP policy remain authoritative. Session preparation already wraps supported MCP registrations, so onboarding must not call persistent `on`, edit shell profiles, install native clients, or duplicate setup/config logic. No preference store, onboarding framework, dependency or new model call is needed.
+
+## Plan
+
+- [x] Audit native discovery, launcher/config boundaries, CLI/tests, and user documentation with Sol workers.
+- [x] Add a small filesystem-only discovery/selection module and meaningful client/TTY/failure tests. Reuse current client resolution and verify candidate files; retain explicit binary overrides, platform handling and JavaScript entrypoint support.
+- [x] Route only the no-argument CLI path to onboarding and the unchanged proxy-default launcher. Preserve explicit native/config/management commands and all native arguments. Add public CLI routing/no-hang checks.
+- [x] Lead README, landing page, getting-started and CLI help with install + bare `speculate`. Explain automatic session setup, both-client choice, missing-client guidance, and explicit commands for scripts/options.
+- [x] Independently review runtime/UX, run build/strict TypeScript/full main suite/isolated scenarios/docs checks, and exercise installed onboarding and existing client defaults on Node 18/22 using fixtures.
+- [x] Record verified results and commit on the current cleanup branch.
+
+**Ownership:** Core Sol worker owns `src/onboarding.ts` and its tests. CLI/docs Sol worker owns CLI dispatch/help and documentation/CLI routing tests. Review Sol worker independently checks parity and preserved host boundaries. Coordinator owns integration, tasks, full verification and commits. Discovery must perform filesystem reads only; actual native session/config processes begin only after client selection.
+
+## Onboarding review and verification
+
+The bounded implementation and documentation are complete. Independent review approved filesystem-only detection, native overrides/platform fallbacks, readable JavaScript entrypoints for both clients, noninteractive no-read behavior, readline EOF/SIGINT settlement, exact proxy-default launch arguments, and unchanged nonempty CLI grammar. The missing-client message links official quickstarts and explains rerunning Speculate/native sign-in. No preference state or configuration migration was introduced.
+
+Core tests passed 16/16; CLI routing and existing management tests also pass. Build, strict unused-code TypeScript and strict MkDocs passed. The main suite passed 1,403 tests with 8 skipped. Built-CLI tests with isolated fake clients and a local model endpoint passed no-client, sole-Claude, sole-Codex, both-noninteractive, actual terminal choice for each client, terminal EOF and Ctrl-C. All four successful selection paths forwarded the exact model request through the existing relay; unsuccessful selections made no native-client invocation. Isolated timing scenarios and final installed Node 18/22 checks remain.
+
+## Completed onboarding verification
+
+All 1,415 tests passed with 8 skipped: 1,403 in the main batch and 12 isolated scenarios. After the final missing-client copy edit, both onboarding suites passed again (21 tests). Build, strict unused-code TypeScript, strict documentation build, diff checks and independent review passed.
+
+The installed package was verified on Node 18.20.8 and 22.14.0 from a directory containing spaces and apostrophes. On each runtime, all eight onboarding cases passed: no clients; sole Claude; sole Codex; both clients with noninteractive open stdin; real PTY selection of Claude; real PTY selection of Codex; terminal EOF; terminal Ctrl-C. Successful launches forwarded an exact request to the local model provider, while unsuccessful selections did not invoke either client. Existing default/fallback/hooks/off launches for both clients, CLI help/version, MCP list/call, and real shell observer-hook delivery also passed on both runtimes. All 61 packed files match the final source/build resources.
+
+The new user flow is install, then bare `speculate`. Automatic session setup reuses the existing native launcher. Both installed clients require an explicit choice; native sign-in/trust/permissions remain native. Existing explicit commands retain their behavior. These changes join the prior simplification on the local `simplify-repo` branch; no new version was published.
