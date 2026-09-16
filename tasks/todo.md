@@ -407,3 +407,17 @@ All 1,415 tests passed with 8 skipped: 1,403 in the main batch and 12 isolated s
 The installed package was verified on Node 18.20.8 and 22.14.0 from a directory containing spaces and apostrophes. On each runtime, all eight onboarding cases passed: no clients; sole Claude; sole Codex; both clients with noninteractive open stdin; real PTY selection of Claude; real PTY selection of Codex; terminal EOF; terminal Ctrl-C. Successful launches forwarded an exact request to the local model provider, while unsuccessful selections did not invoke either client. Existing default/fallback/hooks/off launches for both clients, CLI help/version, MCP list/call, and real shell observer-hook delivery also passed on both runtimes. All 61 packed files match the final source/build resources.
 
 The new user flow is install, then bare `speculate`. Automatic session setup reuses the existing native launcher. Both installed clients require an explicit choice; native sign-in/trust/permissions remain native. Existing explicit commands retain their behavior. These changes join the prior simplification on the local `simplify-repo` branch; no new version was published.
+
+# v0.25.0 release (2026-09-16)
+
+**Authorization:** Push the completed simplification and onboarding work to main and publish a release. Use the existing clean isolated checkout; preserve the original working checkout.
+
+- [x] Confirm origin/main is an ancestor, the checkout is clean, and version 0.25.0 is available.
+- [x] Complete independent Sol release review of platform assumptions, package resources and documentation claims. No blockers found.
+- [x] Update package, lockfile and plugin versions together; document release behavior and retained limits.
+- [x] Verify the release build, strict TypeScript, documentation, tests and installed Node 18/22 package behavior.
+- [ ] Commit and fast-forward push main; verify Linux, macOS, Windows and documentation CI.
+- [ ] Push the release tag and publish through the existing trusted npm workflow; create GitHub release.
+- [ ] Verify public package version, source commit, integrity, contents and provenance; record delivery.
+
+Release candidate verification passed: build, strict unused-code TypeScript, strict MkDocs, 1,403 main tests (8 skipped), 12 isolated scenarios and diff checks. All 61 packed files match the final build/resources. Installed Node 18.20.8 and 22.14.0 each passed eight onboarding cases (including real terminal choice/EOF/Ctrl-C), eight explicit launch cases across both clients and observation modes, CLI version/help, real MCP list/call and both shell observer-hook deliveries from a path containing spaces and apostrophes. No new performance measurement is claimed.

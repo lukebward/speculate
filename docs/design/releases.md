@@ -644,3 +644,21 @@ native performance evidence or change the historical replay gates: the
 and native day-to-day speedup, native hook delivery, and live API-key routing
 remain unverified. The v0.23 hook-default release record and its measured
 artifacts remain unchanged.
+
+## v0.25.0 (2026-09-16): automatic onboarding
+
+After installation, run `speculate`. It detects installed Claude Code and Codex
+clients and starts the available client with context-aware observation. If both
+are installed, an interactive terminal asks which to launch. Noninteractive
+invocations with both clients print explicit commands without reading stdin.
+If neither is installed, Speculate prints installation links and next steps.
+
+Onboarding reuses the existing session launcher and automatic MCP wrapping.
+Native sign-in, trust and permission prompts remain with the selected client.
+Explicit commands, model proxy defaults and startup hook fallback retain their
+behavior. No persistent preference or shell configuration is added.
+
+Shared hook handling, launch configuration and package discovery replace
+duplicated implementations. Unused internal methods and superseded planning
+documents are removed. Current benchmark evidence and performance limits remain
+unchanged; this release makes no new speedup claim.
