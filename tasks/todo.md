@@ -416,9 +416,9 @@ The new user flow is install, then bare `speculate`. Automatic session setup reu
 - [x] Complete independent Sol release review of platform assumptions, package resources and documentation claims. No blockers found.
 - [x] Update package, lockfile and plugin versions together; document release behavior and retained limits.
 - [x] Verify the release build, strict TypeScript, documentation, tests and installed Node 18/22 package behavior.
-- [ ] Commit and fast-forward push main; verify Linux, macOS, Windows and documentation CI.
-- [ ] Push the release tag and publish through the existing trusted npm workflow; create GitHub release.
-- [ ] Verify public package version, source commit, integrity, contents and provenance; record delivery.
+- [x] Commit and fast-forward push main; verify Linux, macOS, Windows and documentation CI.
+- [x] Push the release tag and publish through the existing trusted npm workflow; create GitHub release.
+- [x] Verify public package version, source commit, integrity, contents and provenance; record delivery.
 
 Release candidate verification passed: build, strict unused-code TypeScript, strict MkDocs, 1,403 main tests (8 skipped), 12 isolated scenarios and diff checks. All 61 packed files match the final build/resources. Installed Node 18.20.8 and 22.14.0 each passed eight onboarding cases (including real terminal choice/EOF/Ctrl-C), eight explicit launch cases across both clients and observation modes, CLI version/help, real MCP list/call and both shell observer-hook deliveries from a path containing spaces and apostrophes. No new performance measurement is claimed.
 
@@ -428,6 +428,18 @@ The first Windows run failed five onboarding unit assertions before publication.
 
 - [x] Make PATH fixtures use their host platform; keep intentionally simulated platform cases explicit. Strengthen no-selection assertions to prove the intended branch is reached.
 - [x] Review the test-only correction independently and run focused onboarding checks.
-- [ ] Push the correction and require fresh all-platform CI before tagging. The packaged runtime is unchanged; retain the previously verified tarball and compare its files against the final published archive.
+- [x] Push the correction and require fresh all-platform CI before tagging. The packaged runtime is unchanged; retain the previously verified tarball and compare its files against the final published archive.
 
 The correction is confined to onboarding test fixtures and assertions. Windows shim coverage now uses a semicolon-separated PATH with a missing first entry. Independent Sol review approved; 21 onboarding/CLI tests and strict TypeScript passed, followed by 16 focused tests after the final PATH fixture refinement. First-run Linux and macOS CI passed completely. Fresh Windows verification remains required.
+
+## Cross-platform release gate
+
+Release source is `b14dfab8e66abf01ed4d5d9c91885124c4d40c59`; tag `v0.25.0` points there. CI run `35125291490` is green on Linux, macOS and Windows, including native Codex setup/MCP integration. Documentation run `35124744011` passed before the test-only correction; documentation has not changed since.
+
+Windows required two unchanged retries after the fixture correction. The first attempt failed unchanged timing scenario S2 (off 1,252.678 ms, on 2,171.643 ms; limit 1,815.848 ms). The first retry instead failed installed-hook delivery and a 75 ms integration latency assertion; both had passed in preceding runs. Independent audits found no release change in those timed runtime paths. The final unchanged retry passed the entire job: 1,397 main tests (14 skipped), 12 scenarios and one native Codex integration test. S2 measured about 1.24 s off and 1.23 s on. All original assertions and production deadlines remain intact. The failures did not reproduce on the final run; their underlying scheduling cause is not proven or fixed. These are verification observations, not new performance claims.
+
+## Published delivery
+
+Published `speculate-mcp@0.25.0` through trusted workflow `35126736700`, which passed its main and isolated scenario suites. npm `latest` is 0.25.0. The public registry records source `b14dfab8e66abf01ed4d5d9c91885124c4d40c59`; downloaded archive integrity matches registry SHA-512, all 61 files match the locally tested package byte-for-byte, and SLSA provenance names the same source commit. npm briefly held the accepted upload for processing before making it public; no duplicate publication was attempted.
+
+GitHub latest release is https://github.com/lukebward/speculate/releases/tag/v0.25.0 (public, neither draft nor prerelease). README and maintained onboarding docs lead with installation followed by bare `speculate`. The original working checkout was untouched. Verification artifacts and logs are retained at `/tmp/speculate-release-025-ahQrYQ`. Release-source CI is green; this final delivery-record commit changes only this task log.
