@@ -443,3 +443,39 @@ Windows required two unchanged retries after the fixture correction. The first a
 Published `speculate-mcp@0.25.0` through trusted workflow `35126736700`, which passed its main and isolated scenario suites. npm `latest` is 0.25.0. The public registry records source `b14dfab8e66abf01ed4d5d9c91885124c4d40c59`; downloaded archive integrity matches registry SHA-512, all 61 files match the locally tested package byte-for-byte, and SLSA provenance names the same source commit. npm briefly held the accepted upload for processing before making it public; no duplicate publication was attempted.
 
 GitHub latest release is https://github.com/lukebward/speculate/releases/tag/v0.25.0 (public, neither draft nor prerelease). README and maintained onboarding docs lead with installation followed by bare `speculate`. The original working checkout was untouched. Verification artifacts and logs are retained at `/tmp/speculate-release-025-ahQrYQ`. Release-source CI is green; this final delivery-record commit changes only this task log.
+
+
+# Jev integration assessment (2026-09-17)
+
+- [x] Identify the checkout matching the proposed calibration and latency pipeline.
+- [x] Read current TypeSafe primitive and API documentation.
+- [x] Trace candidate ranking, context availability, and asynchronous safety boundaries.
+- [x] Review probability semantics and recommend a bounded evaluation.
+
+Scope: assessment only; no runtime, dependency, or configuration changes.
+
+## Assessment review
+
+- Reviewed the v0.25.0 implementation in this checkout; the original speculate checkout has an older predictor.
+- The wrapper ranking seam is after canonical dedupe and before utility ordering/admission in predictor.ts. Session candidates also pass through admitResolved, but currently skip next-call evaluation.
+- Existing calibration estimates exact-next-call correctness, not consumption before TTL. Its posterior is not an independent multiplier for Jev probability.
+- Recommend opt-in shadow Noul judgments on immutable concrete candidates, bounded conversation state, separate outcome labels, and measurements of actual saved wait, inference latency, waste and cost.
+- Any active integration needs stale-result rejection across asynchronous judging, existing authorization/executor gates, and preservation of semantic priority through queueing.
+- Verified current TypeSafe HTTP, JavaScript, Noul, Choice and reranking documentation. The SDK requires Node 20 while this package supports Node 18; the HTTP API is a potential compatibility-preserving path. No provider inference was performed.
+- Verification: predictor, calibration and session-predictor suites pass (55 tests across 3 files). No runtime, dependency or configuration files changed.
+
+
+# Jev integration specification (2026-09-17)
+
+- [x] Confirm scope and inspect current prediction, bridge and executor interfaces.
+- [x] Write the integration contract, scoring semantics, lifecycle and host requirements.
+- [x] Independently review the specification and resolve findings.
+- [x] Verify document references, scope and formatting; deliver the spec.
+
+Scope: produce the integration specification; no runtime implementation or release.
+
+## Specification review
+
+- Added `docs/superpowers/specs/2026-09-17-jev-integration-design.md`: bridge-owned score-only Jev integration, off/shadow/rank modes, exact-demand target, bounded context, unchanged execution gates and separate feedback.
+- Independent architecture review resolved shadow queue-order preservation, snapshot timing, demand-start coverage, one-shot correlation, original candidate-age preservation and shadow/active cancellation distinctions.
+- Checked repository source references, JSON examples, code fences, placeholders and whitespace. No implementation, provider inference or new performance claims.
