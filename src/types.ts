@@ -7,6 +7,7 @@
  */
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { AgentKind, SignalKind } from './observerTypes.js';
+import type { SemanticRankingConfig } from './semanticTypes.js';
 
 // ---------------------------------------------------------------------------
 // Speculation policy (DESIGN.md §4)
@@ -67,6 +68,9 @@ export interface Prediction {
   horizon?: 'next' | 'standing';
   executionLease?: ExecutionLease;
   observerAttribution?: ObserverAttribution;
+  schedulingPriorityMs?: number;
+  semanticRevision?: number;
+  semanticNextCallRevision?: number;
 }
 
 export interface ObserverAttribution {
@@ -432,6 +436,7 @@ export interface SpeculateConfig {
   servers: Record<string, ServerConfig>;
   /** Decision-log destination: 'stderr' (JSONL) or 'off'. Default 'stderr'. */
   log: 'stderr' | 'off';
+  semanticRanking?: SemanticRankingConfig;
   /**
    * Learned-state persistence (§13.6): transition model + rule feedback.
    * Tool results are never persisted. Default: enabled, XDG state dir.

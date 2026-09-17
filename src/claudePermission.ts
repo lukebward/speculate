@@ -19,6 +19,7 @@ export interface ClaudePermissionInput {
 export interface ClaudePermissionResult {
   decision: HostPermissionDecision;
   permissionContext: string | null;
+  policyFingerprint?: string | null;
   reason?: string;
 }
 
@@ -276,9 +277,22 @@ export function verifyClaudeMcpPreauthorization(
   input: ClaudePermissionInput,
   target: { alias: string; tool: string; requiresUserInteraction?: boolean },
 ): ClaudePermissionResult {
-  if (target.requiresUserInteraction) return { decision: 'denied', permissionContext: null, reason: 'user-interaction' };
   const state = readClaudePermissionState(input);
-  return 'decision' in state ? state : evaluateClaudePermission(input, target, state);
+  if ('decision' in state) return { ...state, policyFingerprint: null };
+  const policyFingerprint = createHash('sha256').update(JSON.stringify({
+    cwd: resolve(input.cwd),
+    args: input.clientArgs,
+    sources: state.sources.map((source) => ({
+      digest: source.digest,
+      grantsAllowed: source.grantsAllowed,
+      managed: source.managed,
+    })),
+    managedOnly: state.managedOnly,
+  })).digest('base64url');
+  if (target.requiresUserInteraction) {
+    return { decision: 'denied', permissionContext: null, policyFingerprint, reason: 'user-interaction' };
+  }
+  return { ...evaluateClaudePermission(input, target, state), policyFingerprint };
 }
 
 export function projectClaudeMcpPolicy(

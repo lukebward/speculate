@@ -214,6 +214,24 @@ describe('executor drain queue', () => {
     expect(calls.map((c) => c.tool)).toEqual(['a', 'c', 'b']);
   });
 
+  it('orders rank-mode queued predictions by local scheduling utility', async () => {
+    const { executor, calls } = makeHarness('stdio');
+    executor.submit([
+      pred('a', 0.9),
+      { ...pred('b', 0.8), schedulingPriorityMs: 10 },
+      { ...pred('c', 0.2), schedulingPriorityMs: 90 },
+    ]);
+    expect(calls.map((call) => call.tool)).toEqual(['a']);
+
+    calls[0]!.deferred.resolve();
+    await settle();
+    expect(calls.map((call) => call.tool)).toEqual(['a', 'c']);
+
+    calls[1]!.deferred.resolve();
+    await settle();
+    expect(calls.map((call) => call.tool)).toEqual(['a', 'c', 'b']);
+  });
+
   it('http: respects concurrency 2 and drains the third', async () => {
     const { executor, calls } = makeHarness('http');
     executor.submit([pred('a', 0.9), pred('b', 0.8), pred('c', 0.7)]);
@@ -290,6 +308,53 @@ describe('executor drain queue', () => {
 
     expect(h.calls.map((call) => call.tool)).toEqual(['a']);
     expect(h.metrics.statsSnapshot().suppressed['stale-generation']).toBe(1);
+  });
+
+  it('drops queued semantic work after its context revision changes', async () => {
+    const h = makeHarness('stdio');
+    let revision = 1;
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.semanticLeaseValidator = { isCurrent: (candidate: number) => candidate === revision };
+    h.executor.submit([
+      pred('a', 0.9),
+      { ...pred('b', 0.8), semanticRevision: 1, schedulingPriorityMs: 80 },
+    ]);
+    revision = 2;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+
+    expect(h.calls.map((call) => call.tool)).toEqual(['a']);
+    expect(h.metrics.statsSnapshot().suppressed['stale-semantic-context']).toBe(1);
+  });
+
+  it('drops queued semantic work after a newer real-demand revision', async () => {
+    const h = makeHarness('stdio');
+    let revision = 1;
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.semanticNextCallValidator = { isCurrent: (candidate: number) => candidate === revision };
+    h.executor.submit([
+      pred('a', 0.9),
+      { ...pred('b', 0.8), semanticNextCallRevision: 1, schedulingPriorityMs: 80 },
+    ]);
+    revision = 2;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+
+    expect(h.calls.map((call) => call.tool)).toEqual(['a']);
+    expect(h.metrics.statsSnapshot().suppressed['superseded-next-call']).toBe(1);
+  });
+
+  it('does not publish an issued semantic result after context invalidation', async () => {
+    const h = makeHarness('http');
+    let revision = 1;
+    const deps = (h.executor as unknown as { deps: Record<string, unknown> }).deps;
+    deps.semanticLeaseValidator = { isCurrent: (candidate: number) => candidate === revision };
+    h.executor.submit([{ ...pred('a', 0.9), semanticRevision: 1 }]);
+    revision = 2;
+    h.calls[0]!.deferred.resolve();
+    await settle();
+
+    expect(h.cache.lookup(canonicalKey('github', 'a', { tool: 'a' })).outcome).toBe('miss');
   });
 
   it('applies the launch permission gate to opener and learned predictions', () => {

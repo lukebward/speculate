@@ -391,6 +391,7 @@ describe('real completion bridge integration', () => {
       upstreamTool: route.upstreamTool,
       args: {},
       result: { content: [{ type: 'text', text: '{}' }] },
+      success: true,
       latencyMs: completedAt - startedAt,
       startedAt,
       completedAt,

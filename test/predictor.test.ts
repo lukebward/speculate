@@ -916,3 +916,145 @@ describe('prediction telemetry and adaptive admission', () => {
     ]);
   });
 });
+
+describe('prepared prediction batches', () => {
+  it('snapshots the full deduplicated frontier before the baseline cap', () => {
+    const emitted = [
+      pred('detail', { nested: { id: 'a' } }, 0.9, 'frontier'),
+      pred('detail', { nested: { id: 'b' } }, 0.8, 'frontier'),
+      pred('detail', { nested: { id: 'c' } }, 0.7, 'frontier'),
+    ];
+    const predictor = new Predictor({
+      maxPerTrigger: 1,
+      metrics: makeMetrics(),
+      extraRules: {
+        [SERVER]: [{ id: 'frontier', trigger: 'list', predict: () => emitted }],
+      },
+    });
+
+    const batch = predictor.prepareObserved({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 25,
+      timestamp: 100,
+    });
+    (emitted[0]!.args.nested as { id: string }).id = 'mutated';
+
+    expect(batch.candidates).toHaveLength(3);
+    expect(batch.baselineSelection).toHaveLength(1);
+    expect(batch.candidates[0]!.prediction.args).toEqual({ nested: { id: 'a' } });
+    expect(Object.isFrozen(batch.candidates[0]!.prediction.args)).toBe(true);
+    expect(Object.isFrozen(batch.candidates[0]!.prediction.args.nested as object)).toBe(true);
+  });
+
+  it('uses semantic probability only for selection and preserves prediction identity', () => {
+    const predictor = new Predictor({
+      maxPerTrigger: 1,
+      metrics: makeMetrics(),
+      extraRules: {
+        [SERVER]: [{
+          id: 'semantic',
+          trigger: 'list',
+          predict: () => [
+            pred('detail', { id: 'baseline' }, 0.9, 'semantic'),
+            pred('detail', { id: 'semantic' }, 0.2, 'semantic'),
+          ],
+        }],
+      },
+    });
+    const batch = predictor.prepareObserved({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 25,
+      timestamp: 100,
+    });
+    const [baseline, semantic] = batch.candidates;
+
+    const selected = predictor.selectPrepared(batch, {
+      semanticScores: { [baseline!.id]: 0.01, [semantic!.id]: 0.95 },
+      remainingWindowMs: { [baseline!.id]: 1_000, [semantic!.id]: 1_000 },
+    });
+
+    expect(selected).toEqual([
+      expect.objectContaining({
+        args: { id: 'semantic' },
+        confidence: 0.2,
+        ruleId: 'semantic',
+        schedulingPriorityMs: 95,
+      }),
+    ]);
+  });
+
+  it('adds baseline utility only when rank-mode queueing requests it', () => {
+    const predictor = new Predictor({
+      maxPerTrigger: 1,
+      metrics: makeMetrics(),
+      extraRules: {
+        [SERVER]: [{
+          id: 'fallback',
+          trigger: 'list',
+          predict: () => [pred('detail', { id: 1 }, 0.8, 'fallback')],
+        }],
+      },
+    });
+    const makeBatch = () => predictor.prepareObserved({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 25,
+      timestamp: 100,
+    });
+
+    expect(predictor.selectPrepared(makeBatch())[0]).not.toHaveProperty('schedulingPriorityMs');
+    expect(predictor.selectPrepared(makeBatch(), { queueByUtility: true })[0])
+      .toMatchObject({ schedulingPriorityMs: 40, confidence: 0.8 });
+  });
+
+  it('installs baseline next-call calibration before semantic selection can await', () => {
+    const metrics = makeMetrics();
+    const calibration = new CandidateCalibrator({ now: () => 1 });
+    const predictor = new Predictor({
+      maxPerTrigger: 1,
+      metrics,
+      calibration,
+      extraRules: {
+        [SERVER]: [{
+          id: 'sync-baseline',
+          trigger: 'list',
+          predict: () => [pred('detail', { id: 7 }, 0.8, 'sync-baseline')],
+        }],
+      },
+    });
+
+    predictor.prepareObserved({
+      server: SERVER,
+      tool: 'list',
+      args: {},
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 1,
+      eligibleTarget: true,
+    });
+    predictor.prepareObserved({
+      server: SERVER,
+      tool: 'detail',
+      args: { id: 7 },
+      result: jsonResult({}),
+      latencyMs: 5,
+      timestamp: 2,
+      eligibleTarget: true,
+    });
+
+    expect(calibration.revision).toBe(1);
+    expect(metrics.events).toContainEqual(expect.objectContaining({
+      type: 'candidate_evaluated',
+      candidateId: 'sync-baseline',
+      correct: true,
+    }));
+  });
+});

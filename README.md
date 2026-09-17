@@ -118,7 +118,9 @@ short-lived, single-use memory buffer. If it is still running, the real call
 joins it. A miss goes upstream normally.
 
 Calls classified as mutations clear that server's buffer. Speculate never
-generates or combines tool results, and it does not make predictor model calls.
+generates or combines tool results. Local prediction makes no model calls.
+Optional [Jev semantic ranking](docs/jev.md) sends bounded task context and
+concrete candidates to TypeSafe for probabilities; it cannot generate tool calls.
 
 ## Safety and local data
 

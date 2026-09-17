@@ -479,3 +479,25 @@ Scope: produce the integration specification; no runtime implementation or relea
 - Added `docs/superpowers/specs/2026-09-17-jev-integration-design.md`: bridge-owned score-only Jev integration, off/shadow/rank modes, exact-demand target, bounded context, unchanged execution gates and separate feedback.
 - Independent architecture review resolved shadow queue-order preservation, snapshot timing, demand-start coverage, one-shot correlation, original candidate-age preservation and shadow/active cancellation distinctions.
 - Checked repository source references, JSON examples, code fences, placeholders and whitespace. No implementation, provider inference or new performance claims.
+
+
+# Jev integration implementation (2026-09-17)
+
+- [x] Verify isolated workspace and baseline; create feat/jev-ranking.
+- [x] Write implementation plan and dispatch three Sol workers with disjoint ownership.
+- [x] Implement and review bounded Jev service, context, evaluation and configuration.
+- [x] Implement and review immutable prediction batches, proxy integration and executor priority.
+- [x] Implement and review bridge correlation, IPC and both host launchers.
+- [x] Integrate, document and run deterministic comparative verification.
+- [x] Complete build, regression tests and independent review.
+
+Plan: `docs/superpowers/plans/2026-09-17-jev-integration.md`.
+
+
+## Jev implementation review
+
+- Added optional off/shadow/rank semantic judging for Claude Code and Codex. The bridge owns TypeSafe credentials and bounded task context; wrappers retain exact calls and execution authority. Jev cannot create server/tool/argument values.
+- Added immutable pre-cap frontiers, bounded HTTP Noul batches, rank utility scheduling, current-only fallback, authenticated correlation, separate demand-window evaluation, and aggregate reports. Stream/openers bypass judging; existing safety and admission gates remain active.
+- Independent Sol review resolved sensitive labels, partial scores, pinned-model validation, permission censorship, stable policy identity, unresolved demand starts and utility-based payload trimming. No outstanding review blockers.
+- Final verification passed: build, strict unused-code TypeScript, strict MkDocs, 1,514 main tests (8 skipped), 12 isolated scenarios, compiled Node 18.20.8 config/provider smoke and diff checks. The 12 comparative Jev integration tests exercise both host identities with a real socket bridge/service and injected HTTP provider.
+- Setup and reproducible off/shadow/rank results are documented in `docs/jev.md`. No TypeSafe API key was configured; live provider accuracy, cost, latency and native-client speedup remain unmeasured. No release, push or merge was performed.

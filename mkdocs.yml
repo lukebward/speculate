@@ -52,12 +52,16 @@ theme:
     - content.tooltips
     - content.action.edit
 
+exclude_docs: |
+  superpowers/
+
 nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Commands: commands.md
   - Safety: safety.md
   - Configuration: configuration.md
+  - Jev ranking: jev.md
   - Context-aware operation:
       - Results: observer-results.md
       - Headroom-informed speculation: headroom-informed-speculation.md

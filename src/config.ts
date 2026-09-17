@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { parseJsonc } from './jsonc.js';
 import { configRuleSpecSchema } from './configRules.js';
+import { isPinnedJevModel } from './semanticTypes.js';
 import type { SpeculateConfig } from './types.js';
 
 /**
@@ -128,6 +129,20 @@ const serverSchema = z
 const configSchema = z.object({
   mode: z.enum(['strict', 'annotated', 'off']).default('strict'),
   maxPredictionsPerTrigger: z.number().int().positive().max(16).default(3),
+  semanticRanking: z
+    .object({
+      mode: z.enum(['off', 'shadow', 'rank']).default('off'),
+      model: z.string().min(1).max(128)
+        .refine((value) => Buffer.byteLength(value, 'utf8') <= 128 && isPinnedJevModel(value))
+        .default('jev-1.13.0'),
+      timeoutMs: z.number().int().min(1).max(500).default(150),
+      maxCandidates: z.number().int().min(1).max(16).default(16),
+      horizonMs: z.number().int().min(1).max(30_000).default(30_000),
+      maxRequestsPerMinute: z.number().int().min(1).max(60).default(60),
+      maxRequestsPerSession: z.number().int().min(1).max(1_000).default(1_000),
+    })
+    .strict()
+    .optional(),
   servers: z.record(z.string().regex(/^[A-Za-z0-9_-]+$/), serverSchema),
   log: z.enum(['stderr', 'off']).default('stderr'),
   /** §13.6: learned-state persistence. Enabled by default; results never persist. */
@@ -176,7 +191,7 @@ export function parseConfig(raw: unknown): SpeculateConfig {
   return cfg;
 }
 
-export function loadConfig(path: string): SpeculateConfig {
+function readConfig(path: string): SpeculateConfig {
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
@@ -190,7 +205,15 @@ export function loadConfig(path: string): SpeculateConfig {
   } catch (err) {
     throw new Error(`config ${path} is not valid JSON: ${(err as Error).message}`);
   }
-  const cfg = parseConfig(json);
+  return parseConfig(json);
+}
+
+export function loadSessionConfig(path: string): SpeculateConfig {
+  return readConfig(path);
+}
+
+export function loadConfig(path: string): SpeculateConfig {
+  const cfg = readConfig(path);
   if (Object.keys(cfg.servers).length === 0) {
     throw new Error(`config ${path}: at least one upstream server is required`);
   }

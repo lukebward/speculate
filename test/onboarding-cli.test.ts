@@ -65,6 +65,7 @@ describe('zero-argument onboarding CLI routing', () => {
     expect(mocks.runAgent).toHaveBeenCalledWith({
       agent: 'claude',
       clientArgs: ['--print', 'hello'],
+      configPath: null,
       jsonReport: null,
       observe: 'off',
     });

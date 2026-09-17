@@ -194,3 +194,10 @@ protocol sniffing is retired.
 Use `on` or an explicit `wrap` configuration; the
 [migration guide](getting-started.md#upgrading-from-retired-launch-paths)
 covers existing PATH shims and saved commands.
+
+## Optional Jev ranking
+
+Use `speculate run claude --config PATH` or `speculate run codex --config PATH`
+to load a `semanticRanking` block for that session. Set `TYPESAFE_API_KEY` in the
+launch environment. See [Jev semantic ranking](jev.md) for modes, external data
+processing and verification limits.

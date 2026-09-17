@@ -61,6 +61,8 @@ export class SpeculationExecutor {
       config: SpeculateConfig;
       now?: () => number;
       leaseValidator?: LeaseValidator;
+      semanticLeaseValidator?: { isCurrent(revision: number): boolean };
+      semanticNextCallValidator?: { isCurrent(revision: number): boolean };
       predictionGate?: {
         allows(server: string, tool: string): boolean;
         authorize?(server: string, tool: string): Promise<boolean>;
@@ -135,6 +137,10 @@ export class SpeculationExecutor {
     return queue.length;
   }
 
+  effectiveTtlMs(prediction: Pick<Prediction, 'server' | 'tool' | 'horizon'>): number {
+    return this.resolveTtl(prediction.server, prediction.tool, prediction.horizon);
+  }
+
   /**
    * Drain hook: called when a budget slot may have freed (a speculative call
    * settled, or a real call finished on a serial upstream).
@@ -175,6 +181,21 @@ export class SpeculationExecutor {
 
     if (p.executionLease && !this.deps.leaseValidator?.isCurrent(p.executionLease)) {
       this.suppress(p, 'stale-generation');
+      return 'dropped';
+    }
+
+    if (
+      p.semanticRevision !== undefined &&
+      !this.deps.semanticLeaseValidator?.isCurrent(p.semanticRevision)
+    ) {
+      this.suppress(p, 'stale-semantic-context');
+      return 'dropped';
+    }
+    if (
+      p.semanticNextCallRevision !== undefined &&
+      !this.deps.semanticNextCallValidator?.isCurrent(p.semanticNextCallRevision)
+    ) {
+      this.suppress(p, 'superseded-next-call');
       return 'dropped';
     }
 
@@ -276,8 +297,13 @@ export class SpeculationExecutor {
       meta,
       promise,
       ttlMs,
-      p.executionLease || this.deps.predictionGate
+      p.executionLease || p.semanticRevision !== undefined ||
+      p.semanticNextCallRevision !== undefined || this.deps.predictionGate
         ? () => (!p.executionLease || this.deps.leaseValidator?.isCurrent(p.executionLease) === true) &&
+          (p.semanticRevision === undefined ||
+            this.deps.semanticLeaseValidator?.isCurrent(p.semanticRevision) === true) &&
+          (p.semanticNextCallRevision === undefined ||
+            this.deps.semanticNextCallValidator?.isCurrent(p.semanticNextCallRevision) === true) &&
           publicationAllowed && (!this.deps.predictionGate?.authorize && this.deps.predictionGate
             ? this.deps.predictionGate.allows(p.server, p.tool)
             : true)
@@ -364,8 +390,8 @@ export class SpeculationExecutor {
       queue = [];
       this.pending.set(p.server, queue);
     }
-    // Highest-confidence predictions fire first when the slot frees.
-    const at = queue.findIndex((q) => q.p.confidence < p.confidence);
+    const priority = queuePriority(p);
+    const at = queue.findIndex((q) => queuePriority(q.p) < priority);
     const item = { p, queuedAt: now() };
     if (at === -1) queue.push(item);
     else queue.splice(at, 0, item);
@@ -414,4 +440,9 @@ export class SpeculationExecutor {
     // on arrival, quietly turning every standing bet into pure waste.
     return Math.max(1, Math.round(base * factor));
   }
+}
+
+function queuePriority(prediction: Prediction): number {
+  const utility = prediction.schedulingPriorityMs;
+  return typeof utility === 'number' && Number.isFinite(utility) ? utility : prediction.confidence;
 }

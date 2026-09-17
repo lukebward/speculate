@@ -25,7 +25,7 @@ import { SpeculationCache } from './cache.js';
 import { SafetyPolicy } from './policy.js';
 import { BudgetManager } from './budget.js';
 import { Metrics } from './metrics.js';
-import { Predictor } from './predictor.js';
+import { Predictor, type PreparedPredictionBatch, type PreparedPredictionCandidate } from './predictor.js';
 import { TransitionLearner } from './learner.js';
 import { SpeculationExecutor } from './executor.js';
 import { compileConfigRules } from './configRules.js';
@@ -42,6 +42,13 @@ import { candidateSchema, type AgentKind, type AuthorizedCandidate, type Candida
 import type { CodexPolicyProjection } from './codexPolicy.js';
 import type { ExecutionLease, ObserverLifecycleEvent, Rule, SpeculateConfig } from './types.js';
 import type { UsageRecorder } from './usage.js';
+import type {
+  ProxyDemandEvent,
+  SemanticCandidateProjection,
+  SemanticRankingConfig,
+  SemanticRankingReply,
+  SemanticRankingRequest,
+} from './semanticTypes.js';
 
 const STATS_TOOL = 'speculate__stats';
 /** Names the proxy itself serves; upstream tools may never claim them. */
@@ -70,6 +77,16 @@ interface Route {
   exposed: string;
 }
 
+interface SemanticDemandContext {
+  requestId: string;
+  sourceEventId: string;
+  route: RegisteredRoute;
+  nextCallRevision: number;
+  routeRevision: number;
+  conversationId: string | null;
+  semanticReady?: Promise<boolean>;
+}
+
 export interface ProxySessionRuntime {
   setCandidateHandler(handler: (candidates: unknown) => void): void;
   setDisconnectHandler?(handler: () => void): void;
@@ -78,6 +95,10 @@ export interface ProxySessionRuntime {
   invalidateServer(upstreamServer?: string, reason?: string): Promise<void>;
   publishObservation?(observation: Observation): Promise<boolean>;
   publishCompleted?(event: ProxySessionEvent): Promise<boolean>;
+  semanticConfig?(): SemanticRankingConfig | undefined;
+  semanticRevision?(): number;
+  judgeCandidates?(request: SemanticRankingRequest): Promise<SemanticRankingReply | null>;
+  publishDemand?(event: ProxyDemandEvent): Promise<boolean>;
   publishLifecycle?(event: ObserverLifecycleEvent): Promise<boolean>;
   currentPermissionContext?(conversationId: string): string | null;
   readStartupPolicy?(): Promise<unknown>;
@@ -97,7 +118,8 @@ export interface ProxySessionEvent {
   upstreamServer: string;
   upstreamTool: string;
   args: Record<string, unknown>;
-  result: CallToolResult;
+  result?: CallToolResult;
+  success: boolean;
   latencyMs: number;
   startedAt: number;
   completedAt: number;
@@ -147,6 +169,9 @@ export class SpeculateProxy {
   private sessionOps: Promise<void> = Promise.resolve();
   private sessionRouteRevision = 0;
   private sessionEventSequence = 0;
+  private semanticBatchSequence = 0;
+  private semanticNextCallRevision = 0;
+  private readonly semanticRanking: SemanticRankingConfig | null;
   private saveTimer: NodeJS.Timeout | null = null;
   private savedStamp = '';
   /** Remaining opener-recording slots per server this session (§13.15). */
@@ -167,6 +192,7 @@ export class SpeculateProxy {
     this.now = opts.now ?? Date.now;
     this.usageRecorder = opts.usageRecorder ?? null;
     this.session = opts.session ?? null;
+    this.semanticRanking = readSemanticConfig(this.session?.runtime);
     const now = this.now;
 
     this.metrics = new Metrics({
@@ -281,6 +307,10 @@ export class SpeculateProxy {
       config,
       now,
       leaseValidator: { isCurrent: (lease) => this.isCurrentObservedLease(lease) },
+      semanticLeaseValidator: this.session?.runtime.semanticRevision
+        ? { isCurrent: (revision) => this.session!.runtime.semanticRevision?.() === revision }
+        : undefined,
+      semanticNextCallValidator: { isCurrent: (revision) => revision === this.semanticNextCallRevision },
       predictionGate: this.session?.predictionPolicy
         ? {
             allows: (_server, tool) => {
@@ -325,7 +355,7 @@ export class SpeculateProxy {
       for (const [name, up] of this.upstreams) {
         if (!up.connected) continue;
         try {
-          const openers = this.predictor.sessionStart(name);
+          const openers = this.predictor.sessionStart(name, this.semanticRanking?.mode === 'rank');
           if (openers.length > 0) this.executor.submit(openers);
         } catch (err) {
           process.stderr.write(
@@ -746,6 +776,8 @@ export class SpeculateProxy {
     if (!upstream?.connected) {
       throw new McpError(ErrorCode.InternalError, `upstream '${server}' is not connected`);
     }
+    const demand = this.beginSemanticDemand(route, args, startedAt);
+    try {
     this.executor.supersedePendingNext(server);
     const isReadOnly = this.policy.isAffirmativelyReadOnly(server, tool);
 
@@ -872,7 +904,16 @@ export class SpeculateProxy {
     // learning, no state persistence. Off means off (§13.7): a disabled
     // proxy must not accumulate learned argument data on disk.
     const finalResult = result;
-    if (!finalResult.isError) this.publishCompletedRouteCall(route, args, finalResult, latencyMs, startedAt);
+    this.completeSemanticDemand(demand, !finalResult.isError);
+    this.publishCompletedRouteCall(
+      route,
+      args,
+      finalResult,
+      latencyMs,
+      startedAt,
+      !finalResult.isError,
+      demand,
+    );
     if (!finalResult.isError && this.config.mode !== 'off') {
       setImmediate(() => {
         try {
@@ -885,7 +926,7 @@ export class SpeculateProxy {
               this.learner.recordOpener(server, tool, args);
             }
           }
-          const predictions = this.predictor.observe({
+          const completed = {
             server,
             tool,
             args,
@@ -893,9 +934,19 @@ export class SpeculateProxy {
             latencyMs,
             timestamp: this.now(),
             eligibleTarget: isReadOnly,
-          });
-          if (predictions.length > 0) {
-            this.executor.submit(predictions);
+          };
+          if (demand && this.semanticRanking && this.semanticRanking.mode !== 'off') {
+            const batch = this.predictor.prepareObserved(completed);
+            if (this.semanticRanking.mode === 'shadow') {
+              const baseline = this.predictor.selectPrepared(batch);
+              if (baseline.length > 0) this.executor.submit(baseline);
+              void this.dispatchSemanticBatch(batch, demand, { shadow: true });
+            } else {
+              void this.dispatchSemanticBatch(batch, demand, { shadow: false });
+            }
+          } else {
+            const predictions = this.predictor.observe(completed);
+            if (predictions.length > 0) this.executor.submit(predictions);
           }
           this.scheduleSave(); // §13.6: persist newly learned transitions
         } catch (err) {
@@ -905,6 +956,19 @@ export class SpeculateProxy {
     }
 
     return finalResult;
+    } catch (error) {
+      this.completeSemanticDemand(demand, false);
+      this.publishCompletedRouteCall(
+        route,
+        args,
+        undefined,
+        this.now() - startedAt,
+        startedAt,
+        false,
+        demand,
+      );
+      throw error;
+    }
   }
 
   submitObservedCandidates(candidates: unknown): void {
@@ -914,6 +978,9 @@ export class SpeculateProxy {
     const accepted = new Map<string, {
       server: string;
       authorized: boolean;
+      source: Candidate['source'];
+      sourceEventId: string;
+      conversationId: string;
       items: Array<{ candidate: Candidate; route: RegisteredRoute; permissionContext: string }>;
     }>();
     for (const raw of candidates) {
@@ -956,10 +1023,20 @@ export class SpeculateProxy {
         if (permission !== 'allowed') continue;
       }
       this.observedReplay.set(replayKey, now);
-      const groupKey = `${registered.route.upstreamServer}\0${authorized ? 'authorized' : 'raw'}`;
+      const groupKey = [
+        registered.route.instanceId,
+        registered.route.upstreamServer,
+        candidate.conversationId,
+        candidate.sourceEventId,
+        candidate.source,
+        authorized ? 'authorized' : 'raw',
+      ].join('\0');
       const group = accepted.get(groupKey) ?? {
         server: registered.route.upstreamServer,
         authorized: authorized !== null,
+        source: candidate.source,
+        sourceEventId: candidate.sourceEventId,
+        conversationId: candidate.conversationId,
         items: [],
       };
       group.items.push({ candidate, route: registered.route, permissionContext });
@@ -967,10 +1044,11 @@ export class SpeculateProxy {
     }
     while (this.observedReplay.size > 4_096) this.observedReplay.delete(this.observedReplay.keys().next().value!);
     while (this.observedEventCounts.size > 4_096) this.observedEventCounts.delete(this.observedEventCounts.keys().next().value!);
-    for (const { server, authorized, items: group } of accepted.values()) {
-      const admitted = this.predictor.admitResolved(
+    for (const acceptedGroup of accepted.values()) {
+      const { server, authorized, items: group } = acceptedGroup;
+      const batch = this.predictor.prepareResolved(
         server,
-        group.map(({ candidate, route }) => {
+        group.map(({ candidate, route, permissionContext }) => {
           const ruleId = observerRuleId(this.session!.hostClient, candidate.source, route);
           return {
             tool: route.upstreamTool,
@@ -985,22 +1063,293 @@ export class SpeculateProxy {
               generation: route.generation,
               candidateCreatedAt: candidate.createdAt,
             },
+            executionLease: {
+              routeId: route.routeId,
+              generation: route.generation,
+              permissionContext,
+              conversationId: candidate.conversationId,
+            },
           };
         }),
         { timestamp: now, trackNextCall: false },
       );
-      for (const prediction of admitted) {
-        const match = group.find(({ candidate, route }) =>
-          route.upstreamTool === prediction.tool && candidate.args === prediction.args);
-        if (match) prediction.executionLease = {
-          routeId: match.route.routeId,
-          generation: match.route.generation,
-          permissionContext: match.permissionContext,
-          conversationId: match.candidate.conversationId,
-        };
+      const semanticMode = this.semanticRanking?.mode ?? 'off';
+      if (acceptedGroup.source === 'stream' || semanticMode === 'off') {
+        const admitted = this.predictor.selectPrepared(batch, {
+          queueByUtility: semanticMode === 'rank',
+        });
+        this.executor.submit(admitted, { queueOnBusy: !authorized });
+        continue;
       }
-      this.executor.submit(admitted, { queueOnBusy: !authorized });
+      if (semanticMode === 'shadow') {
+        const admitted = this.predictor.selectPrepared(batch);
+        this.executor.submit(admitted, { queueOnBusy: !authorized });
+        void this.dispatchSemanticBatch(batch, {
+          sourceEventId: acceptedGroup.sourceEventId,
+          requestId: acceptedGroup.sourceEventId,
+          route: group[0]!.route,
+          nextCallRevision: this.semanticNextCallRevision,
+          routeRevision: this.sessionRouteRevision,
+          conversationId: acceptedGroup.conversationId,
+        }, {
+          shadow: true,
+          conversationId: acceptedGroup.conversationId,
+          queueOnBusy: !authorized,
+        });
+      } else {
+        void this.dispatchSemanticBatch(batch, {
+          sourceEventId: acceptedGroup.sourceEventId,
+          requestId: acceptedGroup.sourceEventId,
+          route: group[0]!.route,
+          nextCallRevision: this.semanticNextCallRevision,
+          routeRevision: this.sessionRouteRevision,
+          conversationId: acceptedGroup.conversationId,
+        }, {
+          shadow: false,
+          conversationId: acceptedGroup.conversationId,
+          queueOnBusy: !authorized,
+        });
+      }
     }
+  }
+
+  private beginSemanticDemand(
+    route: Route,
+    args: Record<string, unknown>,
+    startedAt: number,
+  ): SemanticDemandContext | null {
+    const nextCallRevision = ++this.semanticNextCallRevision;
+    if (!this.session || !this.semanticRanking || this.semanticRanking.mode === 'off') return null;
+    const registered = this.registeredRoute(route);
+    if (!registered) return null;
+    const sourceEventId = `${this.session.hostServerAlias}:${++this.sessionEventSequence}`;
+    let conversationId: string | null = null;
+    try {
+      conversationId = this.session.conversationIdForCall?.({
+        exposedTool: route.exposed,
+        upstreamServer: route.server,
+        upstreamTool: route.tool.name,
+        args,
+      }) ?? null;
+    } catch {}
+    const context: SemanticDemandContext = {
+      requestId: sourceEventId,
+      sourceEventId,
+      route: registered,
+      nextCallRevision,
+      routeRevision: this.sessionRouteRevision,
+      conversationId,
+    };
+    try {
+      context.semanticReady = this.session.runtime.publishDemand?.({
+        phase: 'start',
+        requestId: sourceEventId,
+        sourceEventId,
+        ownerInstanceId: registered.instanceId,
+        routeId: registered.routeId,
+        generation: registered.generation,
+        server: route.server,
+        tool: route.tool.name,
+        args,
+        startedAt,
+      }).catch(() => false);
+    } catch {}
+    return context;
+  }
+
+  private completeSemanticDemand(context: SemanticDemandContext | null, success: boolean): void {
+    if (!context || !this.session) return;
+    try {
+      void this.session.runtime.publishDemand?.({
+        phase: 'complete',
+        requestId: context.requestId,
+        sourceEventId: context.sourceEventId,
+        ownerInstanceId: context.route.instanceId,
+        routeId: context.route.routeId,
+        generation: context.route.generation,
+        completedAt: this.now(),
+        success,
+      }).catch(() => {});
+    } catch {}
+  }
+
+  private async dispatchSemanticBatch(
+    batch: PreparedPredictionBatch,
+    source: SemanticDemandContext,
+    options: { shadow: boolean; conversationId?: string; queueOnBusy?: boolean },
+  ): Promise<void> {
+    const config = this.semanticRanking;
+    const runtime = this.session?.runtime;
+    const judge = runtime?.judgeCandidates;
+    if (config && source.semanticReady) {
+      const ready = await settleBefore(
+        source.semanticReady,
+        Math.max(0, batch.createdAt + config.timeoutMs - this.now()),
+      );
+      if (!ready) {
+        return;
+      }
+    }
+    let semanticRevision: number | undefined;
+    try { semanticRevision = runtime?.semanticRevision?.(); } catch {}
+    const fallback = () => {
+      if (options.shadow || !this.semanticBatchCurrent(batch, source, semanticRevision)) return;
+      const predictions = this.predictor.selectPrepared(batch, { queueByUtility: true });
+      if (semanticRevision !== undefined) {
+        for (const prediction of predictions) prediction.semanticRevision = semanticRevision;
+      }
+      for (const prediction of predictions) prediction.semanticNextCallRevision = source.nextCallRevision;
+      if (predictions.length > 0) {
+        this.executor.submit(predictions, { queueOnBusy: options.queueOnBusy });
+      }
+    };
+    if (!config || !judge || config.mode === 'off' || semanticRevision === undefined) {
+      fallback();
+      return;
+    }
+    const prepared = this.semanticProjections(batch, source.route.instanceId)
+      .slice(0, config.maxCandidates);
+    if (prepared.length === 0) {
+      fallback();
+      return;
+    }
+    const projections = prepared.map(({ projection }) => projection);
+    let batchDigest: string;
+    try {
+      batchDigest = createHash('sha256').update(JSON.stringify(projections)).digest('base64url');
+    } catch {
+      fallback();
+      return;
+    }
+    const sequence = ++this.semanticBatchSequence;
+    const request: SemanticRankingRequest = {
+      protocolVersion: 1,
+      requestId: `${source.sourceEventId}:rank:${sequence}`,
+      batchId: `${source.route.instanceId}:batch:${sequence}`,
+      sourceEventId: source.sourceEventId,
+      ownerInstanceId: source.route.instanceId,
+      launchId: this.session!.launchId,
+      ...(options.conversationId ? { conversationId: options.conversationId } : {}),
+      createdAt: batch.createdAt,
+      deadlineAt: batch.createdAt + config.timeoutMs,
+      batchDigest,
+      candidates: projections,
+    };
+    let response: SemanticRankingReply | null = null;
+    try {
+      response = await settleBefore(judge.call(runtime, request), Math.max(0, request.deadlineAt - this.now()));
+    } catch {}
+    if (options.shadow) return;
+    if (!response) {
+      fallback();
+      return;
+    }
+    if (
+      !this.semanticBatchCurrent(batch, source, semanticRevision)
+    ) return;
+    if (
+      this.now() > request.deadlineAt ||
+      !validSemanticReply(response, request, options.conversationId ?? source.conversationId, config.model)
+    ) {
+      fallback();
+      return;
+    }
+    const remainingWindowMs = Object.fromEntries(prepared.map(({ candidate, projection }) => [
+      candidate.id,
+      Math.max(0, batch.createdAt + Math.min(config.horizonMs, projection.effectiveTtlMs) - this.now()),
+    ]));
+    const predictions = this.predictor.selectPrepared(batch, {
+      semanticScores: response.scores,
+      remainingWindowMs,
+      queueByUtility: true,
+    });
+    for (const prediction of predictions) prediction.semanticRevision = semanticRevision;
+    for (const prediction of predictions) prediction.semanticNextCallRevision = source.nextCallRevision;
+    if (!this.semanticBatchCurrent(batch, source, semanticRevision)) return;
+    if (predictions.length > 0) {
+      this.executor.submit(predictions, { queueOnBusy: options.queueOnBusy });
+    }
+  }
+
+  private semanticProjections(
+    batch: PreparedPredictionBatch,
+    ownerInstanceId: string,
+  ): Array<{ candidate: PreparedPredictionCandidate; projection: SemanticCandidateProjection }> {
+    const out: Array<{ candidate: PreparedPredictionCandidate; projection: SemanticCandidateProjection }> = [];
+    for (const candidate of batch.candidates) {
+      const route = this.routeForPreparedCandidate(candidate, ownerInstanceId);
+      if (!route) continue;
+      const effectiveTtlMs = this.executor.effectiveTtlMs(candidate.prediction);
+      if (effectiveTtlMs <= 0) continue;
+      const description = [...this.routes.values()].find((local) =>
+        local.server === route.upstreamServer && local.tool.name === route.upstreamTool,
+      )?.tool.description;
+      out.push({
+        candidate,
+        projection: {
+          id: candidate.id,
+          routeId: route.routeId,
+          generation: route.generation,
+          server: candidate.prediction.server,
+          tool: candidate.prediction.tool,
+          ...(description ? { toolDescription: boundedUtf8(description, 2_048) } : {}),
+          args: candidate.prediction.args,
+          baselineScore: candidate.baselineScore,
+          conservativeLatencyMs: candidate.conservativeLatencyMs,
+          effectiveTtlMs,
+        },
+      });
+    }
+    return out;
+  }
+
+  private routeForPreparedCandidate(
+    candidate: PreparedPredictionCandidate,
+    ownerInstanceId: string,
+  ): RegisteredRoute | null {
+    const attribution = candidate.prediction.observerAttribution;
+    if (attribution) {
+      const route = this.observedRoutes.get(attribution.routeId)?.route;
+      return route?.generation === attribution.generation && route.instanceId === ownerInstanceId ? route : null;
+    }
+    return [...this.observedRoutes.values()].find(({ route }) =>
+      route.instanceId === ownerInstanceId &&
+      route.upstreamServer === candidate.prediction.server &&
+      route.upstreamTool === candidate.prediction.tool,
+    )?.route ?? null;
+  }
+
+  private semanticBatchCurrent(
+    batch: PreparedPredictionBatch,
+    source: SemanticDemandContext,
+    semanticRevision?: number,
+  ): boolean {
+    if (
+      this.closing ||
+      source.routeRevision !== this.sessionRouteRevision ||
+      source.nextCallRevision !== this.semanticNextCallRevision ||
+      this.observedRoutes.get(source.route.routeId)?.route.generation !== source.route.generation
+    ) return false;
+    if (semanticRevision !== undefined) {
+      try {
+        if (this.session?.runtime.semanticRevision?.() !== semanticRevision) return false;
+      } catch {
+        return false;
+      }
+    }
+    const now = this.now();
+    return batch.candidates.every(({ prediction }) => {
+      if (prediction.observerAttribution && now - prediction.observerAttribution.candidateCreatedAt > 1_000) return false;
+      return !prediction.executionLease || this.isCurrentObservedLease(prediction.executionLease);
+    });
+  }
+
+  private registeredRoute(route: Route): RegisteredRoute | null {
+    return [...this.observedRoutes.values()].find(({ route: candidate }) =>
+      candidate.exposedTool === route.exposed &&
+      candidate.upstreamServer === route.server &&
+      candidate.upstreamTool === route.tool.name,
+    )?.route ?? null;
   }
 
   invalidateObservedServer(server: string, reason: string): void {
@@ -1100,26 +1449,26 @@ export class SpeculateProxy {
   private publishCompletedRouteCall(
     route: Route,
     args: Record<string, unknown>,
-    result: CallToolResult,
+    result: CallToolResult | undefined,
     latencyMs: number,
     startedAt: number,
+    success: boolean,
+    demand: SemanticDemandContext | null,
   ): void {
     if (!this.session) return;
-    const registered = [...this.observedRoutes.values()].find(({ route: candidate }) =>
-      candidate.exposedTool === route.exposed &&
-      candidate.upstreamServer === route.server &&
-      candidate.upstreamTool === route.tool.name,
-    )?.route;
+    const registered = demand?.route ?? this.registeredRoute(route);
     if (!registered) return;
-    let conversationId: string | null = null;
-    try {
-      conversationId = this.session.conversationIdForCall?.({
-        exposedTool: route.exposed,
-        upstreamServer: route.server,
-        upstreamTool: route.tool.name,
-        args,
-      }) ?? null;
-    } catch {}
+    let conversationId = demand?.conversationId ?? null;
+    if (!demand) {
+      try {
+        conversationId = this.session.conversationIdForCall?.({
+          exposedTool: route.exposed,
+          upstreamServer: route.server,
+          upstreamTool: route.tool.name,
+          args,
+        }) ?? null;
+      } catch {}
+    }
     const completedAt = this.now();
     const event: ProxySessionEvent = {
       kind: 'tool-complete',
@@ -1127,14 +1476,15 @@ export class SpeculateProxy {
       hostClient: this.session.hostClient,
       hostServerAlias: this.session.hostServerAlias,
       conversationId,
-      eventId: `${this.session.hostServerAlias}:${++this.sessionEventSequence}`,
+      eventId: demand?.sourceEventId ?? `${this.session.hostServerAlias}:${++this.sessionEventSequence}`,
       routeId: registered.routeId,
       generation: registered.generation,
       exposedTool: route.exposed,
       upstreamServer: route.server,
       upstreamTool: route.tool.name,
       args,
-      result,
+      ...(result ? { result } : {}),
+      success,
       latencyMs,
       startedAt,
       completedAt,
@@ -1144,4 +1494,73 @@ export class SpeculateProxy {
       void this.session.runtime.publishCompleted?.(event).catch(() => {});
     } catch {}
   }
+}
+
+function readSemanticConfig(runtime: ProxySessionRuntime | undefined): SemanticRankingConfig | null {
+  try {
+    return runtime?.semanticConfig?.() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function settleBefore<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  if (timeoutMs <= 0) return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    timer.unref();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function validSemanticReply(
+  reply: SemanticRankingReply,
+  request: SemanticRankingRequest,
+  expectedConversationId: string | null,
+  expectedModel: string,
+): boolean {
+  if (
+    reply.protocolVersion !== 1 ||
+    reply.requestId !== request.requestId ||
+    reply.batchId !== request.batchId ||
+    reply.sourceEventId !== request.sourceEventId ||
+    reply.ownerInstanceId !== request.ownerInstanceId ||
+    reply.launchId !== request.launchId ||
+    reply.batchDigest !== request.batchDigest ||
+    reply.model !== expectedModel
+  ) return false;
+  if (
+    typeof reply.conversationId !== 'string' || reply.conversationId.length === 0 ||
+    (expectedConversationId !== null && reply.conversationId !== expectedConversationId) ||
+    !Number.isInteger(reply.contextRevision) || reply.contextRevision < 0 ||
+    typeof reply.questionVersion !== 'string' || reply.questionVersion.length === 0 ||
+    !Number.isFinite(reply.providerDurationMs) || reply.providerDurationMs < 0
+  ) return false;
+  const expected = new Set(request.candidates.map((candidate) => candidate.id));
+  const actual = Object.entries(reply.scores);
+  if (actual.length === 0) return false;
+  return actual.every(([id, score]) =>
+    expected.has(id) && typeof score === 'number' && Number.isFinite(score) && score >= 0 && score <= 1,
+  );
+}
+
+function boundedUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(0, middle), 'utf8') <= maxBytes) low = middle;
+    else high = middle - 1;
+  }
+  return value.slice(0, low);
 }

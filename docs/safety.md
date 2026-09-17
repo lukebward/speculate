@@ -146,3 +146,14 @@ cautionary example.
 
 The full threat model, including the bounded latency cost on serial stdio
 upstreams, is in the [design spec](design/index.md).
+
+## Optional semantic ranking
+
+[Jev semantic ranking](jev.md) is off by default. Enabling shadow or rank mode
+sends bounded task text, call metadata and candidate argument projections to
+TypeSafe. These can contain private content despite secret filtering. Raw tool
+results and credentials are excluded from the semantic payload.
+
+Jev returns only candidate probabilities. It cannot change the exact call, grant
+host permission, bypass read-only policy or extend TTL. Provider failures leave
+real calls usable, and stale ranking responses cannot revive invalidated calls.

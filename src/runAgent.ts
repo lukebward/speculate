@@ -25,12 +25,17 @@ import { startLlmProxy, type LlmProxy } from './llmProxy.js';
 import { win32ShimInvocation } from './manage.js';
 import { ObservationBudget } from './observationBudget.js';
 import type { ObserverLifecycleEvent } from './types.js';
+import { loadSessionConfig } from './config.js';
+import { collectRuntimeSecrets } from './privacy.js';
+import { SemanticRankingService } from './semanticService.js';
+import type { SemanticRankingConfig, SemanticServiceReport } from './semanticTypes.js';
 
 export interface RunAgentArgs {
   agent: 'claude' | 'codex';
   observe: ObserverMode;
   clientArgs: string[];
   jsonReport: string | null;
+  configPath?: string | null;
 }
 
 export interface SessionMeasurements {
@@ -46,6 +51,8 @@ export interface PreparedAgentRun {
   registeredRoutes(): number;
   disabledCapabilities(): string[];
   measurements(): SessionMeasurements;
+  semanticConfig?(): SemanticRankingConfig | undefined;
+  semanticReport?(): SemanticServiceReport | null;
   close(): Promise<void>;
 }
 
@@ -229,6 +236,7 @@ export function parseRunArgs(argv: string[]): RunAgentArgs | { error: string } {
   if (agent !== 'claude' && agent !== 'codex') return { error: 'expected claude or codex' };
   let observe: ObserverMode = 'proxy';
   let jsonReport: string | null = null;
+  let configPath: string | null = null;
   let index = 1;
   for (; index < argv.length; index++) {
     const arg = argv[index]!;
@@ -250,9 +258,15 @@ export function parseRunArgs(argv: string[]): RunAgentArgs | { error: string } {
       jsonReport = value;
       continue;
     }
+    if (arg === '--config') {
+      const value = argv[++index];
+      if (!value || value.startsWith('-')) return { error: '--config requires a path' };
+      configPath = value;
+      continue;
+    }
     return { error: `unknown run argument '${arg}'` };
   }
-  return { agent, observe, clientArgs: argv.slice(index), jsonReport };
+  return { agent, observe, clientArgs: argv.slice(index), jsonReport, configPath };
 }
 
 export async function runAgent(args: RunAgentArgs, dependencies: RunAgentDependencies = {}): Promise<number> {
@@ -267,12 +281,19 @@ export async function runAgent(args: RunAgentArgs, dependencies: RunAgentDepende
   let measurements: SessionMeasurements = { sources: {}, transport: { requests: 0, failures: 0 } };
   let registeredRoutes = 0;
   let disabledCapabilities: string[] = [];
+  let semanticReport: SemanticServiceReport | null = null;
   const forwardInt = () => child?.kill('SIGINT');
   const forwardTerm = () => child?.kill('SIGTERM');
   signals.on('SIGINT', forwardInt);
   signals.on('SIGTERM', forwardTerm);
   try {
     log(`[speculate] launching ${args.agent} (observer: ${prepared.mode}, transport: ${prepared.transport})`);
+    const semantic = prepared.semanticConfig?.();
+    if (semantic) {
+      log(`[speculate] semantic ranking ${semantic.mode}: bounded task, call, and candidate data may be sent to TypeSafe (${semantic.model})`);
+      const reason = prepared.disabledCapabilities().find((value) => value === 'semantic-ranking:missing-api-key');
+      if (reason) log('[speculate] semantic ranking unavailable: TYPESAFE_API_KEY is not set; using baseline ranking');
+    }
     if (args.observe === 'proxy' && prepared.mode === 'hooks') {
       const reason = prepared.disabledCapabilities().find((value) => value.startsWith('model-observation:'));
       log(reason
@@ -304,6 +325,7 @@ export async function runAgent(args: RunAgentArgs, dependencies: RunAgentDepende
     registeredRoutes = prepared.registeredRoutes();
     disabledCapabilities = prepared.disabledCapabilities();
     await prepared.close();
+    semanticReport = prepared.semanticReport?.() ?? null;
   }
   if (args.jsonReport) {
     const report = {
@@ -316,6 +338,7 @@ export async function runAgent(args: RunAgentArgs, dependencies: RunAgentDepende
       registeredRoutes,
       measurements,
       disabledCapabilities,
+      ...(semanticReport ? { semantic: semanticReport } : {}),
       exit: { code: exitCode, signal: exitSignal },
     };
     writeReport(args.jsonReport, report);
@@ -411,11 +434,18 @@ class CodexNativeAuthority {
     try {
       const native = await this.read();
       const projection = projectCodexPolicy(native.config, input.route.hostServerAlias);
+      const policyFingerprint = codexPolicyFingerprint({
+        cwd: this.effectiveCwd,
+        globalArgs: this.globalArgs,
+        config: native.config,
+        origins: native.origins,
+      });
       const allowed = projection.enabled && !projection.denyTools.includes(input.route.exposedTool) &&
         (projection.allowTools === null || projection.allowTools.includes(input.route.exposedTool));
-      if (!allowed) return { decision: 'denied', permissionContext: null };
+      if (!allowed) return { decision: 'denied', permissionContext: null, policyFingerprint };
       return {
         decision: 'allowed',
+        policyFingerprint,
         permissionContext: createHash('sha256').update(stable({
           cwd: this.effectiveCwd,
           globalArgs: this.globalArgs,
@@ -426,9 +456,18 @@ class CodexNativeAuthority {
         })).digest('base64url'),
       };
     } catch {
-      return { decision: 'unverifiable', permissionContext: null };
+      return { decision: 'unverifiable', permissionContext: null, policyFingerprint: null };
     }
   }
+}
+
+export function codexPolicyFingerprint(input: {
+  cwd: string;
+  globalArgs: readonly string[];
+  config: Record<string, unknown>;
+  origins: Record<string, unknown>;
+}): string {
+  return createHash('sha256').update(stable(input)).digest('base64url');
 }
 
 function codexUpstream(config: Record<string, unknown>, accountMode: CodexAccountMode): string | null {
@@ -455,9 +494,27 @@ export async function prepareAgentRun(args: RunAgentArgs): Promise<PreparedAgent
   for (const key of Object.keys(env)) {
     if (key.startsWith('SPECULATE_SESSION_') || key.startsWith('SPECULATE_OBSERVER_')) delete env[key];
   }
+  const sessionConfig = args.configPath ? loadSessionConfig(args.configPath) : null;
+  const semanticConfig = sessionConfig?.semanticRanking?.mode !== 'off'
+    ? sessionConfig?.semanticRanking
+    : undefined;
+  const semanticApiKey = semanticConfig ? env.TYPESAFE_API_KEY ?? '' : '';
+  const semanticSecrets = semanticConfig && sessionConfig
+    ? collectRuntimeSecrets(sessionConfig, { env, oauthPath: null })
+    : [];
+  if (semanticConfig) delete env.TYPESAFE_API_KEY;
   const launchId = randomUUID();
   const initialContext: SessionContext = { launchId, conversationId: `launch:${launchId}`, agent: args.agent, cwd };
   const disabled = new Set<string>();
+  if (semanticConfig && semanticApiKey.length === 0) disabled.add('semantic-ranking:missing-api-key');
+  const semanticService = semanticConfig
+    ? new SemanticRankingService({
+        config: semanticConfig,
+        apiKey: semanticApiKey,
+        launchId,
+        secretValues: semanticSecrets,
+      })
+    : null;
   const ledger = new CompletionLedger({ onTrackingLoss: () => disabled.add('completion-correlation:tracking-lost') });
   const measurements = new SessionMeasurementCollector();
   const codexInvocation = args.agent === 'codex' ? extractCodexConfigInvocation(args.clientArgs) : null;
@@ -478,6 +535,7 @@ export async function prepareAgentRun(args: RunAgentArgs): Promise<PreparedAgent
   let bridge: SessionBridge;
   try {
     bridge = await SessionBridge.start(initialContext, {
+    ...(semanticConfig && semanticService ? { semanticConfig, semanticService } : {}),
     correlateCompletion: (event) => ledger.correlate(event),
     authorizeCandidate: async (input) => {
       if (args.agent === 'claude') {
@@ -513,6 +571,7 @@ export async function prepareAgentRun(args: RunAgentArgs): Promise<PreparedAgent
     onLifecycle: (event) => measurements.record(event),
     });
   } catch (error) {
+    semanticService?.shutdown();
     await authority?.close();
     throw error;
   }
@@ -608,6 +667,8 @@ export async function prepareAgentRun(args: RunAgentArgs): Promise<PreparedAgent
       const state = relay?.debugObservationState();
       return measurements.snapshot({ requests: state?.totalRequests ?? 0, failures: state?.failures ?? 0 });
     },
+    semanticConfig: () => semanticConfig ? structuredClone(semanticConfig) : undefined,
+    semanticReport: () => semanticService?.report() ?? null,
     async close() {
       if (closed) return;
       closed = true;

@@ -9,6 +9,13 @@ import type { LocalRouteDescriptor, RegisteredRoute, HostPermissionDecision } fr
 import { SpeculateProxy, type ProxySessionRuntime } from '../src/proxy.js';
 import type { Upstream } from '../src/upstream.js';
 import { canonicalKey } from '../src/keys.js';
+import type {
+  ProxyDemandEvent,
+  SemanticRankingConfig,
+  SemanticRankingReply,
+  SemanticRankingRequest,
+  VerifiedProxyDemandEvent,
+} from '../src/semanticTypes.js';
 
 const context: SessionContext = {
   launchId: 'launch',
@@ -65,6 +72,65 @@ function candidate(routeId: string, generation: number, over: Partial<Candidate>
     args: { path: '/a' },
     confidence: 0.9,
     createdAt: 100,
+    ...over,
+  };
+}
+
+const semanticConfig: SemanticRankingConfig = {
+  mode: 'rank',
+  model: 'jev-1.13.0',
+  timeoutMs: 150,
+  maxCandidates: 16,
+  horizonMs: 30_000,
+  maxRequestsPerMinute: 60,
+  maxRequestsPerSession: 1_000,
+};
+
+function completion(route: RegisteredRoute, over: Partial<import('../src/proxy.js').ProxySessionEvent> = {}) {
+  return {
+    kind: 'tool-complete' as const,
+    launchId: 'launch',
+    hostClient: 'claude' as const,
+    hostServerAlias: 'files',
+    conversationId: null,
+    eventId: 'source-call',
+    routeId: route.routeId,
+    generation: route.generation,
+    exposedTool: route.exposedTool,
+    upstreamServer: route.upstreamServer,
+    upstreamTool: route.upstreamTool,
+    args: { path: '/a' },
+    result: { content: [{ type: 'text' as const, text: 'ok' }] },
+    success: true,
+    latencyMs: 10,
+    startedAt: 90,
+    completedAt: 100,
+    ...over,
+  };
+}
+
+function semanticRequest(route: RegisteredRoute, over: Partial<SemanticRankingRequest> = {}): SemanticRankingRequest {
+  return {
+    protocolVersion: 1,
+    requestId: 'judge-1',
+    batchId: 'batch-1',
+    sourceEventId: 'source-call',
+    ownerInstanceId: route.instanceId,
+    launchId: 'launch',
+    createdAt: 100,
+    deadlineAt: 250,
+    batchDigest: 'digest',
+    candidates: [{
+      id: 'candidate-1',
+      routeId: route.routeId,
+      generation: route.generation,
+      server: route.upstreamServer,
+      tool: route.upstreamTool,
+      args: { path: '/next' },
+      baselineScore: 0.8,
+      conservativeLatencyMs: 20,
+      effectiveTtlMs: 1_000,
+    }],
     ...over,
   };
 }
@@ -148,6 +214,381 @@ describe('SessionBridge route ownership', () => {
         kind: 'invalidate', routeIds: [freshRoute!.routeId], reason: 'disconnect',
       }),
     ]));
+  });
+});
+
+describe('SessionBridge semantic IPC', () => {
+  function semanticService() {
+    const judged: SemanticRankingRequest[] = [];
+    const demands: VerifiedProxyDemandEvent[] = [];
+    const pendingDemands: ProxyDemandEvent[] = [];
+    const censoredDemands: Array<[string, string]> = [];
+    let shutdowns = 0;
+    return {
+      judged,
+      demands,
+      pendingDemands,
+      censoredDemands,
+      get shutdowns() { return shutdowns; },
+      service: {
+        observePrompt: () => true,
+        observeCall: () => true,
+        async judgeCandidates(request: SemanticRankingRequest): Promise<SemanticRankingReply> {
+          judged.push(request);
+          return {
+            protocolVersion: 1,
+            requestId: request.requestId,
+            batchId: request.batchId,
+            sourceEventId: request.sourceEventId,
+            ownerInstanceId: request.ownerInstanceId,
+            launchId: request.launchId,
+            conversationId: request.conversationId!,
+            batchDigest: request.batchDigest,
+            contextRevision: 1,
+            model: semanticConfig.model,
+            questionVersion: 'demand-v1',
+            providerDurationMs: 4,
+            scores: { 'candidate-1': 0.7 },
+          };
+        },
+        async publishDemand(event: VerifiedProxyDemandEvent): Promise<boolean> {
+          demands.push(event);
+          return true;
+        },
+        notePendingDemand(event: Extract<ProxyDemandEvent, { phase: 'start' }>): boolean {
+          pendingDemands.push(event);
+          return true;
+        },
+        censorPendingDemand(ownerInstanceId: string, requestId: string): boolean {
+          censoredDemands.push([ownerInstanceId, requestId]);
+          return true;
+        },
+        report: () => ({ judged: judged.length }),
+        invalidate: () => {},
+        shutdown: () => { shutdowns++; },
+      },
+    };
+  }
+
+  it('invalidates service evaluation when verified permissions change', async () => {
+    const semantic = semanticService();
+    const invalidated: string[] = [];
+    semantic.service.invalidate = (conversationId?: string) => { invalidated.push(conversationId!); };
+    let decision: HostPermissionDecision = 'allowed';
+    let permissionContext: string | null = 'target-read';
+    let policyFingerprint: string | null = 'policy-1';
+    const bridge = await SessionBridge.start(context, {
+      now: () => 100,
+      semanticConfig,
+      semanticService: semantic.service,
+      authorizeCandidate: () => ({ decision, permissionContext, policyFingerprint }),
+    });
+    bridges.push(bridge);
+    const received: Candidate[][] = [];
+    const connection = await owner(bridge, 'files', received);
+    const [route, otherRoute] = await connection.register([
+      localRoute,
+      { ...localRoute, exposedTool: 'search', upstreamTool: 'search' },
+    ]);
+    expect(bridge.submit(candidate(route!.routeId, route!.generation))).toBe(true);
+    for (let attempt = 0; attempt < 20 && received.length < 1; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    invalidated.length = 0;
+    permissionContext = 'target-search';
+    expect(bridge.submit(candidate(otherRoute!.routeId, otherRoute!.generation, {
+      candidateId: 'second', sourceEventId: 'second-event',
+    }))).toBe(true);
+    for (let attempt = 0; attempt < 20 && received.length < 2; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(received).toHaveLength(2);
+    expect(invalidated).toEqual([]);
+    policyFingerprint = 'policy-2';
+    permissionContext = 'target-read-2';
+    expect(bridge.submit(candidate(route!.routeId, route!.generation, {
+      candidateId: 'third', sourceEventId: 'third-event',
+    }))).toBe(true);
+    for (let attempt = 0; attempt < 20 && received.length < 3; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(received).toHaveLength(3);
+    expect(invalidated).toEqual(['thread']);
+    invalidated.length = 0;
+    decision = 'denied';
+    permissionContext = null;
+    policyFingerprint = 'policy-3';
+    expect(bridge.submit(candidate(route!.routeId, route!.generation, {
+      candidateId: 'fourth', sourceEventId: 'fourth-event',
+    }))).toBe(true);
+    for (let attempt = 0; attempt < 20 && invalidated.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(received).toHaveLength(3);
+    expect(invalidated).toEqual(['thread']);
+    invalidated.length = 0;
+    decision = 'unverifiable';
+    policyFingerprint = null;
+    expect(bridge.submit(candidate(route!.routeId, route!.generation, {
+      candidateId: 'fifth', sourceEventId: 'fifth-event',
+    }))).toBe(true);
+    for (let attempt = 0; attempt < 20 && invalidated.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(invalidated).toEqual(['thread']);
+  });
+
+  it.each(['judge-first', 'completion-first'] as const)(
+    'shares one completion correlation when %s',
+    async (order) => {
+      let correlations = 0;
+      const semantic = semanticService();
+      const bridge = await SessionBridge.start(context, {
+        now: () => 100,
+        correlateCompletion: async () => {
+          correlations++;
+          return { conversationId: 'thread', cwd: '/work' };
+        },
+        semanticConfig,
+        semanticService: semantic.service,
+      });
+      bridges.push(bridge);
+      const connection = await owner(bridge, 'files');
+      const [route] = await connection.register([localRoute]);
+      expect(connection.semanticConfig()).toEqual(semanticConfig);
+
+      let pending: Promise<SemanticRankingReply | null>;
+      if (order === 'judge-first') {
+        pending = connection.judgeCandidates(semanticRequest(route!));
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(semantic.judged).toEqual([]);
+        expect(await connection.publishCompleted(completion(route!))).toBe(true);
+      } else {
+        expect(await connection.publishCompleted(completion(route!))).toBe(true);
+        pending = connection.judgeCandidates(semanticRequest(route!));
+      }
+
+      await expect(pending).resolves.toMatchObject({
+        requestId: 'judge-1',
+        conversationId: 'thread',
+        contextRevision: 1,
+        scores: { 'candidate-1': 0.7 },
+      });
+      expect(semantic.judged).toHaveLength(1);
+      expect(semantic.judged[0]).toMatchObject({ conversationId: 'thread' });
+      expect(correlations).toBe(1);
+    },
+  );
+
+  it('rejects a ranking request that claims another owner', async () => {
+    const semantic = semanticService();
+    const bridge = await SessionBridge.start(context, {
+      now: () => 100,
+      correlateCompletion: () => ({ conversationId: 'thread', cwd: '/work' }),
+      semanticConfig,
+      semanticService: semantic.service,
+    });
+    bridges.push(bridge);
+    const connection = await owner(bridge, 'files');
+    const [route] = await connection.register([localRoute]);
+
+    await expect(connection.judgeCandidates(semanticRequest(route!, {
+      ownerInstanceId: 'different-owner',
+    }))).resolves.toBeNull();
+    expect(semantic.judged).toEqual([]);
+  });
+
+  it('scopes identical source event IDs to their authenticated source owners', async () => {
+    const semantic = semanticService();
+    const bridge = await SessionBridge.start(context, {
+      now: () => 100,
+      correlateCompletion: (event) => ({
+        conversationId: event.hostServerAlias === 'files' ? 'thread' : 'subagent',
+        cwd: '/work',
+      }),
+      semanticConfig,
+      semanticService: semantic.service,
+    });
+    bridges.push(bridge);
+    expect(bridge.registerConversation({ ...context, conversationId: 'subagent' })).toBe(true);
+    const first = await owner(bridge, 'files');
+    const second = await owner(bridge, 'other-files');
+    const [firstRoute] = await first.register([localRoute]);
+    const [secondRoute] = await second.register([localRoute]);
+    await first.publishCompleted(completion(firstRoute!));
+    await second.publishCompleted(completion(secondRoute!, { hostServerAlias: 'other-files' }));
+
+    const [firstReply, secondReply] = await Promise.all([
+      first.judgeCandidates(semanticRequest(firstRoute!)),
+      second.judgeCandidates(semanticRequest(secondRoute!, { requestId: 'judge-2', batchId: 'batch-2' })),
+    ]);
+
+    expect(firstReply?.conversationId).toBe('thread');
+    expect(secondReply?.conversationId).toBe('subagent');
+  });
+
+  it('forwards failed demand only after verified completion correlation', async () => {
+    const semantic = semanticService();
+    const bridge = await SessionBridge.start(context, {
+      now: () => 100,
+      correlateCompletion: () => ({ conversationId: 'thread', cwd: '/work' }),
+      semanticConfig,
+      semanticService: semantic.service,
+    });
+    bridges.push(bridge);
+    const connection = await owner(bridge, 'files');
+    const [route] = await connection.register([localRoute]);
+    const start: ProxyDemandEvent = {
+      phase: 'start', requestId: 'source-call', sourceEventId: 'source-call',
+      ownerInstanceId: connection.ownerId, routeId: route!.routeId, generation: route!.generation,
+      server: route!.upstreamServer, tool: route!.upstreamTool, args: { path: '/a' }, startedAt: 90,
+    };
+    const complete: ProxyDemandEvent = {
+      phase: 'complete', requestId: 'source-call', sourceEventId: 'source-call',
+      ownerInstanceId: connection.ownerId, routeId: route!.routeId, generation: route!.generation,
+      completedAt: 100, success: false,
+    };
+
+    const demandStart = connection.publishDemand(start);
+    const demandComplete = connection.publishDemand(complete);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(semantic.demands).toEqual([]);
+    await connection.publishCompleted(completion(route!));
+
+    await expect(Promise.all([demandStart, demandComplete])).resolves.toEqual([true, true]);
+    expect(semantic.demands).toEqual([
+      { ...start, conversationId: 'thread' },
+      { ...complete, conversationId: 'thread' },
+    ]);
+  });
+
+  it('notes a slow demand before completion correlation and promotes it after verification', async () => {
+    const semantic = semanticService();
+    let resolveCorrelation!: (value: { conversationId: string; cwd: string }) => void;
+    const bridge = await SessionBridge.start(context, {
+      now: () => 100,
+      correlateCompletion: () => new Promise((resolve) => { resolveCorrelation = resolve; }),
+      semanticConfig,
+      semanticService: semantic.service,
+    });
+    bridges.push(bridge);
+    const connection = await owner(bridge, 'files');
+    const [route] = await connection.register([localRoute]);
+    const start: Extract<ProxyDemandEvent, { phase: 'start' }> = {
+      phase: 'start', requestId: 'slow-call', sourceEventId: 'slow-call',
+      ownerInstanceId: connection.ownerId, routeId: route!.routeId, generation: route!.generation,
+      server: route!.upstreamServer, tool: route!.upstreamTool, args: { path: '/slow' }, startedAt: 1,
+    };
+
+    await expect(connection.publishDemand(start)).resolves.toBe(true);
+    expect(semantic.pendingDemands).toEqual([start]);
+    expect(semantic.demands).toEqual([]);
+    await connection.publishCompleted(completion(route!, {
+      eventId: 'slow-call', args: { path: '/slow' }, startedAt: 1, completedAt: 100,
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(semantic.demands).toEqual([]);
+    resolveCorrelation({ conversationId: 'thread', cwd: '/work' });
+    for (let attempt = 0; attempt < 20 && semantic.demands.length === 0; attempt++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(semantic.demands).toEqual([{ ...start, conversationId: 'thread' }]);
+    expect(semantic.censoredDemands).toEqual([]);
+  });
+
+  it('invalidates an in-flight judgment when a new prompt changes semantic context', async () => {
+    const semantic = semanticService();
+    let resolveReply!: (reply: SemanticRankingReply) => void;
+    semantic.service.judgeCandidates = (request) => new Promise((resolve) => {
+      resolveReply = resolve;
+      semantic.judged.push(request);
+    });
+    const bridge = await SessionBridge.start(context, {
+      now: () => 100,
+      correlateCompletion: () => ({ conversationId: 'thread', cwd: '/work' }),
+      semanticConfig,
+      semanticService: semantic.service,
+    });
+    bridges.push(bridge);
+    const connection = await owner(bridge, 'files');
+    const [route] = await connection.register([localRoute]);
+    await connection.publishCompleted(completion(route!));
+    const request = semanticRequest(route!);
+    const pending = connection.judgeCandidates(request);
+    for (let attempt = 0; attempt < 20 && semantic.judged.length === 0; attempt++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const revision = connection.semanticRevision();
+
+    expect(bridge.publishObservation({
+      context,
+      eventId: 'new-task',
+      observedAt: 101,
+      kind: 'prompt',
+      text: 'inspect another file',
+    })).toBe(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(connection.semanticRevision()).toBeGreaterThan(revision);
+    resolveReply({
+      protocolVersion: 1,
+      requestId: request.requestId,
+      batchId: request.batchId,
+      sourceEventId: request.sourceEventId,
+      ownerInstanceId: request.ownerInstanceId,
+      launchId: request.launchId,
+      conversationId: 'thread',
+      batchDigest: request.batchDigest,
+      contextRevision: 1,
+      model: semanticConfig.model,
+      questionVersion: 'demand-v1',
+      providerDurationMs: 10,
+      scores: { 'candidate-1': 0.9 },
+    });
+
+    await expect(pending).resolves.toBeNull();
+  });
+});
+
+describe('SessionBridge observer grouping', () => {
+  it('delivers same-source candidates for one owner as one authorized group', async () => {
+    const bridge = await SessionBridge.start(context, {
+      now: () => 100,
+      authorizeCandidate: async ({ candidate }) => {
+        if (candidate.candidateId === 'slow') await new Promise((resolve) => setTimeout(resolve, 5));
+        return { decision: 'allowed', permissionContext: `permission-${candidate.candidateId}` };
+      },
+    });
+    bridges.push(bridge);
+    const received: Array<Array<Candidate | import('../src/observerTypes.js').AuthorizedCandidate>> = [];
+    const connection = await connectSessionBridgeOwner(bridge.coordinates, {
+      hostClient: 'claude',
+      hostServerAlias: 'files',
+      onCandidates: (batch) => received.push(batch),
+    });
+    owners.push(connection);
+    const [route] = await connection.register([localRoute]);
+    (bridge as unknown as { sessionPredictor: { observe(): Candidate[] } }).sessionPredictor.observe = () => [
+      candidate(route!.routeId, route!.generation, { candidateId: 'slow', args: { path: '/one' } }),
+      candidate(route!.routeId, route!.generation, { candidateId: 'fast', args: { path: '/two' } }),
+    ];
+
+    expect(bridge.publishObservation({
+      context,
+      eventId: 'group-source',
+      observedAt: 100,
+      kind: 'prompt',
+      text: 'group fixture',
+    })).toBe(true);
+    for (let attempt = 0; attempt < 20 && received.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toHaveLength(2);
+    expect(received[0]!.map((item) => 'candidate' in item ? item.candidate.candidateId : item.candidateId))
+      .toEqual(['slow', 'fast']);
+    const permissionContexts = received[0]!.map((item) => 'permissionContext' in item ? item.permissionContext : null);
+    expect(new Set(permissionContexts).size).toBe(1);
   });
 });
 

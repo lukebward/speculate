@@ -54,8 +54,8 @@ const HELP = `speculate ${VERSION} — speculative-prefetching MCP proxy
 
 native context-aware sessions (model proxy observation is the default):
   speculate                                detect and launch Claude Code or Codex
-  speculate run claude [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
-  speculate run codex [--observe off|hooks|proxy] [--json-report PATH] -- [native args]
+  speculate run claude [--observe off|hooks|proxy] [--config PATH] [--json-report PATH] -- [native args]
+  speculate run codex [--observe off|hooks|proxy] [--config PATH] [--json-report PATH] -- [native args]
                                            fall back to hooks when the model route or relay setup cannot be verified
 
 managed setup (on/off/status/sync/auth accept --client both|claude|codex):

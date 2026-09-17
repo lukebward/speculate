@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   nativeClientInvocation,
+  codexPolicyFingerprint,
   parseRunArgs,
   prepareAgentRun,
   runAgent,
@@ -450,6 +451,21 @@ describe('native launch plans', () => {
     expect(plan.args.slice(0, clientArgs.length)).toEqual(clientArgs);
   });
 
+  it('fingerprints Codex policy independently of candidate routes', () => {
+    const source = {
+      cwd: '/work',
+      globalArgs: ['-c', 'mcp_servers.files.enabled=true'],
+      config: { mcp_servers: { files: { enabled: true } } },
+      origins: { 'mcp_servers.files': 'cli' },
+    };
+    const first = codexPolicyFingerprint(source);
+    expect(codexPolicyFingerprint({ ...source })).toBe(first);
+    expect(codexPolicyFingerprint({
+      ...source,
+      config: { mcp_servers: { files: { enabled: false } } },
+    })).not.toBe(first);
+  });
+
   it('places verified Codex exec overrides last while preserving the native sentinel tail', async () => {
     const clientArgs = ['exec', '--model', 'selected', '--', 'prompt'];
     const plan = await buildCodexLaunchPlan({
@@ -611,7 +627,11 @@ describe('Claude launch permission verification', () => {
     const second = verifyClaudeMcpPreauthorization(input, { alias: 'files', tool: 'read' });
     expect(second).toMatchObject({ decision: 'allowed' });
     expect(second.permissionContext).not.toBe(first.permissionContext);
-    expect(verifyClaudeMcpPreauthorization(input, { alias: 'files', tool: 'other' })).toMatchObject({ decision: 'allowed' });
+    expect(second.policyFingerprint).not.toBe(first.policyFingerprint);
+    const other = verifyClaudeMcpPreauthorization(input, { alias: 'files', tool: 'other' });
+    expect(other).toMatchObject({ decision: 'allowed' });
+    expect(other.permissionContext).not.toBe(second.permissionContext);
+    expect(other.policyFingerprint).toBe(second.policyFingerprint);
   });
 
   it('lets deny, ask, and non-observer hooks block an exact allow', () => {
@@ -685,21 +705,23 @@ describe('run argument parser', () => {
       observe: 'proxy',
       clientArgs: ['--help'],
       jsonReport: null,
+      configPath: null,
     });
   });
 
   it.each(['off', 'hooks', 'proxy'] as const)('accepts observer mode %s', (observe) => {
     expect(parseRunArgs(['claude', '--observe', observe])).toEqual({
-      agent: 'claude', observe, clientArgs: [], jsonReport: null,
+      agent: 'claude', observe, clientArgs: [], jsonReport: null, configPath: null,
     });
   });
 
   it.each(['claude', 'codex'] as const)('defaults %s to proxy and preserves every argument after the separator', (agent) => {
-    expect(parseRunArgs([agent, '--json-report', '/tmp/report.json', '--', '-c', 'model="chosen"', '--profile', 'work'])).toEqual({
+    expect(parseRunArgs([agent, '--config', '/tmp/speculate.json', '--json-report', '/tmp/report.json', '--', '-c', 'model="chosen"', '--profile', 'work'])).toEqual({
       agent,
       observe: 'proxy',
       clientArgs: ['-c', 'model="chosen"', '--profile', 'work'],
       jsonReport: '/tmp/report.json',
+      configPath: '/tmp/speculate.json',
     });
   });
 
@@ -708,6 +730,7 @@ describe('run argument parser', () => {
     [['other'], 'expected claude or codex'],
     [['claude', '--observe', 'invalid'], '--observe must be off, hooks, or proxy'],
     [['codex', '--json-report'], '--json-report requires a path'],
+    [['claude', '--config'], '--config requires a path'],
     [['codex', '--wat'], "unknown run argument '--wat'"],
   ])('rejects invalid arguments %#', (argv, message) => {
     expect(parseRunArgs(argv)).toEqual({ error: message });
@@ -765,6 +788,88 @@ describe('public run command', () => {
     });
     expect(readFileSync(report, 'utf8')).not.toContain('--model');
     expect(readFileSync(report, 'utf8')).not.toContain('kept');
+  });
+
+  it('keeps an enabled semantic credential in the bridge and reports aggregate semantic state', () => {
+    const root = directory();
+    const home = join(root, 'home');
+    mkdirSync(home);
+    const client = join(root, 'fake-claude.mjs');
+    const childEnv = join(root, 'child-env.json');
+    const config = join(root, 'speculate.config.json');
+    const report = join(root, 'report.json');
+    writeFileSync(client, `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(childEnv)}, JSON.stringify({ typesafe: process.env.TYPESAFE_API_KEY ?? null }));
+process.exit(0);
+`);
+    chmodSync(client, 0o700);
+    writeFileSync(config, JSON.stringify({ servers: {}, semanticRanking: { mode: 'shadow' } }));
+
+    const result = spawnSync(process.execPath, [
+      join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+      join(process.cwd(), 'src', 'cli.ts'),
+      'run', 'claude', '--observe', 'hooks', '--config', config, '--json-report', report,
+    ], {
+      cwd: root,
+      env: {
+        ...process.env,
+        HOME: home,
+        SPECULATE_CLAUDE_BIN: client,
+        TYPESAFE_API_KEY: 'bridge-only-secret',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('semantic ranking shadow');
+    expect(JSON.parse(readFileSync(childEnv, 'utf8'))).toEqual({ typesafe: null });
+    expect(JSON.parse(readFileSync(report, 'utf8'))).toMatchObject({
+      semantic: {
+        mode: 'shadow',
+        model: 'jev-1.13.0',
+        requestsDispatched: 0,
+        candidatesJudged: 0,
+      },
+    });
+    expect(readFileSync(report, 'utf8')).not.toContain('bridge-only-secret');
+  });
+
+  it('preserves an unrelated TypeSafe credential when semantic ranking is off', () => {
+    const root = directory();
+    const home = join(root, 'home');
+    mkdirSync(home);
+    const client = join(root, 'fake-claude.mjs');
+    const childEnv = join(root, 'child-env.json');
+    const config = join(root, 'speculate.config.json');
+    writeFileSync(client, `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(childEnv)}, JSON.stringify({ typesafe: process.env.TYPESAFE_API_KEY ?? null }));
+process.exit(0);
+`);
+    chmodSync(client, 0o700);
+    writeFileSync(config, JSON.stringify({ servers: {}, semanticRanking: { mode: 'off' } }));
+
+    const result = spawnSync(process.execPath, [
+      join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+      join(process.cwd(), 'src', 'cli.ts'),
+      'run', 'claude', '--observe', 'off', '--config', config,
+    ], {
+      cwd: root,
+      env: {
+        ...process.env,
+        HOME: home,
+        SPECULATE_CLAUDE_BIN: client,
+        TYPESAFE_API_KEY: 'client-owned-value',
+      },
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(readFileSync(childEnv, 'utf8'))).toEqual({ typesafe: 'client-owned-value' });
+    expect(result.stderr).not.toContain('semantic ranking off');
   });
 
   it('uses model proxy observation by default for a supported Claude route', () => {
@@ -1008,5 +1113,46 @@ describe('agent process lifecycle', () => {
       exit: { code: 0, signal: null },
     });
     expect(text).not.toContain('secret-argument');
+  });
+
+  it('captures semantic censorship after shutdown in the aggregate report', async () => {
+    const root = directory();
+    const reportPath = join(root, 'report.json');
+    const fake = prepared('process.exitCode = 0');
+    let closed = false;
+    fake.value.close = async () => { closed = true; };
+    fake.value.semanticReport = () => ({
+      mode: 'shadow',
+      model: 'jev-1.13.0',
+      questionVersion: 'demand-v1',
+      requestsDispatched: 1,
+      successes: 1,
+      failures: 0,
+      totalProviderDurationMs: 1,
+      totalJudgingDurationMs: 2,
+      candidatesJudged: 1,
+      candidatesBypassed: 0,
+      inputTokens: null,
+      outputTokens: null,
+      fallbacks: {},
+      evaluation: {
+        judged: 1,
+        positives: 0,
+        negatives: 0,
+        censored: closed ? 1 : 0,
+        brierScore: null,
+        reliability: [],
+        evicted: 0,
+      },
+    });
+
+    await runAgent({ agent: 'claude', observe: 'hooks', clientArgs: [], jsonReport: reportPath }, {
+      prepare: async () => fake.value,
+      log: () => {},
+    });
+
+    expect(JSON.parse(readFileSync(reportPath, 'utf8'))).toMatchObject({
+      semantic: { evaluation: { censored: 1 } },
+    });
   });
 });

@@ -87,6 +87,23 @@ interface ScoredPrediction {
   order: number;
 }
 
+export interface PreparedPredictionCandidate {
+  readonly id: string;
+  readonly prediction: Readonly<Prediction>;
+  readonly candidateId: string;
+  readonly baselineScore: number;
+  readonly conservativeLatencyMs: number;
+  readonly baselineUtilityMs: number;
+  readonly order: number;
+}
+
+export interface PreparedPredictionBatch {
+  readonly server: string;
+  readonly createdAt: number;
+  readonly candidates: readonly PreparedPredictionCandidate[];
+  readonly baselineSelection: readonly Readonly<Prediction>[];
+}
+
 export interface ResolvedCandidate {
   tool: string;
   args: Record<string, unknown>;
@@ -95,6 +112,7 @@ export interface ResolvedCandidate {
   candidateId: string;
   ruleId: string;
   observerAttribution?: import('./types.js').ObserverAttribution;
+  executionLease?: import('./types.js').ExecutionLease;
 }
 
 export class Predictor {
@@ -120,6 +138,10 @@ export class Predictor {
   }
 
   observe(call: CompletedCall): Prediction[] {
+    return this.selectPrepared(this.prepareObserved(call));
+  }
+
+  prepareObserved(call: CompletedCall): PreparedPredictionBatch {
     this.evaluatePreviousBatch(call);
     if (call.eligibleTarget !== false) this.latency?.observe(call.server, call.tool, call.latencyMs);
     // §5.1 result access: structuredContent first, then generic JSON-in-text
@@ -196,7 +218,7 @@ export class Predictor {
       }
     }
 
-    return this.selectBatch(candidates, call.server, call.timestamp);
+    return this.prepareBatch(candidates, call.server, call.timestamp);
   }
 
   /**
@@ -204,7 +226,7 @@ export class Predictor {
    * `server`, run through the same feedback/dedupe/cap pipeline as any
    * trigger-driven batch. Returns [] when nothing qualifies; never throws.
    */
-  sessionStart(server: string): Prediction[] {
+  sessionStart(server: string, queueByUtility = false): Prediction[] {
     if (!this.learner?.openerPredictions) return [];
 
     const candidates: ScoredPrediction[] = [];
@@ -223,14 +245,24 @@ export class Predictor {
     } catch {
       return [];
     }
-    return this.selectBatch(candidates, server);
+    return this.selectPrepared(this.prepareBatch(candidates, server), { queueByUtility });
   }
 
   admitResolved(
     server: string,
     resolved: readonly ResolvedCandidate[],
-    options: { timestamp: number; trackNextCall: boolean },
+    options: { timestamp: number; trackNextCall: boolean; queueByUtility?: boolean },
   ): Prediction[] {
+    return this.selectPrepared(this.prepareResolved(server, resolved, options), {
+      queueByUtility: options.queueByUtility,
+    });
+  }
+
+  prepareResolved(
+    server: string,
+    resolved: readonly ResolvedCandidate[],
+    options: { timestamp: number; trackNextCall: boolean },
+  ): PreparedPredictionBatch {
     const candidates: ScoredPrediction[] = [];
     for (const [order, candidate] of resolved.entries()) {
       const prediction = validatePrediction(candidate, server, candidate.ruleId, 'next');
@@ -244,7 +276,7 @@ export class Predictor {
       );
       if (scored) candidates.push(scored);
     }
-    return this.selectBatch(candidates, server, options.timestamp, options.trackNextCall);
+    return this.prepareBatch(candidates, server, options.timestamp, options.trackNextCall);
   }
 
   /**
@@ -252,12 +284,12 @@ export class Predictor {
    * higher-scored prediction; the key is stamped so the executor reuses it
    * instead of recomputing), rank by score, cap (§5.6), and record events.
    */
-  private selectBatch(
+  private prepareBatch(
     candidates: ScoredPrediction[],
     server: string,
     timestamp?: number,
     trackNextCall = true,
-  ): Prediction[] {
+  ): PreparedPredictionBatch {
     const byKey = new Map<string, ScoredPrediction>();
     for (const cand of candidates) {
       const key = dedupeKey(cand.prediction, cand.order);
@@ -289,28 +321,9 @@ export class Predictor {
       minExpectedSavedMs: DEFAULT_MIN_EXPECTED_SAVED_MS,
     };
     const useful = admission.enabled
-      ? ranked.filter((candidate) => {
-          if (this.utility(candidate) >= admission.minExpectedSavedMs) return true;
-          this.recordSuppressed(candidate.prediction, 'low-utility', timestamp);
-          return false;
-        })
+      ? ranked.filter((candidate) => this.utility(candidate) >= admission.minExpectedSavedMs)
       : ranked;
     const kept = useful.slice(0, this.maxPerTrigger);
-    for (const cut of useful.slice(kept.length)) {
-      this.recordSuppressed(cut.prediction, 'per-trigger-cap', timestamp);
-    }
-
-    for (const { prediction } of kept) {
-      this.metrics.record({
-        type: 'predicted',
-        server: prediction.server,
-        tool: prediction.tool,
-        ruleId: prediction.ruleId,
-        confidence: prediction.confidence,
-        timestamp,
-        observerAttribution: prediction.observerAttribution,
-      });
-    }
     const admitted = new Set(kept);
     if (trackNextCall) this.pendingEvaluation.set(server, evaluated.map((candidate, index) => {
       const { prediction } = candidate;
@@ -326,7 +339,109 @@ export class Predictor {
         admitted: admitted.has(candidate),
       };
     }));
-    return kept.map((c) => c.prediction);
+    const prepared = ranked.map((candidate, index): PreparedPredictionCandidate => {
+      const prediction = freezePrediction(candidate.prediction);
+      const conservativeLatencyMs = this.conservativeLatency(candidate);
+      return Object.freeze({
+        id: `c${index}`,
+        prediction,
+        candidateId: candidate.candidateId,
+        baselineScore: candidate.score,
+        conservativeLatencyMs,
+        baselineUtilityMs: candidate.score * conservativeLatencyMs,
+        order: candidate.order,
+      });
+    });
+    const keptKeys = new Set(kept.map((candidate) => dedupeKey(candidate.prediction, candidate.order)));
+    const baselineSelection = prepared
+      .filter((candidate) => keptKeys.has(dedupeKey(candidate.prediction as Prediction, candidate.order)))
+      .map((candidate) => candidate.prediction);
+    return Object.freeze({
+      server,
+      createdAt: timestamp ?? Date.now(),
+      candidates: Object.freeze(prepared),
+      baselineSelection: Object.freeze(baselineSelection),
+    });
+  }
+
+  selectPrepared(
+    batch: PreparedPredictionBatch,
+    options: {
+      semanticScores?: Readonly<Record<string, number>>;
+      remainingWindowMs?: Readonly<Record<string, number>>;
+      queueByUtility?: boolean;
+    } = {},
+  ): Prediction[] {
+    const admission = this.admission[batch.server] ?? {
+      enabled: false,
+      minExpectedSavedMs: DEFAULT_MIN_EXPECTED_SAVED_MS,
+    };
+    if (!options.semanticScores) {
+      const selected = new Set(batch.baselineSelection);
+      const useful = batch.candidates.filter((candidate) =>
+        !admission.enabled || candidate.baselineUtilityMs >= admission.minExpectedSavedMs,
+      );
+      this.recordSelection(batch, useful, selected);
+      return batch.baselineSelection.map((prediction) => {
+        const output = clonePrediction(prediction);
+        if (options.queueByUtility) {
+          const prepared = batch.candidates.find((candidate) => candidate.prediction === prediction);
+          if (prepared) output.schedulingPriorityMs = prepared.baselineUtilityMs;
+        }
+        return output;
+      });
+    }
+    const ranked = batch.candidates.map((candidate) => {
+      const semanticScore = options.semanticScores![candidate.id];
+      const judged = typeof semanticScore === 'number' && Number.isFinite(semanticScore) &&
+        semanticScore >= 0 && semanticScore <= 1;
+      const probability = judged ? semanticScore : candidate.baselineScore;
+      const remaining = options.remainingWindowMs?.[candidate.id];
+      const latency = judged && typeof remaining === 'number' && Number.isFinite(remaining)
+        ? Math.min(candidate.conservativeLatencyMs, Math.max(0, remaining))
+        : candidate.conservativeLatencyMs;
+      return { candidate, probability, utility: probability * latency };
+    }).sort((a, b) =>
+      b.utility - a.utility || b.probability - a.probability || a.candidate.order - b.candidate.order,
+    );
+    const useful = ranked.filter(({ utility }) =>
+      !admission.enabled || utility >= admission.minExpectedSavedMs,
+    );
+    const selected = useful.slice(0, this.maxPerTrigger);
+    const selectedPredictions = new Set(selected.map(({ candidate }) => candidate.prediction));
+    this.recordSelection(batch, useful.map(({ candidate }) => candidate), selectedPredictions);
+    return selected.map(({ candidate, utility }) => ({
+        ...clonePrediction(candidate.prediction),
+        schedulingPriorityMs: utility,
+      }));
+  }
+
+  private recordSelection(
+    batch: PreparedPredictionBatch,
+    useful: readonly PreparedPredictionCandidate[],
+    selected: ReadonlySet<Readonly<Prediction>>,
+  ): void {
+    const usefulSet = new Set(useful);
+    for (const candidate of batch.candidates) {
+      if (selected.has(candidate.prediction)) {
+        const prediction = candidate.prediction;
+        this.metrics.record({
+          type: 'predicted',
+          server: prediction.server,
+          tool: prediction.tool,
+          ruleId: prediction.ruleId,
+          confidence: prediction.confidence,
+          timestamp: batch.createdAt,
+          observerAttribution: prediction.observerAttribution,
+        });
+      } else {
+        this.recordSuppressed(
+          candidate.prediction as Prediction,
+          usefulSet.has(candidate) ? 'per-trigger-cap' : 'low-utility',
+          batch.createdAt,
+        );
+      }
+    }
   }
 
   /**
@@ -377,8 +492,12 @@ export class Predictor {
   }
 
   private utility(candidate: ScoredPrediction): number {
+    return candidate.score * this.conservativeLatency(candidate);
+  }
+
+  private conservativeLatency(candidate: ScoredPrediction): number {
     const prediction = candidate.prediction;
-    const latency = this.latency
+    return this.latency
       ? this.latency.estimate(
           prediction.server,
           prediction.tool,
@@ -387,7 +506,6 @@ export class Predictor {
       : (prediction.expectedLatencyMs !== undefined && prediction.expectedLatencyMs >= 0
           ? prediction.expectedLatencyMs
           : UNKNOWN_UPSTREAM_LATENCY_MS);
-    return candidate.score * latency;
   }
 
   /** Apply the operational cutoff and source-appropriate correctness score. */
@@ -529,6 +647,7 @@ function validatePrediction(
     confidence?: unknown;
     expectedLatencyMs?: unknown;
     observerAttribution?: unknown;
+    executionLease?: unknown;
   };
   if (typeof p.tool !== 'string' || p.tool.length === 0) return null;
   if (typeof p.args !== 'object' || p.args === null || Array.isArray(p.args)) return null;
@@ -556,7 +675,17 @@ function validatePrediction(
           candidateCreatedAt: p.observerAttribution.candidateCreatedAt,
         } }
       : {}),
+    ...(validExecutionLease(p.executionLease) ? { executionLease: { ...p.executionLease } } : {}),
   };
+}
+
+function validExecutionLease(value: unknown): value is import('./types.js').ExecutionLease {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const lease = value as Partial<import('./types.js').ExecutionLease>;
+  return typeof lease.routeId === 'string' && lease.routeId.length > 0 &&
+    typeof lease.generation === 'number' && Number.isInteger(lease.generation) && lease.generation > 0 &&
+    (lease.permissionContext === undefined || typeof lease.permissionContext === 'string') &&
+    (lease.conversationId === undefined || typeof lease.conversationId === 'string');
 }
 
 function validObserverAttribution(value: unknown): value is import('./types.js').ObserverAttribution {
@@ -583,4 +712,43 @@ function dedupeKey(p: Prediction, order: number): string {
     // the prediction is still deduped against itself and nothing else.
     return `${p.server}:${p.tool}:#${order}`;
   }
+}
+
+function clonePrediction(prediction: Readonly<Prediction>): Prediction {
+  return {
+    server: prediction.server,
+    tool: prediction.tool,
+    args: structuredClone(prediction.args),
+    confidence: prediction.confidence,
+    ...(prediction.expectedLatencyMs === undefined ? {} : { expectedLatencyMs: prediction.expectedLatencyMs }),
+    ruleId: prediction.ruleId,
+    ...(prediction.key === undefined ? {} : { key: prediction.key }),
+    ...(prediction.horizon === undefined ? {} : { horizon: prediction.horizon }),
+    ...(prediction.executionLease === undefined ? {} : { executionLease: { ...prediction.executionLease } }),
+    ...(prediction.observerAttribution === undefined
+      ? {}
+      : { observerAttribution: { ...prediction.observerAttribution } }),
+    ...(prediction.schedulingPriorityMs === undefined
+      ? {}
+      : { schedulingPriorityMs: prediction.schedulingPriorityMs }),
+    ...(prediction.semanticRevision === undefined ? {} : { semanticRevision: prediction.semanticRevision }),
+    ...(prediction.semanticNextCallRevision === undefined
+      ? {}
+      : { semanticNextCallRevision: prediction.semanticNextCallRevision }),
+  };
+}
+
+function freezePrediction(prediction: Prediction): Readonly<Prediction> {
+  const snapshot = clonePrediction(prediction);
+  deepFreeze(snapshot.args);
+  if (snapshot.executionLease) Object.freeze(snapshot.executionLease);
+  if (snapshot.observerAttribution) Object.freeze(snapshot.observerAttribution);
+  return Object.freeze(snapshot);
+}
+
+function deepFreeze(value: unknown, seen = new WeakSet<object>()): void {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  Object.freeze(value);
 }

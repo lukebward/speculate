@@ -40,6 +40,7 @@ The file is JSON with comments (JSONC).
 | `maxPredictionsPerTrigger` | number | `3` | Per-trigger prediction cap |
 | `log` | `stderr` \| `off` | `stderr` | Decision log destination (JSONL) |
 | `servers` | object | — | Upstream servers, keyed by name |
+| `semanticRanking` | object | off | Optional [Jev candidate ranking](jev.md) in context-aware native sessions |
 | `persistence` | object | enabled | `{ enabled?, path?, retentionDays?, maxBytes? }` — learned transition model and aggregate evidence |
 
 !!! note "Persistence never holds results"
