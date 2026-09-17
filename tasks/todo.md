@@ -501,3 +501,29 @@ Plan: `docs/superpowers/plans/2026-09-17-jev-integration.md`.
 - Independent Sol review resolved sensitive labels, partial scores, pinned-model validation, permission censorship, stable policy identity, unresolved demand starts and utility-based payload trimming. No outstanding review blockers.
 - Final verification passed: build, strict unused-code TypeScript, strict MkDocs, 1,514 main tests (8 skipped), 12 isolated scenarios, compiled Node 18.20.8 config/provider smoke and diff checks. The 12 comparative Jev integration tests exercise both host identities with a real socket bridge/service and injected HTTP provider.
 - Setup and reproducible off/shadow/rank results are documented in `docs/jev.md`. No TypeSafe API key was configured; live provider accuracy, cost, latency and native-client speedup remain unmeasured. No release, push or merge was performed.
+
+# Live Jev verification (2026-09-17)
+
+- [x] Authenticate to the live pinned Jev endpoint through the shipped HTTP adapter.
+- [x] Compare off/shadow/rank through the real service, socket bridge and proxy for both host identities.
+- [x] Verify semantic selection, consumed-cache behavior and exact-demand labels.
+- [x] Record latency limitations without changing runtime defaults.
+
+Used `jev-1.13.0` with synthetic task/candidate state and a fake read-only MCP upstream. The provider was live; native Claude/Codex processes were not launched. Credential input used silent stdin and was not written into files, environment configuration or output logs.
+
+Three direct adapter calls reversed the requested file between `src/auth.ts` and `README.md`. Jev assigned the explicitly requested file 0.82–0.83 and the other 0.05. Adapter durations were 393, 284 and 186 ms.
+
+The first pipeline comparison dispatched four requests at the default 150 ms deadline: three timed out and retained baseline behavior, while one rank request completed (143 ms provider / 145 ms judging). Both rank requests at 500 ms succeeded (204 and 160 ms provider), changing the prefetch from README to the authentication file. Off issued no provider calls. These are single-run fixture observations, not host-specific latency estimates.
+
+A second comparison used the natural task “Explain why authentication started failing after the latest change.” Both candidates had exact materialized file arguments; baseline favored README. Each run requested `src/auth.ts` after judging to test consumption.
+
+| Host identity | Mode | Deadline | P(README) | P(auth) | Provider / judging ms | Prefetch | Cache hits | Upstream calls | Positive demand labels |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Claude | shadow | 500 ms | 0.29 | 0.66 | 408 / 412 | README | 0 | 3 | 1 |
+| Claude | rank | 500 ms | 0.31 | 0.64 | 195 / 196 | auth | 1 | 2 | 1 |
+| Codex | shadow | 500 ms | 0.31 | 0.64 | 220 / 223 | README | 0 | 3 | 1 |
+| Codex | rank | 500 ms | 0.32 | 0.65 | 145 / 145 | auth | 1 | 2 | 1 |
+
+All four consumption assertions passed. Shadow preserved the baseline; rank used live probabilities and served the requested file from the speculative cache. Every run recorded the actual demand as positive, independently of cache benefit. Each natural-task request reported 715 input and 38 output tokens.
+
+Thirteen provider requests were dispatched across the smoke tests: ten validated responses and three deadline cancellations. Cancellation does not establish zero billing. This sample supports testing with `timeoutMs: 500`; the default remains 150 ms. It does not establish representative accuracy, monetary cost, net saved wait or native-client performance. No runtime source changes were needed.
