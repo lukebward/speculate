@@ -1,8 +1,11 @@
 node_modules/
-
 coverage/
 *.tsbuildinfo
 .DS_Store
 site/
 .claude-plugin/types/
 tsconfig.mod.json.local
+dist/*
+!dist/src/
+dist/src/*
+!dist/src/cli.js
