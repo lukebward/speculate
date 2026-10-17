@@ -1,23 +1,34 @@
 /**
  * Metrics and decision log (DESIGN.md §9).
  *
- * Every speculative decision is recorded as a DecisionEvent; with
- * log === 'stderr' each event is also emitted as one JSON line on stderr —
- * never stdout, which carries the MCP stdio protocol. Counters roll up into
- * the StatsReport served by `/stats` and the session summary, including the
+ * Every speculative decision is recorded as a DecisionEvent. Counters roll
+ * up into the StatsReport the `/speculate` command shows, including the
  * honest metric: estimated ms saved vs. wasted calls per hit.
  */
-import process from 'node:process';
 import type {
   AgeAtHitReport,
   DecisionEvent,
-  ObserverLifecycleEvent,
-  ObserverSuppression,
   RuleStats,
   SpeculationMode,
   StatsReport,
 } from './types.js';
-import type { UsageBreakdown, UsageCounters } from './usage.js';
+
+/** The cumulative counters kept across sessions (no names, keys, or values). */
+export interface UsageCounters {
+  hits: number;
+  joins: number;
+  misses: number;
+  speculativeCalls: number;
+  wasted: number;
+  estimatedSavedMs: number;
+  estimatedAddedWaitMs: number;
+  predictionOpportunities: number;
+  predictionOffered: number;
+  predictionHitsAt1: number;
+  predictionHitsAt3: number;
+  nearMisses: number;
+  nearMissDistanceOne: number;
+}
 
 /**
  * Age-at-hit histogram resolution and reach (§9). 100 ms bins out to 60 s is
@@ -74,24 +85,6 @@ function emptyDimension(): PerServerCounters {
   };
 }
 
-function usageFromDimension(c: PerServerCounters): UsageCounters {
-  return {
-    hits: c.hits,
-    joins: c.joins,
-    misses: c.misses,
-    speculativeCalls: c.speculativeCalls,
-    wasted: c.wasted,
-    estimatedSavedMs: c.estimatedSavedMs,
-    estimatedAddedWaitMs: c.estimatedAddedWaitMs,
-    predictionOpportunities: c.predictionOpportunities,
-    predictionOffered: c.predictionOffered,
-    predictionHitsAt1: c.predictionHitsAt1,
-    predictionHitsAt3: c.predictionHitsAt3,
-    nearMisses: c.nearMisses,
-    nearMissDistanceOne: c.nearMissDistanceOne,
-  };
-}
-
 interface PerRuleCounters {
   predicted: number;
   speculated: number;
@@ -118,14 +111,7 @@ function feedbackDecayFactor(from: number, to: number): number {
 
 export class Metrics {
   private readonly mode: SpeculationMode;
-  private readonly log: 'stderr' | 'off';
   private readonly now: () => number;
-  private readonly onUsage:
-    | ((counters: UsageCounters, breakdown: UsageBreakdown) => void)
-    | undefined;
-  private readonly onObserverLifecycle:
-    | ((event: ObserverLifecycleEvent) => void | Promise<void>)
-    | undefined;
   private readonly startedAt: number;
 
   private realCalls = 0;
@@ -189,16 +175,10 @@ export class Metrics {
 
   constructor(opts: {
     mode: SpeculationMode;
-    log: 'stderr' | 'off';
     now?: () => number;
-    onUsage?: (counters: UsageCounters, breakdown: UsageBreakdown) => void;
-    onObserverLifecycle?: (event: ObserverLifecycleEvent) => void | Promise<void>;
   }) {
     this.mode = opts.mode;
-    this.log = opts.log;
     this.now = opts.now ?? Date.now;
-    this.onUsage = opts.onUsage;
-    this.onObserverLifecycle = opts.onObserverLifecycle;
     this.startedAt = this.now();
   }
 
@@ -262,11 +242,6 @@ export class Metrics {
   record(ev: DecisionEvent): void {
     const event: DecisionEvent =
       ev.timestamp === undefined ? { ...ev, timestamp: this.now() } : ev;
-    let usageChanged = false;
-
-    if (this.log === 'stderr') {
-      process.stderr.write(`${JSON.stringify({ speculate: event })}\n`);
-    }
 
     switch (event.type) {
       case 'real_call':
@@ -274,7 +249,6 @@ export class Metrics {
         break;
       case 'speculated':
         this.speculativeCalls++;
-        usageChanged = true;
         this.server(event.server).speculativeCalls++;
         this.tool(event.server, event.tool).speculativeCalls++;
         if (event.ruleId !== undefined) {
@@ -284,18 +258,15 @@ export class Metrics {
         break;
       case 'hit':
         this.hits++;
-        usageChanged = true;
         this.recordUse(event);
         this.recordAge(event);
         break;
       case 'joined':
         this.joins++;
-        usageChanged = true;
         this.recordUse(event);
         break;
       case 'miss':
         this.misses++;
-        usageChanged = true;
         this.server(event.server).misses++;
         this.tool(event.server, event.tool).misses++;
         if (event.nearMissDistance !== undefined) {
@@ -311,21 +282,17 @@ export class Metrics {
         break;
       case 'expired':
         this.expired++;
-        usageChanged = true;
         this.recordWaste(event);
         break;
       case 'invalidated':
         this.invalidated++;
-        usageChanged = true;
         this.recordWaste(event);
         break;
       case 'abandoned':
         this.abandoned++;
-        usageChanged = true;
         this.recordWaste(event);
         break;
       case 'spec_error':
-        usageChanged = true;
         this.server(event.server).specErrors++;
         this.tool(event.server, event.tool).specErrors++;
         this.recordWaste(event);
@@ -341,7 +308,6 @@ export class Metrics {
           0,
           event.latencyMs ?? 0,
         );
-        usageChanged = true;
         break;
       case 'predicted':
         if (event.ruleId !== undefined) this.rule(event.ruleId).predicted++;
@@ -358,7 +324,6 @@ export class Metrics {
           if (event.rank === 1) counters.predictionHitsAt1++;
           if (event.rank !== undefined && event.rank <= 3) counters.predictionHitsAt3++;
         }
-        usageChanged = true;
         break;
       }
       case 'candidate_evaluated': {
@@ -394,16 +359,6 @@ export class Metrics {
         // Waste is derived from its terminal causes (expired / invalidated /
         // spec_error); remaining event types carry no counters.
         break;
-    }
-    if (usageChanged) {
-      this.onUsage?.(this.usageCounters(), this.usageBreakdown());
-    }
-    const lifecycle = observerLifecycle(event);
-    if (lifecycle) {
-      try {
-        const result = this.onObserverLifecycle?.(lifecycle);
-        void result?.catch(() => {});
-      } catch {}
     }
   }
 
@@ -628,7 +583,7 @@ export class Metrics {
     return c;
   }
 
-  private usageCounters(): UsageCounters {
+  usageCounters(): UsageCounters {
     return {
       hits: this.hits,
       joins: this.joins,
@@ -646,19 +601,6 @@ export class Metrics {
     };
   }
 
-  private usageBreakdown(): UsageBreakdown {
-    const servers: Record<string, UsageCounters> = {};
-    for (const [name, counters] of this.perServer) servers[name] = usageFromDimension(counters);
-    const tools: Record<string, Record<string, UsageCounters>> = {};
-    for (const [key, counters] of this.perTool) {
-      const split = key.indexOf('\x00');
-      const server = key.slice(0, split);
-      const tool = key.slice(split + 1);
-      (tools[server] ??= {})[tool] = usageFromDimension(counters);
-    }
-    return { servers, tools };
-  }
-
   private rule(ruleId: string): PerRuleCounters {
     let c = this.perRule.get(ruleId);
     if (c === undefined) {
@@ -672,47 +614,5 @@ export class Metrics {
       this.perRule.set(ruleId, c);
     }
     return c;
-  }
-}
-
-function observerLifecycle(event: DecisionEvent): ObserverLifecycleEvent | null {
-  if (!event.ruleId || event.timestamp === undefined) return null;
-  const attribution = event.observerIssue ?? event.observerAttribution;
-  if (!attribution) return null;
-  if (
-    event.type !== 'suppressed' && event.type !== 'speculated' && event.type !== 'hit' &&
-    event.type !== 'joined' && event.type !== 'expired' && event.type !== 'invalidated' &&
-    event.type !== 'abandoned' && event.type !== 'spec_error'
-  ) return null;
-  const issue = event.observerIssue;
-  return {
-    type: event.type,
-    timestamp: event.timestamp,
-    ruleId: event.ruleId,
-    observerAttribution: {
-      client: attribution.client,
-      source: attribution.source,
-      routeId: attribution.routeId,
-      generation: attribution.generation,
-      candidateCreatedAt: attribution.candidateCreatedAt,
-    },
-    ...(issue ? { issueId: issue.issueId, specDispatchAt: issue.specDispatchAt } : {}),
-    ...(event.realDemandAt !== undefined ? { realDemandAt: event.realDemandAt } : {}),
-    ...(event.type === 'suppressed' ? { suppression: observerSuppression(event.reason) } : {}),
-  };
-}
-
-function observerSuppression(reason: string | undefined): ObserverSuppression {
-  switch (reason) {
-    case 'dedup':
-    case 'feedback':
-    case 'low-utility':
-    case 'per-trigger-cap':
-    case 'stale-generation':
-    case 'queue-expired':
-    case 'session-end':
-      return reason;
-    default:
-      return 'other';
   }
 }

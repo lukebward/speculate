@@ -4,15 +4,11 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
-    "outDir": "dist",
-    "rootDir": ".",
-    "declaration": false,
-    "sourceMap": false,
+    "noEmit": true,
     "skipLibCheck": true,
     "types": ["node"],
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "mock/**/*.ts", "bench/**/*.ts", "demo/**/*.ts", "eval/**/*.ts"],
-  "exclude": ["node_modules", "dist", "test"]
+  "include": ["src/**/*.ts", "mock/**/*.ts", "eval/**/*.ts", "test/**/*.ts"]
 }

@@ -14,13 +14,15 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22, cache: npm }
       - run: npm ci
-      - run: npx tsc
-      - run: npm test -- --exclude test/scenarios.test.ts
-      - name: Check timed scenarios without competing test processes
-        run: npm run test:scenarios
-      - name: Install Codex for native integration checks
-        run: npm install --global @openai/codex@0.153.4
-      - name: Check native Codex setup and MCP calls
-        run: npm test -- test/codex-real-e2e.test.ts
-        env:
-          SPECULATE_REAL_CODEX_TEST: '1'
+      - run: npm run typecheck
+      - run: npm test
+  mod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 22 }
+      - name: Install Claude Code
+        run: npm install --global @anthropic-ai/claude-code@2.1.302
+      - run: claude plugin validate .
+      - run: claude plugin test .

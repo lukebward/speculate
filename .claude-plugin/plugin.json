@@ -1,0 +1,9 @@
+{
+  "name": "speculate",
+  "version": "1.0.0",
+  "description": "Learns your MCP call patterns and prefetches likely read-only calls, so Claude Code waits less on tools.",
+  "author": { "name": "Luke Ward", "url": "https://github.com/lukebward" },
+  "homepage": "https://github.com/lukebward/speculate",
+  "repository": "https://github.com/lukebward/speculate",
+  "license": "MIT"
+}

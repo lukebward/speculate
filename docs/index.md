@@ -1,34 +1,19 @@
 # Speculate
 
-**Speculative prefetching for coding agents.** Speculate sits between an MCP
-client and its servers, learns likely read-only calls, and starts useful work
-early. A matching real call consumes the exact upstream result or joins the
-call already in progress.
+**Speculative prefetching for Claude Code.** Speculate is a Claude Code mod that
+learns which read-only MCP calls tend to come next, starts them while the model
+is still thinking, and answers the model's call from that result when it asks
+for exactly the same thing.
 
-![Demo: a GitHub PR workflow run twice, with the second read served from prefetch](https://raw.githubusercontent.com/lukebward/speculate/main/demo/speculate-demo.gif)
-
-```bash
-npm install -g speculate-mcp
-speculate
 ```
-
-With one supported native client installed, `speculate` launches it. With both
-Claude Code and Codex installed, it asks which one to launch in an interactive
-terminal. When both are installed, non-interactive shells must use `speculate
-run claude` or `speculate run codex`; if neither client is available, Speculate
-prints installation guidance.
-
-The selected client starts with context-aware prefetching and automatic MCP
-session setup. Model-proxy observation activates only after startup
-verification and otherwise uses supported hooks. Native sign-in, trust, and
-tool permission remain with the client. See [Getting started](getting-started.md)
-for native arguments, observation controls, and persistent MCP setup.
+/plugin install speculate --marketplace lukebward/speculate
+```
 
 !!! quote "On how this was built"
 
     Built with heavy use of AI coding agents. Everything here is reviewed and
-    tested, and the suite runs on Linux, macOS, and Windows, but weigh that as
-    you would any other statement about how software was made.
+    tested, but weigh that as you would any other statement about how software
+    was made.
 
 <div class="grid cards" markdown>
 
@@ -36,8 +21,7 @@ for native arguments, observation controls, and persistent MCP setup.
 
     ---
 
-    Launch Claude Code or Codex with context-aware prefetching, or install
-    persistent wrappers for supported MCP servers.
+    Install, check that it helps, and upgrade from the old npm package.
 
     [:octicons-arrow-right-24: Install](getting-started.md)
 
@@ -45,36 +29,19 @@ for native arguments, observation controls, and persistent MCP setup.
 
     ---
 
-    Context-aware launch, persistent setup, authentication, diagnostics, and
-    local memory.
+    `/speculate` reports what was served and wasted; `/speculate forget`
+    clears what was learned.
 
-    [:octicons-arrow-right-24: CLI reference](commands.md)
+    [:octicons-arrow-right-24: Commands](commands.md)
 
--   :material-shield-check:{ .lg .middle } **Safety**
+-   :material-shield-check:{ .lg .middle } **Safety and storage**
 
     ---
 
-    How eligibility is restricted to tools declared read-only, and which risks
-    that restriction does not remove.
+    Which calls can be prefetched, how permission and hooks stay in charge, and
+    what is kept on disk.
 
     [:octicons-arrow-right-24: Safety model](safety.md)
-
--   :material-tune:{ .lg .middle } **Configuration**
-
-    ---
-
-    Per-server modes, allowlists, denylists, TTLs, budgets, and prediction rules.
-
-    [:octicons-arrow-right-24: Config reference](configuration.md)
-
--   :material-chart-box-outline:{ .lg .middle } **Observer evidence**
-
-    ---
-
-    Measured limits and native compatibility boundaries for the context signals
-    used by `run`.
-
-    [:octicons-arrow-right-24: Observer results](observer-results.md)
 
 -   :material-file-document-outline:{ .lg .middle } **Design**
 
@@ -89,50 +56,19 @@ for native arguments, observation controls, and persistent MCP setup.
 
 ## What it does
 
-- **Starts without a config file.** The default learner adapts to supported MCP
-  servers; optional per-server settings control policy, TTLs, and budgets.
-- **Requires a read-only declaration.** Only tools with `readOnlyHint: true` are
-  eligible. Strict mode also requires an explicit allowlist.
-- **Preserves exact results.** Speculate returns an upstream result unchanged,
-  joins an identical call in flight, or sends the real call upstream normally.
-- **Keeps managed setup reversible.** `off` restores registrations that still
-  match Speculate's recorded change and reports conflicts instead of overwriting
-  later edits.
-
-## Context-aware and persistent operation
-
-`speculate` selects the installed native client; `speculate run claude|codex`
-selects one explicitly. The native session path adds prompt,
-learned cross-server transition, and supported model-stream signals. The
-model-proxy path is requested by default and activated only after verification,
-with startup fallback to supported hooks. The launcher preserves the client's
-native account, provider, model, effort, arguments, permission policy, sandbox,
-and transport selection.
-See the [compatibility matrix](observer-compatibility.md) for differences
-between native client surfaces.
-
-`speculate on` installs persistent MCP wrappers. They learn repeated call
-sequences and can use explicit rules. The registration-sync hooks installed for
-Claude Code and Codex discover newly added supported servers; `on` alone does
-not observe model or conversation context.
-
-## Evidence and limits
-
-The maintained core qualification preserves current predictor behavior. The
-1,000-record observer replay passed correctness checks but failed its speedup
-and speculative-waste gates for both clients. A later synthetic 60-record
-multi-turn diagnostic measured about 40% less warm cross-server task time for
-both client fixtures, but it does not establish native performance.
-
-Native MCP transfer is verified for Claude Code and Codex. Native day-to-day
-speedup, native hook delivery, and live API-key routing remain unverified. The
-[benchmark guide](design/local-learning-benchmark.md)
-and [observer results](observer-results.md) preserve the methods, historical
-results, failed gates, and limitations.
+- **Lives inside Claude Code.** Calls go over Claude Code's own MCP
+  connections, with its credentials. No server configuration is wrapped or
+  rewritten.
+- **Learns from real calls.** Transitions between reads, a session's usual
+  opening reads, and prompts that name a read outright.
+- **Prefetches only what you already allow.** A tool must have run read-only,
+  and your permission settings must already allow the exact call.
+- **Answers exact matches only, after your hooks.** A served call still runs
+  through your PreToolUse hooks. A miss, a write, or any call your hooks object
+  to runs exactly as it would have.
 
 ## Non-goals
 
-Speculating writes, brokering another client's credentials, general response
-caching, and token savings are outside scope. The intended benefit is lower
-wall-clock latency when a prediction is useful; workloads with poor predictions
-can add upstream work.
+Speculating writes, general response caching, and token savings are outside
+scope. The benefit is less wall-clock waiting when a prediction is right; a
+workload with poor predictions adds upstream reads, which `/speculate` shows.

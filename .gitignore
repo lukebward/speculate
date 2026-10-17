@@ -4,3 +4,5 @@ coverage/
 *.tsbuildinfo
 .DS_Store
 site/
+.claude-plugin/types/
+tsconfig.mod.json.local

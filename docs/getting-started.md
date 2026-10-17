@@ -1,246 +1,75 @@
 # Getting started
 
-```bash
-npm install -g speculate-mcp
-speculate
+Speculate is a Claude Code mod. It runs inside Claude Code and needs nothing
+else: no proxy, no wrapped server configuration, no separate process.
+
+## Install
+
+Requires Claude Code 2.1.296 or later. In a terminal session:
+
+```
+/plugin install speculate --marketplace lukebward/speculate
 ```
 
-With one supported native client installed, `speculate` launches it. With both
-Claude Code and Codex installed, it asks you to choose in an interactive
-terminal. When both are installed, scripts and other non-interactive shells
-must select a client with `speculate run claude` or `speculate run codex`. If
-neither is installed, Speculate prints installation guidance instead of
-creating configuration.
+Answer `y` to add the marketplace, then choose the user scope so Speculate runs
+in every project. It is active in that session at once, and in every session
+after.
 
-The selected client starts with context-aware prefetching and automatic MCP
-session setup. At launch, Speculate requests the model-proxy path, activates it
-only after verifying the native route and temporary controls, and otherwise
-starts with supported hooks. Native sign-in, trust, and tool permission stay
-with the client. The active mode is reported at startup. Put Speculate options
-before `--` and native client arguments after it:
+To try it without installing, start a session with a local checkout:
 
 ```bash
-speculate run claude -- --print "Summarize this workspace."
-speculate run codex -- exec "Summarize this workspace."
-speculate run claude --observe hooks
-speculate run codex --observe off -- exec
+git clone https://github.com/lukebward/speculate
+claude --plugin-dir ./speculate
 ```
 
-`--observe hooks` selects supported native hooks without the model proxy.
-`--observe off` disables session observation while retaining ordinary MCP
-prediction. The launcher preserves the native account, provider, model, effort,
-arguments, permission policy, sandbox, and transport selection.
+## What to expect
 
-## Persistent MCP setup
+Speculate learns from the MCP calls Claude makes, so the first session with a
+server mostly teaches it. From then on:
 
-Use `on` when you want supported MCP registrations to remain wrapped across
-ordinary client launches:
+- after a read, the reads that usually follow it start in the background;
+- a prompt that names a read outright, such as reviewing a GitHub pull request
+  by URL or listing a directory, starts that read before the model asks;
+- a session's usual opening reads start when its first prompt arrives.
+
+Only tools that have already run read-only, and that your permission settings
+already allow without asking, are ever prefetched. A tool that always prompts
+for permission is never touched. To let Speculate help with a server, allow
+its read tools in `/permissions` (for example `mcp__github__get_issue`).
+
+## Check that it helps
+
+```
+/speculate
+```
+
+This reports, for this session and across sessions, how many calls were served
+from a prefetch, how many prefetches were wasted, the estimated time saved
+(net of any wait behind a prefetch), and how often the first prediction was
+right. While calls are being served, the status line shows a running count.
+
+Waste is real work against your servers. If `/speculate` shows mostly waste in
+your workflow, Speculate is not paying for itself there; disable it with
+`/plugin disable speculate`.
+
+## Forget, disable, uninstall
+
+```
+/speculate forget            # delete everything learned, and the totals
+/plugin disable speculate    # stop it, keep what it learned
+/plugin uninstall speculate  # remove it
+```
+
+## Upgrading from speculate-mcp
+
+Versions up to 0.25 were an npm package, `speculate-mcp`, that wrapped MCP
+server registrations in a local proxy. Before removing it, run the old CLI's
+`speculate off` so it restores the registrations it wrapped:
 
 ```bash
-speculate on                  # enable both clients
-speculate status              # inspect both clients
-speculate off --client codex   # leave Claude Code enabled
-speculate on --client codex
-speculate off                  # disable both
+speculate off
+npm uninstall -g speculate-mcp
 ```
 
-`on` wraps supported servers and installs registration-sync hooks that pick up
-new registrations at session start. Those hooks synchronize MCP setup; `on`
-alone does not add model or conversation observation. Restart your clients
-afterward. In Codex, review and trust the Speculate hook through `/hooks` before
-it can run automatically.
-
-The command is global after installation. Configuration applies to the local
-client host: it does not reach another machine, hosted connectors, built-in
-agent tools, or ordinary shell commands. Unsupported registrations are reported
-and left alone. See the client scopes below.
-
-=== "Any other MCP client"
-
-    No install. Prefix the server command already in your client's config:
-
-    ```js
-    // before
-    "github": { "command": "github-mcp-server", "args": ["stdio"] }
-
-    // after
-    "github": {
-      "command": "npx",
-      "args": ["-y", "speculate-mcp", "wrap", "--", "github-mcp-server", "stdio"]
-    }
-    ```
-
-    Or a remote (hosted) server, which is where the latency actually is:
-
-    ```js
-    "github": {
-      "command": "npx",
-      "args": ["-y", "speculate-mcp", "wrap", "--url", "https://api.githubcopilot.com/mcp/",
-               "--header", "Authorization: Bearer ${GITHUB_TOKEN}"]
-    }
-    ```
-
-Speculate wraps remote (streamable HTTP) servers too, which is where most of the
-latency lives. For servers needing OAuth, `on` can offer a browser login. Select the same
-client for setup and authentication, for example `speculate auth --client codex`.
-
-!!! info "Connectors added in the claude.ai UI are untouched"
-
-    The host holds those, so nothing here can see them.
-
-## Codex
-
-```bash
-speculate on --client codex
-speculate status --client codex
-speculate sync --client codex
-speculate off --client codex
-```
-
-Native Codex support is maintained by Speculate. It uses Codex's configuration
-API to wrap enabled **user-level** stdio and Streamable HTTP MCP servers. The
-local CLI, desktop app, and IDE extension share MCP configuration for the same
-Codex host. Restart the client after changing registrations. See
-[OpenAI's MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
-
-Server names, tool enable/disable policies, and environment settings are
-preserved. Setup installs a user-level session-start hook for automatic sync.
-Codex requires review and trust through `/hooks`; installation does not approve
-the hook. See [Codex hook controls](https://learn.chatgpt.com/docs/hooks) for
-trust and administrator restrictions. You can also run `sync --client codex`
-directly after adding servers.
-New registrations may take another session to load.
-`status --client codex [path]` inspects the
-base on-disk configuration and trusted project layers for that directory. A path changes the inspection
-context, not the user-level write scope. Add `--codex-bin /path/to/codex` to any
-of these commands when the executable is not on PATH.
-
-Setup and policy checks cannot observe session-only `--profile` or `-c`
-overrides in another Codex process. If you rely on those overrides to restrict
-MCP tools, use explicit configuration or `speculate off --client codex` until
-that session context is supported.
-
-Project-owned transports, transports shadowed across configuration layers,
-remote executors, header helpers, ChatGPT session authentication, and custom
-OAuth settings are reported as unsupported and skipped.
-Hosted plugin or app tools outside local MCP registrations are not wrapped.
-Speculate does not move these servers into a different configuration scope.
-
-OAuth credentials belong to Speculate's own OAuth client. Existing Codex login
-credentials are not reused. Authenticate and rerun setup when needed:
-
-```bash
-speculate auth --client codex
-speculate on --client codex
-```
-
-`off --client codex` disables automatic sync, removes Speculate's hook, and
-restores the transport fields Speculate changed, preserving
-unrelated later configuration edits, learned state, and authentication. If a
-changed transport no longer matches the recorded wrapper, `off` reports a
-conflict instead of overwriting it.
-
-## Claude Code
-
-Claude Code setup wraps user-scope MCP servers across projects and approved
-servers in known project directories. It uses Claude Code's own CLI to change
-registrations. Shared `.mcp.json` files stay intact; approved entries receive
-local wrapped copies. A user-level session-start hook discovers new projects
-as you open them and wraps newly added, approved servers.
-
-`off --client claude` disables automatic wrapping everywhere and restores
-recorded registrations across projects. Conflicts are reported and retained
-for recovery. Learning and authentication remain.
-
-## How context-aware launch works
-
-Managed wrappers learn from MCP calls without needing model or conversation
-access. `speculate run` adds session context for one native process:
-
-```bash
-speculate run claude -- --print "Summarize this workspace."
-speculate run codex -- exec "Summarize this workspace."
-```
-
-The default `--observe proxy` mode observes supported native model traffic. At
-launch it falls back to hook observation when routing cannot be verified. Use
-`--observe hooks` or `--observe off` to select those modes explicitly.
-`--json-report PATH` writes aggregate diagnostics.
-
-The launcher preserves the native account, provider, model, effort, arguments,
-permission policy, sandbox, and transport selection. It requires the host's
-permission for the specific tool route and Speculate's read-only policy before
-speculative execution and again before publishing a result. Reusing a result
-also requires an exact argument match. It does not acquire native credentials or
-grant tool access. Unsupported provider routes, temporary controls, policy
-forms, or tool-name shapes cause the affected capability to abstain or fall
-back; requested calls continue through the native path.
-
-Context-aware prefetching is Speculate's standard native session path. Its
-observation stages retain measured limits: native MCP transfer is verified for
-Claude Code and Codex, but native performance, native hook delivery, and live
-API-key routing remain unverified. Installed Codex currently exposes MCP tools
-through an opaque executor, so it does not provide direct native stream-call
-signals. See [Observer compatibility](observer-compatibility.md) and [Observer
-results](observer-results.md) for the tested versions and evidence.
-
-## Keeping your token out of the file
-
-Speculate resolves `${VAR}` in `--header` values from the environment at startup.
-An unset variable fails at startup and names itself. Codex static `http_headers`
-are preserved literally; use its environment-backed header settings to reference
-environment variables.
-
-## What your client sees
-
-Standard MCP: same tools, same results. Predicted reads come back from a local
-buffer instead of a network round trip. Ask the agent to call
-`speculate__stats` for the live hit rate, time saved, and how stale the served
-prefetches were.
-
-??? note "How auto-wrapping behaves"
-
-    `on` installs a hook-only plugin at Claude Code's user scope, shared by every
-    project. At each session start it wraps any newly added, already-approved
-    servers.
-
-    - **One session behind.** Claude Code reads MCP config before session-start
-      hooks run, so a server you add now gets wrapped from your *next* session.
-      It works normally meanwhile, just without prefetching.
-    - **Approval never widens.** A server pending approval in `.mcp.json` stays
-      pending. Revoke it, or delete the server, and the next session start
-      removes the wrapped copy.
-    - **Session starts include resumes and clears.** The hook runs when Claude
-      Code starts, resumes, or clears a session; `speculate on` always wraps on
-      the spot.
-    - **Turning it off everywhere:** `speculate off --client claude` stops
-      automatic wrapping and restores managed registrations across projects.
-
-## Upgrading from retired launch paths
-
-v0.20 removes PATH-shim installation, protocol sniffing, and `speculate try`.
-Use `speculate on` for both clients, select one with `--client claude` or
-`--client codex`, or use explicit `wrap` configuration for another MCP client.
-
-If an earlier version installed PATH shims, run:
-
-```bash
-speculate shims uninstall
-```
-
-Restart your shell afterward so `npx` and `uvx` resolve normally. Uninstall
-support remains for migration. Saved `wrap --sniff -- ...` commands now pass
-through immediately without speculation. Replace them with `wrap -- ...` only
-where the launched program is an MCP server.
-
-To evaluate Speculate, enable it with `on`, inspect `stats`, and use `off` to
-restore the selected client's changed server registrations. Learning and aggregate
-usage records persist normally; `speculate memory clear --all` removes managed
-learning and usage records if you want to clear them afterward. See
-[Commands](commands.md#memory) for custom state paths.
-
-## Next steps
-
-- [Commands](commands.md) — everything the CLI does
-- [Safety](safety.md) — what speculation can and cannot touch
-- [Configuration](configuration.md) — only if you want per-server control
+Then install the mod as above. Learning from the old package is not carried
+over; the mod relearns from Claude Code's own calls.

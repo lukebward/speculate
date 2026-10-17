@@ -662,3 +662,57 @@ Shared hook handling, launch configuration and package discovery replace
 duplicated implementations. Unused internal methods and superseded planning
 documents are removed. Current benchmark evidence and performance limits remain
 unchanged; this release makes no new speedup claim.
+
+## v1.0.0 (2026-10-17): a Claude Code mod
+
+Speculate is now a Claude Code mod and supports Claude Code only. Codex
+support, the MCP proxy, server wrapping (`on`, `off`, `sync`, `wrap`), the
+session launcher, the model-API observer, Speculate's own OAuth client, and the
+npm CLI are removed. The mod installs with
+`/plugin install speculate --marketplace lukebward/speculate`.
+
+Claude Code 2.1.287 added mods: hooks modules that run inside Claude Code. One
+of them can see each tool call and its result, answer a call without the tool
+running, and call a connected MCP server over Claude Code's own connection.
+Those are the three things the proxy existed to provide, so the proxy goes. So
+does everything around it that only made the proxy reachable: wrapping each
+client's server registrations, re-wrapping new ones at session start,
+authenticating to remote servers as a second client, and observing the model
+API to learn earlier than a proxy could. About 24,500 lines of source become
+about 7,600, most of which is the learner, predictor, cache, and executor
+carried over unchanged in behavior.
+
+What changed in the safety model:
+
+- **Eligibility comes from the host.** A tool is a target once a real call
+  through Claude Code reports `isReadOnly` (Claude Code's reading of the
+  server's `readOnlyHint`). The `strict`/`annotated` modes and the
+  allowlists and denylists are gone: Claude Code's permission settings are the
+  allowlist. A prefetch starts only when `$.tool.check` reports that the exact
+  call would run without asking, and the result is used only if that still
+  holds when it arrives and again when the model asks.
+- **PreToolUse hooks decide served calls.** A claimed call runs through the
+  PreToolUse hooks; the mod stops it before the tool runs only if they let it
+  through unchanged. Prefetches go through the same hooks and permission check
+  as any call.
+- **PostToolUse is the gap.** A mod cannot raise PostToolUse for a served
+  call. A PostToolUse hook whose matcher names tools keeps those tools out of
+  speculation; catch-all observers miss served calls and see the prefetch.
+
+Signals: learned transitions and openers as before, and prompt intent, which
+the v0.23 observer took from the model API and the mod takes from
+`prompt.submit`. Openers now fire at the first prompt rather than at process
+start. Model-stream candidates (starting a call while the model is still
+writing it) are not carried over; a `turn.step` hook could restore them, and
+that is left until there is a measurement saying it pays. Learning persists in the plugin store, sanitized,
+expired after 30 days, held under 3 MiB, and merged across concurrent
+sessions.
+
+Verification: 449 unit specs of the core, 8 mod tests run in Claude Code's own
+test kit (`claude plugin test .`), and headless sessions of Claude Code 2.1.302
+against the bundled mock GitHub server. In a warm session, both reads of a
+list-then-get task were served from prefetches (no real call reached the
+server, about 3.1 s of a 1.5 s-per-call mock saved), with one wasted prefetch.
+A PreToolUse hook denying the tool stopped both the prefetch and the served
+answer. This is a mock with injected latency; it shows the mechanism, not a
+speedup on real servers.

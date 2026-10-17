@@ -11,9 +11,9 @@
   parallel implementations of the same feature happen. Reconcile by treating
   main as canonical — keep theirs, port only what doesn't exist upstream.
 
-- Treat Codex and Claude Code as first-class peers in setup, transport, authentication, recovery, testing, and release criteria.
+- Since v1.0 Speculate supports Claude Code only, as a mod. Do not add other clients back without a decision to; quality on one host beats parity across several.
+- In the mod, a speculative `$.mcp.call` raises `tool.call` through this plugin too. Handle only calls whose `next.origin.plugin` is `engine`, or the mod serves and learns from its own prefetches.
 
-- Run long baseline benchmarks from a fixed source/build snapshot. This project deletes dist during each build, so a benchmark sharing the active implementation tree can lose its target CLI mid-run.
 - Once a subtask is reported stable, stop editing it and wait for the parent review so the reviewed commit and working tree cannot diverge.
 - Size ephemeral learned state by a conservative estimate that includes retained copies and templates, and clear it at lifecycle shutdown; counting only incoming serialized payload understates retained memory. Nested count limits also need an aggregate byte budget because their cross-product can retain far more data than one message.
 

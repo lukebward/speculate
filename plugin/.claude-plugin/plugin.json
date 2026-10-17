@@ -1,7 +1,0 @@
-{
-  "name": "speculate-autowrap",
-  "version": "0.25.0",
-  "description": "Wraps newly added MCP servers for Speculate at session start.",
-  "author": { "name": "Luke Ward", "url": "https://github.com/lukebward" },
-  "homepage": "https://github.com/lukebward/speculate"
-}

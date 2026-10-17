@@ -1,148 +1,117 @@
-# Safety
+# Safety and storage
 
-The single most important rule: **a speculative call may only be issued if
-Speculate affirmatively classifies the tool as read-only.** The failure mode
-being prevented — speculatively firing a mutation the agent never requested — is
-unrecoverable, so the policy is default-deny: unknown means no.
+The most important rule: **Speculate only starts a call that Claude Code has
+reported read-only, and only when your permission settings would already run it
+without asking.** Unknown means no. Prefetching a write the agent never asked
+for could not be undone, so the policy is default-deny.
 
 !!! danger "Speculating on writes is a permanent non-goal"
 
-    This is not an MVP restriction to relax later. Executing a
-    `create_*`/`update_*`/`delete_*` call the agent never made is unacceptable
-    regardless of how confident the prediction is. Serving *cached reads* is a
-    freshness trade-off; *executing writes* speculatively is a correctness
-    violation.
+    This is not a restriction to relax later. Serving a *cached read* is a
+    freshness trade-off. *Executing a write* nobody asked for is a correctness
+    violation, however confident the prediction.
 
-## Eligibility
+## Which calls can be prefetched
 
-A tool is eligible only if both hold:
+A tool becomes a speculation target only when all of these hold:
 
-1. **Annotation check** — the tool's declared annotations include
-   `readOnlyHint: true`. Tools with no annotations, or with `readOnlyHint`
-   absent or false, are ineligible.
-2. **Operator policy** — one of three modes:
+1. **It ran read-only through Claude Code.** A real call to the tool came back
+   with Claude Code's `isReadOnly` verdict. For an MCP tool, Claude Code takes
+   that verdict from the server's `readOnlyHint`. A tool Speculate has never
+   seen run is not a target, and a later call that comes back otherwise revokes
+   it on the spot.
+2. **Its result can stand in.** The real call returned plain MCP content
+   blocks, so a prefetched result can answer the same call.
+3. **You already allow it.** `$.tool.check` reports that Claude Code would run
+   this exact call, with these arguments, without asking. Speculate checks
+   before starting the prefetch, again when its result arrives, and again
+   before answering with it. It never raises a permission prompt.
+4. **No PostToolUse hook is written for it.** A served call skips PostToolUse,
+   since no tool ran. A settings hook whose matcher names specific tools keeps
+   those tools out of speculation entirely. Catch-all matchers (none, `*`,
+   `.*`) do not.
 
-| Mode | Behavior |
-|---|---|
-| `strict` | The tool must **also** be on an explicit `allowTools` allowlist |
-| `annotated` | Annotation alone suffices unless the tool is denylisted (the zero-config default) |
-| `off` | No speculation; pure pass-through proxy |
+Annotations are hints the server makes about itself. A server that marks a
+writing tool `readOnlyHint: true` misleads Claude Code too. Speculate makes
+that no worse in kind, but it makes such a tool eligible for calls you did not
+ask for. Your permission settings are the allowlist: if you are unsure of a
+server, do not allow its tools without asking, and Speculate will not touch
+them.
 
-!!! warning "Annotations are untrusted hints"
+## How a served call runs
 
-    The MCP spec is explicit about this, which is why the annotation check alone
-    is insufficient. In `annotated` mode a *falsely* annotated tool is doubly
-    dangerous — it becomes speculation-eligible **and** stops triggering cache
-    invalidation. That compounding is why `strict` exists.
+When the model asks for a call that a prefetch already answered, Speculate
+claims the result and lets the call run through Claude Code as far as its
+PreToolUse hooks:
 
-## Hard rules, regardless of mode
+- If your hooks deny it, ask about it, or rewrite its arguments, the claim is
+  dropped. The call goes on exactly as it would have without Speculate, and the
+  prefetch counts as waste.
+- If they let it through unchanged, Speculate stops the call before the tool
+  runs and answers with the claimed result.
 
-- **Real calls are never blocked, transformed, or reordered** — including
-  mutations. Speculate is a proxy first.
-- **Speculative results are never fabricated or merged.** A cache hit returns
-  exactly the bytes the upstream server returned earlier; a miss goes upstream.
-  Speculate never synthesizes tool output.
-- **Calls without a reusable result go upstream normally.** Mutations also
-  clear that server's buffer.
-- **Auth errors suspend, successes reset.** A speculative call failing with an
-  auth or permission error is dropped (not cached) and that tool is suspended
-  from speculation until a subsequent *real* call to the same tool succeeds.
-- **Server→client requests from a speculative call are aborted, never
-  surfaced.** The client never asked, so nothing may reach it — and a tool that
-  needs user interaction is by definition not prefetchable.
+Prefetches are real calls through Claude Code, made with `$.mcp.call`. They go
+through your permission settings and your PreToolUse and PostToolUse hooks like
+any other call, so an audit hook sees every request that actually reached a
+server.
 
-## What the cache holds
+Where an organization manages Claude Code, installed plugins cannot hook
+PreToolUse. Speculate then never answers a call: every call runs as usual. It
+still learns, and its prefetches still run through the same checks.
 
-Cached results are byte-identical, single-use, short-lived, and remain in
-memory. There is no raw call/result archive.
+## Hard rules
 
-## Local learning and secrets
+- **Calls it does not answer are untouched.** Speculate never blocks, rewrites,
+  or reorders a call it does not serve, writes included.
+- **Results are never made up or combined.** A served result is exactly what
+  the server returned for that server, tool and argument values.
+- **Single use, short life, memory only.** A prefetched result answers at most
+  one call and is discarded unused after 30 seconds. It is never written to
+  disk.
+- **Writes flush.** Any call to a server that does not come back read-only,
+  including one that failed, discards everything prefetched from that server
+  and cancels what was queued.
+- **Auth errors suspend.** A prefetch that fails with an authorization error is
+  not kept, and the tool is not prefetched again until a real call to it
+  succeeds.
+- **Real calls come first.** Claude Code does not tell a mod how it reaches a
+  server, so Speculate treats every server as serial: it prefetches only while
+  no real call to that server is running, one at a time, at most 30 a minute.
 
-Speculate writes compact learning to your disk by default: tool names, argument
-source descriptors, filtered literal constants, and aggregate feedback/latency
-evidence. Earlier-call history stays in bounded session memory (eight calls and
-an estimated 1 MiB per server, separate from the current call and cache).
-Persistence uses a 30-day retention window and
-an 8 MiB limit per workspace/account state by default.
+## What is stored
 
-The persistence boundary filters known runtime credentials, sensitive literal
-fields, and recognizable secret formats. The same filtering applies to legacy
-imports, concurrent merges, and atomic temporary files. Structural bindings
-can still obtain values from current calls without keeping those values on
-disk. Unusable literal sources are discarded; redaction text is never used as
-a predicted argument.
+Speculate keeps its learning in the plugin's own store, a JSON file under
+Claude Code's configuration directory (`~/.claude/plugins/store/`). It holds:
 
-Loading an old file sanitizes the model in memory. The original file is replaced
-on the next successful save; merely inspecting it with `doctor` does not rewrite
-it. Use `memory clear` to remove retained learning immediately.
+- learned transitions: tool names, where each argument came from (an earlier
+  argument, a field of an earlier result, or a constant), and filtered constant
+  values;
+- each session's usual opening reads, with their arguments;
+- per-rule feedback and latency aggregates;
+- per tool, whether it ran read-only and the argument **names** it was called
+  with;
+- cumulative counters for `/speculate`.
 
-Filtering cannot recognize every arbitrary secret or private string. Ordinary
-identifiers and paths can remain as useful learned constants. The state is not
-encrypted; local open-source software does not make stored data secret-proof.
-POSIX files request owner-only permissions. On Windows, protection comes from
-the containing folder's ACL, not POSIX mode bits.
+Tool results are never stored. Before anything is written, values and names
+that look like credentials (bearer tokens, private keys, JWTs, URLs with
+passwords, fields named like `password` or `api_key`) are dropped. Entries
+unused for 30 days expire, and the whole value is kept under 3 MiB. Sessions
+that run at the same time merge their learning rather than overwrite it.
 
-`speculate memory` reports aggregate inventory without dumping values.
-`speculate memory clear --all` removes managed learning and usage records;
-`clear --config PATH` handles an explicitly configured state file. These
-commands preserve OAuth credentials and host configuration. See
-[configuration](configuration.md#top-level) for locations and limits.
-
-## Credentials
-
-Speculate registers as its own OAuth client and never reads another
-application's credential store, so refreshing its token cannot disturb Claude
-Code's or Codex's.
-
-## Native client configuration
-
-Codex integration writes supported user-level MCP transport fields through
-Codex's configuration API. Server names, environment settings, enabled/disabled
-tool policies, and unrelated settings are preserved. Project-owned or shadowed
-transports, remote executors, header helpers, ChatGPT session authentication,
-and custom OAuth settings are skipped with an explanation.
-Hosted plugin and app tools outside local MCP configuration are outside this
-integration's scope.
-
-At startup, a native wrapper rereads Codex tool policy from base on-disk
-configuration and trusted project layers. Disabled tools and reads requiring
-approval in those layers are excluded from prefetching. If that policy cannot
-be read or understood, speculation is disabled and requested calls continue
-through the proxy.
-
-These checks cannot observe session-only `--profile` or `-c` overrides in
-another Codex process. Sessions relying on those overrides for MCP restrictions
-need explicit configuration or `speculate off --client codex`. Do not rely on
-native setup to enforce a policy it cannot see.
-
-The original transport fields are recorded locally for undo and can include
-credentials already present in the host configuration. `off --client codex`
-restores those fields only when the current transport still matches Speculate's
-record. It reports conflicts and preserves unrelated later edits. It also
-preserves learning and authentication. Setup installs a user-level sync hook;
-Codex requires you to review and trust it through `/hooks`. Speculate does not
-approve its own hook. `off --client codex` disables automatic sync and removes
-that hook. Claude Code's global off likewise prevents future session hooks
-from re-enabling wrapping in another project.
+Filtering cannot recognize every private string. Ordinary identifiers and paths
+can remain as learned constants, and the store is not encrypted. Run
+`/speculate forget` to delete everything Speculate has learned.
 
 ## Risks that read-only does not solve
 
 !!! danger "Speculation reveals intent"
 
-    A speculative call discloses to the upstream service — before the agent
-    commits to anything — what the user is *probably* about to do. "Read-only"
-    bounds state mutation, not information disclosure.
+    A prefetch tells the upstream service what you are *probably* about to do,
+    before the agent commits to it. Read-only bounds changes, not disclosure.
+    A session's usual opening reads run when its first prompt arrives. If that
+    matters for a server, do not allow its tools without asking.
 
-    Speculation targets configured, connected upstreams. Learned opening reads
-    can run at startup before the agent's first real call to that server.
-    Privacy-sensitive deployments should use per-server denylists or `off`.
-    Documented, not solved.
-
-**Reads with side effects.** Even a "read" can write an audit-log entry, trip a
-read receipt, consume usage-based billing, or eat rate limit. This is why
-`strict` mode requires human allowlisting and why per-server budgets exist.
-Gmail's own prefetching produces 1–6% "false opens" in email analytics — the
-cautionary example.
-
-The full threat model, including the bounded latency cost on serial stdio
-upstreams, is in the [design spec](design/index.md).
+**Reads with side effects.** Even a read can write an audit entry, mark
+something as seen, count against a rate limit, or be billed. An unused
+prefetch costs one of those. `/speculate` reports waste so you can judge the
+trade.

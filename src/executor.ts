@@ -1,6 +1,12 @@
 /**
- * Speculation executor (DESIGN.md §3.1): takes predictions, applies the
- * safety policy, budgets, and dedup, and issues surviving calls upstream.
+ * Speculation executor (DESIGN.md §3.1): takes predictions, applies tool
+ * eligibility, host permission, budgets, and dedup, and issues surviving
+ * calls through Claude Code's own MCP connection.
+ *
+ * The executor never holds the host interface. Each submit carries a
+ * SpeculationIo built inside the mod hook that raised it, so every call it
+ * makes is that hook's own `$.mcp.call` and every authorization its own
+ * `$.tool.check`.
  *
  * Predictions denied only by a busy budget slot (stdio idle-only rule, HTTP
  * concurrency cap) are not dropped: they wait in a small per-server drain
@@ -9,38 +15,51 @@
  * (Refinement discovered during MVP benchmarking; see DESIGN.md §3.1.)
  */
 import { DEFAULT_TTL_MS, LONG_HORIZON_TTL_FACTOR, type SpeculationCache } from './cache.js';
-import type { SafetyPolicy } from './policy.js';
+import type { ToolKnowledge } from './tools.js';
 import type { BudgetManager } from './budget.js';
 import type { Metrics } from './metrics.js';
 import { canonicalKey } from './keys.js';
-import { looksLikeAuthError, resultText, type Upstream } from './upstream.js';
-import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
-import type {
-  LeaseValidator,
-  Prediction,
-  SpeculateConfig,
-} from './types.js';
+import type { Prediction, ToolResult } from './types.js';
 
-const SPECULATIVE_CALL_TIMEOUT_MS = 30_000;
 const QUEUE_MAX_AGE_MS = 5_000;
 const QUEUE_MAX_LENGTH = 8;
 
+/** The host operations one speculative call needs, bound to one mod hook. */
+export interface SpeculationIo {
+  /** Calls the tool on Claude Code's own connection to the server. */
+  call(server: string, tool: string, args: Record<string, unknown>): Promise<ToolResult>;
+  /** True only when the host would run this exact call without asking. */
+  authorize(server: string, tool: string, args: Record<string, unknown>): Promise<boolean>;
+  /** Resolves after `ms`; bounds a speculative call so it cannot hold a slot. */
+  sleep?(ms: number): Promise<void>;
+}
+
+/** A speculative call still unsettled after this is abandoned (its slot freed). */
+export const SPECULATIVE_CALL_TIMEOUT_MS = 30_000;
+
 interface QueuedPrediction {
   p: Prediction;
+  io: SpeculationIo;
   queuedAt: number;
 }
 
-/**
- * The server structurally cannot serve this tool. SDK-based servers reject a
- * vanished/unknown tool with InvalidParams ("Tool X not found", per the MCP
- * spec's example); MethodNotFound means tools/call itself is unsupported.
- */
-function isToolUnavailable(err: McpError): boolean {
-  if (err.code === ErrorCode.MethodNotFound) return true;
-  return (
-    err.code === ErrorCode.InvalidParams &&
-    /\btool\b.{0,40}\bnot found\b|\bunknown tool\b/i.test(err.message)
+export function looksLikeAuthError(text: string): boolean {
+  return /\b(unauthorized|forbidden|permission denied|not authorized|invalid[ _-]?token|expired[ _-]?token|401|403)\b/i.test(
+    text,
   );
+}
+
+/** First text block of a result, for error sniffing. */
+export function resultText(result: ToolResult): string {
+  for (const block of result.content ?? []) {
+    if (block.type === 'text' && typeof block.text === 'string') return block.text;
+  }
+  return '';
+}
+
+/** The server structurally cannot serve this tool (it vanished, or is unknown). */
+function isToolUnavailable(message: string): boolean {
+  return /\btool\b.{0,40}\bnot found\b|\bunknown tool\b|\bmethod not found\b/i.test(message);
 }
 
 export class SpeculationExecutor {
@@ -49,37 +68,22 @@ export class SpeculationExecutor {
   private readonly invalidationRevisions = new Map<string, number>();
   private readonly nextSupersessionRevisions = new Map<string, number>();
   private lifecycleRevision = 0;
-  private observerIssueSequence = 0;
 
   constructor(
     private readonly deps: {
-      upstreams: Map<string, Upstream>;
       cache: SpeculationCache;
-      policy: SafetyPolicy;
+      tools: ToolKnowledge;
       budget: BudgetManager;
       metrics: Metrics;
-      config: SpeculateConfig;
+      ttlMs?: number;
       now?: () => number;
-      leaseValidator?: LeaseValidator;
-      predictionGate?: {
-        allows(server: string, tool: string): boolean;
-        authorize?(server: string, tool: string): Promise<boolean>;
-      };
     },
   ) {}
 
   /** Fire-and-forget: never throws, never blocks the caller. */
-  submit(predictions: Prediction[], opts: { queueOnBusy?: boolean } = {}): void {
+  submit(predictions: Prediction[], io: SpeculationIo, opts: { queueOnBusy?: boolean } = {}): void {
     for (const p of predictions) {
-      if (this.deps.predictionGate?.authorize) {
-        void this.authorizeAndIssue(p, { queueOnBusy: opts.queueOnBusy !== false });
-        continue;
-      }
-      try {
-        this.tryIssue(p, { queueOnBusy: opts.queueOnBusy !== false });
-      } catch (err) {
-        this.suppress(p, `executor-error: ${(err as Error).message}`);
-      }
+      void this.authorizeAndIssue(p, io, { queueOnBusy: opts.queueOnBusy !== false });
     }
   }
 
@@ -108,7 +112,7 @@ export class SpeculationExecutor {
   }
 
   /**
-   * Drop predictions that never acquired an upstream slot before shutdown.
+   * Drop predictions that never acquired a slot before the session ended.
    * They are suppression, not waste: no speculative call was issued. Keeping
    * the event makes the end-of-session funnel reconcile without penalizing a
    * rule for work the budget deliberately prevented.
@@ -137,28 +141,11 @@ export class SpeculationExecutor {
 
   /**
    * Drain hook: called when a budget slot may have freed (a speculative call
-   * settled, or a real call finished on a serial upstream).
+   * settled, or a real call finished). Queued work runs on the io it was
+   * submitted with, unless the caller hands a fresher one.
    */
-  drainServer(server: string): void {
-    if (this.deps.predictionGate?.authorize) {
-      if (!this.draining.has(server)) void this.drainServerAuthorized(server);
-      return;
-    }
-    const queue = this.pending.get(server);
-    if (!queue?.length) return;
-    const now = this.deps.now ?? Date.now;
-    while (queue.length > 0) {
-      const head = queue[0]!;
-      if (now() - head.queuedAt > QUEUE_MAX_AGE_MS) {
-        queue.shift();
-        this.suppress(head.p, 'queue-expired');
-        continue;
-      }
-      const outcome = this.tryIssue(head.p, { queueOnBusy: false });
-      if (outcome === 'busy') return; // slot still occupied; keep queue intact
-      queue.shift();
-    }
-    this.pending.delete(server);
+  drainServer(server: string, io?: SpeculationIo): void {
+    if (!this.draining.has(server)) void this.drainServerAuthorized(server, io);
   }
 
   /**
@@ -167,43 +154,25 @@ export class SpeculationExecutor {
    */
   private tryIssue(
     p: Prediction,
+    io: SpeculationIo,
     opts: { queueOnBusy: boolean },
-    hostAuthorized = false,
   ): 'issued' | 'dropped' | 'busy' {
-    const { cache, policy, budget, metrics, upstreams } = this.deps;
+    const { cache, tools, budget, metrics } = this.deps;
     const now = this.deps.now ?? Date.now;
 
-    if (p.executionLease && !this.deps.leaseValidator?.isCurrent(p.executionLease)) {
-      this.suppress(p, 'stale-generation');
-      return 'dropped';
-    }
-
-    if (!hostAuthorized && this.deps.predictionGate && !this.deps.predictionGate.allows(p.server, p.tool)) {
-      this.suppress(p, 'host-permission');
-      return 'dropped';
-    }
-
-    const upstream = upstreams.get(p.server);
-    if (!upstream?.connected) {
-      this.suppress(p, 'upstream-unavailable');
-      return 'dropped';
-    }
-
-    const decision = policy.eligibility(p.server, p.tool);
+    const decision = tools.eligibility(p.server, p.tool);
     if (!decision.eligible) {
       this.suppress(p, `policy:${decision.reason}`);
       return 'dropped';
     }
 
-    const ttlMs = this.resolveTtl(p.server, p.tool, p.horizon);
+    const ttlMs = this.resolveTtl(p.horizon);
     if (ttlMs <= 0) {
       this.suppress(p, 'ttl-zero');
       return 'dropped';
     }
 
-    const key =
-      p.key ??
-      canonicalKey(p.server, p.tool, p.args);
+    const key = p.key ?? canonicalKey(p.server, p.tool, p.args);
     if (cache.has(key)) {
       this.suppress(p, 'dedup');
       return 'dropped';
@@ -215,7 +184,7 @@ export class SpeculationExecutor {
       // on any event we see, so queuing them would defeat the budget.
       const isBusy = b.reason === 'stdio-busy' || b.reason === 'concurrency';
       if (isBusy && opts.queueOnBusy) {
-        this.enqueue(p);
+        this.enqueue(p, io);
         return 'busy';
       }
       if (isBusy) return 'busy';
@@ -224,44 +193,52 @@ export class SpeculationExecutor {
     }
 
     const specDispatchAt = now();
-    const observerIssue = p.observerAttribution ? {
-      ...p.observerAttribution,
-      issueId: `observer-issue:${++this.observerIssueSequence}`,
-      specDispatchAt,
-    } : undefined;
     const meta = {
       server: p.server,
       tool: p.tool,
       ruleId: p.ruleId,
       issuedAt: specDispatchAt,
-      observerIssue,
     };
 
     let publicationAllowed = true;
-    const promise = upstream
-      .callTool(p.tool, p.args, { timeoutMs: SPECULATIVE_CALL_TIMEOUT_MS })
+    let call: Promise<ToolResult>;
+    try {
+      call = io.call(p.server, p.tool, p.args);
+      const timer = io.sleep?.(SPECULATIVE_CALL_TIMEOUT_MS);
+      if (timer) {
+        call = Promise.race([
+          call,
+          timer.then(
+            () => Promise.reject(new Error('speculative call timed out')),
+            () => new Promise<never>(() => {}),
+          ),
+        ]);
+      }
+    } catch (err) {
+      call = Promise.reject(err);
+    }
+    const promise = call
       .then(async (result) => {
         if (result.isError) {
           // §4/§6: error results are never cached speculatively.
           const text = resultText(result);
-          if (looksLikeAuthError({ resultText: text })) {
-            policy.suspend(p.server, p.tool, 'auth');
-          }
+          if (looksLikeAuthError(text)) tools.suspend(p.server, p.tool, 'auth');
           throw new Error(`upstream error result: ${text.slice(0, 200)}`);
         }
-        if (this.deps.predictionGate?.authorize) {
-          publicationAllowed = await this.authorize(p);
-        }
+        // Permission may have changed while the call ran; an entry is only
+        // published if the host would still run this exact call.
+        publicationAllowed = await this.authorize(p, io);
         return result;
       })
       .catch((err: unknown) => {
-        if (looksLikeAuthError({ message: (err as Error)?.message })) {
-          policy.suspend(p.server, p.tool, 'auth');
-        } else if (err instanceof McpError && isToolUnavailable(err)) {
-          // Structurally un-callable (tool vanished, server can't serve it):
-          // stop speculating it rather than re-burning budget every trigger.
-          // A real call succeeding later resets this (§4).
-          policy.suspend(p.server, p.tool, 'tool-unavailable');
+        const message = String((err as Error)?.message ?? err);
+        if (looksLikeAuthError(message)) {
+          tools.suspend(p.server, p.tool, 'auth');
+        } else if (isToolUnavailable(message)) {
+          // Structurally un-callable: stop speculating it rather than
+          // re-burning budget every trigger. A real call succeeding later
+          // resets this (§4).
+          tools.suspend(p.server, p.tool, 'tool-unavailable');
         }
         throw err;
       })
@@ -271,18 +248,7 @@ export class SpeculationExecutor {
       });
 
     // The cache attaches handlers synchronously, so rejections are owned there.
-    cache.putInFlight(
-      key,
-      meta,
-      promise,
-      ttlMs,
-      p.executionLease || this.deps.predictionGate
-        ? () => (!p.executionLease || this.deps.leaseValidator?.isCurrent(p.executionLease) === true) &&
-          publicationAllowed && (!this.deps.predictionGate?.authorize && this.deps.predictionGate
-            ? this.deps.predictionGate.allows(p.server, p.tool)
-            : true)
-        : undefined,
-    );
+    cache.putInFlight(key, meta, promise, ttlMs, () => publicationAllowed);
     metrics.record({
       type: 'speculated',
       server: p.server,
@@ -290,17 +256,31 @@ export class SpeculationExecutor {
       ruleId: p.ruleId,
       confidence: p.confidence,
       timestamp: specDispatchAt,
-      observerIssue,
     });
     return 'issued';
   }
 
-  private async authorizeAndIssue(p: Prediction, opts: { queueOnBusy: boolean }): Promise<void> {
+  private async authorizeAndIssue(
+    p: Prediction,
+    io: SpeculationIo,
+    opts: { queueOnBusy: boolean },
+  ): Promise<void> {
     const lifecycleRevision = this.lifecycleRevision;
     const invalidationRevision = this.invalidationRevisions.get(p.server) ?? 0;
     const nextSupersessionRevision = this.nextSupersessionRevisions.get(p.server) ?? 0;
-    const allowed = await this.authorize(p);
-    if (lifecycleRevision !== this.lifecycleRevision || invalidationRevision !== (this.invalidationRevisions.get(p.server) ?? 0)) {
+    // Cheap synchronous checks first, so an ineligible prediction never costs
+    // a permission query.
+    const decision = this.deps.tools.eligibility(p.server, p.tool);
+    if (!decision.eligible) {
+      this.suppress(p, `policy:${decision.reason}`);
+      return;
+    }
+    const allowed = await this.authorize(p, io);
+    if (lifecycleRevision !== this.lifecycleRevision) {
+      this.suppress(p, 'session-end');
+      return;
+    }
+    if (invalidationRevision !== (this.invalidationRevisions.get(p.server) ?? 0)) {
       this.suppress(p, 'cache-invalidation');
       return;
     }
@@ -313,22 +293,23 @@ export class SpeculationExecutor {
       return;
     }
     try {
-      this.tryIssue(p, opts, true);
+      this.tryIssue(p, io, opts);
     } catch (err) {
       this.suppress(p, `executor-error: ${(err as Error).message}`);
     }
   }
 
-  private async authorize(p: Prediction): Promise<boolean> {
+  private async authorize(p: Prediction, io: SpeculationIo): Promise<boolean> {
     try {
-      return await this.deps.predictionGate!.authorize!(p.server, p.tool);
+      return (await io.authorize(p.server, p.tool, p.args)) === true;
     } catch {
       return false;
     }
   }
 
-  private async drainServerAuthorized(server: string): Promise<void> {
+  private async drainServerAuthorized(server: string, fresh?: SpeculationIo): Promise<void> {
     this.draining.add(server);
+    let replaced = false;
     try {
       const queue = this.pending.get(server);
       if (!queue?.length) return;
@@ -340,24 +321,31 @@ export class SpeculationExecutor {
           this.suppress(head.p, 'queue-expired');
           continue;
         }
-        const allowed = await this.authorize(head.p);
-        if (this.pending.get(server) !== queue || queue[0] !== head) return;
+        const io = fresh ?? head.io;
+        const allowed = await this.authorize(head.p, io);
+        if (this.pending.get(server) !== queue || queue[0] !== head) {
+          // The queue changed while authorization ran (superseded, flushed,
+          // or a new queue started): drain what is there now, not this copy.
+          replaced = true;
+          return;
+        }
         if (!allowed) {
           queue.shift();
           this.suppress(head.p, 'host-permission');
           continue;
         }
-        const outcome = this.tryIssue(head.p, { queueOnBusy: false }, true);
+        const outcome = this.tryIssue(head.p, io, { queueOnBusy: false });
         if (outcome === 'busy') return;
         queue.shift();
       }
       this.pending.delete(server);
     } finally {
       this.draining.delete(server);
+      if (replaced && this.pending.get(server)?.length) this.drainServer(server, fresh);
     }
   }
 
-  private enqueue(p: Prediction): void {
+  private enqueue(p: Prediction, io: SpeculationIo): void {
     const now = this.deps.now ?? Date.now;
     let queue = this.pending.get(p.server);
     if (!queue) {
@@ -366,7 +354,7 @@ export class SpeculationExecutor {
     }
     // Highest-confidence predictions fire first when the slot frees.
     const at = queue.findIndex((q) => q.p.confidence < p.confidence);
-    const item = { p, queuedAt: now() };
+    const item = { p, io, queuedAt: now() };
     if (at === -1) queue.push(item);
     else queue.splice(at, 0, item);
     while (queue.length > QUEUE_MAX_LENGTH) {
@@ -383,35 +371,18 @@ export class SpeculationExecutor {
       ruleId: p.ruleId,
       confidence: p.confidence,
       reason,
-      observerAttribution: p.observerAttribution,
     });
   }
 
   /**
-   * The TTL this prediction is fetched with (§6.2). Resolution order is
-   * unchanged — operator per-tool, operator default, hardcoded fallback —
-   * and a long-horizon prediction then
-   * gets a FRACTION of whatever won, so an operator's per-tool freshness
-   * decision still sets the ceiling.
+   * The TTL this prediction is fetched with (§6.2). A long-horizon
+   * prediction gets a fraction of the base, which stays the ceiling.
    */
-  private resolveTtl(
-    server: string,
-    tool: string,
-    horizon: Prediction['horizon'],
-  ): number {
-    const { config } = this.deps;
-    const serverCfg = config.servers[server];
-    const cfgByTool = serverCfg?.speculation?.ttlMsByTool;
-    const operatorTtl =
-      cfgByTool && Object.hasOwn(cfgByTool, tool) ? cfgByTool[tool] : undefined;
-    const base =
-      operatorTtl ?? // operator per-tool beats everything (incl. 0 = never)
-      serverCfg?.speculation?.defaultTtlMs ??
-      DEFAULT_TTL_MS;
+  private resolveTtl(horizon: Prediction['horizon']): number {
+    const base = this.deps.ttlMs ?? DEFAULT_TTL_MS;
     if (horizon !== 'standing' || base <= 0) return base; // 0 stays disabled
-    const factor = serverCfg?.speculation?.longHorizonTtlFactor ?? LONG_HORIZON_TTL_FACTOR;
     // At least 1 ms: rounding a live TTL down to 0 would make the entry dead
     // on arrival, quietly turning every standing bet into pure waste.
-    return Math.max(1, Math.round(base * factor));
+    return Math.max(1, Math.round(base * LONG_HORIZON_TTL_FACTOR));
   }
 }

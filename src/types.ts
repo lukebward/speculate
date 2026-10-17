@@ -2,21 +2,34 @@
  * Shared contracts for Speculate. Design: DESIGN.md.
  *
  * Modules implement against these types; do not widen them casually —
- * the proxy core, executor, predictor, cache, policy, and budgets all
- * meet here.
+ * the speculator, executor, predictor, cache, tool facts, and budgets all
+ * meet here. Nothing in src/ may import Node or a runtime package: the
+ * Claude Code mod loads these files as they are.
  */
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import type { AgentKind, SignalKind } from './observerTypes.js';
 
 // ---------------------------------------------------------------------------
-// Speculation policy (DESIGN.md §4)
+// MCP results
 // ---------------------------------------------------------------------------
 
-export type SpeculationMode = 'strict' | 'annotated' | 'off';
+/** One content block of an MCP tool result. */
+export interface ToolContentBlock {
+  type: string;
+  text?: string;
+  [field: string]: unknown;
+}
+
+/** An MCP tools/call result, as `$.mcp.call` resolves it. */
+export interface ToolResult {
+  content: ToolContentBlock[];
+  isError?: boolean;
+  structuredContent?: unknown;
+}
+
+export type SpeculationMode = 'on' | 'off';
 
 export interface EligibilityDecision {
   eligible: boolean;
-  /** Machine-readable reason, e.g. 'allowlisted', 'not-annotated', 'denylisted', 'suspended:auth' */
+  /** Machine-readable reason, e.g. 'read-only', 'not-read-only', 'unknown', 'suspended:auth' */
   reason: string;
 }
 
@@ -29,7 +42,7 @@ export interface ObservedCall {
   server: string;
   tool: string;
   args: Record<string, unknown>;
-  result: CallToolResult;
+  result: ToolResult;
   /**
    * Structured view of `result`: `result.structuredContent` when present,
    * otherwise generic JSON-in-text parsing, else null.
@@ -65,45 +78,6 @@ export interface Prediction {
    * them with a configurable TTL factor (§6.2, LONG_HORIZON_TTL_FACTOR).
    */
   horizon?: 'next' | 'standing';
-  executionLease?: ExecutionLease;
-  observerAttribution?: ObserverAttribution;
-}
-
-export interface ObserverAttribution {
-  client: AgentKind;
-  source: SignalKind;
-  routeId: string;
-  generation: number;
-  candidateCreatedAt: number;
-}
-
-export interface ObserverIssue extends ObserverAttribution {
-  issueId: string;
-  specDispatchAt: number;
-}
-
-export interface ExecutionLease {
-  routeId: string;
-  generation: number;
-  permissionContext?: string;
-  conversationId?: string;
-}
-
-export interface LeaseValidator {
-  isCurrent(lease: ExecutionLease): boolean;
-}
-
-/** A Tier-1 co-occurrence rule (DESIGN.md §5.2). */
-export interface Rule {
-  id: string;
-  /** Tool name that triggers this rule (unprefixed, server-local). */
-  trigger: string;
-  /**
-   * Produce predictions from the observed call. Return [] when the rule
-   * has nothing to say (e.g. `call.parsed` is null and the rule needs it).
-   * Must not throw; throwing rules are treated as [] and logged.
-   */
-  predict(call: ObservedCall): Prediction[];
 }
 
 // ---------------------------------------------------------------------------
@@ -121,13 +95,12 @@ export interface CacheEntryMeta {
   issuedAt: number;
   /** Upstream latency of the speculative call (set once resolved). */
   upstreamLatencyMs?: number;
-  observerIssue?: ObserverIssue;
 }
 
 export type CacheLookup =
   | {
       outcome: 'hit';
-      result: CallToolResult;
+      result: ToolResult;
       meta: CacheEntryMeta;
       /**
        * How long the entry had been READY when it was consumed — the same
@@ -139,7 +112,7 @@ export type CacheLookup =
       /** `ageMs` as a fraction of this entry's TTL, in [0,1). */
       ttlFraction: number;
     }
-  | { outcome: 'joined'; promise: Promise<CallToolResult>; meta: CacheEntryMeta }
+  | { outcome: 'joined'; promise: Promise<ToolResult>; meta: CacheEntryMeta }
   | { outcome: 'miss'; /** top-level arg-key distance to nearest same-tool entry, for near-miss telemetry; undefined when no same-tool entries exist */ nearMissDistance?: number };
 
 // ---------------------------------------------------------------------------
@@ -206,30 +179,6 @@ export interface DecisionEvent {
   /** For candidate_evaluated: whether admission returned this candidate. */
   admitted?: boolean;
   timestamp?: number;
-  observerAttribution?: ObserverAttribution;
-  observerIssue?: ObserverIssue;
-  realDemandAt?: number;
-}
-
-export type ObserverSuppression =
-  | 'dedup'
-  | 'feedback'
-  | 'low-utility'
-  | 'per-trigger-cap'
-  | 'stale-generation'
-  | 'queue-expired'
-  | 'session-end'
-  | 'other';
-
-export interface ObserverLifecycleEvent {
-  type: 'suppressed' | 'speculated' | 'hit' | 'joined' | 'expired' | 'invalidated' | 'abandoned' | 'spec_error';
-  timestamp: number;
-  ruleId: string;
-  observerAttribution: ObserverAttribution;
-  issueId?: string;
-  specDispatchAt?: number;
-  realDemandAt?: number;
-  suppression?: ObserverSuppression;
 }
 
 export interface RuleStats {
@@ -352,96 +301,17 @@ export interface CalibrationReport {
 }
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Options
 // ---------------------------------------------------------------------------
 
-export interface ServerConfig {
-  /** stdio upstream */
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  /** Working directory for a stdio child; omitted to inherit the proxy cwd. */
-  cwd?: string;
-  /** streamable-HTTP upstream */
-  url?: string;
-  /**
-   * Extra HTTP request headers for a `url` upstream: this is how an
-   * AUTHENTICATED remote MCP server is reached (`Authorization: Bearer …`).
-   * `${VAR}` placeholders in values are resolved from the environment by
-   * config.ts at load, so the token need not live in the config file.
-   *
-   * AFTER LOADING, THE VALUES HERE ARE SECRETS. Nothing may print one:
-   * diagnostics show header NAMES only (doctor.ts), and anything that
-   * echoes upstream error text runs it through Upstream#redact first.
-   */
-  headers?: Record<string, string>;
-  /**
-   * Path to Speculate's own OAuth credential store, when this `url` upstream
-   * is one the user has run `speculate auth` for. Set by the proxy at startup,
-   * not written by hand: the store is consulted by URL, so authorizing a
-   * server is the only step: nothing has to be added to a config file.
-   *
-   * Mutually exclusive with an `Authorization` header, and enforced as such,
-   * because the transport spreads configured headers AFTER the OAuth bearer
-   * (streamableHttp.js `_commonHeaders`) — a stale hand-set header would
-   * silently shadow a valid token and present as an inexplicable 401.
-   */
-  oauthStorePath?: string;
-  /** Stable authorization identity; changes on fresh consent, not refresh. */
-  oauthAuthEpoch?: string;
-  /**
-   * Accepted and ignored. Vetted per-server profiles were removed; the field
-   * stays in the type so an older config still LOADS (config.ts warns and
-   * drops it) rather than failing a working setup over a dead line.
-   */
-  profile?: string;
-  /**
-   * Declarative prediction rules (validated by configRules.ts) so ANY
-   * server gets speculation without a vetted profile.
-   */
-  rules?: import('./configRules.js').ConfigRuleSpec[];
-  /** Tools the operator vouches for; the whole `strict`-mode allowlist. */
-  allowTools?: string[];
-  /** Denylist: never speculate on these, regardless of mode. */
-  denyTools?: string[];
-  speculation?: {
-    defaultTtlMs?: number;
-    /** Per-tool TTL overrides; 0 disables. */
-    ttlMsByTool?: Record<string, number>;
-    /**
-     * TTL multiplier for long-horizon ('standing') predictions, in (0,1].
-     * Defaults to LONG_HORIZON_TTL_FACTOR, which is 1 (no shortening) on
-     * measured grounds — see src/cache.ts and DESIGN.md §13.19 before
-     * lowering it, and watch `expired` / `perRule['opener:*'].wasted` if
-     * you do.
-     */
-    longHorizonTtlFactor?: number;
-    maxPerMinute?: number;
-    maxConcurrent?: number;
-    /** Minimum probability-weighted latency benefit required to issue. */
-    minExpectedSavedMs?: number;
-    /** Set false to retain fixed-cap admission regardless of latency. */
-    adaptiveAdmission?: boolean;
-  };
-}
-
-export interface SpeculateConfig {
+export interface SpeculateOptions {
   mode: SpeculationMode;
   /** Per-trigger prediction cap (DESIGN.md §5.6). Default 3. */
   maxPredictionsPerTrigger: number;
-  servers: Record<string, ServerConfig>;
-  /** Decision-log destination: 'stderr' (JSONL) or 'off'. Default 'stderr'. */
-  log: 'stderr' | 'off';
-  /**
-   * Learned-state persistence (§13.6): transition model + rule feedback.
-   * Tool results are never persisted. Default: enabled, XDG state dir.
-   */
-  persistence?: {
-    enabled?: boolean;
-    path?: string;
-    /** Entries older than this many days are discarded. Default 30. */
-    retentionDays?: number;
-    /** Maximum UTF-8 size of one scoped state file. Default 8 MiB. */
-    maxBytes?: number;
-  };
+  /** Lifetime of a prefetched result before it is discarded unused. */
+  ttlMs: number;
+  /** Speculative calls one server may start per minute. */
+  maxPerMinute: number;
+  /** Minimum probability-weighted latency benefit required to issue. */
+  minExpectedSavedMs: number;
 }

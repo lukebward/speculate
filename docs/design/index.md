@@ -8,6 +8,14 @@ were later removed. Current behavior is documented in [Commands](../commands.md)
 [Configuration](../configuration.md), and [Safety](../safety.md). Measurement
 methods and scoped results live in the [benchmark guide](local-learning-benchmark.md).
 
+!!! info "Since v1.0 Speculate is a Claude Code mod"
+
+    This spec describes the original proxy. From v1.0 the router, observer, and
+    transport are a Claude Code mod's hooks; the prediction, cache, budget, and
+    safety sections still describe the core it runs. See
+    [§13.29](implementation-notes.md#1329-v10-the-proxy-becomes-a-mod-2026-10-17)
+    and the [v1.0 release notes](releases.md).
+
 Speculate is a transparent MCP proxy that reduces perceived agent latency by *speculatively prefetching read-only tool calls* — predicting what the agent will ask for next and having the answer cached (or already in flight) before it asks.
 
 !!! info "Current architecture amendment"

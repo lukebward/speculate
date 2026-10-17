@@ -1,9 +1,3 @@
-import type { SpeculateConfig } from './types.js';
-import {
-  oauthStorePath as defaultOAuthStorePath,
-  readOAuthRecord,
-} from './oauthStore.js';
-
 export interface SecretGuard {
   isSensitive(value: unknown, fieldName?: string): boolean;
   redact(text: string): string;
@@ -103,61 +97,6 @@ export function createSecretGuard(secretValues: Iterable<string> = []): SecretGu
   };
   const guard: SecretGuard = { isSensitive, redact };
   return guard;
-}
-
-function credentialHeader(name: string): boolean {
-  const joined = keyTokens(name).join('');
-  return joined === 'authorization' || joined === 'proxyauthorization' || joined === 'cookie' ||
-    joined === 'setcookie' || joined === 'xapikey' || joined === 'apikey';
-}
-
-/** Values are returned for in-memory comparison only; callers must never log them. */
-export function collectRuntimeSecrets(
-  config: SpeculateConfig,
-  options: { env?: NodeJS.ProcessEnv; oauthPath?: string | null } = {},
-): string[] {
-  const secrets = new Set<string>();
-  const add = (value: unknown): void => {
-    if (typeof value === 'string' && value.length >= 4) secrets.add(value);
-  };
-  const addAuthorization = (value: string): void => {
-    add(value);
-    const auth = /^(Bearer|Basic)\s+(.+)$/i.exec(value);
-    if (!auth?.[2]) return;
-    add(auth[2]);
-    if (auth[1]!.toLowerCase() === 'basic') {
-      try {
-        const decoded = Buffer.from(auth[2], 'base64').toString('utf8');
-        add(decoded);
-        const separator = decoded.indexOf(':');
-        if (separator >= 0) add(decoded.slice(separator + 1));
-      } catch {}
-    }
-  };
-  for (const [name, value] of Object.entries(options.env ?? process.env)) {
-    if (typeof value === 'string' && isSensitiveFieldName(name)) add(value);
-  }
-  for (const server of Object.values(config.servers)) {
-    for (const [name, value] of Object.entries(server.env ?? {})) {
-      if (isSensitiveFieldName(name)) add(value);
-    }
-    for (const [name, value] of Object.entries(server.headers ?? {})) {
-      if (credentialHeader(name) && value.length >= 4) {
-        addAuthorization(value);
-      }
-    }
-  }
-  const oauthPath = options.oauthPath === undefined ? defaultOAuthStorePath() : options.oauthPath;
-  if (oauthPath !== null) {
-    for (const server of Object.values(config.servers)) {
-      if (!server.url) continue;
-      const record = readOAuthRecord(oauthPath, server.url);
-      add(record?.tokens?.access_token);
-      add(record?.tokens?.refresh_token);
-      add(record?.client.client_secret);
-    }
-  }
-  return [...secrets];
 }
 
 function record(value: unknown): value is Record<string, unknown> {

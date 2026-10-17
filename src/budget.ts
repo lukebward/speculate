@@ -1,7 +1,9 @@
 /**
  * Speculation budgets and backpressure (DESIGN.md §7, §3.1).
  *
- * Speculative traffic is strictly lower priority than real traffic:
+ * Speculative traffic is strictly lower priority than real traffic. Claude
+ * Code does not tell a mod how it reaches a server, so the mod budgets every
+ * server as stdio, the conservative case:
  * - HTTP upstreams: speculative calls use spare concurrency only
  *   (default cap 2), bounded by a per-minute sliding-window budget
  *   (default 30/min).
@@ -36,31 +38,35 @@ export class BudgetManager {
   private readonly servers = new Map<string, ServerBudgetState>();
   private readonly now: () => number;
 
+  private readonly defaults: ServerBudgetConfig | undefined;
+
+  /**
+   * `defaults`, when given, budgets any server not listed in `perServer` the
+   * first time it is seen; without it an unlisted server never speculates.
+   */
   constructor(
     perServer: Record<string, ServerBudgetConfig>,
-    opts?: { now?: () => number },
+    opts?: { now?: () => number; defaults?: ServerBudgetConfig },
   ) {
     this.now = opts?.now ?? Date.now;
-    for (const [name, cfg] of Object.entries(perServer)) {
-      this.servers.set(name, {
-        transport: cfg.transport,
-        maxPerMinute: cfg.maxPerMinute ?? DEFAULT_MAX_PER_MINUTE,
-        maxConcurrent:
-          cfg.transport === 'stdio'
-            ? 1
-            : cfg.maxConcurrent ?? DEFAULT_HTTP_MAX_CONCURRENT,
-        realInFlight: 0,
-        specInFlight: 0,
-        issuedAt: [],
-      });
+    this.defaults = opts?.defaults;
+    for (const [name, cfg] of Object.entries(perServer)) this.servers.set(name, initialState(cfg));
+  }
+
+  private state(server: string): ServerBudgetState | undefined {
+    let s = this.servers.get(server);
+    if (s === undefined && this.defaults !== undefined) {
+      s = initialState(this.defaults);
+      this.servers.set(server, s);
     }
+    return s;
   }
 
   // -- Real-traffic bookkeeping (real calls are never blocked; we only
   //    observe them so stdio speculation can stay idle-only). --------------
 
   realStarted(server: string): void {
-    const s = this.servers.get(server);
+    const s = this.state(server);
     if (s !== undefined) s.realInFlight++;
   }
 
@@ -80,7 +86,7 @@ export class BudgetManager {
    * per-minute token. A denial consumes nothing.
    */
   tryAcquire(server: string): BudgetDecision {
-    const s = this.servers.get(server);
+    const s = this.state(server);
     if (s === undefined) return { ok: false, reason: 'unknown-server' };
     if (s.transport === 'stdio' && (s.realInFlight > 0 || s.specInFlight > 0)) {
       return { ok: false, reason: 'stdio-busy' };
@@ -115,4 +121,15 @@ export class BudgetManager {
     while (drop < s.issuedAt.length && s.issuedAt[drop]! <= cutoff) drop++;
     if (drop > 0) s.issuedAt.splice(0, drop);
   }
+}
+
+function initialState(cfg: ServerBudgetConfig): ServerBudgetState {
+  return {
+    transport: cfg.transport,
+    maxPerMinute: cfg.maxPerMinute ?? DEFAULT_MAX_PER_MINUTE,
+    maxConcurrent: cfg.transport === 'stdio' ? 1 : cfg.maxConcurrent ?? DEFAULT_HTTP_MAX_CONCURRENT,
+    realInFlight: 0,
+    specInFlight: 0,
+    issuedAt: [],
+  };
 }

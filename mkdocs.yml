@@ -1,8 +1,8 @@
 site_name: Speculate
 site_url: https://lukebward.github.io/speculate/
 site_description: >-
-  Speculative prefetching for coding agents. A transparent MCP proxy that
-  learns likely read-only tool calls and runs them early to reduce waiting.
+  Speculative prefetching for Claude Code. A mod that learns likely read-only
+  MCP calls and runs them early to reduce waiting.
 site_author: Luke Ward
 copyright: MIT © 2026 Luke Ward
 
@@ -56,22 +56,13 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Commands: commands.md
-  - Safety: safety.md
-  - Configuration: configuration.md
-  - Context-aware operation:
-      - Results: observer-results.md
-      - Headroom-informed speculation: headroom-informed-speculation.md
-      - Compatibility: observer-compatibility.md
-      - Native routing: observer-native-routing.md
-      - Native tool shapes: observer-native-tool-shapes.md
+  - Safety and storage: safety.md
   - Design document:
       - Design spec: design/index.md
       - Implementation notes: design/implementation-notes.md
       - Release notes: design/releases.md
       - Benchmark methodology and results: design/local-learning-benchmark.md
       - Prior art: design/prior-art.md
-  - Proposals:
-      - Host-provided wrapper seam: upstream/mcp-wrapper-seam.md
   - Contributing: https://github.com/lukebward/speculate/blob/main/CONTRIBUTING.md
 
 markdown_extensions:
@@ -122,6 +113,3 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/lukebward/speculate
       name: Speculate on GitHub
-    - icon: fontawesome/brands/npm
-      link: https://www.npmjs.com/package/speculate-mcp
-      name: speculate-mcp on npm

@@ -1,6 +1,6 @@
 {
-  "name": "speculate-mcp",
+  "name": "speculate",
   "owner": { "name": "Luke Ward", "url": "https://github.com/lukebward" },
-  "description": "Speculate's session-start auto-wrap hook.",
-  "plugins": [{ "name": "speculate-autowrap", "source": "./plugin" }]
+  "description": "Speculate: prefetches the read-only MCP calls Claude Code is about to make.",
+  "plugins": [{ "name": "speculate", "source": "./" }]
 }

@@ -6,7 +6,7 @@
  * rules (§5.2, contained) → validate/normalize predictions → per-rule
  * feedback scoring (§5.6) → batch dedupe on canonical key → rank and cap.
  */
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { ToolResult } from './types.js';
 import { canonicalKey } from './keys.js';
 import type { LatencyEstimator } from './latency.js';
 import type { CandidateCalibration } from './calibration.js';
@@ -14,7 +14,6 @@ import type {
   DecisionEvent,
   ObservedCall,
   Prediction,
-  Rule,
 } from './types.js';
 
 /** Per-rule outcome counters consumed by the §5.6 feedback loop. */
@@ -35,12 +34,6 @@ export interface PredictorOptions {
   maxPerTrigger: number;
   metrics: PredictorMetrics;
   /**
-   * Declarative rules per server label, compiled from config `rules`. The
-   * only hand-written prediction source left; everything else comes from the
-   * learner, which needs no per-server code at all.
-   */
-  extraRules?: Record<string, Rule[]>;
-  /**
    * Server-agnostic learned-transition predictor (§5.3 Tier 2). Observes
    * every served call; its predictions join the same validate/feedback/
    * dedupe/cap pipeline as rule output.
@@ -56,6 +49,8 @@ export interface PredictorOptions {
   /** Correctness calibration used for ranking and adaptive admission. */
   calibration?: CandidateCalibration;
   admission?: Record<string, { enabled: boolean; minExpectedSavedMs: number }>;
+  /** Admission for servers `admission` does not list. */
+  defaultAdmission?: { enabled: boolean; minExpectedSavedMs: number };
 }
 
 /** A completed real call, as reported by the proxy core. */
@@ -63,7 +58,7 @@ export interface CompletedCall {
   server: string;
   tool: string;
   args: Record<string, unknown>;
-  result: CallToolResult;
+  result: ToolResult;
   latencyMs: number;
   timestamp: number;
   /** Whether this real call was eligible to have been prefetched. */
@@ -94,27 +89,30 @@ export interface ResolvedCandidate {
   expectedLatencyMs?: number;
   candidateId: string;
   ruleId: string;
-  observerAttribution?: import('./types.js').ObserverAttribution;
 }
 
 export class Predictor {
-  private readonly extraRules: Map<string, Rule[]>;
   private readonly learner: PredictorOptions['learner'];
   private readonly maxPerTrigger: number;
   private readonly metrics: PredictorMetrics;
   private readonly admission: Record<string, { enabled: boolean; minExpectedSavedMs: number }>;
+  private readonly defaultAdmission: { enabled: boolean; minExpectedSavedMs: number };
   private readonly latency: LatencyEstimator | undefined;
   private readonly calibration: CandidateCalibration | undefined;
   /** Last ranked batch emitted on each server, for real recall@K telemetry. */
   private readonly pendingEvaluation = new Map<string, PendingCandidateEvaluation[]>();
 
   constructor(opts: PredictorOptions) {
-    // A Map avoids Object.prototype lookups for hostile server labels.
-    this.extraRules = new Map(Object.entries(opts.extraRules ?? {}));
     this.learner = opts.learner;
     this.maxPerTrigger = opts.maxPerTrigger;
     this.metrics = opts.metrics;
     this.admission = opts.admission ?? {};
+    // Embedders that do not opt into an admission policy retain the
+    // predictor's historical fixed-cap behavior.
+    this.defaultAdmission = opts.defaultAdmission ?? {
+      enabled: false,
+      minExpectedSavedMs: DEFAULT_MIN_EXPECTED_SAVED_MS,
+    };
     this.latency = opts.latency;
     this.calibration = opts.calibration;
   }
@@ -137,53 +135,18 @@ export class Predictor {
       latencyMs: call.latencyMs,
     };
 
-    // §5.2 run every matching rule (contained), §5.6 feedback-weight the
-    // output. Config-authored rules and the learner share one pipeline.
-    const rules: Rule[] = this.extraRules.get(call.server) ?? [];
     const candidates: ScoredPrediction[] = [];
     let order = 0;
-    for (const rule of rules) {
-      if (rule.trigger !== call.tool) continue;
-
-      let emitted: readonly unknown[];
-      try {
-        const out: unknown = rule.predict(observed);
-        emitted = Array.isArray(out) ? out : [];
-      } catch {
-        this.metrics.record({
-          type: 'suppressed',
-          server: call.server,
-          tool: call.tool,
-          ruleId: rule.id,
-          reason: 'rule-error',
-          timestamp: call.timestamp,
-        });
-        continue;
-      }
-
-      const valid: Prediction[] = [];
-      for (const raw of emitted) {
-        const p = validatePrediction(raw, call.server, rule.id, 'next');
-        if (p) valid.push(p); // malformed predictions are dropped silently
-      }
-      if (valid.length === 0) continue;
-
-      for (const [index, p] of valid.entries()) {
-        const candidateId = index === 0 ? rule.id : `${rule.id}#${index + 1}`;
-        const candidate = this.scoreCandidate(p, candidateId, order++, call.timestamp);
-        if (candidate) candidates.push(candidate);
-      }
-    }
 
     // §5.3 Tier 2: the learner sees every served call and proposes learned
-    // transitions through the same validation/feedback/dedupe/cap pipeline.
+    // transitions through the validation/feedback/dedupe/cap pipeline.
     // It is best-effort — a learner failure never costs a real call.
     if (this.learner) {
       try {
         this.learner.observe(observed);
         for (const raw of this.learner.predict(observed)) {
           const learnedId =
-            typeof (raw as { ruleId?: unknown }).ruleId === 'string'
+            typeof (raw as { ruleId?: unknown } | null)?.ruleId === 'string'
               ? (raw as { ruleId: string }).ruleId
               : 'learned:unknown';
           const p = validatePrediction(raw, call.server, learnedId, 'next');
@@ -192,7 +155,7 @@ export class Predictor {
           if (candidate) candidates.push(candidate);
         }
       } catch {
-        // Learner errors are contained; rule-based prediction continues.
+        // Learner errors are contained; the real call is unaffected.
       }
     }
 
@@ -212,7 +175,7 @@ export class Predictor {
     try {
       for (const raw of this.learner.openerPredictions(server)) {
         const openerId =
-          typeof (raw as { ruleId?: unknown }).ruleId === 'string'
+          typeof (raw as { ruleId?: unknown } | null)?.ruleId === 'string'
             ? (raw as { ruleId: string }).ruleId
             : 'opener:unknown';
         const p = validatePrediction(raw, server, openerId, 'standing');
@@ -240,7 +203,7 @@ export class Predictor {
         candidate.candidateId,
         order,
         options.timestamp,
-        prediction.observerAttribution !== undefined,
+        true,
       );
       if (scored) candidates.push(scored);
     }
@@ -281,13 +244,9 @@ export class Predictor {
     // appears as a model miss, making it impossible to distinguish "wrong"
     // from "right but not worth issuing" in day-to-day diagnostics.
     const evaluated = ranked.slice(0, this.maxPerTrigger);
-    const admission = this.admission[server] ?? {
-      // Embedders that do not opt into an admission policy retain the
-      // predictor's historical behavior. The proxy supplies an explicit
-      // enabled policy for every configured server.
-      enabled: false,
-      minExpectedSavedMs: DEFAULT_MIN_EXPECTED_SAVED_MS,
-    };
+    const admission = Object.hasOwn(this.admission, server)
+      ? this.admission[server]!
+      : this.defaultAdmission;
     const useful = admission.enabled
       ? ranked.filter((candidate) => {
           if (this.utility(candidate) >= admission.minExpectedSavedMs) return true;
@@ -308,7 +267,6 @@ export class Predictor {
         ruleId: prediction.ruleId,
         confidence: prediction.confidence,
         timestamp,
-        observerAttribution: prediction.observerAttribution,
       });
     }
     const admitted = new Set(kept);
@@ -435,7 +393,6 @@ export class Predictor {
       reason,
       confidence: prediction.confidence,
       timestamp,
-      observerAttribution: prediction.observerAttribution,
     });
   }
 }
@@ -455,14 +412,14 @@ interface PendingCandidateEvaluation {
  * §5.1 structured result access, exported for tests: `structuredContent`
  * when present and non-null; otherwise generic JSON-in-text parsing.
  */
-export function parseResult(result: CallToolResult): unknown | null {
+export function parseResult(result: ToolResult): unknown | null {
   const structured: unknown = result.structuredContent;
   if (structured !== undefined && structured !== null) return structured;
   return genericJsonText(result);
 }
 
 /** Best-effort JSON extraction from text/resource blocks; null otherwise. */
-function genericJsonText(result: CallToolResult): unknown | null {
+function genericJsonText(result: ToolResult): unknown | null {
   if (result.isError) return null;
   for (const block of result.content ?? []) {
     const text =
@@ -528,7 +485,6 @@ function validatePrediction(
     args?: unknown;
     confidence?: unknown;
     expectedLatencyMs?: unknown;
-    observerAttribution?: unknown;
   };
   if (typeof p.tool !== 'string' || p.tool.length === 0) return null;
   if (typeof p.args !== 'object' || p.args === null || Array.isArray(p.args)) return null;
@@ -547,26 +503,7 @@ function validatePrediction(
     // Timing follows the entrypoint: trigger batches predict the next
     // call; only session-start predictions may outlive the next real call.
     horizon,
-    ...(validObserverAttribution(p.observerAttribution)
-      ? { observerAttribution: {
-          client: p.observerAttribution.client,
-          source: p.observerAttribution.source,
-          routeId: p.observerAttribution.routeId,
-          generation: p.observerAttribution.generation,
-          candidateCreatedAt: p.observerAttribution.candidateCreatedAt,
-        } }
-      : {}),
   };
-}
-
-function validObserverAttribution(value: unknown): value is import('./types.js').ObserverAttribution {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const item = value as Partial<import('./types.js').ObserverAttribution>;
-  return (item.client === 'claude' || item.client === 'codex') &&
-    (item.source === 'intent' || item.source === 'transition' || item.source === 'stream') &&
-    typeof item.routeId === 'string' && item.routeId.length > 0 &&
-    typeof item.generation === 'number' && Number.isInteger(item.generation) && item.generation > 0 &&
-    typeof item.candidateCreatedAt === 'number' && Number.isFinite(item.candidateCreatedAt) && item.candidateCreatedAt >= 0;
 }
 
 /** Canonical key for in-batch dedupe; degrades rather than throws. */

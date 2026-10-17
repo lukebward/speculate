@@ -1,49 +1,32 @@
 /**
- * On-disk persistence for learned state (DESIGN.md §13.6).
+ * Learned memory, encoded for the plugin store (DESIGN.md §13.6).
  *
  * What persists: the transition learner's model (tool names + argument
- * templates, including constant argument values) and per-rule feedback
- * counters. What NEVER persists: tool results — the speculation cache is
- * memory-only by design (§6.4) — and anything else request-scoped.
+ * templates, including constant argument values), per-rule feedback, latency
+ * aggregates, and what each tool turned out to be (read-only or not, and the
+ * argument key shapes it was called with). What NEVER persists: tool results.
+ * The speculation cache is memory-only by design (§6.4).
  *
- * Failure philosophy: state is an optimization, so every failure mode
- * degrades to "cold start". A missing, corrupt, or version-mismatched file
- * loads as null; a failed save logs once to stderr and the proxy carries on.
- * Writes are atomic (tmp + rename) and 0600 — argument values can be
- * private, so the file is owner-only.
+ * The codec is pure: the mod hands it whatever `$.store` returned and writes
+ * whatever it returns. Every malformed input decodes as a cold start, never
+ * an error. Concurrent sessions share one store value, so a save merges into
+ * the latest stored value instead of overwriting another session's learning.
  */
-import {
-  closeSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  realpathSync,
-  readdirSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
-import { homedir, tmpdir } from 'node:os';
 import { mergeLatencySnapshots, type LatencySnapshot } from './latency.js';
 import {
   mergeCandidateFeedbackSnapshots,
   type CandidateFeedbackSnapshot,
 } from './calibration.js';
 import { createSecretGuard, sanitizeLearnerState, type SecretGuard } from './privacy.js';
+import { mergeToolFacts, sanitizeToolFacts, type ToolFacts } from './tools.js';
 
 export const DEFAULT_RETENTION_DAYS = 30;
-export const DEFAULT_MAX_STATE_BYTES = 8_388_608;
+/** The plugin store holds 4 MiB in all; learned memory keeps headroom under it. */
+export const DEFAULT_MAX_STATE_BYTES = 3_145_728;
 
 export interface PersistencePolicy {
   retentionDays?: number;
   maxBytes?: number;
-  /** Resolved credentials used only for exact in-memory filtering/redaction. */
-  secretValues?: readonly string[] | (() => readonly string[]);
 }
 
 export interface MemoryDiagnostics {
@@ -52,7 +35,6 @@ export interface MemoryDiagnostics {
   removedInvalid: number;
   trimmedForSize: number;
   oversizedReads: number;
-  staleGenerationSaves: number;
 }
 
 export interface RuleFeedbackSnapshot {
@@ -66,14 +48,14 @@ export interface RuleFeedbackSnapshot {
 export interface PersistedState {
   version: 1;
   savedAt: number;
-  /** Hashed workspace/upstream/account identity; never contains credentials. */
-  scope?: string;
   learner: unknown;
   ruleFeedback: Record<string, RuleFeedbackSnapshot>;
   /** Aggregate target latency only; no arguments, results, or cache keys. */
   latency?: LatencySnapshot;
   /** Shadow correctness by stable rule/alternative ID. */
   candidateFeedback?: Record<string, CandidateFeedbackSnapshot>;
+  /** Read-only verdicts and argument key shapes per tool; never values. */
+  tools?: ToolFacts;
   /** Aggregate privacy/retention actions only; never includes removed data. */
   memory?: Pick<MemoryDiagnostics, 'removedSensitive' | 'removedExpired' | 'removedInvalid' | 'trimmedForSize'> & {
     retentionDays?: number;
@@ -81,185 +63,97 @@ export interface PersistedState {
   };
 }
 
+/** What a session hands the codec to save. */
+export interface MemorySnapshot {
+  learner: unknown;
+  ruleFeedback: Record<string, RuleFeedbackSnapshot>;
+  latency?: LatencySnapshot;
+  candidateFeedback?: Record<string, CandidateFeedbackSnapshot>;
+  tools?: ToolFacts;
+}
+
 const STATE_VERSION = 1 as const;
 
-export class StateStore {
-  private warnedSaveFailure = false;
-  /** This process's own last-loaded/saved view, used to isolate feedback deltas. */
+export class MemoryCodec {
+  /** This session's own last-loaded/saved view, used to isolate feedback deltas. */
   private baseline: PersistedState | null = null;
-  private generation: string | null = null;
-  private directoryGeneration: string | null = null;
   private readonly retentionMs: number;
   private readonly retentionDays: number;
   private readonly maxBytes: number;
-  private readonly secretValues: readonly string[] | (() => readonly string[]);
-  private readonly knownSecretValues: string[] = [];
   readonly diagnostics: MemoryDiagnostics = {
     removedSensitive: 0,
     removedExpired: 0,
     removedInvalid: 0,
     trimmedForSize: 0,
     oversizedReads: 0,
-    staleGenerationSaves: 0,
   };
 
   constructor(
-    readonly path: string,
     private readonly now: () => number = Date.now,
-    private readonly expectedScope?: string,
     policy: PersistencePolicy = {},
   ) {
     const retentionDays = validRetentionDays(policy.retentionDays);
     this.retentionDays = retentionDays;
     this.retentionMs = retentionDays * 24 * 60 * 60_000;
     this.maxBytes = validMaxBytes(policy.maxBytes);
-    this.secretValues = policy.secretValues ?? [];
   }
 
-  /** null on missing/corrupt/version-mismatch — cold start, never an error. */
-  load(): PersistedState | null {
-    this.generation = readStateGeneration(this.path);
-    this.directoryGeneration = readStateDirectoryGeneration(dirname(this.path));
-    this.baseline = this.loadPath(this.path);
+  /** Decodes a stored value and adopts it as this session's baseline. */
+  load(raw: unknown): PersistedState | null {
+    this.baseline = this.decode(raw);
     return this.baseline;
   }
 
-  /** Read sanitized memory for inventory without adopting another scope's model. */
-  static inspect(path: string, policy: PersistencePolicy = {}): PersistedState | null {
-    return new StateStore(path, Date.now, undefined, policy).loadPath(path, false);
+  /**
+   * The value to store: this session's snapshot merged into `latest`, the
+   * value the store holds now (another session may have saved since load).
+   */
+  encode(snapshot: MemorySnapshot, latest: unknown): PersistedState {
+    const incoming = this.sanitize({
+      version: STATE_VERSION,
+      savedAt: this.now(),
+      ...snapshot,
+    });
+    const stored = this.decode(latest);
+    const merged = stored === null
+      ? incoming
+      : mergePersistedState(stored, incoming, this.baseline ?? undefined);
+    // The in-memory learner corresponds to incoming, not to entities unioned
+    // from another session. Keep that as the next delta baseline.
+    this.baseline = incoming;
+    return this.fit(this.sanitize(merged));
   }
 
-  private loadPath(path: string, checkScope = true): PersistedState | null {
-    let text: string;
+  private decode(raw: unknown): PersistedState | null {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const data = raw as PersistedState;
+    if (
+      data.version !== STATE_VERSION ||
+      data.ruleFeedback === null ||
+      typeof data.ruleFeedback !== 'object' ||
+      Array.isArray(data.ruleFeedback)
+    ) {
+      return null;
+    }
     try {
-      if (statSync(path).size > this.maxBytes) {
+      if (byteLength(data) > this.maxBytes * 2) {
         this.diagnostics.oversizedReads++;
         return null;
       }
-      text = readFileSync(path, 'utf8');
-    } catch {
-      return null; // most commonly ENOENT: first run
-    }
-    try {
-      const data = JSON.parse(text) as PersistedState;
-      if (
-        data === null ||
-        typeof data !== 'object' ||
-        Array.isArray(data) ||
-        data.version !== STATE_VERSION ||
-        data.ruleFeedback === null ||
-        typeof data.ruleFeedback !== 'object' ||
-        Array.isArray(data.ruleFeedback) ||
-        (data.scope !== undefined && typeof data.scope !== 'string')
-      ) {
-        return null;
-      }
-      // Missing means a legacy file: allow one migration load. A current
-      // file from another workspace/account is a cold start, never imported.
-      if (checkScope && data.scope !== undefined && data.scope !== this.expectedScope) return null;
       return this.sanitize(data);
     } catch {
       return null;
     }
   }
 
-  /** Atomic write; returns false (and warns once) on failure. */
-  save(state: {
-    learner: unknown;
-    ruleFeedback: Record<string, RuleFeedbackSnapshot>;
-    latency?: LatencySnapshot;
-    candidateFeedback?: Record<string, CandidateFeedbackSnapshot>;
-  }): boolean {
-    if (this.generation === null) this.generation = readStateGeneration(this.path);
-    if (this.directoryGeneration === null) {
-      this.directoryGeneration = readStateDirectoryGeneration(dirname(this.path));
-    }
-    if (readStateGeneration(this.path) !== this.generation ||
-      readStateDirectoryGeneration(dirname(this.path)) !== this.directoryGeneration) {
-      this.diagnostics.staleGenerationSaves++;
-      return true;
-    }
-    const tmp = `${this.path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-    const lockPath = `${this.path}.lock`;
-    let lockFd: number | null = null;
-    const directoryLockPath = stateDirectoryLockPath(dirname(this.path));
-    let directoryLockFd: number | null = null;
-    try {
-      const incoming = this.sanitize({
-        version: STATE_VERSION,
-        savedAt: this.now(),
-        ...(this.expectedScope !== undefined ? { scope: this.expectedScope } : {}),
-        learner: state.learner,
-        ruleFeedback: state.ruleFeedback,
-        ...(state.latency !== undefined ? { latency: state.latency } : {}),
-        ...(state.candidateFeedback !== undefined
-          ? { candidateFeedback: state.candidateFeedback }
-          : {}),
-      });
-      mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-      directoryLockFd = acquireLock(directoryLockPath, this.now);
-      if (directoryLockFd === null) throw new Error('state directory is busy in another process');
-      lockFd = acquireLock(lockPath, this.now);
-      if (lockFd === null) throw new Error('state file is busy in another process');
-      if (readStateGeneration(this.path) !== this.generation ||
-        readStateDirectoryGeneration(dirname(this.path)) !== this.directoryGeneration) {
-        this.diagnostics.staleGenerationSaves++;
-        return true;
-      }
-      // Serialize the read/merge/rename section. Independent projects are
-      // already isolated by their state keys; this preserves disjoint rules,
-      // transitions, contexts, and argument sources when two sessions for the
-      // same project happen to close together.
-      const latest = this.loadPath(this.path);
-      const merged = latest === null
-        ? incoming
-        : mergePersistedState(latest, incoming, this.baseline ?? undefined);
-      const full = this.fit(this.sanitize(merged));
-      const serialized = JSON.stringify(full);
-      writeFileSync(tmp, serialized, { mode: 0o600 });
-      renameSync(tmp, this.path);
-      // The in-memory learner/metrics correspond to incoming, not to entities
-      // unioned from another process. Keep that as the next delta baseline.
-      this.baseline = incoming;
-      return true;
-    } catch (err) {
-      if (!this.warnedSaveFailure) {
-        this.warnedSaveFailure = true;
-        const code = (err as NodeJS.ErrnoException).code;
-        process.stderr.write(
-          `[speculate] state save failed${code ? ` (${code})` : ''}; will keep retrying silently\n`,
-        );
-      }
-      return false;
-    } finally {
-      if (lockFd !== null) {
-        try { closeSync(lockFd); } catch {}
-        try { unlinkSync(lockPath); } catch {}
-      }
-      if (directoryLockFd !== null) {
-        try { closeSync(directoryLockFd); } catch {}
-        try { unlinkSync(directoryLockPath); } catch {}
-      }
-      try { unlinkSync(tmp); } catch {}
-    }
-  }
-
   private sanitize(state: PersistedState): PersistedState {
+    const beforeSensitive = this.diagnostics.removedSensitive;
     const beforeExpired = this.diagnostics.removedExpired;
     const beforeInvalid = this.diagnostics.removedInvalid;
     const now = this.now();
     const cutoff = now - this.retentionMs;
     const fallbackStamp = finiteStamp(state.savedAt) ? state.savedAt : now;
-    const currentSecrets = typeof this.secretValues === 'function'
-      ? this.secretValues()
-      : this.secretValues;
-    for (const secret of currentSecrets) {
-      if (!this.knownSecretValues.includes(secret)) this.knownSecretValues.push(secret);
-    }
-    if (this.knownSecretValues.length > 1_024) {
-      this.knownSecretValues.splice(0, this.knownSecretValues.length - 1_024);
-    }
-    const guard = createSecretGuard(this.knownSecretValues);
+    const guard = createSecretGuard();
     const learner = sanitizeLearnerState(state.learner, {
       guard,
       now,
@@ -280,17 +174,21 @@ export class StateStore {
       this.diagnostics,
       guard,
     );
+    const tools = sanitizeToolFacts(state.tools, cutoff, guard);
+    this.diagnostics.removedSensitive += tools.removedSensitive;
+    this.diagnostics.removedExpired += tools.removedExpired;
     const prior = state.memory;
     return {
       version: STATE_VERSION,
       savedAt: finiteStamp(state.savedAt) ? state.savedAt : now,
-      ...(state.scope !== undefined ? { scope: state.scope } : {}),
       learner: learner.value,
       ruleFeedback,
       ...(latency !== undefined ? { latency: latency as LatencySnapshot } : {}),
       ...(Object.keys(candidateFeedback).length > 0 ? { candidateFeedback } : {}),
+      ...(Object.keys(tools.value).length > 0 ? { tools: tools.value } : {}),
       memory: {
-        removedSensitive: Math.max(0, numeric(prior?.removedSensitive)) + learner.removedSensitive,
+        removedSensitive: Math.max(0, numeric(prior?.removedSensitive)) +
+          (this.diagnostics.removedSensitive - beforeSensitive),
         removedExpired: Math.max(0, numeric(prior?.removedExpired)) +
           (this.diagnostics.removedExpired - beforeExpired),
         removedInvalid: Math.max(0, numeric(prior?.removedInvalid)) +
@@ -303,7 +201,7 @@ export class StateStore {
   }
 
   private fit(state: PersistedState): PersistedState {
-    const size = (): number => Buffer.byteLength(JSON.stringify(state), 'utf8');
+    const size = (): number => byteLength(state);
     if (size() <= this.maxBytes) return state;
     const learner = state.learner as { transitions: Record<string, unknown>[]; openers: Record<string, unknown>[] };
     const candidates: Array<{ stamp: number; score: number; key: string; remove: () => void }> = [];
@@ -325,6 +223,20 @@ export class StateStore {
       stamp: value.lastUpdated, score: value.evaluated,
       key: `candidate:${key}`, remove: () => { delete state.candidateFeedback?.[key]; },
     });
+    // A tool fact is cheap and re-learned on the tool's next real call, so it
+    // goes before anything with evidence behind it, least recently seen first.
+    for (const [server, byTool] of Object.entries(state.tools ?? {})) {
+      for (const [tool, fact] of Object.entries(byTool)) candidates.push({
+        stamp: fact.lastSeen, score: 0,
+        key: `tool:${server}:${tool}`,
+        remove: () => {
+          const tools = state.tools;
+          if (!tools?.[server]) return;
+          delete tools[server][tool];
+          if (Object.keys(tools[server]).length === 0) delete tools[server];
+        },
+      });
+    }
     candidates.sort((a, b) => a.score - b.score || a.stamp - b.stamp || a.key.localeCompare(b.key));
     // Removal closures find the same object again after earlier array removals.
     for (const candidate of candidates) {
@@ -345,6 +257,9 @@ export class StateStore {
       learner.openers = [];
       state.ruleFeedback = {};
       delete state.candidateFeedback;
+      delete state.tools;
+      this.diagnostics.trimmedForSize++;
+      if (state.memory) state.memory.trimmedForSize++;
     }
     return state;
   }
@@ -355,7 +270,7 @@ function validRetentionDays(value: number | undefined): number {
 }
 
 function validMaxBytes(value: number | undefined): number {
-  return Number.isInteger(value) && value! >= 65_536 && value! <= 67_108_864
+  return Number.isInteger(value) && value! >= 65_536 && value! <= DEFAULT_MAX_STATE_BYTES
     ? value!
     : DEFAULT_MAX_STATE_BYTES;
 }
@@ -451,241 +366,6 @@ function sanitizeLatency(
   return { version: 1, tools: clean(raw['tools'], true), servers: clean(raw['servers'], false) };
 }
 
-const LOCK_WAIT_MS = 500;
-const LOCK_STALE_MS = 30_000;
-const LOCK_POLL_MS = 10;
-
-export function stateGenerationPath(path: string): string {
-  return `${path}.generation`;
-}
-
-export function readStateGeneration(path: string): string {
-  return readGenerationMarker(stateGenerationPath(path));
-}
-
-export function stateDirectoryGenerationPath(directory: string): string {
-  return join(directory, '.generation');
-}
-
-export function stateDirectoryLockPath(directory: string): string {
-  return join(directory, '.memory.lock');
-}
-
-export function readStateDirectoryGeneration(directory: string): string {
-  return readGenerationMarker(stateDirectoryGenerationPath(directory));
-}
-
-function readGenerationMarker(marker: string): string {
-  try {
-    const stat = lstatSync(marker);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1_024) return `invalid:${stat.size}:${stat.mtimeMs}`;
-    return readFileSync(marker, 'utf8');
-  } catch {
-    return '';
-  }
-}
-
-/** Hold the state-directory writer lock and advance its clear generation. */
-export function clearPersistedStateDirectory<T>(
-  directory: string,
-  action: () => T,
-): { acquired: true; value: T } | { acquired: false; error: string } {
-  const marker = stateDirectoryGenerationPath(directory);
-  const markerTmp = `${marker}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-  let lockFd: number | null = null;
-  try {
-    if (!safeStateParent(directory)) {
-      return { acquired: false, error: 'state directory is linked or invalid' };
-    }
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    if (existsSync(marker)) {
-      const stat = lstatSync(marker);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        return { acquired: false, error: 'directory generation marker is not a regular file' };
-      }
-    }
-    lockFd = acquireLock(stateDirectoryLockPath(directory), Date.now);
-    if (lockFd === null) return { acquired: false, error: 'state directory is busy' };
-    if (existsSync(marker)) {
-      const stat = lstatSync(marker);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        return { acquired: false, error: 'directory generation marker is not a regular file' };
-      }
-    }
-    // Prepare the new generation before mutation so an inability to create it
-    // leaves the old state untouched.
-    writeFileSync(markerTmp, randomUUID(), { flag: 'wx', mode: 0o600 });
-    const value = action();
-    try { unlinkSync(marker); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    renameSync(markerTmp, marker);
-    return { acquired: true, value };
-  } catch (error) {
-    return { acquired: false, error: (error as Error).message };
-  } finally {
-    try { unlinkSync(markerTmp); } catch {}
-    if (lockFd !== null) {
-      try { closeSync(lockFd); } catch {}
-      try { unlinkSync(stateDirectoryLockPath(directory)); } catch {}
-    }
-  }
-}
-
-export interface ClearStateResult {
-  cleared: boolean;
-  skipped: boolean;
-  error?: string;
-}
-
-/** Clear one exact regular state file and invalidate stores that loaded it. */
-export function clearPersistedState(path: string): ClearStateResult {
-  const lockPath = `${path}.lock`;
-  let lockFd: number | null = null;
-  const marker = stateGenerationPath(path);
-  const markerTmp = `${marker}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-  try {
-    if (!safeStateParent(dirname(path))) {
-      return { cleared: false, skipped: true, error: 'state parent is linked or not a directory' };
-    }
-    if (existsSync(path)) {
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.isSymbolicLink()) return { cleared: false, skipped: true, error: 'not a regular file' };
-    }
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    if (existsSync(marker)) {
-      const markerStat = lstatSync(marker);
-      if (!markerStat.isFile() || markerStat.isSymbolicLink()) {
-        return { cleared: false, skipped: true, error: 'generation marker is not a regular file' };
-      }
-    }
-    lockFd = acquireLock(lockPath, Date.now);
-    if (lockFd === null) return { cleared: false, skipped: true, error: 'state file is busy' };
-    if (existsSync(path)) {
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        return { cleared: false, skipped: true, error: 'not a regular file' };
-      }
-    }
-    if (existsSync(marker)) {
-      const markerStat = lstatSync(marker);
-      if (!markerStat.isFile() || markerStat.isSymbolicLink()) {
-        return { cleared: false, skipped: true, error: 'generation marker is not a regular file' };
-      }
-    }
-    // Prepare the replacement before deleting state. If the directory cannot
-    // create a secure marker, the old state remains intact.
-    writeFileSync(markerTmp, randomUUID(), { flag: 'wx', mode: 0o600 });
-    try { unlinkSync(path); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    try { unlinkSync(marker); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    renameSync(markerTmp, marker);
-    const escaped = basename(path).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const tmpPattern = new RegExp(
-      `^${escaped}(?:\\.\\d+\\.\\d+(?:\\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?)?\\.tmp$`,
-      'i',
-    );
-    for (const entry of readdirSync(dirname(path))) {
-      if (!tmpPattern.test(entry)) continue;
-      try {
-        const candidate = join(dirname(path), entry);
-        const stat = lstatSync(candidate);
-        if (stat.isFile() && !stat.isSymbolicLink()) unlinkSync(candidate);
-      } catch {}
-    }
-    return { cleared: true, skipped: false };
-  } catch (error) {
-    return { cleared: false, skipped: false, error: (error as Error).message };
-  } finally {
-    try { unlinkSync(markerTmp); } catch {}
-    if (lockFd !== null) {
-      try { closeSync(lockFd); } catch {}
-      try { unlinkSync(lockPath); } catch {}
-    }
-  }
-}
-
-function safeStateParent(path: string): boolean {
-  let existing = resolve(path);
-  while (!existsSync(existing)) {
-    const parent = dirname(existing);
-    if (parent === existing) break;
-    existing = parent;
-  }
-  try {
-    const stat = lstatSync(existing);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return false;
-    const actual = realpathSync(existing);
-    return isCanonicalDirectoryIdentity(existing, actual);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Compare a requested directory with its real path without rejecting an OS
- * alias on the runtime's own temp/home roots. The suffix must remain identical,
- * so a user-created symlink below either trusted root still fails this check.
- */
-export function isCanonicalDirectoryIdentity(
-  requested: string,
-  actual: string,
-  platform: NodeJS.Platform = process.platform,
-  trustedRoots: readonly (readonly [requested: string, actual: string])[] = runtimeTrustedRoots(platform),
-): boolean {
-  if (platform === 'win32') return requested.toLowerCase() === actual.toLowerCase();
-  if (requested === actual) return true;
-  if (platform !== 'darwin') return false;
-  for (const [requestedRoot, actualRoot] of trustedRoots) {
-    if (requested === requestedRoot || requested.startsWith(`${requestedRoot}/`)) {
-      return actual === `${actualRoot}${requested.slice(requestedRoot.length)}`;
-    }
-  }
-  return false;
-}
-
-function runtimeTrustedRoots(platform: NodeJS.Platform): readonly (readonly [string, string])[] {
-  if (platform !== 'darwin') return [];
-  const roots: Array<readonly [string, string]> = [];
-  for (const requested of [tmpdir(), homedir()]) {
-    try {
-      const actual = realpathSync(requested);
-      const requestedRoot = requested.replace(/\/$/, '');
-      const actualRoot = actual.replace(/\/$/, '');
-      const fixedAppleAlias = (requestedRoot === '/var' || requestedRoot.startsWith('/var/') ||
-        requestedRoot === '/tmp' || requestedRoot.startsWith('/tmp/')) &&
-        actualRoot === `/private${requestedRoot}`;
-      if (fixedAppleAlias) roots.push([requestedRoot, actualRoot]);
-    } catch {}
-  }
-  return roots;
-}
-
-/** Small bounded synchronous lock: saves happen only during periodic flush/close. */
-function acquireLock(path: string, _now: () => number): number | null {
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  const sleeper = new Int32Array(new SharedArrayBuffer(4));
-  while (Date.now() <= deadline) {
-    try {
-      const fd = openSync(path, 'wx', 0o600);
-      writeFileSync(fd, `${process.pid}\n`);
-      return fd;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      try {
-        if (Date.now() - statSync(path).mtimeMs > LOCK_STALE_MS) {
-          unlinkSync(path);
-          continue;
-        }
-      } catch {}
-      Atomics.wait(sleeper, 0, 0, LOCK_POLL_MS);
-    }
-  }
-  return null;
-}
 
 /**
  * Monotonic, fail-soft merge for concurrently saved v1 snapshots. It does
@@ -702,7 +382,6 @@ export function mergePersistedState(
   return {
     version: STATE_VERSION,
     savedAt,
-    ...(incoming.scope !== undefined ? { scope: incoming.scope } : {}),
     learner: mergeLearner(existing.learner, incoming.learner),
     ruleFeedback: mergeFeedback(
       existing.ruleFeedback,
@@ -729,6 +408,9 @@ export function mergePersistedState(
             savedAt,
           ),
         }
+      : {}),
+    ...(existing.tools !== undefined || incoming.tools !== undefined
+      ? { tools: mergeToolFacts(existing.tools, incoming.tools) }
       : {}),
     ...((existing.memory !== undefined || incoming.memory !== undefined)
       ? {
@@ -917,32 +599,18 @@ function numeric(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-/**
- * Default state-file location for a given config file: one state file per
- * config (≈ per project), under XDG state dir. Moving the config starts a
- * fresh state file — acceptable for an optimization cache.
- */
-export function defaultStatePath(configPath: string): string {
-  const abs = isAbsolute(configPath) ? configPath : resolve(configPath);
-  return defaultStatePathForKey(abs);
-}
-
-/**
- * State path for config-less runs (`speculate wrap`): keyed by whatever
- * stable identity string the caller derives (e.g. the wrapped command line).
- */
-export function defaultStatePathForKey(key: string): string {
-  const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
-  return join(defaultStateDirectory(), `state-${hash}.json`);
-}
-
-export function defaultStateDirectory(): string {
-  const xdg = process.env.XDG_STATE_HOME;
-  const stateHome =
-    xdg && xdg.length > 0 && isAbsolute(xdg)
-      ? xdg // XDG spec: relative values are to be ignored
-      : process.platform === 'win32' && process.env.LOCALAPPDATA
-        ? process.env.LOCALAPPDATA
-        : join(homedir(), '.local', 'state');
-  return join(stateHome, 'speculate');
+/** UTF-8 size of the value's JSON text. */
+export function byteLength(value: unknown): number {
+  const text = JSON.stringify(value) ?? '';
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
 }

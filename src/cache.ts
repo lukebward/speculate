@@ -6,7 +6,7 @@
  * questionable. Expiry is lazy — checked on lookup and via an explicit
  * sweep(); there are no internal timers.
  */
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { ToolResult } from './types.js';
 import { argsDistance, keyServer, keyTool, parseKeyArgs } from './keys.js';
 import type { CacheEntryMeta, CacheKey, CacheLookup } from './types.js';
 
@@ -52,7 +52,7 @@ interface EntryBase {
   readonly tool: string;
   readonly meta: CacheEntryMeta;
   /** The original speculative promise (handed to joiners as-is). */
-  readonly promise: Promise<CallToolResult>;
+  readonly promise: Promise<ToolResult>;
   /**
    * Invalidated while in flight: unmapped already; when the promise resolves
    * it is dropped with an 'invalidated' event (rejections still report
@@ -79,7 +79,7 @@ interface InFlightEntry extends EntryBase {
 
 interface ReadyEntry extends EntryBase {
   readonly state: 'ready';
-  readonly result: CallToolResult;
+  readonly result: ToolResult;
   /** When the result landed. TTL counts from completion, not issuance. */
   readonly readyAt: number;
   /** Absolute ms deadline; TTL counts from completion, not issuance. */
@@ -110,7 +110,7 @@ export class SpeculationCache {
   putInFlight(
     key: CacheKey,
     meta: CacheEntryMeta,
-    promise: Promise<CallToolResult>,
+    promise: Promise<ToolResult>,
     ttlMs: number,
     canPublish?: () => boolean,
   ): void {
@@ -250,7 +250,7 @@ export class SpeculationCache {
   private settleResolved(
     key: CacheKey,
     entry: InFlightEntry,
-    result: CallToolResult,
+    result: ToolResult,
     ttlMs: number,
   ): void {
     const t = this.now();

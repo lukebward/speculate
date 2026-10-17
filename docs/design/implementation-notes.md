@@ -716,3 +716,56 @@ existsSync calls, not hundreds of config parses. A project whose
 directory is gone is classified from its raw local entries alone —
 discovery rooted at a dead path would walk up to some OTHER repository's
 root and misattribute its servers.
+
+### 13.29 v1.0: the proxy becomes a mod (2026-10-17)
+
+Claude Code mods made the proxy unnecessary for Claude Code, and a set of
+disposable spikes against the bundled mock server settled how the mod has to
+work. Each finding below changed the design.
+
+**A hook can serve, observe, and prefetch.** A `tool.call` hook that returns
+`{ result }` without calling `next` answers the call; one that awaits `next`
+sees the result, including the host's `isReadOnly` verdict; `$.mcp.call`
+reaches a connected server with the host's connection, and a call started in a
+hook keeps running after the hook returns. That covers §3.1's router,
+observation, and executor transport.
+
+**`$` cannot be kept.** A hooks module may not store or pass `$`; every host
+call is spelled inside a hook. The core therefore stays pure, and each hook
+hands the speculator a `SpeculationIo` of closures (`$.mcp.call`,
+`$.tool.check`, `$.clock.sleep`) built in that hook. Queued work drains on the
+io it was queued with.
+
+**`$.mcp.call` is a tool call.** It raises `tool.call` through every plugin,
+this one included, and through the permission check and settings hooks. The
+first build's own `tool.call` hook saw its prefetch as a model call, found the
+in-flight entry for that very call, and joined itself until the hook's budget
+ran out. The hook now handles only calls whose `next.origin.plugin` is
+`engine`. The side effect is welcome: prefetches are visible to PreToolUse and
+PostToolUse hooks and to permission rules exactly as real calls are.
+
+**Answering above the hooks skipped them.** Returning `{ result }` from
+`tool.call` answers above PreToolUse, PostToolUse, and the permission flow, and
+a first guard that refused to speculate any tool a settings hook could match
+disabled Speculate entirely on a machine with catch-all logging hooks. The mod
+instead claims the prefetched result, calls `next`, and lets its own
+`classic.PreToolUse` hook answer last: it refuses the call (stopping the tool)
+only when the settings hooks beneath let it through unchanged, and the
+`tool.call` hook then swaps that refusal for the claimed result. A deny, an
+ask, or an `updatedInput` from any hook sends the call on as usual. The model
+never sees the refusal. PostToolUse cannot be raised by a mod, so tool-specific
+PostToolUse hooks keep their tools out of speculation (§4).
+
+**Openers wait for the first prompt.** An opener fired from `session.start`
+raced the MCP connections and the session's own setup; the first prompt is
+both safe and the real idle window, since the model then spends seconds
+reading.
+
+**A refused call says nothing about the tool.** A call denied by a hook comes
+back as an error with no `isReadOnly`. Recording that as "not read-only" made
+a read ineligible after one denial. An error without a verdict now leaves the
+recorded verdict alone while still flushing the server.
+
+**Budgets assume a serial server.** A mod cannot see whether a server is stdio
+or HTTP, so every server gets the stdio rule (§3.1): speculate only while no
+real call to it is running, one at a time.
