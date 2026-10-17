@@ -1,16 +1,28 @@
 {
-  "name": "speculate",
+  "name": "speculate-mcp",
   "version": "1.0.0",
-  "private": true,
-  "description": "Claude Code mod that learns your MCP call patterns and prefetches likely read-only calls",
+  "description": "Speculate for Claude Code: a mod that learns your MCP call patterns and prefetches likely read-only calls",
   "type": "module",
+  "bin": {
+    "speculate": "dist/src/cli.js",
+    "speculate-mcp": "dist/src/cli.js"
+  },
+  "files": [
+    ".claude-plugin",
+    "hooks",
+    "src",
+    "dist/src/cli.js",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "vitest run",
     "test:mod": "claude plugin test .",
     "validate": "claude plugin validate .",
     "typecheck": "tsc -p tsconfig.core.json && tsc",
     "eval": "tsx eval/eval.ts",
-    "mock-github": "tsx mock/mock-github.ts"
+    "mock-github": "tsx mock/mock-github.ts",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "repository": {
     "type": "git",
@@ -26,6 +38,9 @@
     "latency"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "bugs": {
     "url": "https://github.com/lukebward/speculate/issues"
   },
@@ -41,6 +56,6 @@
     "zod": "^4.4.3"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   }
 }

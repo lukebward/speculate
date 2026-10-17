@@ -15,6 +15,21 @@ Answer `y` to add the marketplace, then choose the user scope so Speculate runs
 in every project. It is active in that session at once, and in every session
 after.
 
+### From npm
+
+Requires Node.js 18 or later:
+
+```bash
+npm install -g speculate-mcp
+speculate install
+```
+
+`speculate install` registers the installed package as a plugin marketplace
+and installs the mod from it for every project. Claude Code reads the mod
+straight from the package folder, so `npm update -g speculate-mcp` updates it;
+run `/reload-plugins` in an open session to pick up a change. Run through
+`npx`, which keeps packages in a cache, it installs from GitHub instead.
+
 To try it without installing, start a session with a local checkout:
 
 ```bash
@@ -60,16 +75,27 @@ your workflow, Speculate is not paying for itself there; disable it with
 /plugin uninstall speculate  # remove it
 ```
 
-## Upgrading from speculate-mcp
+Installed from npm, `speculate uninstall` removes the mod and its marketplace,
+and `npm uninstall -g speculate-mcp` removes the command.
 
-Versions up to 0.25 were an npm package, `speculate-mcp`, that wrapped MCP
-server registrations in a local proxy. Before removing it, run the old CLI's
-`speculate off` so it restores the registrations it wrapped:
+## Upgrading from 0.x
+
+Versions up to 0.25 wrapped MCP server registrations, in Claude Code and in
+Codex, so each server launched through Speculate's local proxy. Upgrade with:
 
 ```bash
-speculate off
-npm uninstall -g speculate-mcp
+npm install -g speculate-mcp
+speculate install
 ```
 
-Then install the mod as above. Learning from the old package is not carried
+`speculate install` finds registrations 0.x wrapped and restores them with
+0.25's own `off` (`npx speculate-mcp@0.25.0 off`, which handles every scope and
+both clients and leaves later edits alone). It then removes 0.x's auto-wrap
+plugin and installs the mod. If a registration is still wrapped afterwards
+(0.x kept no record of it), the command lists it.
+
+Until then nothing breaks: a local server 0.x wrapped keeps starting through
+the 1.0 package, which now runs its original command as a plain pass-through.
+A remote server 0.x wrapped cannot be passed through; it reports the restore
+command when Claude Code tries to start it. Learning from 0.x is not carried
 over; the mod relearns from Claude Code's own calls.

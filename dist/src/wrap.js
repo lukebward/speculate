@@ -1,0 +1,249 @@
+/**
+ * `speculate wrap` — zero-config speculation (DESIGN.md §13.9).
+ *
+ * Instead of writing a speculate.config.json and re-pointing the host at
+ * it, the user prefixes their EXISTING server command:
+ *
+ *   { "command": "npx",
+ *     "args": ["-y", "github:lukebward/speculate", "wrap", "--",
+ *              "github-mcp-server", "stdio"] }
+ *
+ * Defaults chosen for the zero-config path: mode `annotated` (there is no
+ * allowlist to consult, so `readOnlyHint` is the only signal — documented
+ * trade-off, overridable with --mode/--allow), persistence on (keyed by
+ * the workspace, upstream, and account scope).
+ */
+import { HEADER_NAME, resolveHeaderValue } from './config.js';
+import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { RESERVED_LAUNCH_ENV } from './hostConfig.js';
+export function parseWrapArgs(argv) {
+    const out = {
+        mode: 'annotated',
+        profile: null,
+        allow: [],
+        legacyPassthrough: false,
+        command: [],
+        url: null,
+        headers: {},
+    };
+    let i = 0;
+    for (; i < argv.length; i++) {
+        const a = argv[i];
+        if (a === '--') {
+            out.command = argv.slice(i + 1);
+            break;
+        }
+        if (a === '--mode') {
+            const m = argv[++i];
+            if (m !== 'strict' && m !== 'annotated' && m !== 'off') {
+                return { error: `--mode must be strict|annotated|off (got '${m ?? ''}')` };
+            }
+            out.mode = m;
+        }
+        else if (a === '--profile') {
+            // Accepted and ignored: vetted profiles were removed, and failing an
+            // invocation over a flag that used to work would break wrapped entries
+            // already written into people's MCP config.
+            const p = argv[++i];
+            if (!p)
+                return { error: '--profile requires a name' };
+            out.profile = p;
+        }
+        else if (a === '--allow') {
+            const list = argv[++i];
+            if (!list)
+                return { error: '--allow requires a comma-separated tool list' };
+            out.allow.push(...list.split(',').map((s) => s.trim()).filter(Boolean));
+        }
+        else if (a === '--sniff') {
+            out.legacyPassthrough = true;
+        }
+        else if (a === '--host-client') {
+            const value = argv[++i];
+            if (value !== 'claude' && value !== 'codex')
+                return { error: '--host-client must be claude|codex' };
+            out.hostClient = value;
+        }
+        else if (a === '--host-server') {
+            const value = argv[++i];
+            if (!value || value.startsWith('--'))
+                return { error: '--host-server requires a value' };
+            out.hostServerAlias = value;
+        }
+        else if (a === '--codex-server' || a === '--codex-bin' || a === '--codex-home' || a === '--cwd') {
+            const value = argv[++i];
+            if (!value || value.startsWith('--'))
+                return { error: `${a} requires a value` };
+            if (a === '--codex-server')
+                out.codexServer = value;
+            else if (a === '--codex-bin')
+                out.codexBin = value;
+            else if (a === '--codex-home')
+                out.codexHome = value;
+            else
+                out.cwd = value;
+        }
+        else if (a === '--url') {
+            const u = argv[++i];
+            if (!u)
+                return { error: '--url requires a URL' };
+            let parsed;
+            try {
+                parsed = new URL(u);
+            }
+            catch {
+                return { error: `--url is not a valid URL: '${u}'` };
+            }
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return { error: `--url must be http or https (got '${parsed.protocol}')` };
+            }
+            out.url = u;
+        }
+        else if (a === '--literal-header') {
+            const raw = argv[++i];
+            if (!raw)
+                return { error: '--literal-header requires a "Name: value" pair' };
+            const split = raw.indexOf(':');
+            const name = raw.slice(0, split);
+            if (split <= 0 || !HEADER_NAME.test(name) || /[\r\n]/.test(raw)) {
+                return { error: '--literal-header requires a valid HTTP header without newlines' };
+            }
+            // Codex static headers are literal. Remove only the optional separator
+            // space inserted by our argv builder, retaining every value byte.
+            const value = raw.slice(split + 1);
+            out.headers[name] = value.startsWith(' ') ? value.slice(1) : value;
+        }
+        else if (a === '--header') {
+            const raw = argv[++i];
+            if (!raw)
+                return { error: '--header requires a "Name: value" pair' };
+            // First colon only: a value may contain colons (a URL, a timestamp).
+            const split = raw.indexOf(':');
+            if (split <= 0) {
+                return { error: `--header must be "Name: value" (got '${raw}')` };
+            }
+            const name = raw.slice(0, split).trim();
+            const value = raw.slice(split + 1).trim();
+            try {
+                // Same contract as a config file's headers, from the same function:
+                // ${VAR} resolved here, an unset variable fatal and named.
+                out.headers[name] = resolveHeaderValue(name, value);
+            }
+            catch (err) {
+                return { error: `--header ${name}: ${err.message}` };
+            }
+        }
+        else {
+            return { error: `unknown wrap argument '${a}' (flags go before '--', the wrapped command after)` };
+        }
+    }
+    const codexFlags = [out.codexServer, out.codexBin, out.codexHome].filter((value) => value !== undefined);
+    if (codexFlags.length !== 0 && codexFlags.length !== 3) {
+        return { error: '--codex-server, --codex-bin, and --codex-home must be provided together' };
+    }
+    if ((out.hostClient === undefined) !== (out.hostServerAlias === undefined)) {
+        return { error: '--host-client and --host-server must be provided together' };
+    }
+    if (codexFlags.length && out.legacyPassthrough) {
+        return { error: '--sniff cannot be combined with Codex integration' };
+    }
+    if (out.url && out.cwd !== undefined) {
+        return { error: '--cwd applies to stdio servers only' };
+    }
+    // Exactly one upstream: a remote URL or a child process, never both.
+    if (out.url && out.command.length > 0) {
+        return { error: "--url wraps a remote server; drop the command after '--'" };
+    }
+    if (!out.url && out.command.length === 0) {
+        return { error: "wrap needs a server command after '--', or --url <url> for a remote server" };
+    }
+    if (out.url && out.legacyPassthrough) {
+        // The compatibility path must have a command to run.
+        return { error: '--sniff is retired and only passes through a legacy wrapped command; remove it for --url' };
+    }
+    if (!out.url && Object.keys(out.headers).length > 0) {
+        return { error: '--header applies to --url servers only (a stdio server takes env vars)' };
+    }
+    if (out.profile) {
+        process.stderr.write(`[speculate] warning: --profile '${out.profile}' no longer exists and is ignored. ` +
+            `Prediction is learned per server; use a config file's "rules" for hand-written ones.
+`);
+        out.profile = null;
+    }
+    return out;
+}
+export function readWrapSessionMetadata(args, env = process.env) {
+    const socketPath = env.SPECULATE_SESSION_SOCKET;
+    const capability = env.SPECULATE_SESSION_CAPABILITY;
+    const launchId = env.SPECULATE_SESSION_LAUNCH_ID;
+    const hasCoordinates = [socketPath, capability, launchId].some((value) => value !== undefined);
+    if (!args.hostClient && !args.hostServerAlias && !hasCoordinates)
+        return null;
+    if (!args.hostClient || !args.hostServerAlias || !socketPath || !capability || !launchId) {
+        throw new Error('incomplete session bridge metadata');
+    }
+    return {
+        hostClient: args.hostClient,
+        hostServerAlias: args.hostServerAlias,
+        coordinates: { socketPath, capability, launchId },
+    };
+}
+/** Build the in-memory SpeculateConfig for a wrap invocation. */
+export function buildWrapConfig(args, workspace = process.cwd(), oauthScope = 'none') {
+    const ambientCredentialEnv = Object.entries(process.env)
+        .filter((entry) => typeof entry[1] === 'string' && !RESERVED_LAUNCH_ENV.has(entry[0]) &&
+        /token|api_?key|secret|credential|account|tenant/i.test(entry[0]))
+        .sort(([a], [b]) => a.localeCompare(b));
+    const credentialScope = Object.keys(args.headers).length === 0 && ambientCredentialEnv.length === 0
+        ? 'none'
+        : createHash('sha256')
+            .update(JSON.stringify({
+            headers: Object.entries(args.headers).sort(([a], [b]) => a.localeCompare(b)),
+            env: ambientCredentialEnv,
+        }))
+            .digest('hex');
+    // The state key must NEVER carry the headers: it names the on-disk state
+    // file. The URL alone identifies the upstream.
+    const upstream = args.url
+        ? {
+            url: args.url,
+            ...(Object.keys(args.headers).length ? { headers: { ...args.headers } } : {}),
+        }
+        : {
+            command: args.command[0],
+            args: args.command.slice(1),
+            // The SDK's default environment deliberately includes only a small
+            // allowlist. A wrapper must preserve the environment the host gave it,
+            // including credentials and server-specific settings.
+            env: Object.fromEntries(Object.entries(process.env).filter((entry) => typeof entry[1] === 'string' && !RESERVED_LAUNCH_ENV.has(entry[0]))),
+            ...(args.cwd === undefined ? {} : { cwd: resolve(workspace, args.cwd) }),
+        };
+    return {
+        config: {
+            mode: args.mode,
+            maxPredictionsPerTrigger: 3,
+            log: 'stderr',
+            servers: {
+                upstream: {
+                    ...upstream,
+                    ...(args.allow.length ? { allowTools: args.allow } : {}),
+                },
+            },
+        },
+        // v1 keyed only by URL or a space-joined argv. Besides argv collisions,
+        // that mixed memorized entity ids and session openers across unrelated
+        // projects using the same server. v2 is structured and workspace-local.
+        stateKey: `wrap:v2:${JSON.stringify({
+            workspace: resolve(workspace),
+            upstream: args.url ? { url: args.url } : {
+                command: args.command,
+                ...(args.cwd === undefined ? {} : { cwd: resolve(workspace, args.cwd) }),
+            },
+            // Only a one-way scope discriminator is retained. A changed account or
+            // API token starts clean without ever putting a credential in a path.
+            credentialScope,
+            oauthScope,
+        })}`,
+    };
+}

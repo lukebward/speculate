@@ -113,3 +113,6 @@ extra:
     - icon: fontawesome/brands/github
       link: https://github.com/lukebward/speculate
       name: Speculate on GitHub
+    - icon: fontawesome/brands/npm
+      link: https://www.npmjs.com/package/speculate-mcp
+      name: speculate-mcp on npm

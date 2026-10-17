@@ -37,6 +37,7 @@ when the turn that made them ends.
 | `src/cache.ts` | the single-use, short-TTL buffer |
 | `src/tools.ts`, `hookGuard.ts` | eligibility and settings-hook rules |
 | `src/persistence.ts`, `privacy.ts` | the stored memory and its filtering |
+| `dist/src/cli.js` | the npm command: `speculate install`, and 0.x `wrap` compatibility (its path is fixed: 0.x wrote it into registrations) |
 | `mock/`, `eval/` | the mock MCP servers and the offline evaluation |
 
 Architecture, measured results, threat model, and the design history

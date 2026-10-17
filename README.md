@@ -1,5 +1,6 @@
 # Speculate
 
+[![npm](https://img.shields.io/npm/v/speculate-mcp)](https://www.npmjs.com/package/speculate-mcp)
 [![CI](https://github.com/lukebward/speculate/actions/workflows/ci.yml/badge.svg)](https://github.com/lukebward/speculate/actions/workflows/ci.yml)
 [![license](https://img.shields.io/github/license/lukebward/speculate)](LICENSE)
 
@@ -14,18 +15,29 @@ it was.
 
 ## Install
 
-Requires Claude Code 2.1.296 or later, in the terminal:
+Requires Claude Code 2.1.296 or later. In a terminal session:
 
 ```
 /plugin install speculate --marketplace lukebward/speculate
 ```
 
-Answer `y` to add the marketplace and choose the user scope. Speculate starts
-working in that session. It needs no configuration.
+Answer `y` to add the marketplace and choose the user scope. Or install from
+npm (Node.js 18 or later):
 
-Upgrading from the `speculate-mcp` npm package (0.25 or earlier)? Run
-`speculate off` with the old CLI first. That restores the MCP registrations it
-wrapped. Then run `npm uninstall -g speculate-mcp`.
+```bash
+npm install -g speculate-mcp
+speculate install
+```
+
+Either way, Speculate starts working in that session (run `/reload-plugins`
+in one already open) and needs no configuration. With npm, Claude Code runs
+the mod from the installed package, so `npm update -g speculate-mcp` updates
+it.
+
+**Upgrading from 0.x.** Speculate 0.25 and earlier wrapped your MCP server
+registrations in a local proxy. `speculate install` restores them first, using
+0.25's own `off`, and removes 0.x's auto-wrap plugin. Until you run it,
+servers that 0.x wrapped keep working through a plain pass-through.
 
 ## What it does
 

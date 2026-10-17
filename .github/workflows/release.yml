@@ -1,0 +1,68 @@
+name: release
+
+# Publishes to npm when a v* tag is pushed.
+#
+# Authentication is npm trusted publishing (OIDC), so there is no NPM_TOKEN
+# secret to leak or rotate. It requires a one-time setup on npmjs.com:
+# Package settings -> Trusted publishers -> GitHub Actions, naming this
+# repository, this workflow file (release.yml), and the `npm` environment
+# below. OIDC cannot perform a package's FIRST publish, so 0.12.0 was
+# published by hand; every release from then on goes through here.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # required for OIDC auth and provenance
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1; Node 22 ships an older npm.
+      # Pinned to an exact version so this job never runs an npm release
+      # nobody has looked at yet (dependabot does not cover this line).
+      - run: npm install -g npm@12.0.2
+
+      - run: npm ci
+
+      - name: Fail if the tag does not match package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match package.json version $pkg" >&2
+            exit 1
+          fi
+
+      # A version already on the registry is not an error. It happens when a
+      # release is bootstrapped by hand (0.12.0 was), when a tag is pushed
+      # twice, or when a run is retried after a later step failed. Publishing
+      # is the only non-idempotent step here, so it is the only one guarded.
+      - name: Skip if this version is already published
+        id: published
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if npm view "speculate-mcp@$v" version >/dev/null 2>&1; then
+            echo "speculate-mcp@$v is already on the registry; nothing to publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # prepublishOnly would re-run typecheck+test; already done above.
+      - if: steps.published.outputs.skip != 'true'
+        run: npm publish --provenance --ignore-scripts

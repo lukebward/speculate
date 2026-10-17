@@ -667,9 +667,19 @@ unchanged; this release makes no new speedup claim.
 
 Speculate is now a Claude Code mod and supports Claude Code only. Codex
 support, the MCP proxy, server wrapping (`on`, `off`, `sync`, `wrap`), the
-session launcher, the model-API observer, Speculate's own OAuth client, and the
-npm CLI are removed. The mod installs with
-`/plugin install speculate --marketplace lukebward/speculate`.
+session launcher, the model-API observer, and Speculate's own OAuth client are
+removed. The mod installs with
+`/plugin install speculate --marketplace lukebward/speculate`, or from npm:
+`npm install -g speculate-mcp`, then `speculate install`.
+
+The npm package stays an install path. Its one command installs the package
+folder as a plugin marketplace, so npm updates the mod. It also carries 0.x
+users across: it restores wrapped registrations with 0.25.0's own `off` and
+removes the auto-wrap plugin. It keeps answering `wrap` at the path 0.x wrote
+into registrations (`dist/src/cli.js`), as a pass-through to the original
+command, so a server 0.x wrapped does not break between `npm update` and
+`speculate install`. Claude Code's own `claude plugin install <package>@npm`
+form was tried and is not enabled for every account, so it is not documented.
 
 Claude Code 2.1.287 added mods: hooks modules that run inside Claude Code. One
 of them can see each tool call and its result, answer a call without the tool
