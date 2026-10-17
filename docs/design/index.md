@@ -5,7 +5,7 @@
 
 This document preserves the design history; proposals such as vetted profiles
 were later removed. Current behavior is documented in [Commands](../commands.md),
-[Configuration](../configuration.md), and [Safety](../safety.md). Measurement
+[Configuration](https://github.com/lukebward/speculate/blob/v0.25.0/docs/configuration.md) (v0.25), and [Safety](../safety.md). Measurement
 methods and scoped results live in the [benchmark guide](local-learning-benchmark.md).
 
 !!! info "Since v1.0 Speculate is a Claude Code mod"

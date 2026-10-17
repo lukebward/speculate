@@ -204,31 +204,38 @@ export class MemoryCodec {
     const size = (): number => byteLength(state);
     if (size() <= this.maxBytes) return state;
     const learner = state.learner as { transitions: Record<string, unknown>[]; openers: Record<string, unknown>[] };
-    const candidates: Array<{ stamp: number; score: number; key: string; remove: () => void }> = [];
+    // Each candidate carries its own serialized size, so trimming subtracts
+    // instead of re-serializing the whole state after every removal (which
+    // is quadratic, and runs inside a hook's time budget). Array entries are
+    // marked and filtered once at the end for the same reason.
+    const candidates: Array<{ stamp: number; score: number; key: string; bytes: number; remove: () => void }> = [];
+    const dropped = new Set<Record<string, unknown>>();
     learner.transitions.forEach((item) => candidates.push({
       stamp: numeric(item['lastUpdated']), score: numeric(item['score']) || numeric(item['count']),
       key: `transition:${String(item['server'])}:${String(item['prevTool'])}:${String(item['nextTool'])}`,
-      remove: () => { const index = learner.transitions.indexOf(item); if (index >= 0) learner.transitions.splice(index, 1); },
+      bytes: byteLength(item), remove: () => { dropped.add(item); },
     }));
     learner.openers.forEach((item, index) => candidates.push({
       stamp: numeric(item['lastUpdated']), score: numeric(item['score']) || numeric(item['count']),
       key: `opener:${String(item['server'])}:${String(item['tool'])}:${index}`,
-      remove: () => { const at = learner.openers.indexOf(item); if (at >= 0) learner.openers.splice(at, 1); },
+      bytes: byteLength(item), remove: () => { dropped.add(item); },
     }));
     for (const [key, value] of Object.entries(state.ruleFeedback)) candidates.push({
       stamp: value.lastUpdated ?? state.savedAt, score: value.hits + value.speculated,
-      key: `feedback:${key}`, remove: () => { delete state.ruleFeedback[key]; },
+      key: `feedback:${key}`, bytes: byteLength(key) + byteLength(value),
+      remove: () => { delete state.ruleFeedback[key]; },
     });
     for (const [key, value] of Object.entries(state.candidateFeedback ?? {})) candidates.push({
       stamp: value.lastUpdated, score: value.evaluated,
-      key: `candidate:${key}`, remove: () => { delete state.candidateFeedback?.[key]; },
+      key: `candidate:${key}`, bytes: byteLength(key) + byteLength(value),
+      remove: () => { delete state.candidateFeedback?.[key]; },
     });
     // A tool fact is cheap and re-learned on the tool's next real call, so it
     // goes before anything with evidence behind it, least recently seen first.
     for (const [server, byTool] of Object.entries(state.tools ?? {})) {
       for (const [tool, fact] of Object.entries(byTool)) candidates.push({
         stamp: fact.lastSeen, score: 0,
-        key: `tool:${server}:${tool}`,
+        key: `tool:${server}:${tool}`, bytes: byteLength(tool) + byteLength(fact),
         remove: () => {
           const tools = state.tools;
           if (!tools?.[server]) return;
@@ -238,12 +245,28 @@ export class MemoryCodec {
       });
     }
     candidates.sort((a, b) => a.score - b.score || a.stamp - b.stamp || a.key.localeCompare(b.key));
-    // Removal closures find the same object again after earlier array removals.
+    // `estimate` never falls below the true size: removing an entry shrinks
+    // the JSON by at least the entry's own bytes. So stopping only once the
+    // exact size confirms it never stops early.
+    let estimate = size();
     for (const candidate of candidates) {
-      if (size() <= this.maxBytes) break;
+      if (estimate <= this.maxBytes) {
+        if (dropped.size > 0) {
+          learner.transitions = learner.transitions.filter((item) => !dropped.has(item));
+          learner.openers = learner.openers.filter((item) => !dropped.has(item));
+          dropped.clear();
+        }
+        estimate = size();
+        if (estimate <= this.maxBytes) break;
+      }
       candidate.remove();
+      estimate -= candidate.bytes;
       this.diagnostics.trimmedForSize++;
       if (state.memory) state.memory.trimmedForSize++;
+    }
+    if (dropped.size > 0) {
+      learner.transitions = learner.transitions.filter((item) => !dropped.has(item));
+      learner.openers = learner.openers.filter((item) => !dropped.has(item));
     }
     // Latency is useful but optional; if all prediction entities were not enough,
     // discard it as one deterministic block before falling back to empty memory.

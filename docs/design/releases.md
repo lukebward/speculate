@@ -478,7 +478,7 @@ CLI compatibility passed.
 installation/status, protocol sniffing, and `speculate try` are retired. Old
 `wrap --sniff` invocations now pass through immediately without speculation.
 Existing shim users can run `speculate shims uninstall`, restart their shell, and switch
-to an explicit wrapper configuration. The [migration guide](../getting-started.md#upgrading-from-retired-launch-paths)
+to an explicit wrapper configuration. The [migration guide](https://github.com/lukebward/speculate/blob/v0.25.0/docs/getting-started.md#upgrading-from-retired-launch-paths)
 includes saved commands and how to evaluate and undo normal activation.
 
 The trial command's zero-write promise did not match its behavior: it wrote a
@@ -546,7 +546,7 @@ and custom OAuth settings are skipped. Hosted plugin/app tools are outside
 local MCP wrapping. Speculate uses its own OAuth login through
 `auth --client codex`. No Codex hook is installed: rerun `on --client codex` or
 `sync --client codex` after adding servers. See the
-[Codex setup guide](../getting-started.md#codex) for scope and recovery behavior.
+[Codex setup guide](https://github.com/lukebward/speculate/blob/v0.25.0/docs/getting-started.md#codex) for scope and recovery behavior.
 
 Session-only `--profile` and `-c` overrides in another Codex process are not
 visible to these checks. Sessions relying on those MCP restrictions require
@@ -614,8 +614,8 @@ The observer remains experimental. The original 1,000-record replay failed its
 speedup and waste gates. A later 60-record synthetic diagnostic showed a warm
 cross-server benefit under fixed timing, but neither that result nor this
 package release establishes native day-to-day speedup. See
-[Observer results](../observer-results.md) and
-[Observer compatibility](../observer-compatibility.md) for evidence and limits.
+[Observer results](https://github.com/lukebward/speculate/blob/v0.25.0/docs/observer-results.md) and
+[Observer compatibility](https://github.com/lukebward/speculate/blob/v0.25.0/docs/observer-compatibility.md) for evidence and limits.
 
 ## v0.24.0 (2026-09-15): context-aware launch by default
 
