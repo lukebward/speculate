@@ -726,3 +726,25 @@ server, about 3.1 s of a 1.5 s-per-call mock saved), with one wasted prefetch.
 A PreToolUse hook denying the tool stopped both the prefetch and the served
 answer. This is a mock with injected latency; it shows the mechanism, not a
 speedup on real servers.
+
+## Unreleased (after v1.0.0)
+
+On `main`, not yet tagged or published. Reasons and limits are in
+[§13.30](implementation-notes.md#1330-what-the-mod-can-see-that-the-proxy-could-not-2026-11-15).
+
+- A built-in tool call that Claude Code does not report read-only (a shell
+  command, a file edit) discards everything prefetched, on every server.
+  `TodoWrite`, `TaskCreate` and `TaskUpdate` are exempt.
+- An in-flight prefetch is joined only if the tool's learned latency says it
+  can land within the wait the hook can afford. A slower read runs as a normal
+  call instead of waiting out the hook's budget first.
+- Where the host runs claimed calls without asking the mod's PreToolUse hook
+  (managed settings), speculation stops itself after two in a row, and
+  `/speculate` reports it.
+- A read the agent is already making in parallel, made while the trigger ran,
+  or that is a repeat of the trigger itself is not prefetched. The ordering
+  behind that rule no longer depends on the clock.
+- The release workflow now runs the mod's own tests before publishing, and CI
+  also runs them against the latest Claude Code without blocking on it.
+
+No new measurement accompanies these changes.

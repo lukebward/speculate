@@ -41,6 +41,22 @@ interface QueuedPrediction {
   p: Prediction;
   io: SpeculationIo;
   queuedAt: number;
+  trigger: number;
+}
+
+interface IssueOptions {
+  queueOnBusy: boolean;
+  /** Where the call that led to this prediction started, in the order of the agent's calls. */
+  trigger: number;
+}
+
+/** One of the agent's own calls. `started` and `finished` are places in the order of its calls. */
+interface AgentCall {
+  server: string;
+  started: number;
+  finished?: number;
+  /** Clock time it finished, for forgetting old calls only. */
+  finishedAt?: number;
 }
 
 export function looksLikeAuthError(text: string): boolean {
@@ -67,6 +83,13 @@ export class SpeculationExecutor {
   private readonly draining = new Set<string>();
   private readonly invalidationRevisions = new Map<string, number>();
   private readonly nextSupersessionRevisions = new Map<string, number>();
+  /** The agent's own calls this session, by key (see realStarted). */
+  private readonly agentCalls = new Map<string, AgentCall>();
+  /**
+   * Counts the starts and finishes of the agent's calls, to order them. A
+   * clock cannot: a call can finish in the very millisecond the next starts.
+   */
+  private order = 0;
   private lifecycleRevision = 0;
 
   constructor(
@@ -80,11 +103,68 @@ export class SpeculationExecutor {
     },
   ) {}
 
-  /** Fire-and-forget: never throws, never blocks the caller. */
-  submit(predictions: Prediction[], io: SpeculationIo, opts: { queueOnBusy?: boolean } = {}): void {
+  /**
+   * Fire-and-forget: never throws, never blocks the caller. `trigger` is
+   * what realFinished returned for the call these predictions follow
+   * (default: they follow everything the agent has done so far).
+   */
+  submit(
+    predictions: Prediction[],
+    io: SpeculationIo,
+    opts: { queueOnBusy?: boolean; trigger?: number } = {},
+  ): void {
+    const trigger = opts.trigger ?? this.order;
     for (const p of predictions) {
-      void this.authorizeAndIssue(p, io, { queueOnBusy: opts.queueOnBusy !== false });
+      void this.authorizeAndIssue(p, io, { queueOnBusy: opts.queueOnBusy !== false, trigger });
     }
+  }
+
+  /**
+   * The agent is making this exact call itself. Models often issue sibling
+   * calls in parallel, so a prediction made after one call can name another
+   * that is already running, or that ran while the trigger did: the agent
+   * has its answer and will not ask again, so prefetching it is pure waste.
+   * A prediction is dropped when the agent's own call with its key is still
+   * running or finished after the prediction's trigger started. One that
+   * finished before is a repeat read a prefetch can still serve.
+   *
+   * The trigger is itself such a call: it finished after it started, so a
+   * prediction that repeats its own trigger is never prefetched. An agent
+   * that asks the same thing twice running (a poll) wants an answer newer
+   * than one fetched the moment the first came back.
+   */
+  realStarted(server: string, key: string): void {
+    const now = (this.deps.now ?? Date.now)();
+    this.agentCalls.set(key, { server, started: ++this.order });
+    if (this.agentCalls.size > 256) {
+      const ttl = this.deps.ttlMs ?? DEFAULT_TTL_MS;
+      for (const [k, c] of this.agentCalls) {
+        if (c.finishedAt !== undefined && now - c.finishedAt > ttl) this.agentCalls.delete(k);
+      }
+    }
+  }
+
+  /**
+   * The agent's call with this key settled. Returns where it started in the
+   * order of the agent's calls: the `trigger` of the predictions it leads to.
+   */
+  realFinished(key: string): number | undefined {
+    const call = this.agentCalls.get(key);
+    if (!call) return undefined;
+    call.finished = ++this.order;
+    call.finishedAt = (this.deps.now ?? Date.now)();
+    return call.started;
+  }
+
+  private calledByAgent(p: Prediction, trigger: number): boolean {
+    let key: string;
+    try {
+      key = p.key ?? canonicalKey(p.server, p.tool, p.args);
+    } catch {
+      return false; // tryIssue reports the unkeyable prediction
+    }
+    const call = this.agentCalls.get(key);
+    return call !== undefined && (call.finished === undefined || call.finished > trigger);
   }
 
   /**
@@ -119,6 +199,7 @@ export class SpeculationExecutor {
    */
   abandonPending(): number {
     this.lifecycleRevision++;
+    this.agentCalls.clear();
     let dropped = 0;
     for (const queue of this.pending.values()) {
       for (const { p } of queue) {
@@ -132,6 +213,8 @@ export class SpeculationExecutor {
 
   invalidatePending(server: string): number {
     this.invalidationRevisions.set(server, (this.invalidationRevisions.get(server) ?? 0) + 1);
+    // After a possible write, the same read again is a new read.
+    for (const [key, call] of this.agentCalls) if (call.server === server) this.agentCalls.delete(key);
     const queue = this.pending.get(server);
     if (!queue?.length) return 0;
     for (const { p } of queue) this.suppress(p, 'cache-invalidation');
@@ -155,7 +238,7 @@ export class SpeculationExecutor {
   private tryIssue(
     p: Prediction,
     io: SpeculationIo,
-    opts: { queueOnBusy: boolean },
+    opts: IssueOptions,
   ): 'issued' | 'dropped' | 'busy' {
     const { cache, tools, budget, metrics } = this.deps;
     const now = this.deps.now ?? Date.now;
@@ -177,6 +260,10 @@ export class SpeculationExecutor {
       this.suppress(p, 'dedup');
       return 'dropped';
     }
+    if (this.calledByAgent(p, opts.trigger)) {
+      this.suppress(p, 'already-called');
+      return 'dropped';
+    }
 
     const b = budget.tryAcquire(p.server);
     if (!b.ok) {
@@ -184,7 +271,7 @@ export class SpeculationExecutor {
       // on any event we see, so queuing them would defeat the budget.
       const isBusy = b.reason === 'stdio-busy' || b.reason === 'concurrency';
       if (isBusy && opts.queueOnBusy) {
-        this.enqueue(p, io);
+        this.enqueue(p, io, opts.trigger);
         return 'busy';
       }
       if (isBusy) return 'busy';
@@ -263,7 +350,7 @@ export class SpeculationExecutor {
   private async authorizeAndIssue(
     p: Prediction,
     io: SpeculationIo,
-    opts: { queueOnBusy: boolean },
+    opts: IssueOptions,
   ): Promise<void> {
     const lifecycleRevision = this.lifecycleRevision;
     const invalidationRevision = this.invalidationRevisions.get(p.server) ?? 0;
@@ -273,6 +360,10 @@ export class SpeculationExecutor {
     const decision = this.deps.tools.eligibility(p.server, p.tool);
     if (!decision.eligible) {
       this.suppress(p, `policy:${decision.reason}`);
+      return;
+    }
+    if (this.calledByAgent(p, opts.trigger)) {
+      this.suppress(p, 'already-called');
       return;
     }
     const allowed = await this.authorize(p, io);
@@ -334,7 +425,7 @@ export class SpeculationExecutor {
           this.suppress(head.p, 'host-permission');
           continue;
         }
-        const outcome = this.tryIssue(head.p, io, { queueOnBusy: false });
+        const outcome = this.tryIssue(head.p, io, { queueOnBusy: false, trigger: head.trigger });
         if (outcome === 'busy') return;
         queue.shift();
       }
@@ -345,7 +436,7 @@ export class SpeculationExecutor {
     }
   }
 
-  private enqueue(p: Prediction, io: SpeculationIo): void {
+  private enqueue(p: Prediction, io: SpeculationIo, trigger: number): void {
     const now = this.deps.now ?? Date.now;
     let queue = this.pending.get(p.server);
     if (!queue) {
@@ -354,7 +445,7 @@ export class SpeculationExecutor {
     }
     // Highest-confidence predictions fire first when the slot frees.
     const at = queue.findIndex((q) => q.p.confidence < p.confidence);
-    const item = { p, io, queuedAt: now() };
+    const item = { p, io, queuedAt: now(), trigger };
     if (at === -1) queue.push(item);
     else queue.splice(at, 0, item);
     while (queue.length > QUEUE_MAX_LENGTH) {

@@ -56,8 +56,11 @@ any other call, so an audit hook sees every request that actually reached a
 server.
 
 Where an organization manages Claude Code, installed plugins cannot hook
-PreToolUse. Speculate then never answers a call: every call runs as usual. It
-still learns, and its prefetches still run through the same checks.
+PreToolUse. Speculate then never answers a call: every call runs as usual. A
+prefetch it can never use is only an extra upstream call, so once two calls in
+a row that it held an answer for have run for real without its PreToolUse hook
+being asked, it stops prefetching and learning for the rest of the session.
+`/speculate` reports that it is off, and why.
 
 ## Hard rules
 
@@ -71,6 +74,14 @@ still learns, and its prefetches still run through the same checks.
 - **Writes flush.** Any call to a server that does not come back read-only,
   including one that failed, discards everything prefetched from that server
   and cancels what was queued.
+- **Writes outside MCP flush everything.** A shell command or a file edit can
+  change what any server would return. When a built-in tool call settles
+  without Claude Code reporting it read-only, including one that failed or was
+  interrupted, everything prefetched from every server is discarded. The
+  agent's own task-list tools (`TodoWrite`, `TaskCreate`, `TaskUpdate`) are the
+  exception: they change nothing outside the session. A write that does not go
+  through Claude Code at all (a teammate, another terminal) is still invisible;
+  the 30 seconds bound it.
 - **Auth errors suspend.** A prefetch that fails with an authorization error is
   not kept, and the tool is not prefetched again until a real call to it
   succeeds.

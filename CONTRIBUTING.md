@@ -35,7 +35,7 @@ when the turn that made them ends.
 | `src/executor.ts`, `budget.ts` | prefetching, the drain queue, limits |
 | `src/predictor.ts`, `learner.ts`, `priming.ts`, `intent.ts` | prediction |
 | `src/cache.ts` | the single-use, short-TTL buffer |
-| `src/tools.ts`, `hookGuard.ts` | eligibility and settings-hook rules |
+| `src/tools.ts`, `hookGuard.ts`, `sideEffects.ts` | eligibility, settings-hook rules, and which built-in calls flush |
 | `src/persistence.ts`, `privacy.ts` | the stored memory and its filtering |
 | `dist/src/cli.js` | the npm command: `speculate install`, and 0.x `wrap` compatibility (its path is fixed: 0.x wrote it into registrations) |
 | `mock/`, `eval/` | the mock MCP servers and the offline evaluation |

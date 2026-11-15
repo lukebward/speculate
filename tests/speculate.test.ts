@@ -36,6 +36,12 @@ const TOOLS: Record<string, Fixture> = {
   },
 }
 
+/** Built-in tools the model calls between its MCP reads, and the host's verdict on each. */
+const BUILTINS: Record<string, { readOnly: boolean }> = {
+  Bash: { readOnly: false },
+  Read: { readOnly: true },
+}
+
 interface Upstream {
   tool: string
   args: Args
@@ -68,7 +74,7 @@ function world(on: On, options: WorldOptions = {}) {
   on('store.keys', async () => ({ value: [...store.keys()] }))
   on('ui.status', async () => ({ value: undefined }) as never)
   const upstream: Upstream[] = []
-  const allow = new Set(options.allow ?? Object.keys(TOOLS))
+  const allow = new Set(options.allow ?? [...Object.keys(TOOLS), ...Object.keys(BUILTINS)])
   const deny = denyPre
 
   const run = async (tool: string, args: Args) => {
@@ -81,9 +87,15 @@ function world(on: On, options: WorldOptions = {}) {
     deny.has(String(e.tool)) ? { deny: 'a settings hook refused it' } : next(e))
   on('tool.call', async ($, e, next) => {
     const { tool, tool_use_id: _id, ...args } = e as unknown as { tool: string; tool_use_id: string } & Args
+    const by = next.origin.plugin === 'engine' ? 'model' : 'plugin'
+    const builtin = BUILTINS[tool]
+    if (builtin) {
+      upstream.push({ tool, args, by })
+      return (builtin.readOnly ? { result: {}, text: 'ok', isReadOnly: true } : { result: {}, text: 'ok' }) as never
+    }
     const fixture = TOOLS[tool]
     if (!fixture) return next(e)
-    upstream.push({ tool, args, by: next.origin.plugin === 'engine' ? 'model' : 'plugin' })
+    upstream.push({ tool, args, by })
     const content = await run(tool, args)
     return (fixture.readOnly
       ? { result: content, text: content[0]!.text, isReadOnly: true }
@@ -103,7 +115,7 @@ function world(on: On, options: WorldOptions = {}) {
   on('prompt.submit', async ($, e) => ({ text: e.text }))
   on('command.register', async () => ({ value: undefined }) as never)
 
-  return { clock, upstream, store }
+  return { clock, upstream, store, allow }
 }
 
 type Kit = Parameters<Parameters<typeof test>[1] extends infer B ? B extends (...a: infer P) => unknown ? (...a: P) => unknown : never : never>[0]
@@ -166,13 +178,26 @@ test('learns a list-then-get chain and serves the get from a prefetch', { timeou
   expect(upstream.some(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue')).toBe(true)
 })
 
-test('never prefetches a tool the person has not allowed', { timeoutMs: 20_000 }, async ($, on) => {
-  const { clock, upstream } = world(on, { allow: ['mcp__gh__list_issues'] })
+test('never prefetches a call the person does not allow', { timeoutMs: 20_000 }, async ($, on) => {
+  const { clock, upstream, allow } = world(on)
+  const prefetchedGets = () => upstream.filter(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue').length
   await startSession($, clock)
-  await learnChain($, clock, 4)
-  expect(upstream.filter(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue')).toEqual([])
-  // The allowed read in the same chain is still prefetched.
-  expect(upstream.some(u => u.by === 'plugin' && u.tool === 'mcp__gh__list_issues')).toBe(true)
+
+  // While the get is allowed, the chain is learned and the get is prefetched,
+  // then used, so nothing prefetched is left standing.
+  await learnChain($, clock)
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  await call($, clock, 'mcp__gh__get_issue', GET_42)
+  const whileAllowed = prefetchedGets()
+  expect(whileAllowed).toBeGreaterThan(0)
+
+  // The person's settings change: the get would now ask. The same list still
+  // predicts it, and the prediction starts nothing.
+  allow.delete('mcp__gh__get_issue')
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  expect(prefetchedGets()).toBe(whileAllowed)
 })
 
 test('a PreToolUse hook that refuses the call wins over a prefetched result', { timeoutMs: 20_000 }, async ($, on) => {
@@ -202,6 +227,36 @@ test('a call that may write clears what was prefetched', { timeoutMs: 20_000 }, 
   const before = upstream.length
   await call($, clock, 'mcp__gh__get_issue', GET_42)
   expect(upstream.slice(before).filter(u => u.by === 'model').map(u => u.tool)).toEqual(['mcp__gh__get_issue'])
+})
+
+test('a shell command that may write clears what was prefetched', { timeoutMs: 20_000 }, async ($, on) => {
+  const { clock, upstream } = world(on)
+  await startSession($, clock)
+  await learnChain($, clock)
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  expect(upstream.at(-1)).toEqual({ tool: 'mcp__gh__get_issue', args: GET_42, by: 'plugin' })
+  // The shell reaches the same service by another road: the prefetched issue may be stale.
+  await call($, clock, 'Bash', { command: 'gh issue edit 42 --title Renamed' })
+
+  const before = upstream.length
+  await call($, clock, 'mcp__gh__get_issue', GET_42)
+  expect(upstream.slice(before).filter(u => u.by === 'model').map(u => u.tool)).toEqual(['mcp__gh__get_issue'])
+})
+
+test('a built-in call the host holds read-only leaves what was prefetched', { timeoutMs: 20_000 }, async ($, on) => {
+  const { clock, upstream } = world(on)
+  await startSession($, clock)
+  await learnChain($, clock)
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  expect(upstream.at(-1)).toEqual({ tool: 'mcp__gh__get_issue', args: GET_42, by: 'plugin' })
+  await call($, clock, 'Read', { file_path: '/work/README.md' })
+
+  const before = upstream.length
+  const got = await call($, clock, 'mcp__gh__get_issue', GET_42)
+  expect(JSON.parse(got.text).title).toBe('Rate limiter drops burst traffic')
+  expect(upstream.slice(before).filter(u => u.by === 'model')).toEqual([])
 })
 
 test('a PostToolUse hook written for a tool keeps that tool out of speculation', { timeoutMs: 20_000 }, async ($, on) => {

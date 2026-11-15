@@ -7,9 +7,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   addUsage,
+  CLAIM_BYPASSED,
   mcpToolName,
   parseMcpToolName,
   Speculator,
+  unservedReason,
   type RealOutcome,
   type SpeculationIo,
 } from '../src/speculator.js';
@@ -140,6 +142,76 @@ describe('serve', () => {
     expect(stats(h.spec).speculativeCalls).toBe(1);
   });
 
+  /** Teaches LIST -> GET, then runs LIST and GET as parallel calls. */
+  async function parallelPair(h: ReturnType<typeof harness>, getSettlesFirst: boolean) {
+    await h.real(LIST);
+    await h.real(GET);
+    await h.real(LIST);
+    await h.real(GET);
+    h.io.calls.length = 0;
+    expect(await h.spec.serve(S, LIST, ARGS, h.io)).toBeNull();
+    const listStarted = h.spec.beginReal(S);
+    expect(await h.spec.serve(S, GET, ARGS, h.io)).toBeNull();
+    const getStarted = h.spec.beginReal(S);
+    h.advance(400);
+    const done = (tool: string, started: { mayWaitBehindSpeculation: boolean }) =>
+      h.spec.observe(S, tool, ARGS, h.outcome(text({ tool, ...ARGS })), h.io, started);
+    if (getSettlesFirst) done(GET, getStarted);
+    done(LIST, listStarted);
+    await settle();
+    return () => done(GET, getStarted);
+  }
+
+  it('never prefetches a call the agent is already making in parallel', async () => {
+    const h = harness();
+    const finishGet = await parallelPair(h, false);
+    expect(h.io.calls.filter((c) => c.tool === GET)).toEqual([]);
+    finishGet();
+    await settle();
+    expect(stats(h.spec).speculativeCalls).toBe(0);
+  });
+
+  it('never prefetches a call the agent made while the trigger ran', async () => {
+    const h = harness();
+    await parallelPair(h, true);
+    expect(h.io.calls.filter((c) => c.tool === GET)).toEqual([]);
+    expect(stats(h.spec).speculativeCalls).toBe(0);
+  });
+
+  it('still prefetches a repeat of a call that finished before the trigger', async () => {
+    const h = harness();
+    await h.warm(); // GET ran, then LIST started: GET again is a new read
+    expect(h.io.calls.map((c) => c.tool)).toEqual([GET]);
+  });
+
+  it('still prefetches a repeat read when its trigger started in the same clock tick it finished', async () => {
+    const h = harness();
+    await h.real(LIST);
+    await h.real(GET);
+    await h.real(LIST);
+    // The second GET settles and the next LIST starts with no time between.
+    expect(await h.spec.serve(S, GET, ARGS, h.io)).toBeNull();
+    const getStarted = h.spec.beginReal(S);
+    h.advance(400);
+    h.spec.observe(S, GET, ARGS, h.outcome(text({ tool: GET, ...ARGS })), h.io, getStarted);
+    await settle();
+    h.io.calls.length = 0;
+    await h.real(LIST);
+    expect(h.io.calls.map((c) => c.tool)).toEqual([GET]);
+  });
+
+  it('never prefetches a repeat of the very call that triggered the prediction', async () => {
+    const h = harness();
+    // LIST -> LIST, as a poll does: the agent holds the answer it just got,
+    // and asks again only to see something newer than a prefetch made now.
+    await h.real(LIST);
+    await h.real(LIST);
+    await h.real(LIST);
+    await h.real(LIST);
+    expect(h.io.calls).toEqual([]);
+    expect(stats(h.spec).suppressed['already-called']).toBeGreaterThan(0);
+  });
+
   it('serves a hit for a real call with the same args, and commit records it', async () => {
     const h = harness();
     await h.warm();
@@ -195,6 +267,44 @@ describe('serve', () => {
     const claim = await h.spec.serve(S, GET, ARGS, h.io, Promise.resolve());
     expect(claim).toBeNull();
     expect(stats(h.spec).perServer[S]!.specErrors).toBe(1);
+  });
+
+  /** GET really takes 20 s; a LIST has just started a prefetch of it. */
+  async function slowPrefetchInFlight() {
+    const h = harness();
+    await h.real(LIST);
+    await h.real(GET, ARGS, { latencyMs: 20_000 });
+    await h.real(LIST);
+    await h.real(GET, ARGS, { latencyMs: 20_000 });
+    h.io.auto = false;
+    h.io.calls.length = 0;
+    await h.real(LIST);
+    expect(h.io.calls.map((c) => c.tool)).toEqual([GET]);
+    return h;
+  }
+
+  it('does not join a prefetch that cannot land within the wait the caller can afford', async () => {
+    const h = await slowPrefetchInFlight();
+    h.advance(3_000); // about 17 s of the 20 s still to go; the caller can wait 8.5 s
+
+    const outcome = await Promise.race([
+      h.spec.serve(S, GET, ARGS, h.io, new Promise(() => {}), 8_500),
+      settle().then(() => 'still waiting'),
+    ]);
+    expect(outcome).toBeNull();
+    expect(stats(h.spec).wasted).toBe(1);
+    expect(stats(h.spec).joins).toBe(0);
+  });
+
+  it('joins a slow prefetch that is far enough along to land in time', async () => {
+    const h = await slowPrefetchInFlight();
+    h.advance(15_000); // about 5 s to go, inside the 8.5 s the caller can wait
+
+    const pending = h.spec.serve(S, GET, ARGS, h.io, new Promise(() => {}), 8_500);
+    await settle();
+    h.io.calls[0]!.resolve();
+    const claim = await pending;
+    expect(claim?.source).toBe('joined');
   });
 
   it('discard records waste rather than a hit', async () => {
@@ -255,6 +365,43 @@ describe('observe', () => {
     await h.warm();
     h.spec.observe('linear', 'create_issue', {}, h.outcome(text({}), { isReadOnly: false }), h.io);
     expect(h.spec.cache.size().ready).toBe(1);
+  });
+
+  it('a write outside MCP discards what was prefetched from every server', async () => {
+    const h = harness();
+    for (const server of [S, 'linear']) {
+      await h.real(LIST, ARGS, {}, server);
+      await h.real(GET, ARGS, {}, server);
+      await h.real(LIST, ARGS, {}, server);
+      await h.real(GET, ARGS, {}, server);
+    }
+    await h.real(LIST, ARGS, {}, S);
+    await h.real(LIST, ARGS, {}, 'linear');
+    expect(h.spec.cache.size().ready).toBe(2);
+
+    h.spec.externalWrite();
+    expect(h.spec.cache.size()).toEqual({ ready: 0, inFlight: 0 });
+    expect(stats(h.spec).invalidated).toBe(2);
+    expect(await h.spec.serve(S, GET, ARGS, h.io)).toBeNull();
+    expect(await h.spec.serve('linear', GET, ARGS, h.io)).toBeNull();
+  });
+
+  it('a write outside MCP cancels a prefetch still waiting on its permission check', async () => {
+    const h = harness();
+    await h.real(LIST);
+    await h.real(GET);
+    await h.real(LIST);
+    await h.real(GET);
+    h.io.calls.length = 0;
+    let answer: (allowed: boolean) => void = () => {};
+    h.io.authorize = () => new Promise<boolean>((resolve) => (answer = resolve));
+    await h.real(LIST); // predicts GET, which now waits on the permission check
+
+    h.spec.externalWrite();
+    answer(true);
+    await settle();
+    expect(h.io.calls).toEqual([]);
+    expect(stats(h.spec).suppressed['cache-invalidation']).toBe(1);
   });
 
   it('an error without isReadOnly keeps the verdict but still invalidates', async () => {
@@ -446,6 +593,74 @@ describe("mode 'off'", () => {
     expect(h.spec.sessionStart([mcpToolName(S, GET)], h.io)).toBe(0);
     expect(stats(h.spec).speculativeCalls).toBe(0);
     expect(stats(h.spec).misses).toBe(0);
+  });
+});
+
+// --- a host that never lets a claim answer ------------------------------------------
+
+describe('a host that runs claimed calls without asking the mod', () => {
+  /**
+   * One call by the agent on a host that runs it for real whether or not a
+   * prefetched result was claimed for it. Returns whether one was.
+   */
+  async function ranAnyway(h: ReturnType<typeof harness>, tool: string, reason: string) {
+    const claim = await h.spec.serve(S, tool, ARGS, h.io);
+    const started = h.spec.beginReal(S);
+    claim?.discard(reason);
+    h.advance(400);
+    h.spec.observe(S, tool, ARGS, h.outcome(text({ tool, ...ARGS })), h.io, started);
+    h.advance(100);
+    await settle();
+    return claim !== null;
+  }
+
+  it('stops speculating once two claims in a row ran without its PreToolUse hook being asked', async () => {
+    const h = harness();
+    await h.warm(); // GET is prefetched; each call below prefetches the other
+    expect(await ranAnyway(h, GET, CLAIM_BYPASSED)).toBe(true);
+    expect(h.spec.enabled).toBe(true); // one alone could be another plugin's doing
+    expect(stats(h.spec).halted).toBeNull();
+
+    expect(await ranAnyway(h, LIST, CLAIM_BYPASSED)).toBe(true);
+    expect(h.spec.enabled).toBe(false);
+    expect(stats(h.spec).halted).toBe(CLAIM_BYPASSED);
+    // Off means off: nothing left standing, nothing new started, nothing served.
+    expect(h.spec.cache.size()).toEqual({ ready: 0, inFlight: 0 });
+    const prefetches = h.io.calls.length;
+    await h.real(GET);
+    await h.real(LIST);
+    expect(h.io.calls).toHaveLength(prefetches);
+    expect(await h.spec.serve(S, GET, ARGS, h.io)).toBeNull();
+  });
+
+  it('keeps speculating when a served call comes between two such claims', async () => {
+    const h = harness();
+    await h.warm();
+    expect(await ranAnyway(h, GET, CLAIM_BYPASSED)).toBe(true);
+    expect(await h.real(LIST)).not.toBeNull(); // claimed and answered: the host does ask
+    expect(await ranAnyway(h, GET, CLAIM_BYPASSED)).toBe(true);
+    expect(h.spec.enabled).toBe(true);
+  });
+
+  it('keeps speculating when the PreToolUse hooks it was asked about turned the claims down', async () => {
+    const h = harness();
+    await h.warm();
+    expect(await ranAnyway(h, GET, 'tool-hooks')).toBe(true);
+    expect(await ranAnyway(h, LIST, 'tool-hooks')).toBe(true);
+    expect(await ranAnyway(h, GET, 'tool-hooks')).toBe(true);
+    expect(h.spec.enabled).toBe(true);
+  });
+});
+
+describe('unservedReason', () => {
+  const ran = { result: [], text: 'ok' };
+  it.each([
+    ['its hook was asked and the hooks beneath decided otherwise', true, ran, 'tool-hooks'],
+    ['its hook was never asked and the tool ran', false, ran, CLAIM_BYPASSED],
+    ['its hook was never asked because a hook above refused the call', false, { result: [], text: 'no', isError: true }, 'tool-hooks'],
+    ['its hook was never asked because the call was denied', false, { deny: 'no' }, 'tool-hooks'],
+  ] as Array<[string, boolean, Record<string, unknown>, string]>)('%s', (_what, asked, outcome, expected) => {
+    expect(unservedReason(asked, outcome)).toBe(expected);
   });
 });
 

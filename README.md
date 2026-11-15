@@ -74,7 +74,9 @@ everything Speculate has learned.
 - **Exact bytes, once, briefly.** A served result is exactly what the server
   returned for that call. It is used at most once and kept for at most 30
   seconds, in memory only. Any call that is not read-only flushes everything
-  prefetched from that server.
+  prefetched from that server. A shell command, a file edit, or any other
+  built-in call that Claude Code does not report read-only flushes everything
+  prefetched from every server.
 
 See [safety and storage](https://lukebward.github.io/speculate/safety/) for the
 full rules and what is stored on disk.
@@ -87,8 +89,12 @@ full rules and what is stored on disk.
   run for the prefetch that produced it. A PostToolUse hook whose matcher names
   a specific tool keeps that tool out of speculation entirely.
 - Where an organization manages Claude Code, installed plugins cannot hook
-  PreToolUse. Speculate then still prefetches and learns, but it never answers
-  a call. Every call runs as usual.
+  PreToolUse, so Speculate can never answer a call. Once two calls in a row
+  that it held an answer for have run anyway, it turns itself off for the
+  session, and `/speculate` says so. Every call runs as usual.
+- A prefetch still in flight when the model asks is waited for only if the
+  tool's usual latency says it will land within about eight seconds. A slower
+  read is left to run as a normal call.
 - An unused prefetch is an extra upstream read. It costs server time and may
   cost quota. `/speculate` shows the waste, so you can see whether Speculate
   pays for itself in your workflow.

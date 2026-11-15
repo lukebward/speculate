@@ -12,9 +12,10 @@
  * speculator as a closure (SpeculationIo). The speculator itself is pure.
  */
 import type { Register } from 'claude-code'
-import { addUsage, mcpToolName, parseMcpToolName, Speculator, type SpeculationIo } from '../src/speculator.js'
+import { addUsage, mcpToolName, parseMcpToolName, Speculator, unservedReason, type SpeculationIo } from '../src/speculator.js'
 import { MemoryCodec } from '../src/persistence.js'
 import { settingsToolWatch } from '../src/hookGuard.js'
+import { mayWriteOutside } from '../src/sideEffects.js'
 import { formatReport } from '../src/report.js'
 import type { ToolResult } from '../src/types.js'
 
@@ -44,6 +45,8 @@ export const register: Register = on => {
   let saving: Promise<void> = Promise.resolve()
   /** tool_use_ids of calls a prefetched result is waiting to answer. */
   const claimed = new Set<string>()
+  /** Those of them this mod's PreToolUse hook has been asked about. */
+  const asked = new Set<string>()
 
   const persist = (store: Store): Promise<void> => {
     saving = saving.then(async () => {
@@ -103,6 +106,7 @@ export const register: Register = on => {
   // runs, and the tool.call hook answers with the claimed result. When they
   // deny, ask, or rewrite it, the call goes on exactly as it would have.
   on('classic.PreToolUse', async ($, e, next) => {
+    if (claimed.has(e.tool_use_id)) asked.add(e.tool_use_id)
     const decision = await next(e)
     if (!claimed.has(e.tool_use_id)) return decision
     if (decision.deny !== undefined || decision.ask !== undefined || decision.updatedInput !== undefined) {
@@ -113,10 +117,25 @@ export const register: Register = on => {
 
   on('tool.call', async ($, e, next) => {
     const name = parseMcpToolName(String(e.tool))
+    if (!name) {
+      // A built-in tool. Nothing is served or learned, but a shell command or
+      // a file edit can change what any server would return: once one that
+      // may have written settles, nothing prefetched before it is kept.
+      if (!speculator.enabled) return next(e)
+      let ran: Awaited<ReturnType<typeof next>>
+      try {
+        ran = await next(e)
+      } catch (err) {
+        speculator.externalWrite() // interrupted partway: assume it wrote
+        throw err
+      }
+      if (mayWriteOutside(String(e.tool), ran)) speculator.externalWrite()
+      return ran
+    }
     // Only the model's own calls are served or learned from. A plugin's call
     // (this mod's own prefetches through $.mcp.call among them) runs through
     // the host untouched: its permission check, its hooks, the tool.
-    if (!name || !speculator.enabled || next.origin.plugin !== 'engine') return next(e)
+    if (!speculator.enabled || next.origin.plugin !== 'engine') return next(e)
     const { server, tool } = name
     const args: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(e)) if (!RESERVED.has(key)) args[key] = value
@@ -137,20 +156,23 @@ export const register: Register = on => {
     }
 
     const stop = new AbortController()
+    const joinWaitMs = Math.max(0, next.budget.remainingMs - JOIN_MARGIN_MS)
     const deadline = $.clock
-      .sleep(Math.max(0, next.budget.remainingMs - JOIN_MARGIN_MS), { signal: stop.signal })
+      .sleep(joinWaitMs, { signal: stop.signal })
       .catch(() => new Promise<never>(() => {}))
-    const claim = await speculator.serve(server, tool, args, io, deadline)
+    const claim = await speculator.serve(server, tool, args, io, deadline, joinWaitMs)
     stop.abort()
 
     const started = speculator.beginReal(server)
     const startedAt = await $.clock.now()
     if (claim) claimed.add(e.tool_use_id)
     let ran: Awaited<ReturnType<typeof next>> | undefined
+    let wasAsked = false
     try {
       ran = await next(e)
     } finally {
       claimed.delete(e.tool_use_id)
+      wasAsked = asked.delete(e.tool_use_id)
     }
 
     if (claim && ran.isError === true && ran.text === SERVED) {
@@ -162,8 +184,13 @@ export const register: Register = on => {
       return { result: claim.result.content }
     }
     // The hooks had another say, or this session runs no plugin PreToolUse
-    // hooks (an organization's managed settings): the tool ran for real.
-    claim?.discard('tool-hooks')
+    // hooks (an organization's managed settings): the tool ran for real. In
+    // the second case no claim can ever answer a call, and after a couple in
+    // a row the speculator stops itself rather than go on prefetching.
+    if (claim) {
+      claim.discard(unservedReason(wasAsked, ran))
+      if (!speculator.enabled) $.ui.status('speculate: off for this session (see /speculate)')
+    }
     const endedAt = await $.clock.now()
     const outcome = ran.deny !== undefined
       ? null

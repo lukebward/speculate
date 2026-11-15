@@ -769,3 +769,55 @@ recorded verdict alone while still flushing the server.
 **Budgets assume a serial server.** A mod cannot see whether a server is stdio
 or HTTP, so every server gets the stdio rule (§3.1): speculate only while no
 real call to it is running, one at a time.
+
+### 13.30 What the mod can see that the proxy could not (2026-11-15)
+
+A review of v1.0 found four places where the mod still behaved like the proxy
+it replaced, or where its own hooks worked against it.
+
+**Built-in writes flush.** §6.2 calls writes outside the proxy the sharpest
+staleness caveat: a `git push` in a shell, then a read served from a snapshot
+taken before it. A proxy could not see the shell. A mod's `tool.call` hook
+sees every tool, and each result carries the host's `isReadOnly` verdict, so
+the caveat no longer has to stand for the agent's own calls. When a built-in
+call settles without that verdict, everything prefetched from every server is
+discarded and what was queued is cancelled (`src/sideEffects.ts`). The host's
+own documentation reads an absent verdict as a write, and so does this. A
+refused call ran nothing and flushes nothing; a failed or interrupted one may
+have run partway and does. The agent's task-list tools (`TodoWrite`,
+`TaskCreate`, `TaskUpdate`) are exempt by name: they change nothing outside
+the session, and an agent calls them between its reads all the time. A write
+on one MCP server still flushes only that server (§6.2): a shell can reach
+anything, a server's tool reaches what that server manages.
+
+**A slow read is not joined past the hook's budget.** A `tool.call` hook has
+10 s. A join waited up to 8.5 s of it for an in-flight prefetch, then gave up
+and started the real call from zero, so a correctly predicted read that takes
+longer than that became slower than no speculation at all, by up to the whole
+wait. `serve` now takes the wait it can afford and compares it with the tool's
+learned latency less the prefetch's head start; a prefetch that cannot land in
+time is not joined, and counts as waste. On a serial server the real call may
+still queue behind it (§3.1).
+
+**A host that never asks the PreToolUse hook is noticed.** Where managed
+settings keep plugins from hooking PreToolUse, a claimed call runs for real
+and the claim is discarded, every time: prefetching continued with no way to
+use a result. The hooks now tell "the hooks beneath turned the claim down"
+(the mod's PreToolUse hook was reached) from "the tool ran and the hook was
+never reached". Two of the second in a row, with no served call between,
+stop speculation for the session; `/speculate` says why. This was not run
+against a managed installation; the rule is derived from the documented
+behavior and tested in the core.
+
+**The agent's own calls are ordered by count, not by clock.** Dropping a
+prediction for a call the agent is already making, or made while the trigger
+ran, compared millisecond timestamps. Back-to-back calls can share a
+millisecond, and then a repeat read looked concurrent and was dropped. Starts
+and finishes are now numbered. One consequence is kept on purpose: a
+prediction that repeats its own trigger is never prefetched. The agent holds
+that answer already, and asks again (a poll) only to see something newer than
+a prefetch made the moment the first answer came back.
+
+Verification: 481 unit specs; 10 mod tests and `claude plugin validate` under
+Claude Code 2.1.302 and 2.1.319. No latency measurement was made; none of
+these changes is a speedup claim.

@@ -8,8 +8,11 @@ import type { UsageCounters } from './metrics.js';
 import type { ToolFacts } from './tools.js';
 import type { StatsReport } from './types.js';
 
+/** The `halted` reason a host that skips the mod's PreToolUse hook leads to. */
+const HOOK_SKIPPED = 'pre-tool-use-skipped';
+
 export function formatReport(
-  session: StatsReport & { cache: { ready: number; inFlight: number } },
+  session: StatsReport & { cache: { ready: number; inFlight: number }; halted?: string | null },
   totals: unknown,
   tools: ToolFacts,
 ): string {
@@ -19,8 +22,16 @@ export function formatReport(
   );
   const reads = known.filter(({ fact }) => fact.readOnly && fact.servable);
 
-  const lines = [
-    'Speculate',
+  const lines = ['Speculate'];
+  if (session.halted) {
+    lines.push(
+      '',
+      session.halted === HOOK_SKIPPED
+        ? 'Off for this session. Claude Code ran calls Speculate held prefetched results for without asking its PreToolUse hook, which is where a result is handed over (managed settings that allow only managed hooks do this). Prefetching could only add upstream calls here, so it stopped.'
+        : `Off for this session (${escape(session.halted)}).`,
+    );
+  }
+  lines.push(
     '',
     'This session',
     `  Served from prefetch: ${session.hits + session.joins} (${session.hits} ready, ${session.joins} in flight)`,
@@ -28,7 +39,7 @@ export function formatReport(
     `  Prefetches started: ${session.speculativeCalls}, wasted: ${session.wasted}`,
     `  Estimated time saved: ${duration(session.estimatedSavedMs)} (net of waits behind prefetches: ${signed(session.netEstimatedSavedMs)})`,
     `  Next-call recall: ${percent(session.predictionQuality.recallAt1)} at 1, ${percent(session.predictionQuality.recallAt3)} at 3`,
-  ];
+  );
   if (lifetime) {
     const served = lifetime.hits + lifetime.joins;
     lines.push(
