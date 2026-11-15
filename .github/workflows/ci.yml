@@ -17,12 +17,21 @@ jobs:
       - run: npm run typecheck
       - run: npm test
   mod:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The pinned build is the gate (release.yml pins the same one). The
+        # mods API is early access and people run newer builds than the pin,
+        # so `latest` runs too: it shows a host change the day it ships, and
+        # never fails the workflow over a release this repository did not make.
+        claude: ['2.1.302', latest]
+    continue-on-error: ${{ matrix.claude == 'latest' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22 }
       - name: Install Claude Code
-        run: npm install --global @anthropic-ai/claude-code@2.1.302
+        run: npm install --global @anthropic-ai/claude-code@${{ matrix.claude }}
       - run: claude plugin validate .
       - run: claude plugin test .
