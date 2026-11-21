@@ -764,7 +764,11 @@ are in the
 The last proxy release, 0.25.0, run in the same sessions, was faster on the
 scripted workflow (96% and 77% less tool wait): it served the call that opens
 a session, which the mod did not, and its served and unserved calls cost
-less. It left more prefetches unused.
+less. It left more prefetches unused. Hit rate across the six workloads was
+50% for the mod and 66% for the proxy, with 65% and 58% of prefetches used.
+Run side by side on one workload, the predictor's recall was the same in both
+(63% at 1, about 90% at 3), the mod's hit rate equalled its recall at 1, and
+the proxy started 58 prefetches to the mod's 27.
 
 This measures `main` as a whole against no mod. It does not isolate the
 changes listed above from v1.0.0, and none of them is a speedup claim.

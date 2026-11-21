@@ -880,9 +880,20 @@ prefetched and made sessions wait longer where the mod stayed out. Two
 design differences are candidates and neither was tested: the proxy took
 eligibility from the server's annotation at connect, where the mod waits to
 see a tool run (§13.29), and it ran two speculative calls at a time on an
-HTTP server, where the mod runs one on every server. The v1.0 notes describe
-the learner as carried over unchanged, which points at how the mod drives it
-and not at prediction. That was not confirmed.
+HTTP server, where the mod runs one on every server.
+
+**The mod predicts as well as the proxy and starts half as much.** With both
+run at once on the scripted Microsoft Learn workload and the predictor's
+recall recorded, recall at 1 was 63% in each and recall at 3 was 92% for the
+mod and 87% for the proxy. Hit rate was 63% for the mod and 97% for the
+proxy. The mod's hit rate is its recall at 1: the right call was among its
+first three predictions for 35 of 38 calls, at least 9 of the 12 searches
+among them, and it started 27 prefetches where the proxy started 58. The 29
+points between its recall at 3 and its hit rate were lost after a correct
+prediction. In exchange it left 3 prefetches unused to the proxy's 21. So
+the question §13.29 closed with one sentence, that every server gets the
+serial rule because a mod cannot tell stdio from HTTP, is where the hit rate
+went, if that rule is the cause; the counts fit it and it was not tested.
 
 **`ToolSearch` does not flush.** Claude Code defers MCP tool schemas, so a
 model often calls the built-in `ToolSearch` before its first MCP call, after
@@ -905,7 +916,7 @@ counted apart and is not a wait sample. One search took 10.5 s in an `off`
 session and moved a pooled mean by 280 ms, so summaries lead with per-session
 medians. The first run is kept beside the reported one.
 
-Verification: 500 unit specs, 19 of them the benchmark's arithmetic; 10 mod
+Verification: 502 unit specs, 21 of them the benchmark's arithmetic; 10 mod
 tests and `claude plugin validate` under Claude Code 2.1.330. Only
 `bench/` and its spec are new code: `src/` and `hooks/` are unchanged, so
 nothing above is a change in the mod's behavior.

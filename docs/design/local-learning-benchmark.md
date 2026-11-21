@@ -73,6 +73,16 @@ What is measured, and from where:
   in-flight joins. Unused is prefetches started minus served, so a prefetch
   still outstanding when a session ends counts as unused. Every unused
   prefetch is an extra read against the server.
+- **Hit rate** is served calls over every MCP call the model made in the
+  `on` arm, the ones that errored included: how often a call was answered
+  from a prefetch. **Prefetches used** is served calls over prefetches
+  started. The two pull against each other, since starting more prefetches
+  raises the first and lowers the second, so report both.
+- **Next-call recall** at 1 and at 3 is the predictor's own count: of the
+  calls it could have predicted, how many were its first choice, and among
+  its first three. A prediction that was right but never started, or not
+  ready in time, counts here and not in the hit rate, so the gap between the
+  two is what was lost after prediction.
 
 A pair is left out of a summary only when one of its sessions failed or got no
 result from any MCP call; the count of excluded pairs is reported.
@@ -95,10 +105,12 @@ configuration directory starts empty. Behind an HTTPS proxy, set
 `NODE_USE_ENV_PROXY=1` for the runner's own check of the server.
 
 Report the revision, the Claude Code version, the model, the date and where
-the run was made from. Lead with per-session medians: a phase has a few dozen
-calls, and one slow call moves a mean a long way. Report the learning pairs
-as well as the warm ones, the unused prefetches as well as the served calls,
-and session time as well as tool wait. Keep the result file: it holds every
+the run was made from. Report hit rate beside tool wait: a wait is a property
+of the server as much as of Speculate, and a hit rate is not. Lead the waits
+with per-session medians: a phase has a few dozen calls, and one slow call
+moves a mean a long way. Report the learning pairs as well as the warm ones,
+the unused prefetches as well as the served calls, and session time as well
+as tool wait. Keep the result file: it holds every
 session and every call, so a reader can check a summary against it.
 
 ### Results: `main` after v1.0.0 (2026-11-21)
@@ -112,7 +124,7 @@ The first measurement of the mod on real servers.
 | Model | `claude-haiku-5-5` for both arms; one workload repeated with `claude-sonnet-5-5` |
 | Servers | Microsoft Learn (`learn.microsoft.com/api/mcp`, JSON results, about 260 ms a fetch and 500 ms a search) and the Hugging Face Hub (`huggingface.co/mcp`, Markdown results, about 70 ms a call). Neither needs a credential |
 | Run from | A Linux cloud container (Node 22.23.5) behind an HTTPS egress proxy, on one day |
-| Size | 8 pairs per workload: pairs 1 and 2 learning, pairs 3 to 8 warm. 328 sessions in the result files, $6.90 of model use |
+| Size | 8 pairs per workload: pairs 1 and 2 learning, pairs 3 to 8 warm. 360 sessions in the result files, $7.48 of model use |
 | Result files | [`bench/results/2026-11-21/`](https://github.com/lukebward/speculate/tree/main/bench/results/2026-11-21) |
 
 Warm pairs, per session. Tool wait and session time are medians over the six
@@ -150,10 +162,11 @@ What the tables show:
   instead of about 260 ms) and every call on the Hub (36 of 36, in about
   28 ms instead of about 70 ms). Tool wait per session fell 40% and 61%, in
   every pair.
-- **It does not predict the session's first call.** No search on Microsoft
+- **It does not serve the session's first call.** No search on Microsoft
   Learn was served, 0 of 12, although the first search was identical in every
-  scripted session and the second always followed the same fetch. The cause
-  was not investigated. On that server the searches are the slower calls, so
+  scripted session and the second always followed the same fetch. A later run
+  shows the predictor had those searches and the mod did not start them: see
+  [hit rate](#hit-rate). On that server the searches are the slower calls, so
   most of the remaining wait is theirs.
 - **An ordinary repeated question ranges from a large gain to a loss.** With
   the model choosing the calls, the result depends on whether it makes the
@@ -260,19 +273,78 @@ Session time fell 19% in the proxy's scripted Microsoft Learn sessions
 (13.5 s to 11.0 s), about what removing 2.3 s of tool wait gives. It is the
 largest change in session time in this benchmark.
 
-Two differences in design are candidates for the gap, and neither was tested.
-The proxy takes a tool's eligibility from the server's own annotation when it
-connects, so it can prefetch a tool it has never seen run; the mod waits for
-a real call through the host to report the tool read-only. The proxy runs two
-speculative calls at a time against an HTTP server; the mod runs one at a
-time against every server (§13.29). Why the mod leaves a search that opens
-every session unserved was not investigated.
+Two differences in design are candidates for the gap, and neither was tested
+directly. The proxy takes a tool's eligibility from the server's own
+annotation when it connects, so it can prefetch a tool it has never seen run;
+the mod waits for a real call through the host to report the tool read-only.
+The proxy runs two speculative calls at a time against an HTTP server; the
+mod runs one at a time against every server (§13.29). The
+[hit rates](#hit-rate) narrow it: the mod predicts the unserved searches and
+does not start them.
 
-Read this as a measurement of speed only. The proxy was one run, at another
-hour, by its config-file path and not 0.25's `speculate run` observer. And
-speed is not why v1.0 replaced it: the proxy could not see the permission
-settings, the hooks, or the shell commands that the mod's safety rules are
-built on, and it had to rewrite every server registration to be reached.
+The proxy here was run by its config-file path and not 0.25's `speculate run`
+observer, and the six-workload run was made at another hour than the mod's;
+the scripted Microsoft Learn row was repeated with both at once and came out
+the same (-95% and -44%). Neither speed nor hit rate is why v1.0 replaced the
+proxy: it could not see the permission settings, the hooks, or the shell
+commands that the mod's safety rules are built on, and it had to rewrite
+every server registration to be reached.
+
+#### Hit rate
+
+Tool wait depends on the server as much as on Speculate. Hit rate does not:
+it is how often a call the model made was answered from a prefetch. Warm
+pairs of the runs above, beside the share of prefetches that were used:
+
+| Server | Workload | Mod: hit rate | Mod: prefetches used | Proxy 0.25.0: hit rate | Proxy 0.25.0: prefetches used |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Microsoft Learn | scripted | 67% (24 of 36) | 71% (24 of 34) | 100% (36 of 36) | 67% (36 of 54) |
+| Microsoft Learn | repeat | 56% (10 of 18) | 100% (10 of 10) | 50% (9 of 18) | 43% (9 of 21) |
+| Microsoft Learn | varied | 0% (0 of 18) | none started | 6% (1 of 18) | 13% (1 of 8) |
+| Hugging Face Hub | scripted | 100% (36 of 36) | 71% (36 of 51) | 100% (36 of 36) | 71% (36 of 51) |
+| Hugging Face Hub | repeat | 17% (3 of 18) | 18% (3 of 17) | 42% (5 of 12) | 33% (5 of 15) |
+| Hugging Face Hub | varied | 0% (0 of 19) | none started | 0% (0 of 12) | none started |
+| All six | | 50% (73 of 145) | 65% (73 of 112) | 66% (87 of 132) | 58% (87 of 149) |
+
+The mod's other runs gave 46%, 32%, 6%, 100%, 43% and 0% in the same order
+(the first run, whose scripted Microsoft Learn workload differed) and 64%
+for the scripted Microsoft Learn workload with `claude-sonnet-5-5`. In the
+two learning pairs of that workload the hit rate was 17% for the mod (2 of
+12) and 58% for the proxy (7 of 12).
+
+The proxy's hit rate is higher overall, and the whole of that is two rows.
+On the scripted Microsoft Learn workload the mod served every fetch and no
+search; the proxy served both. The Hub's repeat row is the workload that does
+not repeat from run to run. The mod used more of what it prefetched.
+
+To separate prediction from what happens after it, both versions were run
+once more at the same time on the scripted Microsoft Learn workload (8
+pairs, 6 warm, `same-time/` in the result files), with the predictor's own
+recall recorded:
+
+| Version | Recall@1 | Recall@3 | Hit rate | Prefetches | Used | Unused | Tool wait per session |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mod | 63% (24 of 38) | 92% (35 of 38) | 63% (24 of 38) | 27 | 89% | 3 | -44% (6 of 6) |
+| Proxy 0.25.0 | 63% (24 of 38) | 87% (33 of 38) | 97% (37 of 38) | 58 | 64% | 21 | -95% (6 of 6) |
+
+- **Prediction is the same in both.** The first choice was right for 24 of
+  38 calls in each, and the right call was among the first three for 35 and
+  for 33.
+- **The mod serves its first choice and little else.** Its hit rate equals
+  its recall at 1. The right call was among its first three predictions for
+  35 of 38 calls, which includes at least 9 of the 12 searches, and it served
+  none of those searches. It started 27 prefetches for 38 calls; the proxy
+  started 58. So 29 points of hit rate were lost after a correct prediction,
+  not for want of one.
+- **The proxy's hit rate is above its recall at 3.** Some of what it served
+  came from predictions that recall does not count as next-call predictions.
+- **It is a trade, and the versions sit at opposite ends of it.** The proxy
+  made 21 reads nothing used, three and a half a session, to serve 13 more
+  calls. The mod made 3.
+
+Why the mod starts so few was not established. It runs one speculative call
+at a time against every server, where the proxy ran two against an HTTP
+server (§13.29); that fits these counts and was not tested.
 
 #### Run-to-run variation
 
