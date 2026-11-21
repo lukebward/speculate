@@ -59,6 +59,9 @@ export const USAGE_KEYS = [
   'wasted',
   'estimatedSavedMs',
   'estimatedAddedWaitMs',
+  'predictionOpportunities',
+  'predictionHitsAt1',
+  'predictionHitsAt3',
 ] as const;
 export type UsageKey = (typeof USAGE_KEYS)[number];
 export type Usage = Record<UsageKey, number>;
@@ -253,6 +256,21 @@ export interface PhaseSummary {
   prefetches: number;
   /** Prefetches nothing used: started minus served. Extra upstream reads. */
   unused: number;
+  /**
+   * Served over every MCP call the model made in the `on` arm, the ones that
+   * errored included: how often a call was answered from a prefetch.
+   */
+  hitRate: number | null;
+  /** Served over prefetches started: how much of what was fetched early was used. */
+  prefetchUse: number | null;
+  /**
+   * The predictor's own next-call recall: of the calls it could have
+   * predicted, how many were its first choice, and among its first three.
+   * A prediction that was right but not started, or not ready, counts here
+   * and not in the hit rate. Null where the counters were not recorded.
+   */
+  recallAt1: number | null;
+  recallAt3: number | null;
   /** The mod's own estimate, for comparison with the measured waits. */
   estimatedSavedMs: number;
 }
@@ -316,6 +334,9 @@ function summarizePhase(rows: readonly SessionRow[], pairs: readonly number[]): 
   const hits = total('hits');
   const joins = total('joins');
   const prefetches = total('speculativeCalls');
+  const modelCalls = on.reduce((sum, row) => sum + row.mcpCalls, 0);
+  const opportunities = total('predictionOpportunities');
+  const ratio = (part: number, whole: number): number | null => (whole > 0 ? part / whole : null);
   return {
     pairs: off.length,
     excludedPairs,
@@ -329,6 +350,10 @@ function summarizePhase(rows: readonly SessionRow[], pairs: readonly number[]): 
     joins,
     prefetches,
     unused: prefetches - hits - joins,
+    hitRate: ratio(hits + joins, modelCalls),
+    prefetchUse: ratio(hits + joins, prefetches),
+    recallAt1: ratio(total('predictionHitsAt1'), opportunities),
+    recallAt3: ratio(total('predictionHitsAt3'), opportunities),
     estimatedSavedMs: total('estimatedSavedMs'),
   };
 }
@@ -401,6 +426,27 @@ export function markdownTable(summaries: readonly Summary[], phase: Phase = 'war
       `| ${summary.scenario} | ${summary.workload} | ${p.off.calls} / ${p.on.calls} | ${p.off.errors} / ${p.on.errors} ` +
         `| ${p.served} (${p.hits} ready, ${p.joins} joined) | ${p.prefetches} | ${p.unused} ` +
         `| ${ms(p.off.meanCallWaitMs)} | ${ms(p.on.meanCallWaitMs)} | ${change(p.callWaitReduction)} |`,
+    );
+  }
+  return lines.join('\n');
+}
+
+const share = (value: number | null): string => (value === null ? 'n/a' : `${(value * 100).toFixed(0)}%`);
+
+/**
+ * One phase as hit rates: how often a call was answered from a prefetch, how
+ * much of what was prefetched was used, and how often the predictor was right.
+ */
+export function markdownHitTable(summaries: readonly Summary[], phase: Phase = 'warm'): string {
+  const lines = [
+    '| Server | Workload | Calls | Served | Hit rate | Prefetches | Used | Unused | Recall@1 | Recall@3 |',
+    '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+  ];
+  for (const summary of summaries) {
+    const p = summary[phase];
+    lines.push(
+      `| ${summary.scenario} | ${summary.workload} | ${p.on.calls + p.on.errors} | ${p.served} | ${share(p.hitRate)} ` +
+        `| ${p.prefetches} | ${share(p.prefetchUse)} | ${p.unused} | ${share(p.recallAt1)} | ${share(p.recallAt3)} |`,
     );
   }
   return lines.join('\n');

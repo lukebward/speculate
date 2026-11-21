@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  markdownHitTable,
   markdownSessionTable,
   markdownTable,
   measureSession,
@@ -167,6 +168,7 @@ describe('usage', () => {
     const usage = readUsage({ hits: 2, joins: 1, speculativeCalls: 5, wasted: -3, misses: 'many', other: 9 });
     expect(usage).toEqual({
       hits: 2, joins: 1, misses: 0, speculativeCalls: 5, wasted: 0, estimatedSavedMs: 0, estimatedAddedWaitMs: 0,
+      predictionOpportunities: 0, predictionHitsAt1: 0, predictionHitsAt3: 0,
     });
     expect(readUsage(null).hits).toBe(0);
   });
@@ -272,6 +274,36 @@ describe('summarize', () => {
     const summary = summarize([row(1, 'off', [500])], 0);
     expect(summary.warm).toMatchObject({ pairs: 0, excludedPairs: 1, callWaitReduction: null });
     expect(median([])).toBeNull();
+  });
+
+  it('reports hit rate over every call the model made, and how many prefetches were used', () => {
+    const summary = summarize(rows, 1);
+    // Warm: 4 calls, 3 served, 5 prefetches. Learning: 2 calls, none served, none started.
+    expect(summary.warm.hitRate).toBeCloseTo(0.75);
+    expect(summary.warm.prefetchUse).toBeCloseTo(0.6);
+    expect(summary.cold).toMatchObject({ hitRate: 0, prefetchUse: null });
+
+    const refused = row(2, 'on', [60, 20], { mod: readUsage({ hits: 1, speculativeCalls: 1 }) });
+    refused.calls[0]!.isError = true;
+    refused.mcpErrors = 1;
+    expect(summarize([row(2, 'off', [900, 900]), refused], 0).warm.hitRate).toBeCloseTo(0.5);
+  });
+
+  it('reports the predictor\'s recall only where its counters were recorded', () => {
+    expect(summarize(rows, 1).warm).toMatchObject({ recallAt1: null, recallAt3: null });
+    const counted = summarize(
+      [
+        row(1, 'off', [900, 900]),
+        row(1, 'on', [900, 20], {
+          mod: readUsage({ hits: 1, speculativeCalls: 2, predictionOpportunities: 4, predictionHitsAt1: 1, predictionHitsAt3: 3 }),
+        }),
+      ],
+      0,
+    );
+    expect(counted.warm.recallAt1).toBeCloseTo(0.25);
+    expect(counted.warm.recallAt3).toBeCloseTo(0.75);
+    expect(markdownHitTable([counted])).toContain('| docs | scripted | 2 | 1 | 50% | 2 | 50% | 1 | 25% | 75% |');
+    expect(markdownHitTable([summarize(rows, 1)])).toContain('| docs | scripted | 4 | 3 | 75% | 5 | 60% | 2 | n/a | n/a |');
   });
 
   it('writes a result file that parses back, one session to a line', () => {

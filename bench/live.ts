@@ -10,7 +10,9 @@
  * pairs are its learning sessions, and are reported apart from the rest.
  *
  * Tool wait comes from the host's own event timestamps (bench/measure.ts).
- * The mod's counters are read from its plugin store after each session.
+ * The mod's counters are read from its plugin store after each session: they
+ * give the hit rate (calls answered from a prefetch), how many prefetches
+ * were used, and the predictor's own next-call recall.
  *
  * GATED. It calls other people's services and spends model tokens, so it
  * never runs in CI or under `npm test`, and needs SPECULATE_BENCH_LIVE=1:
@@ -59,6 +61,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
+  markdownHitTable,
   markdownSessionTable,
   markdownTable,
   measureSession,
@@ -328,7 +331,8 @@ function printSummary(summary: Summary): void {
       `  ${name}: ${phase.pairs} pair(s)${phase.excludedPairs > 0 ? `, ${phase.excludedPairs} excluded` : ''}; ` +
         `wait per call ${ms(phase.off.meanCallWaitMs)} ms off, ${ms(phase.on.meanCallWaitMs)} ms on` +
         `${change(phase.callWaitReduction)}; ` +
-        `served ${phase.served} of ${phase.on.calls} calls; ${phase.prefetches} prefetches, ${phase.unused} unused; ` +
+        `hit rate ${phase.hitRate === null ? 'n/a' : `${(phase.hitRate * 100).toFixed(0)}%`} ` +
+        `(${phase.served} of ${phase.on.calls + phase.on.errors} calls); ${phase.prefetches} prefetches, ${phase.unused} unused; ` +
         `less tool wait in ${phase.pairsWithLessToolWait} of ${phase.pairs} pair(s)`,
     );
   }
@@ -442,8 +446,10 @@ async function run(opts: Options): Promise<void> {
 
 function printTables(summaries: Summary[]): void {
   console.log(`\nWarm pairs, per session (medians)\n\n${markdownSessionTable(summaries)}`);
+  console.log(`\nWarm pairs, hit rate\n\n${markdownHitTable(summaries)}`);
   console.log(`\nWarm pairs, per call\n\n${markdownTable(summaries)}`);
   console.log(`\nLearning pairs, per session (medians)\n\n${markdownSessionTable(summaries, 'cold')}`);
+  console.log(`\nLearning pairs, hit rate\n\n${markdownHitTable(summaries, 'cold')}`);
   console.log(`\nLearning pairs, per call\n\n${markdownTable(summaries, 'cold')}\n`);
 }
 
