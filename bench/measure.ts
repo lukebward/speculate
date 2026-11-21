@@ -364,6 +364,22 @@ export function summarize(rows: readonly SessionRow[], warmupPairs: number): Sum
 
 const ms = (value: number | null): string => (value === null ? 'n/a' : `${Math.round(value)} ms`);
 
+/** What a run writes: its conditions, every session, and the summaries of them. */
+export interface ResultFile {
+  meta: Record<string, unknown>;
+  sessions: SessionRow[];
+  summaries: Summary[];
+}
+
+/** A result file as JSON with one session to a line: small, and readable in a diff. */
+export function serializeResults(out: ResultFile): string {
+  const sessions = out.sessions.map(row => JSON.stringify(row)).join(',\n');
+  return (
+    `{"meta":${JSON.stringify(out.meta, null, 1)},\n"sessions":[\n${sessions}\n],\n` +
+    `"summaries":${JSON.stringify(out.summaries)}}\n`
+  );
+}
+
 export type Phase = 'cold' | 'warm';
 
 /** A reduction as a signed change: 25% less wait reads "-25%". */

@@ -59,11 +59,13 @@ import {
   markdownTable,
   measureSession,
   readUsage,
+  serializeResults,
   summarize,
   summarizeAll,
   usageDelta,
   USAGE_KEYS,
   type Arm,
+  type ResultFile,
   type SessionRow,
   type StreamLine,
   type Summary,
@@ -95,12 +97,6 @@ interface Options {
   claude: string;
   json: string | null;
   keep: boolean;
-}
-
-interface ResultFile {
-  meta: Record<string, unknown>;
-  sessions: SessionRow[];
-  summaries: Summary[];
 }
 
 const flag = (name: string): string | undefined => {
@@ -318,7 +314,7 @@ async function run(opts: Options): Promise<void> {
     summaries: [],
   };
   const save = (): void => {
-    if (opts.json) writeFileSync(opts.json, `${JSON.stringify(out, null, 1)}\n`);
+    if (opts.json) writeFileSync(opts.json, serializeResults(out));
   };
 
   let spent = 0;

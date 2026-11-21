@@ -10,6 +10,7 @@ import {
   measureSession,
   median,
   readUsage,
+  serializeResults,
   summarize,
   summarizeAll,
   unionLength,
@@ -271,6 +272,14 @@ describe('summarize', () => {
     const summary = summarize([row(1, 'off', [500])], 0);
     expect(summary.warm).toMatchObject({ pairs: 0, excludedPairs: 1, callWaitReduction: null });
     expect(median([])).toBeNull();
+  });
+
+  it('writes a result file that parses back, one session to a line', () => {
+    const file = { meta: { scenario: 'docs', pairs: 3 }, sessions: rows, summaries: [summarize(rows, 1)] };
+    const text = serializeResults(file);
+    expect(JSON.parse(text)).toEqual(file);
+    expect(text.split('\n').filter(line => line.startsWith('{"scenario"'))).toHaveLength(rows.length);
+    expect(serializeResults({ meta: {}, sessions: [], summaries: [] })).toBe('{"meta":{},\n"sessions":[\n\n],\n"summaries":[]}\n');
   });
 
   it('renders a phase as table rows, a shorter wait as a negative change', () => {
