@@ -37,6 +37,10 @@
  *   --warmup N          leading pairs reported as learning sessions (default 2)
  *   --model NAME        model for both arms (default haiku)
  *   --mod DIR           the mod to load in the `on` arm (default this checkout)
+ *   --cold              forget before every `on` session: the mod never has a
+ *                       memory to predict from, so with the scripted workload
+ *                       both arms make the same calls and nothing is served.
+ *                       What is left is what the mod costs a call it cannot help.
  *   --claude BIN        the Claude Code binary (default claude)
  *   --json FILE         write every session and the summaries
  *   --keep              keep the temporary directories (raw event streams)
@@ -87,6 +91,7 @@ interface Options {
   warmup: number;
   model: string;
   mod: string;
+  cold: boolean;
   claude: string;
   json: string | null;
   keep: boolean;
@@ -135,6 +140,7 @@ function options(): Options | null {
     warmup: Math.min(count('warmup', 2, 0), pairs),
     model: flag('model') ?? 'haiku',
     mod: resolve(flag('mod') ?? ROOT),
+    cold: has('cold'),
     claude: flag('claude') ?? 'claude',
     json: flag('json') ?? null,
     keep: has('keep'),
@@ -168,19 +174,24 @@ async function discover(scenario: Scenario): Promise<{ readOnly: string[]; ctx: 
   }
 }
 
-/** The mod's cumulative counters, from wherever Claude Code keeps its store. */
-function storedUsage(configDir: string): Usage {
+/** The mod's store files under one Claude Code config directory. */
+function storeFiles(configDir: string): string[] {
   const dir = join(configDir, 'plugins', 'store');
-  const total = readUsage(null);
-  let files: string[];
   try {
-    files = readdirSync(dir).filter(name => name.startsWith('speculate') && name.endsWith('.json'));
+    return readdirSync(dir)
+      .filter(name => name.startsWith('speculate') && name.endsWith('.json'))
+      .map(name => join(dir, name));
   } catch {
-    return total;
+    return [];
   }
-  for (const name of files) {
+}
+
+/** The mod's cumulative counters. */
+function storedUsage(configDir: string): Usage {
+  const total = readUsage(null);
+  for (const file of storeFiles(configDir)) {
     try {
-      const usage = readUsage((JSON.parse(readFileSync(join(dir, name), 'utf8')) as { totals?: unknown }).totals);
+      const usage = readUsage((JSON.parse(readFileSync(file, 'utf8')) as { totals?: unknown }).totals);
       for (const key of USAGE_KEYS) total[key] += usage[key];
     } catch {
       // A store that cannot be read counts nothing.
@@ -276,7 +287,7 @@ function capture(command: string, args: string[]): string {
 
 async function run(opts: Options): Promise<void> {
   const { scenario } = opts;
-  console.log(`\n${scenario.label} (${scenario.url}), model ${opts.model}`);
+  console.log(`\n${scenario.label} (${scenario.url}), model ${opts.model}${opts.cold ? ', cold (the mod forgets before every session)' : ''}`);
   const { readOnly, ctx } = await discover(scenario);
   const allowed = readOnly.map(tool => `mcp__${scenario.key}__${tool}`);
 
@@ -299,6 +310,7 @@ async function run(opts: Options): Promise<void> {
       model: opts.model,
       pairs: opts.pairs,
       warmupPairs: opts.warmup,
+      cold: opts.cold,
       allowedTools: allowed,
       context: ctx,
     },
@@ -324,6 +336,8 @@ async function run(opts: Options): Promise<void> {
         const prompt = scenario.prompt(workload, ctx, pair);
         const arms: Arm[] = pair % 2 === 1 ? ['off', 'on'] : ['on', 'off'];
         for (const [index, arm] of arms.entries()) {
+          // Cold: this arm's own store, in the temporary directory made above.
+          if (opts.cold && arm === 'on') for (const file of storeFiles(dirs.on)) rmSync(file, { force: true });
           const before = storedUsage(dirs.on);
           const lines = await runSession({
             opts, arm, prompt, allowed, mcpConfig, workDir,
