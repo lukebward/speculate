@@ -821,3 +821,75 @@ a prefetch made the moment the first answer came back.
 Verification: 481 unit specs; 10 mod tests and `claude plugin validate` under
 Claude Code 2.1.302 and 2.1.319. No latency measurement was made; none of
 these changes is a speedup claim.
+
+### 13.31 The mod measured on real servers (2026-11-21)
+
+v1.0 shipped with a mock demonstration and §13.30 with no measurement at all.
+`bench/live.ts` now runs paired headless Claude Code sessions, the mod off
+and on, against Microsoft Learn and the Hugging Face Hub, with a real model
+choosing the calls. Method, tables, and limits are in the
+[benchmark guide](local-learning-benchmark.md#live-sessions). This section
+records what the measurement says about the design.
+
+**The head start was never the constraint.** §8 expected in-flight joins to
+be the common case inside a turn. Every one of the 73 calls served in the
+warm pairs was a ready result. The fastest current model still takes a second
+or two between calls, and both servers answer in well under one. On servers
+like these, whether a call is served is decided by prediction alone.
+
+**Prediction decides, and a model does not repeat itself the way a script
+does.** A scripted workflow was served (every fetch on Microsoft Learn, every
+call on the Hub). An ordinary question asked again came out anywhere from 64%
+less tool wait to 40% more across two runs. Where it lost, the model had
+changed how it wrote the same call partway through the run (another argument
+name, another `limit`), and an exact-match buffer has nothing for a reworded
+call. A new subject each session was served nothing. That is §11's
+first risk, observed. The offline replay's 85.9% recall@3 describes the
+scripted case, not the ordinary one.
+
+**The session's first call was not served.** No search on Microsoft Learn was
+answered from a prefetch, 0 of 12, though the scripted session opened with
+the same search every time. In a traced session of the first run's workload,
+the opener that fired at the first prompt was a fetch. On that server the
+searches are the slower calls, so the largest single piece of tool wait was
+left in place. Not investigated further.
+
+**The mod has a per-call cost.** §2 budgeted 5 ms for pass-through and 10 ms
+for a completed hit, for a proxy. The mod's hooks added about 9 ms to an MCP
+call it did not answer (76 ms to 85 ms, 72 calls a side, memory cleared so
+nothing was prefetched), a built-in `ToolSearch` call took 38 ms instead of
+16 ms in that run, and a served call took 25 ms to 28 ms. Where that time
+goes inside the hooks was not measured. Against a server that answers in
+70 ms it is the difference between helping and not: the varied workload on
+the Hub was slower with the mod in all six pairs.
+
+**`/speculate` credits a served call with the tool's whole latency.** That
+ignores what serving costs. On the Hub the estimate was 3.7 s saved against a
+measured 1.5 s; on Microsoft Learn (the Sonnet run), 8.1 s against 7.0 s. The
+slower the server, the closer the estimate.
+
+**`ToolSearch` does not flush.** Claude Code defers MCP tool schemas, so a
+model often calls the built-in `ToolSearch` before its first MCP call, after
+the opener's prefetch has started. Had the host not held that call read-only,
+§13.30's rule would have discarded every opener. A probe mod recording each
+call's verdict showed `isReadOnly: true` for it under Claude Code 2.1.330.
+
+**A quota is not hypothetical.** Context7 answered some anonymous calls from
+the test network with "Monthly quota exceeded" and could not be measured. An
+unused prefetch spends exactly that budget, and the scripted workload left
+about two unused per session with every session identical.
+
+What the harness itself got wrong on the way, since the numbers depend on it.
+The first run's scripted Microsoft Learn session fetched one url twice in
+each half, because the server's top two hits were sections of one page; the
+plan step now requires two distinct pages. The first rule left out any pair
+with a tool error, and the errors turned out to be the model guessing an
+argument name, being refused in 60 ms, and retrying; an errored call is now
+counted apart and is not a wait sample. One search took 10.5 s in an `off`
+session and moved a pooled mean by 280 ms, so summaries lead with per-session
+medians. The first run is kept beside the reported one.
+
+Verification: 500 unit specs, 19 of them the benchmark's arithmetic; 10 mod
+tests and `claude plugin validate` under Claude Code 2.1.330. Only
+`bench/` and its spec are new code: `src/` and `hooks/` are unchanged, so
+nothing above is a change in the mod's behavior.

@@ -746,5 +746,20 @@ On `main`, not yet tagged or published. Reasons and limits are in
   behind that rule no longer depends on the clock.
 - The release workflow now runs the mod's own tests before publishing, and CI
   also runs them against the latest Claude Code without blocking on it.
+- `npm run bench:live` measures the mod in real Claude Code sessions against
+  hosted MCP servers, with the mod off and on. It replaces the proxy's
+  `bench:remote`, which v1.0 removed with nothing in its place.
 
-No new measurement accompanies these changes.
+Measurement (2026-11-21, Claude Code 2.1.330, `claude-haiku-5-5`, six warm
+pairs per workload): the first on real servers for the mod. Where sessions
+repeated a scripted workflow, median tool wait per session fell 40% on
+Microsoft Learn (2.1 s to 1.3 s) and 61% on the Hugging Face Hub (420 ms to
+162 ms), in every pair. Where every session asked about a new subject, no
+call was served, and on the Hub, which answers in about 70 ms, sessions waited
+longer with the mod than without. Session time did not measurably change. The
+mod's hooks add about 9 ms to a call it does not answer. Conditions, the
+ordinary-question workload that came out between those two, costs, and limits
+are in the
+[benchmark guide](local-learning-benchmark.md#results-main-after-v100-2026-11-21).
+This measures `main` as a whole against no mod. It does not isolate the
+changes listed above from v1.0.0, and none of them is a speedup claim.

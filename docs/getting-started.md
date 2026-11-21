@@ -67,6 +67,11 @@ Waste is real work against your servers. If `/speculate` shows mostly waste in
 your workflow, Speculate is not paying for itself there; disable it with
 `/plugin disable speculate`.
 
+What to expect depends on the work. In
+[measured sessions](design/local-learning-benchmark.md#live-sessions) it
+helped where a session repeated calls an earlier one had made, and did not
+where each session asked about something new.
+
 ## Forget, disable, uninstall
 
 ```

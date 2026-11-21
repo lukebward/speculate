@@ -2,10 +2,281 @@
 
 This page is the authoritative guide to Speculate's performance instruments.
 Every result must identify its source revision, workload, latency conditions,
-training/held-out split, and accounting. Historical release results below are
-snapshots of those versions, not measurements of the current release.
+training/held-out split, and accounting. A result is a snapshot of the version
+it names, not a measurement of a later one.
+
+Speculate has been two programs. Since v1.0 it is a Claude Code mod; before
+that it was an MCP proxy. The proxy's instruments were removed with the proxy,
+and its results are kept [at the end of this page](#history-the-0x-proxy) as
+history. They do not describe the mod. The predictor is the same code, but
+what turns a prediction into time saved is not: Claude Code's hooks,
+permission checks and connections replaced the proxy's router, and a real
+model's time between calls replaced a scripted pause.
 
 ## Maintained instruments
+
+| Command | What it measures | Limits |
+| --- | --- | --- |
+| `npm run bench:live` | Tool wait and session time in real Claude Code sessions with the mod off and on, against hosted MCP servers, with a real model choosing the calls | Network and service noise; a few pairs per workload; one model and one network location per run; spends model tokens and other people's server time, so it is opt-in |
+| `npm run bench:live -- --cold` | What the mod's hooks cost a call it cannot help: the same sessions with the mod's memory cleared before each one | Only meaningful with the scripted workload, where both arms make the same calls |
+| `npm run eval` | Generic offline replay prediction recall and adversarial floor | A synthetic corpus; no timing and no whole-task speedup |
+
+`npm test` and `npm run test:mod` establish behavior, not speed.
+
+## Live sessions
+
+### Method
+
+A pair is two headless sessions (`claude -p`) given the same prompt. The `off`
+session is Claude Code without the mod. The `on` session loads the mod from
+the checkout (`--plugin-dir`). Which runs first alternates from pair to pair:
+a hosted server answers a repeat of a recent request faster, and that must
+favour neither arm. Use an even number of warm pairs.
+
+Each arm has its own empty `CLAUDE_CONFIG_DIR` and an empty working directory,
+so no settings, hooks, or earlier memory reach a session. The `on` arm keeps
+its directory for a whole workload, so what the mod learns in one pair is in
+its store for the next. The first two pairs are therefore its learning
+sessions. They are reported apart from the later, warm pairs, and that split
+is fixed before a run, not chosen from its results.
+
+Three workloads, from most to least favourable to prediction:
+
+- **scripted**: the prompt dictates every call and its arguments, one at a
+  time. Every session makes the same calls. This is the repeated script the
+  0.x `bench:remote` ran, now with a real model between the calls. It is the
+  only workload in which both arms are certain to make identical calls.
+- **repeat**: one ordinary question, the same every session. The model picks
+  the calls, their arguments, and what to run in parallel, and the two arms
+  of a pair often pick differently.
+- **varied**: an ordinary question on a different subject every pair. Nothing
+  can be recalled; only a learned shape can help.
+
+What is measured, and from where:
+
+- **Tool wait** is the time between the host's own timestamps for an MCP call
+  and for its result, in the session's event stream. It is what the model
+  waited, whoever answered, and it includes everything the mod adds to a call
+  it does not answer. It does not come from the mod.
+- **Wait per call** pools every answered call of a phase: total wait over
+  total calls. Sessions differ in how many calls the model makes, so a
+  per-session figure alone would mix that in. A call that returned an error is
+  counted apart and is not a wait sample: it is usually a fast refusal, the
+  model's own bad argument or a server's quota message.
+- **Session time** is the host's reported duration of the session, model
+  time included.
+- **Served, prefetches, unused** come from the mod's counters in its plugin
+  store, read before and after each session. Served is ready results plus
+  in-flight joins. Unused is prefetches started minus served, so a prefetch
+  still outstanding when a session ends counts as unused. Every unused
+  prefetch is an extra read against the server.
+
+A pair is left out of a summary only when one of its sessions failed or got no
+result from any MCP call; the count of excluded pairs is reported.
+
+The runner asks the server for its tool list first and stops unless every tool
+a workload names is annotated `readOnlyHint: true`. Sessions are allowed the
+server's read-only tools and nothing else.
+
+```bash
+SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario mslearn --json mslearn.json
+SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario huggingface --json huggingface.json
+npm run bench:live -- --summarize mslearn.json huggingface.json
+```
+
+`--pairs`, `--warmup`, `--model`, `--workload`, `--cold` and `--mod` (another
+checkout to load in the `on` arm) are described at the top of `bench/live.ts`. Claude
+Code must be able to authenticate from the environment, because each arm's
+configuration directory starts empty. Behind an HTTPS proxy, set
+`NODE_USE_ENV_PROXY=1` for the runner's own check of the server.
+
+Report the revision, the Claude Code version, the model, the date and where
+the run was made from. Lead with per-session medians: a phase has a few dozen
+calls, and one slow call moves a mean a long way. Report the learning pairs
+as well as the warm ones, the unused prefetches as well as the served calls,
+and session time as well as tool wait. Keep the result file: it holds every
+session and every call, so a reader can check a summary against it.
+
+### Results: `main` after v1.0.0 (2026-11-21)
+
+The first measurement of the mod on real servers.
+
+| Condition | Value |
+| --- | --- |
+| Mod | `main` at `77df2fe`: v1.0.0 plus the [unreleased changes](releases.md#unreleased-after-v100). The runner's own commits (`d03083a`, `69c570b`) do not touch `src/` or `hooks/` |
+| Host | Claude Code 2.1.330, headless (`claude -p`) |
+| Model | `claude-haiku-5-5` for both arms; one workload repeated with `claude-sonnet-5-5` |
+| Servers | Microsoft Learn (`learn.microsoft.com/api/mcp`, JSON results, about 260 ms a fetch and 500 ms a search) and the Hugging Face Hub (`huggingface.co/mcp`, Markdown results, about 70 ms a call). Neither needs a credential |
+| Run from | A Linux cloud container (Node 22.23.5) behind an HTTPS egress proxy, on one day |
+| Size | 8 pairs per workload: pairs 1 and 2 learning, pairs 3 to 8 warm. 232 sessions in the result files, $6.05 of model use |
+| Result files | [`bench/results/2026-11-21/`](https://github.com/lukebward/speculate/tree/main/bench/results/2026-11-21) |
+
+Warm pairs, per session. Tool wait and session time are medians over the six
+warm sessions of each arm:
+
+| Server | Workload | Tool wait per session, off | Tool wait per session, on | Change | Pairs with less wait | Session time, off | Session time, on | Change |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Microsoft Learn | scripted | 2108 ms | 1269 ms | -40% | 6 of 6 | 11170 ms | 10128 ms | -9% |
+| Microsoft Learn | repeat | 1561 ms | 684 ms | -56% | 6 of 6 | 10477 ms | 9363 ms | -11% |
+| Microsoft Learn | varied | 1680 ms | 1521 ms | -9% | 2 of 6 | 8298 ms | 8323 ms | 0% |
+| Hugging Face Hub | scripted | 420 ms | 162 ms | -61% | 6 of 6 | 9254 ms | 9393 ms | +2% |
+| Hugging Face Hub | repeat | 172 ms | 240 ms | +40% | 1 of 6 | 7017 ms | 6946 ms | -1% |
+| Hugging Face Hub | varied | 189 ms | 291 ms | +54% | 0 of 6 | 7319 ms | 7595 ms | +4% |
+
+The same pairs, per call:
+
+| Server | Workload | Calls off / on | Errors off / on | Served | Prefetches | Unused | Mean wait per call, off | Mean wait per call, on |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Microsoft Learn | scripted | 36 / 36 | 0 / 0 | 24 | 34 | 10 | 621 ms | 224 ms |
+| Microsoft Learn | repeat | 19 / 18 | 0 / 0 | 10 | 10 | 0 | 529 ms | 243 ms |
+| Microsoft Learn | varied | 20 / 18 | 0 / 0 | 0 | 0 | 0 | 522 ms | 588 ms |
+| Hugging Face Hub | scripted | 36 / 36 | 0 / 0 | 36 | 51 | 15 | 71 ms | 28 ms |
+| Hugging Face Hub | repeat | 12 / 12 | 4 / 6 | 3 | 17 | 14 | 94 ms | 102 ms |
+| Hugging Face Hub | varied | 13 / 15 | 3 / 4 | 0 | 0 | 0 | 86 ms | 133 ms |
+
+Every served call was a ready result; none was an in-flight join. The 621 ms
+in the first row includes one search that took 10.5 s in an `off` session, a
+server outlier that is kept: without that one call the `off` mean is 340 ms.
+The per-session medians above barely move with it, which is why they lead.
+
+What the tables show:
+
+- **A workflow that repeats exactly is served.** In the scripted workload the
+  mod answered every fetch on Microsoft Learn (24 of 24, in about 25 ms
+  instead of about 260 ms) and every call on the Hub (36 of 36, in about
+  28 ms instead of about 70 ms). Tool wait per session fell 40% and 61%, in
+  every pair.
+- **It does not predict the session's first call.** No search on Microsoft
+  Learn was served, 0 of 12, although the first search was identical in every
+  scripted session and the second always followed the same fetch. The cause
+  was not investigated. On that server the searches are the slower calls, so
+  most of the remaining wait is theirs.
+- **An ordinary repeated question ranges from a large gain to a loss.** With
+  the model choosing the calls, the result depends on whether it makes the
+  same call as last time. Microsoft Learn: 10 of 18 calls served, tool wait
+  down 56%. The Hub: 3 of 12 served, 14 of 17 prefetches unused, tool wait up
+  40%. The [first run](#run-to-run-variation) of the same workloads gave -14%
+  and -64%. The two arms of a pair often make different calls here, so part
+  of each difference is the calls and not the mod.
+- **A new subject every session is not helped.** Nothing was served in the
+  varied workload, 0 of 33 calls, and nothing was prefetched. Microsoft Learn
+  shows no effect either way (2 of 6 pairs). The Hub was slower with the mod
+  in all six pairs.
+- **Session time did not measurably change.** Tools were 15% to 20% of a
+  session on Microsoft Learn and 2% to 5% on the Hub; the model is the rest.
+  The 9% and 11% on Microsoft Learn are in the right direction and the right
+  size for the tool wait removed (about 0.9 s of 10 s to 11 s), but session
+  medians moved between the arms by as much (-14% to +14%) in the learning
+  pairs, where almost nothing was served. This design cannot resolve a
+  difference that small.
+
+#### What the mod costs
+
+- **Unused prefetches.** 10 of 34 on Microsoft Learn and 15 of 51 on the Hub
+  in the scripted workload, with every session identical: about 2 extra reads
+  per session against the server. 14 of 17 in the Hub's repeat workload.
+- **A call it does not answer waits longer.** A separate run (`--cold`,
+  scripted, the Hub, 12 pairs) cleared the mod's store before every `on`
+  session, so both arms made the same 72 calls and the mod prefetched
+  nothing. Mean wait per call was 76 ms off and 85 ms on (medians 70.5 ms and
+  79 ms): about 9 ms a call, and less tool wait with the mod in 1 of 12
+  pairs. The built-in `ToolSearch` call, which the mod only passes through,
+  took a median 16 ms off and 38 ms on in that run (12 calls each). On a
+  server that answers in 70 ms, that overhead is why the varied workload was
+  slower with the mod.
+- **A served call is not free.** It took about 25 ms to 28 ms: it still goes
+  through the host's permission check and PreToolUse hooks. Against a 70 ms
+  server that leaves about 45 ms to save per call.
+- **`/speculate` overstates the saving on a fast server.** The mod's estimate
+  credits a served call with the tool's whole latency. For the Hub's scripted
+  warm pairs it reported 3.7 s saved where the measured difference in tool
+  wait was 1.5 s. For Microsoft Learn (the Sonnet run, which had no outlier)
+  it reported 8.1 s against a measured 7.0 s.
+
+#### A second model
+
+The scripted workload on Microsoft Learn, repeated with `claude-sonnet-5-5`
+(8 pairs, 6 warm). The other workloads were not run with this model: a
+session cost about $0.26, seventeen times the Haiku session.
+
+| Model | Tool wait per session, off | Tool wait per session, on | Change | Pairs with less wait | Served | Prefetches | Unused | Session time, off | Session time, on |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `claude-haiku-5-5` | 2108 ms | 1269 ms | -40% | 6 of 6 | 24 of 36 | 34 | 10 | 11170 ms | 10128 ms |
+| `claude-sonnet-5-5` | 2381 ms | 1211 ms | -49% | 6 of 6 | 23 of 36 | 30 | 7 | 10471 ms | 9866 ms |
+
+#### Run-to-run variation
+
+The whole Haiku benchmark was run twice on the day. The first run
+(`first-run/` in the result files) was made before the runner's first commit;
+its summaries are recomputed by the committed rules. Change in median tool
+wait per session, warm pairs, with the pairs that waited less:
+
+| Server | Workload | First run | Reported run |
+| --- | --- | ---: | ---: |
+| Microsoft Learn | scripted | -34% (4 of 6) | -40% (6 of 6) |
+| Microsoft Learn | repeat | -14% (5 of 6) | -56% (6 of 6) |
+| Microsoft Learn | varied | -6% (3 of 6) | -9% (2 of 6) |
+| Hugging Face Hub | scripted | -61% (6 of 6) | -61% (6 of 6) |
+| Hugging Face Hub | repeat | -64% (6 of 6) | +40% (1 of 6) |
+| Hugging Face Hub | varied | +55% (3 of 6) | +54% (0 of 6) |
+
+The first run's Microsoft Learn scripted row is a slightly different
+workload: the server's top two hits were sections of one page, so each half
+of the session fetched one url twice, and the mod never prefetches a repeat
+of the call that triggered the prediction. The plan step now requires two
+distinct pages. The scripted and varied rows repeat; the repeat rows do not,
+on either server. Six pairs of a workload in which the model chooses the
+calls are not enough to give that workload a number.
+
+#### Limits
+
+- Six warm pairs per workload, one day, one network location. No claim of
+  statistical significance is made, and the repeat workload shows how far a
+  run can move.
+- Both servers are fast. Neither is the seconds-per-call server the design
+  argues from, where a served call would save the most and the per-call
+  overhead would matter least. Nothing here says what happens there.
+- Headless sessions with one prompt. There is no person, so no idle time
+  between turns, and prompt-named reads and long-idle expiry were not
+  exercised. Sessions were allowed MCP read tools only, so no shell command
+  or file edit ever flushed a prefetch.
+- The published v1.0.0 was not measured apart from `main`. With no shell or
+  file writes in a session, the unreleased flush rule had nothing to act on,
+  but that is an inference, not a measurement.
+- Not measured: Context7, which refused some anonymous calls from this
+  network with "Monthly quota exceeded" (the kind of budget an unused prefetch
+  spends); GitHub's hosted server, which needs a token; any stdio server; a
+  managed installation.
+
+## Offline replay
+
+`npm run eval` replays a synthetic corpus through the generic learner and
+scores whether the agent's next call, tool and arguments both, was among the
+predictions. It has no clock and no server. At `77df2fe` (2026-11-21) it
+reports what it reported at v0.20, because the learner has not changed since:
+
+| Corpus | Pairs | recall@1 | recall@3 | Predictions wasted per hit |
+| --- | ---: | ---: | ---: | ---: |
+| Workflow archetypes (headline) | 1,470 | 57.2% | 85.9% | 1.85 |
+| Adversarial floor | 300 | 8.7% | 8.7% | 9.08 |
+
+Cold start, workflow archetypes with no warm-up excluded, recall@3: 0% in
+session 1, 50.0% in session 2, 68.3% in session 3, 74.2% in sessions 4 and 5,
+85.0% in sessions 6 to 10, and 91.6% from session 11.
+
+Read it beside the live results, not instead of them. The corpus is authored
+sessions in which workflows recur, so its headline is nearest the live
+scripted workload. The live varied workload, where no call was served, is
+what the same learner does when they do not.
+
+## History: the 0.x proxy
+
+Everything below measured the MCP proxy that v1.0 removed, with instruments
+that no longer exist in this repository. To run one, check out the release it
+names (the last proxy release is `v0.25.0`). The numbers are snapshots of
+those versions and are not claims about the mod.
+
+### Instruments removed in v1.0
 
 | Command | What it measures | Limits |
 | --- | --- | --- |
@@ -19,7 +290,7 @@ The unused daily-workflow generator had no runner and was removed in v0.20,
 along with its unused comparison API. The repeated-workflow harness and its
 paired accounting remain maintained.
 
-## Repeated workflows
+### Repeated workflows
 
 Build before running; the driver invokes `dist/src/cli.js` from each target.
 The default command compares this checkout with speculation off and on. It uses
@@ -72,7 +343,7 @@ unused upstream work. Estimated saved time in stats is distinct from measured
 tool wait. Driver CPU/RSS does not measure all proxy/server process resources.
 Neither tool-wait reductions nor offline recall establish end-to-end task gains.
 
-## Real-server checks
+### Real-server checks
 
 Hosted scenarios require live opt-in. The harness checks each tool's
 `readOnlyHint` before calling it and aborts if a requested tool is not explicitly
@@ -106,14 +377,14 @@ These real harnesses accept `SPECULATE_E2E_TARGET_ROOT=/path/to/built/checkout`,
 so one driver can compare revisions. Machine-readable summaries use the labels
 `REMOTE_E2E`, `FILESYSTEM_REAL_E2E`, and `GIT_REAL_E2E`.
 
-## v0.20 qualification against v0.19
+### v0.20 qualification against v0.19
 
 This is a simplification and prediction-lifecycle release. Validation on
 2026-09-07 used Node 22.23.2 on Linux and the released v0.19.0 commit
 `3c503a015bc7f841a77e03d54c4cf7ed1b4cf64a` as the baseline. It does not
 establish a general task-speed improvement.
 
-### Paired repeated workflows
+#### Paired repeated workflows
 
 The complete comparison ran all five workflows over seeds 1, 2, and 3, with
 four training and four held-out sessions per seed and 120 ms injected latency.
@@ -145,7 +416,7 @@ npm run bench -- --baseline ../speculate-release-baseline --candidate . \
   --seeds 1,2,3 --train 4 --holdout 4 --latency 120 --json repeated-release.json
 ```
 
-### Feedback ablation
+#### Feedback ablation
 
 The operational feedback cutoff remains alongside correctness calibration.
 They address different outcomes: a correct prediction can expire before the
@@ -170,7 +441,7 @@ calls. That recovery limitation remains; this release does not introduce a
 new exploration mechanism. These are controlled fixtures, not live-server
 performance measurements.
 
-### Other validation
+#### Other validation
 
 The default test suite passed 853 tests with seven platform/opt-in skips.
 Strict documentation build and the production TypeScript build passed. A clean
@@ -198,7 +469,7 @@ Outstanding predictions at the final snapshots were 2, 2, and 4, so zero
 completed waste at those snapshots does not mean zero terminal waste. This
 was a candidate off/on check, not a live comparison with v0.19.
 
-## Historical hosted-server snapshots
+### Historical hosted-server snapshots
 
 These earlier snapshots used three alternating off/on runs each with no
 per-server prediction configuration. Warm tool wait is the median of runs 2
@@ -218,14 +489,14 @@ historical observations, not current-release qualification. Full run history
 and caveats remain in the [implementation notes](implementation-notes.md) and
 [release notes](releases.md).
 
-## Historical qualification: v0.19 versus v0.18
+### Historical qualification: v0.19 versus v0.18
 
 The upgrade passed the release gates set before measurement. The clearest
 benefit is more useful prefetches on repeated workflows whose arguments depend
 on earlier calls. These are controlled MCP fixtures with 120 ms injected
 upstream latency, not measurements of GitHub or Linear service performance.
 
-### Before and after
+#### Before and after
 
 Five seeds each ran eight training and eight held-out sessions through the
 full MCP proxy. Speculation off, v0.18.0, and the candidate used the same
@@ -265,7 +536,7 @@ Ready hits decreased; the additional useful work was predominantly joined
 in flight. PR-review waste increased from 40 to 56 calls, although its
 waste/useful ratio remained below one. Tail latency did not improve.
 
-### Controls and uncertainty
+#### Controls and uncertainty
 
 The unpredictable control made 320 held-out requests per arm and issued zero
 speculative calls in either version. Its mean wait was 139.94 ms for v0.18 and
@@ -295,7 +566,7 @@ by only 0.15 percentage points. The pooled interval does not establish a
 confidence bound above either workflow's threshold. CPU/RSS measurements
 cover only the driver.
 
-### Release gates and other checks
+#### Release gates and other checks
 
 The fixed performance gate required at least two varied workflows to reduce
 mean wait by at least 15% and improve useful rate by at least 10 percentage
@@ -317,7 +588,7 @@ reads. Live Microsoft Learn produced 10/18 useful calls before and 9/18 after,
 with eight terminal wasted calls each. Separate host/network conditions make
 those runs unsuitable for isolating an upgrade speedup.
 
-### Reproduce and inspect
+#### Reproduce and inspect
 
 The baseline is commit `1371efef3758d6bdf679556867c0c4828a9d6657`.
 The frozen candidate is `9d61a06d96ea5749c5382120948ca11854737409`;

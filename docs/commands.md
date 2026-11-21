@@ -19,6 +19,11 @@ Shows whether speculation is paying for itself:
 
 Saved time is estimated: a served call is credited with the upstream time its
 prefetch took, and a joined call with the time the prefetch had already run.
+The estimate leaves out what serving costs: a served call still takes about
+25 ms. Against a server that answers in about 70 ms, a
+[measured run](design/local-learning-benchmark.md#what-the-mod-costs) saved
+less than half of what `/speculate` reported; against a slower one the two
+were close.
 
 ## `/speculate forget`
 

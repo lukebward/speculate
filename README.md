@@ -57,6 +57,29 @@ Run `/speculate` to see what was served, what was wasted, and the estimated
 time saved, for this session and across sessions. `/speculate forget` clears
 everything Speculate has learned.
 
+## Measured
+
+In paired real sessions against two hosted MCP servers, with Speculate off
+and on (Claude Code 2.1.330, Claude Haiku 5.5, six warm pairs per workload,
+one day):
+
+- When sessions repeated a scripted workflow, the median time a session
+  waited on tools fell 40% on Microsoft Learn (2.1 s to 1.3 s) and 61% on the
+  Hugging Face Hub (420 ms to 162 ms), in every pair.
+- When every session asked about a new subject, no call was served. On the
+  Hub, which answers in about 70 ms, sessions then waited longer on tools
+  with Speculate than without.
+- An ordinary question asked again came out between those two, from a large
+  gain to a loss, depending on whether the model made the same calls again.
+- Session time did not measurably change. Tools were at most a fifth of a
+  session; the model was the rest.
+- Speculate's hooks add about 9 ms to a call it does not answer.
+
+Both servers answer in well under a second. Nothing was measured on a server
+that takes seconds per call. The
+[benchmark guide](https://lukebward.github.io/speculate/design/local-learning-benchmark/)
+has the method, the costs, and the limits.
+
 ## Safety
 
 - **Reads only, by the host's verdict.** A tool is a candidate only after a
@@ -103,7 +126,8 @@ full rules and what is stored on disk.
 
 - [Getting started](https://lukebward.github.io/speculate/getting-started/): install, check it works, uninstall.
 - [Safety and storage](https://lukebward.github.io/speculate/safety/): eligibility, permission and hook handling, what persists.
-- [Design](https://lukebward.github.io/speculate/design/): how learning and prefetching work, with benchmark history.
-- [Contributing](CONTRIBUTING.md): tests, the mod's test kit, and the offline evaluation.
+- [Design](https://lukebward.github.io/speculate/design/): how learning and prefetching work.
+- [Benchmarks](https://lukebward.github.io/speculate/design/local-learning-benchmark/): what was measured in real sessions against hosted MCP servers, how, and what was not.
+- [Contributing](CONTRIBUTING.md): tests, the mod's test kit, the offline evaluation, and the live benchmark.
 
 [MIT license](LICENSE)
