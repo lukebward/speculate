@@ -379,8 +379,9 @@ async function run(opts: Options): Promise<void> {
 }
 
 function printTables(summaries: Summary[]): void {
-  console.log(`\nWarm pairs, per call\n\n${markdownTable(summaries)}`);
   console.log(`\nWarm pairs, per session (medians)\n\n${markdownSessionTable(summaries)}`);
+  console.log(`\nWarm pairs, per call\n\n${markdownTable(summaries)}`);
+  console.log(`\nLearning pairs, per session (medians)\n\n${markdownSessionTable(summaries, 'cold')}`);
   console.log(`\nLearning pairs, per call\n\n${markdownTable(summaries, 'cold')}\n`);
 }
 

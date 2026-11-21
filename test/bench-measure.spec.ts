@@ -277,9 +277,10 @@ describe('summarize', () => {
     const summary = summarize(rows, 1);
     const table = markdownTable([summary]);
     expect(table.split('\n')).toHaveLength(3);
-    expect(table).toContain('| docs | scripted | 2 | 4 / 4 | 0 / 0 | 1000 ms | 360 ms | -64% | 3 (2 ready, 1 joined) | 5 | 2 | 2 of 2 |');
-    expect(markdownTable([summary], 'cold')).toContain('| docs | scripted | 1 | 2 / 2 | 0 / 0 | 1000 ms | 1000 ms | 0% | 0 (0 ready, 0 joined) | 0 | 0 | 0 of 1 |');
-    expect(markdownSessionTable([summary])).toContain('| docs | scripted | 2000 ms | 720 ms | 12000 ms | 9000 ms | -25% |');
+    expect(table).toContain('| docs | scripted | 4 / 4 | 0 / 0 | 3 (2 ready, 1 joined) | 5 | 2 | 1000 ms | 360 ms | -64% |');
+    expect(markdownTable([summary], 'cold')).toContain('| docs | scripted | 2 / 2 | 0 / 0 | 0 (0 ready, 0 joined) | 0 | 0 | 1000 ms | 1000 ms | 0% |');
+    expect(markdownSessionTable([summary])).toContain('| docs | scripted | 2 | 2000 ms | 720 ms | -64% | 2 of 2 | 12000 ms | 9000 ms | -25% |');
+    expect(markdownSessionTable([summary], 'cold')).toContain('| docs | scripted | 1 | 2000 ms | 2000 ms | 0% | 0 of 1 | 10000 ms | 10000 ms | 0% |');
   });
 });
 

@@ -373,34 +373,39 @@ function change(reduction: number | null): string {
   return percent === '0' ? '0%' : `${reduction > 0 ? '-' : '+'}${percent}%`;
 }
 
-/** One phase of each summary as a Markdown table of per-call waits, for the docs. */
+/** One phase of each summary as a Markdown table of calls and what served them, for the docs. */
 export function markdownTable(summaries: readonly Summary[], phase: Phase = 'warm'): string {
   const lines = [
-    '| Server | Workload | Pairs | Calls off / on | Errors off / on | Wait per call, off | Wait per call, on | Change | Served | Prefetches | Unused | Pairs with less wait |',
-    '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| Server | Workload | Calls off / on | Errors off / on | Served | Prefetches | Unused | Mean wait per call, off | Mean wait per call, on | Change |',
+    '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   for (const summary of summaries) {
     const p = summary[phase];
     lines.push(
-      `| ${summary.scenario} | ${summary.workload} | ${p.pairs}${p.excludedPairs > 0 ? ` (${p.excludedPairs} excluded)` : ''} ` +
-        `| ${p.off.calls} / ${p.on.calls} | ${p.off.errors} / ${p.on.errors} | ${ms(p.off.meanCallWaitMs)} | ${ms(p.on.meanCallWaitMs)} ` +
-        `| ${change(p.callWaitReduction)} | ${p.served} (${p.hits} ready, ${p.joins} joined) ` +
-        `| ${p.prefetches} | ${p.unused} | ${p.pairsWithLessToolWait} of ${p.pairs} |`,
+      `| ${summary.scenario} | ${summary.workload} | ${p.off.calls} / ${p.on.calls} | ${p.off.errors} / ${p.on.errors} ` +
+        `| ${p.served} (${p.hits} ready, ${p.joins} joined) | ${p.prefetches} | ${p.unused} ` +
+        `| ${ms(p.off.meanCallWaitMs)} | ${ms(p.on.meanCallWaitMs)} | ${change(p.callWaitReduction)} |`,
     );
   }
   return lines.join('\n');
 }
 
-/** The same phase per session: what the tools cost a session, and the session itself. */
+/**
+ * The same phase per session, as medians: what the tools cost a session, and
+ * the session itself. One slow call moves a median far less than a mean.
+ */
 export function markdownSessionTable(summaries: readonly Summary[], phase: Phase = 'warm'): string {
   const lines = [
-    '| Server | Workload | Tool wait per session, off | Tool wait per session, on | Session time, off | Session time, on | Change in session time |',
-    '| --- | --- | ---: | ---: | ---: | ---: | ---: |',
+    '| Server | Workload | Pairs | Tool wait per session, off | Tool wait per session, on | Change | Pairs with less wait | Session time, off | Session time, on | Change |',
+    '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   for (const summary of summaries) {
     const p = summary[phase];
     lines.push(
-      `| ${summary.scenario} | ${summary.workload} | ${ms(p.off.medianSessionToolWaitMs)} | ${ms(p.on.medianSessionToolWaitMs)} ` +
+      `| ${summary.scenario} | ${summary.workload} | ${p.pairs}${p.excludedPairs > 0 ? ` (${p.excludedPairs} excluded)` : ''} ` +
+        `| ${ms(p.off.medianSessionToolWaitMs)} | ${ms(p.on.medianSessionToolWaitMs)} ` +
+        `| ${change(reduction(p.off.medianSessionToolWaitMs, p.on.medianSessionToolWaitMs))} ` +
+        `| ${p.pairsWithLessToolWait} of ${p.pairs} ` +
         `| ${ms(p.off.medianSessionDurationMs)} | ${ms(p.on.medianSessionDurationMs)} | ${change(p.durationReduction)} |`,
     );
   }
