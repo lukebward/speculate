@@ -74,6 +74,10 @@ one day):
 - Session time did not measurably change. Tools were at most a fifth of a
   session; the model was the rest.
 - Speculate's hooks add about 9 ms to a call it does not answer.
+- The last proxy release (0.25.0), run in the same sessions, was faster on
+  the scripted workflow: it cut tool wait 96% and 77% on those two servers,
+  mainly because it also served each session's first call. It started more
+  prefetches that nothing used.
 
 Both servers answer in well under a second. Nothing was measured on a server
 that takes seconds per call. The

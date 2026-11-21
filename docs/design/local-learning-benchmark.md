@@ -12,6 +12,8 @@ history. They do not describe the mod. The predictor is the same code, but
 what turns a prediction into time saved is not: Claude Code's hooks,
 permission checks and connections replaced the proxy's router, and a real
 model's time between calls replaced a scripted pause.
+The one like-for-like comparison of the two is
+[the proxy run in the mod's own benchmark](#against-the-last-proxy-release).
 
 ## Maintained instruments
 
@@ -19,6 +21,7 @@ model's time between calls replaced a scripted pause.
 | --- | --- | --- |
 | `npm run bench:live` | Tool wait and session time in real Claude Code sessions with the mod off and on, against hosted MCP servers, with a real model choosing the calls | Network and service noise; a few pairs per workload; one model and one network location per run; spends model tokens and other people's server time, so it is opt-in |
 | `npm run bench:live -- --cold` | What the mod's hooks cost a call it cannot help: the same sessions with the mod's memory cleared before each one | Only meaningful with the scripted workload, where both arms make the same calls |
+| `npm run bench:live -- --proxy <cli.js>` | A 0.x proxy release in the same sessions, in place of the mod: the release's `dist/src/cli.js` in front of the server | The proxy by its config-file path only; a second run, so not the same minutes as the mod's |
 | `npm run eval` | Generic offline replay prediction recall and adversarial floor | A synthetic corpus; no timing and no whole-task speedup |
 
 `npm test` and `npm run test:mod` establish behavior, not speed.
@@ -84,8 +87,9 @@ SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario huggingface --json huggi
 npm run bench:live -- --summarize mslearn.json huggingface.json
 ```
 
-`--pairs`, `--warmup`, `--model`, `--workload`, `--cold` and `--mod` (another
-checkout to load in the `on` arm) are described at the top of `bench/live.ts`. Claude
+`--pairs`, `--warmup`, `--model`, `--workload`, `--cold`, `--proxy` and `--mod`
+(another checkout to load in the `on` arm) are described at the top of
+`bench/live.ts`. Claude
 Code must be able to authenticate from the environment, because each arm's
 configuration directory starts empty. Behind an HTTPS proxy, set
 `NODE_USE_ENV_PROXY=1` for the runner's own check of the server.
@@ -108,7 +112,7 @@ The first measurement of the mod on real servers.
 | Model | `claude-haiku-5-5` for both arms; one workload repeated with `claude-sonnet-5-5` |
 | Servers | Microsoft Learn (`learn.microsoft.com/api/mcp`, JSON results, about 260 ms a fetch and 500 ms a search) and the Hugging Face Hub (`huggingface.co/mcp`, Markdown results, about 70 ms a call). Neither needs a credential |
 | Run from | A Linux cloud container (Node 22.23.5) behind an HTTPS egress proxy, on one day |
-| Size | 8 pairs per workload: pairs 1 and 2 learning, pairs 3 to 8 warm. 232 sessions in the result files, $6.05 of model use |
+| Size | 8 pairs per workload: pairs 1 and 2 learning, pairs 3 to 8 warm. 328 sessions in the result files, $6.90 of model use |
 | Result files | [`bench/results/2026-11-21/`](https://github.com/lukebward/speculate/tree/main/bench/results/2026-11-21) |
 
 Warm pairs, per session. Tool wait and session time are medians over the six
@@ -203,6 +207,72 @@ session cost about $0.26, seventeen times the Haiku session.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `claude-haiku-5-5` | 2108 ms | 1269 ms | -40% | 6 of 6 | 24 of 36 | 34 | 10 | 11170 ms | 10128 ms |
 | `claude-sonnet-5-5` | 2381 ms | 1211 ms | -49% | 6 of 6 | 23 of 36 | 30 | 7 | 10471 ms | 9866 ms |
+
+#### Against the last proxy release
+
+The same benchmark with the last proxy release, 0.25.0 from npm, in the `on`
+arm in place of the mod (`--proxy`): the same servers, prompts, model and
+day, about three and a half hours after the mod's run. The proxy ran from a
+config file in `annotated` mode, the mode 0.x's own setup used, with one
+state file per workload. Change in median tool wait per session against each
+run's own `off` arm, warm pairs:
+
+| Server | Workload | Proxy 0.25.0 | Served | Unused | Mod | Served | Unused |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Microsoft Learn | scripted | -96% (6 of 6) | 36 of 36 | 18 of 54 | -40% (6 of 6) | 24 of 36 | 10 of 34 |
+| Microsoft Learn | repeat | -38% (5 of 6) | 9 of 18 | 12 of 21 | -56% (6 of 6) | 10 of 18 | 0 of 10 |
+| Microsoft Learn | varied | +15% (2 of 6) | 1 of 18 | 7 of 8 | -9% (2 of 6) | 0 of 18 | 0 of 0 |
+| Hugging Face Hub | scripted | -77% (6 of 6) | 36 of 36 | 15 of 51 | -61% (6 of 6) | 36 of 36 | 15 of 51 |
+| Hugging Face Hub | repeat | -43% (6 of 6) | 5 of 12 | 10 of 15 | +40% (1 of 6) | 3 of 12 | 14 of 17 |
+| Hugging Face Hub | varied | -8% (3 of 6) | 0 of 12 | 0 of 0 | +54% (0 of 6) | 0 of 15 | 0 of 0 |
+
+In the scripted workload a session's tool wait went from 2385 ms to 107 ms on
+Microsoft Learn and from 479 ms to 109 ms on the Hub with the proxy. The mod's
+figures are 2108 ms to 1269 ms and 420 ms to 162 ms.
+
+On a workflow that repeats, the proxy was faster than the mod that replaced
+it. Three differences show in the calls:
+
+- **It served the session's first call.** Every search on Microsoft Learn
+  came from a prefetch, 12 of 12, where the mod served none. The searches were
+  about half of what a session waited on tools there, and that is most of the
+  gap on that server.
+- **A served call cost less:** about 18 ms through the proxy, 25 ms to 28 ms
+  through the mod.
+- **A call it did not answer cost nothing measurable.** Unanswered Hub calls
+  took a median 84 ms to 86 ms with the proxy and 84 ms to 88 ms without, and
+  the built-in `ToolSearch` 18 ms and 19 ms. The mod's hooks add about 9 ms
+  to the first and about 22 ms to the second. In the Hub's varied workload,
+  where neither version served anything, sessions waited 8% less on tools
+  with the proxy and 54% more with the mod.
+
+The proxy also started sooner. In the two learning pairs of the scripted
+Microsoft Learn workload it served 7 of 12 calls and the mod 2 of 12; its
+very first session served 3 of 6.
+
+It spent more of the server to do it: 18 unused prefetches to the mod's 10
+in that workload, and in the varied one it started 8, used 1, and its
+sessions waited 15% longer, where the mod started none. In the repeat
+workload neither is ahead on both servers, and that workload does not repeat
+from run to run for either.
+
+Session time fell 19% in the proxy's scripted Microsoft Learn sessions
+(13.5 s to 11.0 s), about what removing 2.3 s of tool wait gives. It is the
+largest change in session time in this benchmark.
+
+Two differences in design are candidates for the gap, and neither was tested.
+The proxy takes a tool's eligibility from the server's own annotation when it
+connects, so it can prefetch a tool it has never seen run; the mod waits for
+a real call through the host to report the tool read-only. The proxy runs two
+speculative calls at a time against an HTTP server; the mod runs one at a
+time against every server (§13.29). Why the mod leaves a search that opens
+every session unserved was not investigated.
+
+Read this as a measurement of speed only. The proxy was one run, at another
+hour, by its config-file path and not 0.25's `speculate run` observer. And
+speed is not why v1.0 replaced it: the proxy could not see the permission
+settings, the hooks, or the shell commands that the mod's safety rules are
+built on, and it had to rewrite every server registration to be reached.
 
 #### Run-to-run variation
 

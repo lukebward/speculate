@@ -761,5 +761,10 @@ mod's hooks add about 9 ms to a call it does not answer. Conditions, the
 ordinary-question workload that came out between those two, costs, and limits
 are in the
 [benchmark guide](local-learning-benchmark.md#results-main-after-v100-2026-11-21).
+The last proxy release, 0.25.0, run in the same sessions, was faster on the
+scripted workflow (96% and 77% less tool wait): it served the call that opens
+a session, which the mod did not, and its served and unserved calls cost
+less. It left more prefetches unused.
+
 This measures `main` as a whole against no mod. It does not isolate the
 changes listed above from v1.0.0, and none of them is a speedup claim.

@@ -17,4 +17,5 @@ npm run bench:live -- --summarize bench/results/2026-11-21/mslearn-haiku.json be
 | `mslearn-haiku.json`, `huggingface-haiku.json` | The reported run: three workloads, 8 pairs each, `claude-haiku-5-5` |
 | `mslearn-sonnet-scripted.json` | The scripted workload on Microsoft Learn with `claude-sonnet-5-5`; stopped after that workload to limit cost |
 | `huggingface-haiku-cold.json` | `--cold`: the mod's store cleared before every session, to measure what its hooks cost a call |
+| `proxy-0.25.0/` | `--proxy`: the last proxy release from npm in the `on` arm in place of the mod, three workloads, 8 pairs each |
 | `first-run/` | The same benchmark run earlier that day, before the runner's first commit. Summaries recomputed by the committed rules; `meta.note` says what differed |

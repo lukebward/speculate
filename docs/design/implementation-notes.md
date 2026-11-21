@@ -868,6 +868,22 @@ ignores what serving costs. On the Hub the estimate was 3.7 s saved against a
 measured 1.5 s; on Microsoft Learn (the Sonnet run), 8.1 s against 7.0 s. The
 slower the server, the closer the estimate.
 
+**The proxy it replaced was faster.** v1.0 changed the architecture without
+a measurement of what that cost. 0.25.0 from npm, put in the same sessions in
+place of the mod, cut a scripted session's tool wait 96% on Microsoft Learn
+(2385 ms to 107 ms) and 77% on the Hub, against the mod's 40% and 61%. It
+served the searches the mod left (12 of 12), a served call cost about 18 ms
+instead of 25 ms to 28 ms, a call it did not answer cost nothing measurable,
+and it served 7 of 12 calls in the two learning pairs where the mod served 2.
+It also left 18 prefetches unused to the mod's 10, and on new subjects it
+prefetched and made sessions wait longer where the mod stayed out. Two
+design differences are candidates and neither was tested: the proxy took
+eligibility from the server's annotation at connect, where the mod waits to
+see a tool run (§13.29), and it ran two speculative calls at a time on an
+HTTP server, where the mod runs one on every server. The v1.0 notes describe
+the learner as carried over unchanged, which points at how the mod drives it
+and not at prediction. That was not confirmed.
+
 **`ToolSearch` does not flush.** Claude Code defers MCP tool schemas, so a
 model often calls the built-in `ToolSearch` before its first MCP call, after
 the opener's prefetch has started. Had the host not held that call read-only,
