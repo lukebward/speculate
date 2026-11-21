@@ -37,6 +37,10 @@
  *   --warmup N          leading pairs reported as learning sessions (default 2)
  *   --model NAME        model for both arms (default haiku)
  *   --mod DIR           the mod to load in the `on` arm (default this checkout)
+ *   --proxy CLI         measure a 0.x proxy release in place of the mod: the `on`
+ *                       arm loads no mod, and reaches the server through
+ *                       `node CLI --config ...` (the release's dist/src/cli.js),
+ *                       which keeps its learned state for the whole workload
  *   --cold              forget before every `on` session: the mod never has a
  *                       memory to predict from, so with the scripted workload
  *                       both arms make the same calls and nothing is served.
@@ -93,6 +97,8 @@ interface Options {
   warmup: number;
   model: string;
   mod: string;
+  /** A 0.x proxy's cli.js to measure in the `on` arm, in place of the mod. */
+  proxy: string | null;
   cold: boolean;
   claude: string;
   json: string | null;
@@ -129,6 +135,11 @@ function options(): Options | null {
     return null;
   }
   const pairs = count('pairs', 8, 1);
+  const proxy = flag('proxy');
+  if (proxy !== undefined && has('cold')) {
+    console.log('--cold clears the mod\'s store; it has no meaning with --proxy');
+    return null;
+  }
   return {
     scenario,
     workloads,
@@ -136,6 +147,7 @@ function options(): Options | null {
     warmup: Math.min(count('warmup', 2, 0), pairs),
     model: flag('model') ?? 'haiku',
     mod: resolve(flag('mod') ?? ROOT),
+    proxy: proxy === undefined ? null : resolve(proxy),
     cold: has('cold'),
     claude: flag('claude') ?? 'claude',
     json: flag('json') ?? null,
@@ -196,6 +208,23 @@ function storedUsage(configDir: string): Usage {
   return total;
 }
 
+/**
+ * A 0.x proxy's cumulative counters: the same names, from its own `stats`
+ * command, read from the state directory the `on` arm gave it.
+ */
+function proxyUsage(cli: string, stateHome: string): Usage {
+  try {
+    const out = execFileSync(process.execPath, [cli, 'stats', '--json'], {
+      encoding: 'utf8',
+      env: { ...process.env, XDG_STATE_HOME: stateHome },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return readUsage((JSON.parse(out) as { totals?: unknown }).totals);
+  } catch {
+    return readUsage(null);
+  }
+}
+
 interface SessionSetup {
   opts: Options;
   arm: Arm;
@@ -218,7 +247,7 @@ function runSession(setup: SessionSetup): Promise<StreamLine[]> {
     '--output-format', 'stream-json',
     '--verbose',
     '--max-budget-usd', SESSION_BUDGET_USD,
-    ...(arm === 'on' ? ['--plugin-dir', opts.mod] : []),
+    ...(arm === 'on' && opts.proxy === null ? ['--plugin-dir', opts.mod] : []),
   ];
   return new Promise(done => {
     const child = spawn(opts.claude, args, {
@@ -237,6 +266,38 @@ function runSession(setup: SessionSetup): Promise<StreamLine[]> {
     child.on('error', finish);
     child.on('close', finish);
   });
+}
+
+/**
+ * The session's MCP config for a 0.x proxy in front of the server: the proxy
+ * from a config file, so its learned state has one fixed path for the whole
+ * workload (a `wrap` registration keys its state on the environment, which a
+ * headless session does not hold still). `annotated` is the mode 0.x's own
+ * setup used. With one upstream the proxy leaves tool names as they are.
+ */
+function proxyMcpConfig(cli: string, scenario: Scenario, dir: string): string {
+  const proxyConfig = join(dir, 'proxy.json');
+  writeFileSync(
+    proxyConfig,
+    JSON.stringify({
+      mode: 'annotated',
+      log: 'off',
+      persistence: { enabled: true, path: join(dir, 'proxy-state.json') },
+      servers: { upstream: { url: scenario.url } },
+    }),
+  );
+  const env: Record<string, string> = { XDG_STATE_HOME: dir };
+  // The proxy is its own HTTP client: behind an egress proxy it needs telling.
+  const useEnvProxy = process.env['NODE_USE_ENV_PROXY'];
+  if (useEnvProxy !== undefined) env['NODE_USE_ENV_PROXY'] = useEnvProxy;
+  const mcpConfig = join(dir, 'mcp.json');
+  writeFileSync(
+    mcpConfig,
+    JSON.stringify({
+      mcpServers: { [scenario.key]: { command: process.execPath, args: [cli, '--config', proxyConfig], env } },
+    }),
+  );
+  return mcpConfig;
 }
 
 const pad = (value: string | number, width: number): string => String(value).padStart(width);
@@ -283,7 +344,8 @@ function capture(command: string, args: string[]): string {
 
 async function run(opts: Options): Promise<void> {
   const { scenario } = opts;
-  console.log(`\n${scenario.label} (${scenario.url}), model ${opts.model}${opts.cold ? ', cold (the mod forgets before every session)' : ''}`);
+  const variant = opts.proxy ? `, proxy ${capture(process.execPath, [opts.proxy, '--version'])} in the on arm` : '';
+  console.log(`\n${scenario.label} (${scenario.url}), model ${opts.model}${opts.cold ? ', cold (the mod forgets before every session)' : ''}${variant}`);
   const { readOnly, ctx } = await discover(scenario);
   const allowed = readOnly.map(tool => `mcp__${scenario.key}__${tool}`);
 
@@ -296,7 +358,8 @@ async function run(opts: Options): Promise<void> {
       startedAt: new Date().toISOString(),
       revision: capture('git', ['rev-parse', 'HEAD']),
       dirtySrc: capture('git', ['status', '--porcelain', '--', 'src', 'hooks']) !== '',
-      mod: opts.mod === resolve(ROOT) ? 'this checkout' : opts.mod,
+      mod: opts.proxy ? null : opts.mod === resolve(ROOT) ? 'this checkout' : opts.mod,
+      proxy: opts.proxy ? capture(process.execPath, [opts.proxy, '--version']) : null,
       claudeCode: capture(opts.claude, ['--version']),
       node: process.version,
       platform: process.platform,
@@ -324,6 +387,8 @@ async function run(opts: Options): Promise<void> {
       const dirs = { off: join(root, `${workload}-off`), on: join(root, `${workload}-on`) };
       const workDir = join(root, `${workload}-work`);
       for (const dir of [dirs.off, dirs.on, workDir]) mkdirSync(dir, { recursive: true });
+      const usage = (): Usage => (opts.proxy ? proxyUsage(opts.proxy, dirs.on) : storedUsage(dirs.on));
+      const mcpConfigs = { off: mcpConfig, on: opts.proxy ? proxyMcpConfig(opts.proxy, scenario, dirs.on) : mcpConfig };
 
       console.log(`\n ${workload}`);
       console.log('  pair  arm  order  calls  wait (ms)  total (ms)  served  prefetch    cost');
@@ -334,9 +399,10 @@ async function run(opts: Options): Promise<void> {
         for (const [index, arm] of arms.entries()) {
           // Cold: this arm's own store, in the temporary directory made above.
           if (opts.cold && arm === 'on') for (const file of storeFiles(dirs.on)) rmSync(file, { force: true });
-          const before = storedUsage(dirs.on);
+          const before = usage();
           const lines = await runSession({
-            opts, arm, prompt, allowed, mcpConfig, workDir,
+            opts, arm, prompt, allowed, workDir,
+            mcpConfig: mcpConfigs[arm],
             configDir: dirs[arm],
             log: join(root, `${workload}-${pair}-${arm}.jsonl`),
           });
@@ -348,7 +414,7 @@ async function run(opts: Options): Promise<void> {
             arm,
             order: index === 0 ? 1 : 2,
             ...measureSession(lines),
-            mod: arm === 'on' ? usageDelta(before, storedUsage(dirs.on)) : null,
+            mod: arm === 'on' ? usageDelta(before, usage()) : null,
           };
           rows.push(row);
           out.sessions.push(row);
