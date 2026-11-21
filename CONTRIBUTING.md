@@ -10,11 +10,17 @@ npm run test:mod     # the mod in Claude Code's own test kit (tests/*.test.ts)
 npm run validate     # what Claude Code would refuse in the manifest or hooks
 npm run typecheck    # the core with no Node types, then everything with them
 npm run eval         # offline prediction recall, headline and floor
+npm run bench:live   # opt-in: real sessions against hosted MCP servers, mod off and on
 ```
 
 `test:mod` and `validate` need Claude Code 2.1.296 or later on PATH. To run
 your checkout in a real session, start `claude --plugin-dir .`; edits reload
 when the turn that made them ends.
+
+`bench:live` does nothing unless `SPECULATE_BENCH_LIVE=1` is set: it starts
+real Claude Code sessions, spends model tokens, and calls other people's
+servers. The [benchmark guide](docs/design/local-learning-benchmark.md) says
+how to run it and what a result must report.
 
 ## Rules for `src/`
 
@@ -24,7 +30,8 @@ when the turn that made them ends.
 - **No `$`.** The core never touches the host. Hooks build a `SpeculationIo`
   of closures and pass it in.
 - Production learning stays generic, comments included. Fixtures belong in
-  `test/`, `tests/`, `mock/`, and `eval/`; never tune on held-out answers.
+  `test/`, `tests/`, `mock/`, `eval/`, and `bench/`; never tune on held-out
+  answers.
 
 ## Layout
 
@@ -39,6 +46,7 @@ when the turn that made them ends.
 | `src/persistence.ts`, `privacy.ts` | the stored memory and its filtering |
 | `dist/src/cli.js` | the npm command: `speculate install`, and 0.x `wrap` compatibility (its path is fixed: 0.x wrote it into registrations) |
 | `mock/`, `eval/` | the mock MCP servers and the offline evaluation |
+| `bench/` | the live benchmark: paired real sessions, mod off and on, against hosted MCP servers |
 
 Architecture, measured results, threat model, and the design history
 (including the changes that measurement killed): [`docs/design/`](docs/design/),

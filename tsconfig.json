@@ -10,5 +10,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "mock/**/*.ts", "eval/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "mock/**/*.ts", "eval/**/*.ts", "bench/**/*.ts", "test/**/*.ts"]
 }

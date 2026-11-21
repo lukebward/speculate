@@ -1,0 +1,396 @@
+/**
+ * Live benchmark: the mod in real Claude Code sessions, against real hosted
+ * MCP servers, with a real model deciding the calls.
+ *
+ * Each pair is two headless sessions (`claude -p`) with the same prompt: one
+ * without the mod (`off`) and one with it loaded from this checkout (`on`).
+ * The order alternates from pair to pair, so a server that answers a repeat
+ * faster favours neither arm. The `on` arm keeps one plugin store for the
+ * whole run, so what it learns in one pair is there for the next: the first
+ * pairs are its learning sessions, and are reported apart from the rest.
+ *
+ * Tool wait comes from the host's own event timestamps (bench/measure.ts).
+ * The mod's counters are read from its plugin store after each session.
+ *
+ * GATED. It calls other people's services and spends model tokens, so it
+ * never runs in CI or under `npm test`, and needs SPECULATE_BENCH_LIVE=1:
+ *
+ *   SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario mslearn --json mslearn.json
+ *   npm run bench:live -- --summarize mslearn.json huggingface.json
+ *
+ * READ-ONLY BY CONSTRUCTION. The runner asks the server for its tool list
+ * first and stops unless every tool a workload names is annotated
+ * `readOnlyHint: true`. Sessions are allowed the server's read-only tools and
+ * nothing else: no shell, no file edits, no other MCP server.
+ *
+ * ISOLATED. Each arm gets its own empty CLAUDE_CONFIG_DIR and an empty working
+ * directory, so your settings, hooks, and learned memory neither change nor
+ * affect a run. Claude Code must therefore be able to authenticate from the
+ * environment (ANTHROPIC_API_KEY, or a host-managed login). Behind an HTTPS
+ * proxy, run with NODE_USE_ENV_PROXY=1 so the runner's own check reaches the
+ * server; Claude Code reads HTTPS_PROXY by itself.
+ *
+ * Options:
+ *   --scenario KEY      mslearn | huggingface | context7 (default mslearn)
+ *   --workload KEY      scripted | repeat | varied | all (default all)
+ *   --pairs N           off/on pairs per workload (default 8)
+ *   --warmup N          leading pairs reported as learning sessions (default 2)
+ *   --model NAME        model for both arms (default haiku)
+ *   --mod DIR           the mod to load in the `on` arm (default this checkout)
+ *   --claude BIN        the Claude Code binary (default claude)
+ *   --json FILE         write every session and the summaries
+ *   --keep              keep the temporary directories (raw event streams)
+ *   --summarize FILES   print the Markdown tables for result files, run nothing
+ */
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {
+  markdownSessionTable,
+  markdownTable,
+  measureSession,
+  readUsage,
+  summarize,
+  summarizeAll,
+  usageDelta,
+  USAGE_KEYS,
+  type Arm,
+  type SessionRow,
+  type StreamLine,
+  type Summary,
+  type Usage,
+} from './measure.js';
+import {
+  SCENARIOS,
+  WORKLOADS,
+  type DirectResult,
+  type Scenario,
+  type ScenarioContext,
+  type WorkloadKey,
+} from './scenarios.js';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+/** A session that has not finished by now is killed and its pair left out. */
+const SESSION_TIMEOUT_MS = 300_000;
+/** The most one session may spend on the model before Claude Code stops it. */
+const SESSION_BUDGET_USD = '1.00';
+
+interface Options {
+  scenario: Scenario;
+  workloads: WorkloadKey[];
+  pairs: number;
+  warmup: number;
+  model: string;
+  mod: string;
+  claude: string;
+  json: string | null;
+  keep: boolean;
+}
+
+interface ResultFile {
+  meta: Record<string, unknown>;
+  sessions: SessionRow[];
+  summaries: Summary[];
+}
+
+const flag = (name: string): string | undefined => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i !== -1 ? process.argv[i + 1] : undefined;
+};
+const has = (name: string): boolean => process.argv.includes(`--${name}`);
+
+function count(name: string, fallback: number, least: number): number {
+  const raw = Number(flag(name) ?? fallback);
+  return Number.isFinite(raw) && raw >= least ? Math.floor(raw) : fallback;
+}
+
+function options(): Options | null {
+  const key = flag('scenario') ?? 'mslearn';
+  const scenario = SCENARIOS[key];
+  if (!scenario) {
+    console.log(`unknown scenario '${key}'; available: ${Object.keys(SCENARIOS).join(', ')}`);
+    return null;
+  }
+  const workload = flag('workload') ?? 'all';
+  const workloads = workload === 'all' ? [...WORKLOADS] : WORKLOADS.filter(w => w === workload);
+  if (workloads.length === 0) {
+    console.log(`unknown workload '${workload}'; available: ${WORKLOADS.join(', ')}, all`);
+    return null;
+  }
+  if (process.env['SPECULATE_BENCH_LIVE'] !== '1') {
+    console.log('live benchmark skipped: it calls a real hosted MCP server and spends model tokens.');
+    console.log(`to run it: SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario ${scenario.key}`);
+    return null;
+  }
+  const pairs = count('pairs', 8, 1);
+  return {
+    scenario,
+    workloads,
+    pairs,
+    warmup: Math.min(count('warmup', 2, 0), pairs),
+    model: flag('model') ?? 'haiku',
+    mod: resolve(flag('mod') ?? ROOT),
+    claude: flag('claude') ?? 'claude',
+    json: flag('json') ?? null,
+    keep: has('keep'),
+  };
+}
+
+/**
+ * Connects to the server directly: proves every tool a workload names is
+ * read-only by the server's own annotation, lists the read-only tools a
+ * session may use, and fetches real arguments for the scripted workload.
+ */
+async function discover(scenario: Scenario): Promise<{ readOnly: string[]; ctx: ScenarioContext }> {
+  const client = new Client({ name: 'speculate-bench', version: '1.0.0' }, { capabilities: {} });
+  await client.connect(new StreamableHTTPClientTransport(new URL(scenario.url)));
+  try {
+    const { tools } = await client.listTools();
+    const readOnly = tools.filter(tool => tool.annotations?.readOnlyHint === true).map(tool => tool.name);
+    const refused = scenario.needTools.filter(name => !readOnly.includes(name));
+    if (refused.length > 0) {
+      throw new Error(
+        `refusing to run: ${refused.join(', ')} not annotated readOnlyHint:true by ${scenario.url} ` +
+          `(it lists ${tools.map(tool => tool.name).join(', ')})`,
+      );
+    }
+    const ctx = await scenario.plan(
+      async (name, args) => (await client.callTool({ name, arguments: args })) as DirectResult,
+    );
+    return { readOnly, ctx };
+  } finally {
+    await client.close();
+  }
+}
+
+/** The mod's cumulative counters, from wherever Claude Code keeps its store. */
+function storedUsage(configDir: string): Usage {
+  const dir = join(configDir, 'plugins', 'store');
+  const total = readUsage(null);
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter(name => name.startsWith('speculate') && name.endsWith('.json'));
+  } catch {
+    return total;
+  }
+  for (const name of files) {
+    try {
+      const usage = readUsage((JSON.parse(readFileSync(join(dir, name), 'utf8')) as { totals?: unknown }).totals);
+      for (const key of USAGE_KEYS) total[key] += usage[key];
+    } catch {
+      // A store that cannot be read counts nothing.
+    }
+  }
+  return total;
+}
+
+interface SessionSetup {
+  opts: Options;
+  arm: Arm;
+  prompt: string;
+  configDir: string;
+  workDir: string;
+  mcpConfig: string;
+  allowed: string[];
+  log: string;
+}
+
+function runSession(setup: SessionSetup): Promise<StreamLine[]> {
+  const { opts, arm } = setup;
+  const args = [
+    '-p', setup.prompt,
+    '--model', opts.model,
+    '--mcp-config', setup.mcpConfig,
+    '--strict-mcp-config',
+    '--allowedTools', ...setup.allowed,
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--max-budget-usd', SESSION_BUDGET_USD,
+    ...(arm === 'on' ? ['--plugin-dir', opts.mod] : []),
+  ];
+  return new Promise(done => {
+    const child = spawn(opts.claude, args, {
+      cwd: setup.workDir,
+      env: { ...process.env, CLAUDE_CONFIG_DIR: setup.configDir },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const lines: StreamLine[] = [];
+    const timer = setTimeout(() => child.kill('SIGKILL'), SESSION_TIMEOUT_MS);
+    createInterface({ input: child.stdout }).on('line', line => lines.push({ at: Date.now(), line }));
+    const finish = (): void => {
+      clearTimeout(timer);
+      if (opts.keep) writeFileSync(setup.log, lines.map(entry => entry.line).join('\n'));
+      done(lines);
+    };
+    child.on('error', finish);
+    child.on('close', finish);
+  });
+}
+
+const pad = (value: string | number, width: number): string => String(value).padStart(width);
+const ms = (value: number | null): string => (value === null ? 'n/a' : String(Math.round(value)));
+
+function printRow(row: SessionRow): void {
+  const served = row.mod ? row.mod.hits + row.mod.joins : null;
+  console.log(
+    `  ${pad(row.pair, 4)}  ${row.arm.padEnd(3)}  ${pad(row.order, 5)}  ${pad(row.mcpCalls, 5)}  ` +
+      `${pad(ms(row.toolWaitMs), 9)}  ${pad(ms(row.durationMs), 10)}  ` +
+      `${pad(served ?? '-', 6)}  ${pad(row.mod?.speculativeCalls ?? '-', 8)}  ` +
+      `${pad(row.costUsd === null ? 'n/a' : row.costUsd.toFixed(3), 6)}` +
+      `${row.ok ? '' : '  FAILED'}${row.mcpErrors > 0 ? `  ${row.mcpErrors} tool error(s)` : ''}`,
+  );
+}
+
+/** A reduction as words: a negative one is an increase, and says so. */
+function change(reduction: number | null): string {
+  if (reduction === null) return '';
+  const percent = Math.abs(reduction * 100).toFixed(0);
+  return ` (${percent}% ${reduction >= 0 ? 'less' : 'more'})`;
+}
+
+function printSummary(summary: Summary): void {
+  for (const [name, phase] of [['learning', summary.cold], ['warm', summary.warm]] as const) {
+    if (phase.pairs + phase.excludedPairs === 0) continue;
+    console.log(
+      `  ${name}: ${phase.pairs} pair(s)${phase.excludedPairs > 0 ? `, ${phase.excludedPairs} excluded` : ''}; ` +
+        `wait per call ${ms(phase.off.meanCallWaitMs)} ms off, ${ms(phase.on.meanCallWaitMs)} ms on` +
+        `${change(phase.callWaitReduction)}; ` +
+        `served ${phase.served} of ${phase.on.calls} calls; ${phase.prefetches} prefetches, ${phase.unused} unused; ` +
+        `less tool wait in ${phase.pairsWithLessToolWait} of ${phase.pairs} pair(s)`,
+    );
+  }
+}
+
+function capture(command: string, args: string[]): string {
+  try {
+    return execFileSync(command, args, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+async function run(opts: Options): Promise<void> {
+  const { scenario } = opts;
+  console.log(`\n${scenario.label} (${scenario.url}), model ${opts.model}`);
+  const { readOnly, ctx } = await discover(scenario);
+  const allowed = readOnly.map(tool => `mcp__${scenario.key}__${tool}`);
+
+  const root = mkdtempSync(join(tmpdir(), 'speculate-live-'));
+  const mcpConfig = join(root, 'mcp.json');
+  writeFileSync(mcpConfig, JSON.stringify({ mcpServers: { [scenario.key]: { type: 'http', url: scenario.url } } }));
+
+  const out: ResultFile = {
+    meta: {
+      startedAt: new Date().toISOString(),
+      revision: capture('git', ['rev-parse', 'HEAD']),
+      dirtySrc: capture('git', ['status', '--porcelain', '--', 'src', 'hooks']) !== '',
+      mod: opts.mod === resolve(ROOT) ? 'this checkout' : opts.mod,
+      claudeCode: capture(opts.claude, ['--version']),
+      node: process.version,
+      platform: process.platform,
+      scenario: scenario.key,
+      url: scenario.url,
+      results: scenario.results,
+      model: opts.model,
+      pairs: opts.pairs,
+      warmupPairs: opts.warmup,
+      allowedTools: allowed,
+      context: ctx,
+    },
+    sessions: [],
+    summaries: [],
+  };
+  const save = (): void => {
+    if (opts.json) writeFileSync(opts.json, `${JSON.stringify(out, null, 1)}\n`);
+  };
+
+  let spent = 0;
+  try {
+    for (const workload of opts.workloads) {
+      // Each workload starts from nothing learned: its own store, both arms.
+      const dirs = { off: join(root, `${workload}-off`), on: join(root, `${workload}-on`) };
+      const workDir = join(root, `${workload}-work`);
+      for (const dir of [dirs.off, dirs.on, workDir]) mkdirSync(dir, { recursive: true });
+
+      console.log(`\n ${workload}`);
+      console.log('  pair  arm  order  calls  wait (ms)  total (ms)  served  prefetch    cost');
+      const rows: SessionRow[] = [];
+      for (let pair = 1; pair <= opts.pairs; pair++) {
+        const prompt = scenario.prompt(workload, ctx, pair);
+        const arms: Arm[] = pair % 2 === 1 ? ['off', 'on'] : ['on', 'off'];
+        for (const [index, arm] of arms.entries()) {
+          const before = storedUsage(dirs.on);
+          const lines = await runSession({
+            opts, arm, prompt, allowed, mcpConfig, workDir,
+            configDir: dirs[arm],
+            log: join(root, `${workload}-${pair}-${arm}.jsonl`),
+          });
+          const row: SessionRow = {
+            scenario: scenario.key,
+            workload,
+            model: opts.model,
+            pair,
+            arm,
+            order: index === 0 ? 1 : 2,
+            ...measureSession(lines),
+            mod: arm === 'on' ? usageDelta(before, storedUsage(dirs.on)) : null,
+          };
+          rows.push(row);
+          out.sessions.push(row);
+          out.meta['servedModel'] ??= row.servedModel;
+          spent += row.costUsd ?? 0;
+          printRow(row);
+        }
+        save();
+      }
+      const summary = summarize(rows, opts.warmup);
+      out.summaries.push(summary);
+      printSummary(summary);
+      save();
+    }
+  } finally {
+    out.meta['finishedAt'] = new Date().toISOString();
+    out.meta['modelCostUsd'] = Number(spent.toFixed(4));
+    save();
+    if (opts.keep) console.log(`\n raw event streams kept in ${root}`);
+    else rmSync(root, { recursive: true, force: true });
+  }
+  console.log(`\n model cost of this run: $${spent.toFixed(2)}`);
+  printTables(out.summaries);
+}
+
+function printTables(summaries: Summary[]): void {
+  console.log(`\nWarm pairs, per call\n\n${markdownTable(summaries)}`);
+  console.log(`\nWarm pairs, per session (medians)\n\n${markdownSessionTable(summaries)}`);
+  console.log(`\nLearning pairs, per call\n\n${markdownTable(summaries, 'cold')}\n`);
+}
+
+function summarizeFiles(files: string[]): void {
+  // From the sessions, not the stored summaries: a file written by an older
+  // runner is read by today's rules.
+  printTables(
+    files.flatMap(file => {
+      const { meta, sessions } = JSON.parse(readFileSync(file, 'utf8')) as ResultFile;
+      const warmup = typeof meta['warmupPairs'] === 'number' ? meta['warmupPairs'] : 2;
+      return summarizeAll(sessions, warmup);
+    }),
+  );
+}
+
+const summarizeAt = process.argv.indexOf('--summarize');
+if (summarizeAt !== -1) {
+  summarizeFiles(process.argv.slice(summarizeAt + 1).filter(arg => !arg.startsWith('--')));
+} else {
+  const opts = options();
+  if (opts) {
+    run(opts).catch((err: unknown) => {
+      console.error(err instanceof Error ? err.message : err);
+      process.exitCode = 1;
+    });
+  }
+}
