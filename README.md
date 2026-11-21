@@ -116,6 +116,10 @@ full rules and what is stored on disk.
 
 - It covers MCP tools only. Built-in tools such as Bash and Read are not
   prefetched.
+- A tool that returns structured content is never prefetched. Claude Code
+  hands such a result to a mod as text, and Speculate serves only results it
+  can hand back in the form they came. The search tool of Microsoft Learn is
+  one.
 - PostToolUse hooks do not run for a served call, because no tool ran. They do
   run for the prefetch that produced it. A PostToolUse hook whose matcher names
   a specific tool keeps that tool out of speculation entirely.

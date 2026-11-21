@@ -162,12 +162,13 @@ What the tables show:
   instead of about 260 ms) and every call on the Hub (36 of 36, in about
   28 ms instead of about 70 ms). Tool wait per session fell 40% and 61%, in
   every pair.
-- **It does not serve the session's first call.** No search on Microsoft
-  Learn was served, 0 of 12, although the first search was identical in every
-  scripted session and the second always followed the same fetch. A later run
-  shows the predictor had those searches and the mod did not start them: see
-  [hit rate](#hit-rate). On that server the searches are the slower calls, so
-  most of the remaining wait is theirs.
+- **It cannot serve a tool that returns structured content.** No search on
+  Microsoft Learn was served, 0 of 12, although the first search was
+  identical in every scripted session and the second always followed the same
+  fetch. The predictor had those searches; the mod holds that tool
+  unservable, for the reason under [hit rate](#why-the-search-is-never-served).
+  On that server the searches are the slower calls, so most of the remaining
+  wait is theirs.
 - **An ordinary repeated question ranges from a large gain to a loss.** With
   the model choosing the calls, the result depends on whether it makes the
   same call as last time. Microsoft Learn: 10 of 18 calls served, tool wait
@@ -273,14 +274,21 @@ Session time fell 19% in the proxy's scripted Microsoft Learn sessions
 (13.5 s to 11.0 s), about what removing 2.3 s of tool wait gives. It is the
 largest change in session time in this benchmark.
 
-Two differences in design are candidates for the gap, and neither was tested
-directly. The proxy takes a tool's eligibility from the server's own
-annotation when it connects, so it can prefetch a tool it has never seen run;
-the mod waits for a real call through the host to report the tool read-only.
-The proxy runs two speculative calls at a time against an HTTP server; the
-mod runs one at a time against every server (§13.29). The
-[hit rates](#hit-rate) narrow it: the mod predicts the unserved searches and
-does not start them.
+The causes, as far as they were found:
+
+- **The unserved searches** are a tool the mod cannot serve: one that returns
+  structured content. See [why the search is never served](#why-the-search-is-never-served).
+- **The slower start** is by design. The mod prefetches a tool only after a
+  real call through Claude Code has reported it read-only; the proxy took the
+  server's own annotation when it connected and could prefetch a tool it had
+  never seen run.
+- **The dearer served call** is by design too. A served call still runs
+  through the host's permission check and PreToolUse hooks before the mod
+  answers it (§13.29); the proxy answered from its buffer.
+- **The cost on a call it does not answer** comes with being a mod: its hooks
+  run on every tool call, built-in tools included, where the proxy saw only
+  MCP calls to its own server. How that time divides between the host
+  dispatching a hook and the mod's own calls to the host was not measured.
 
 The proxy here was run by its config-file path and not 0.25's `speculate run`
 observer, and the six-workload run was made at another hour than the mod's;
@@ -342,9 +350,31 @@ recall recorded:
   made 21 reads nothing used, three and a half a session, to serve 13 more
   calls. The mod made 3.
 
-Why the mod starts so few was not established. It runs one speculative call
-at a time against every server, where the proxy ran two against an HTTP
-server (§13.29); that fits these counts and was not tested.
+##### Why the search is never served
+
+The mod records a tool as servable only when Claude Code hands its hook the
+tool's result as an array of content blocks (`hooks/register.ts`), because
+that is the form in which a mod can hand a result back. Microsoft Learn's
+search declares an `outputSchema` and returns `structuredContent` beside its
+text block, and for it the hook receives a string. A probe mod recorded the
+shapes under Claude Code 2.1.330: a string for `microsoft_docs_search`, an
+array of blocks for `microsoft_docs_fetch`, and the Hub's tools return no
+structured content. The mod's store accordingly holds `servable: false` for
+the search, so every prediction of it is dropped as `not-servable` before it
+starts. That is the 12 searches, and it is the whole of the hit-rate gap on
+this server.
+
+The proxy has no such limit. It sits on the MCP connection and passes on
+whatever the server returned.
+
+The serial rule was the first suspect and is not the cause. The mod runs one
+speculative call at a time against every server, where the proxy ran two
+against an HTTP server (§13.29). The scripted session was replayed offline
+through the mod's own core on a virtual clock, with the search servable, 500
+ms and 280 ms calls and one second between them: every call was served from
+the third session on, searches and the opening call included, under the
+serial budget and under the proxy's HTTP budget alike.
+
 
 #### Run-to-run variation
 

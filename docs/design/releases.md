@@ -769,6 +769,9 @@ less. It left more prefetches unused. Hit rate across the six workloads was
 Run side by side on one workload, the predictor's recall was the same in both
 (63% at 1, about 90% at 3), the mod's hit rate equalled its recall at 1, and
 the proxy started 58 prefetches to the mod's 27.
+The difference is one tool: the mod cannot serve a tool that returns
+structured content, because Claude Code hands a hook that result as a string,
+and Microsoft Learn's search is such a tool.
 
 This measures `main` as a whole against no mod. It does not isolate the
 changes listed above from v1.0.0, and none of them is a speedup claim.

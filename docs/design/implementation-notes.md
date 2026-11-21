@@ -847,12 +847,20 @@ call. A new subject each session was served nothing. That is §11's
 first risk, observed. The offline replay's 85.9% recall@3 describes the
 scripted case, not the ordinary one.
 
-**The session's first call was not served.** No search on Microsoft Learn was
-answered from a prefetch, 0 of 12, though the scripted session opened with
-the same search every time. In a traced session of the first run's workload,
-the opener that fired at the first prompt was a fetch. On that server the
-searches are the slower calls, so the largest single piece of tool wait was
-left in place. Not investigated further.
+**A tool that returns structured content cannot be served.** No search on
+Microsoft Learn was answered from a prefetch, 0 of 12, though the scripted
+session opened with the same search every time, and the opener that fired at
+the first prompt was a fetch. The hooks record a tool as servable only when
+its result reaches them as an array of content blocks (`servable:
+Array.isArray(ran.result)`), since that is what a hook can return. The search
+declares an `outputSchema` and returns `structuredContent`, and Claude Code
+2.1.330 hands a hook that result as a string. The store therefore holds
+`servable: false` for it and every prediction of it is dropped. §5.1 calls
+structured content the durable path that grows with server adoption; for the
+mod it is, today, the path that cannot be served. On this server the
+searches are the slower calls, so the largest piece of tool wait was left in
+place. Whether a hook can return such a result in the form the host would
+have produced was not tried.
 
 **The mod has a per-call cost.** §2 budgeted 5 ms for pass-through and 10 ms
 for a completed hit, for a proxy. The mod's hooks added about 9 ms to an MCP
@@ -876,11 +884,11 @@ served the searches the mod left (12 of 12), a served call cost about 18 ms
 instead of 25 ms to 28 ms, a call it did not answer cost nothing measurable,
 and it served 7 of 12 calls in the two learning pairs where the mod served 2.
 It also left 18 prefetches unused to the mod's 10, and on new subjects it
-prefetched and made sessions wait longer where the mod stayed out. Two
-design differences are candidates and neither was tested: the proxy took
-eligibility from the server's annotation at connect, where the mod waits to
-see a tool run (§13.29), and it ran two speculative calls at a time on an
-HTTP server, where the mod runs one on every server.
+prefetched and made sessions wait longer where the mod stayed out. The
+searches are the structured-content limit above. The faster start is the
+proxy taking eligibility from the server's annotation at connect, where the
+mod waits to see a tool run (§13.29). The cheaper calls are the proxy not
+being in the host's hook path at all.
 
 **The mod predicts as well as the proxy and starts half as much.** With both
 run at once on the scripted Microsoft Learn workload and the predictor's
@@ -890,10 +898,11 @@ proxy. The mod's hit rate is its recall at 1: the right call was among its
 first three predictions for 35 of 38 calls, at least 9 of the 12 searches
 among them, and it started 27 prefetches where the proxy started 58. The 29
 points between its recall at 3 and its hit rate were lost after a correct
-prediction. In exchange it left 3 prefetches unused to the proxy's 21. So
-the question §13.29 closed with one sentence, that every server gets the
-serial rule because a mod cannot tell stdio from HTTP, is where the hit rate
-went, if that rule is the cause; the counts fit it and it was not tested.
+prediction. In exchange it left 3 prefetches unused to the proxy's 21. The
+serial rule of §13.29 looked like the cause and is not: replayed offline
+through the core with the search servable, the same session was served in
+full under the serial budget and under the HTTP one alike. The lost 29
+points are the searches the hooks hold unservable.
 
 **`ToolSearch` does not flush.** Claude Code defers MCP tool schemas, so a
 model often calls the built-in `ToolSearch` before its first MCP call, after
