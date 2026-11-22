@@ -1842,8 +1842,20 @@ function isUnderivable(tpl: ArgTemplate): boolean {
 interface PrevIndex {
   args: Array<{ key: string; value: unknown; repr: string | undefined }>;
   paths: Array<{ segs: string[]; value: unknown; repr: string | undefined }>;
+  /** `paths` as the plain reading resolves them (see resolvePlainPath); built on first use. */
+  plain?: Array<{ segs: string[]; value: unknown; repr: string | undefined }>;
   parsed: unknown;
   history?: HistoryCall[];
+}
+
+/** The index's paths for one reading of an argument: as they stand, or by document. */
+function indexedPaths(index: PrevIndex, plain: boolean): PrevIndex['paths'] {
+  if (!plain || !namesSections(index.parsed)) return index.paths;
+  index.plain ??= index.paths.flatMap((p) => {
+    const resolved = resolvePlainPath(index.parsed, p.segs);
+    return resolved.ok ? [{ segs: p.segs, value: resolved.value, repr: safeStringify(resolved.value) }] : [];
+  });
+  return index.plain;
 }
 
 function indexPrevCall(prev: PrevCall): PrevIndex {
@@ -1872,27 +1884,33 @@ function indexPrevCall(prev: PrevCall): PrevIndex {
 function matchingParsedPaths(parsed: unknown, repr: string, plain: boolean): ParsedPath[] {
   const out: ParsedPath[] = [];
   let visited = 0;
-  const walk = (value: unknown, path: string[], depth: number): void => {
+  // By document, a path below a list reads the row the plain reading counts,
+  // which need not be the row this walk stands on (see resolvePlainPath).
+  const byDocument = plain && namesSections(parsed);
+  const walk = (raw: unknown, path: string[], depth: number, listed: boolean): void => {
     if (depth > 8 || visited++ >= 1_024 || out.length >= MAX_SOURCES_PER_ARG) return;
-    if (path.length > 0 && sameValue(value, safeStringify(value), repr, plain)) out.push({ segs: path, value });
-    if (Array.isArray(value)) {
+    if (path.length > 0) {
+      const read: Resolution = byDocument && listed ? resolvePlainPath(parsed, path) : { ok: true, value: raw };
+      if (read.ok && sameValue(read.value, safeStringify(read.value), repr, plain)) out.push({ segs: path, value: read.value });
+    }
+    if (Array.isArray(raw)) {
       // Keep learned positional hypotheses to the first few rows. Schema
       // cold-start extraction below can materialize arbitrary list items from
       // their fields without turning every observed row index into a standing
       // alternative that crowds the shipped three-call batch.
-      for (let i = 0; i < Math.min(value.length, 3); i++) {
-        walk(value[i], [...path, String(i)], depth + 1);
+      for (let i = 0; i < Math.min(raw.length, 3); i++) {
+        walk(raw[i], [...path, String(i)], depth + 1, true);
       }
-    } else if (isPlainObject(value)) {
+    } else if (isPlainObject(raw)) {
       let keys = 0;
-      for (const [key, child] of Object.entries(value)) {
+      for (const [key, child] of Object.entries(raw)) {
         if (++keys > MAX_PARSED_KEYS_PER_LEVEL) break;
-        walk(child, [...path, key], depth + 1);
+        walk(child, [...path, key], depth + 1, listed);
       }
     }
   };
   try {
-    walk(parsed, [], 0);
+    walk(parsed, [], 0, false);
   } catch {
     // Keep matches collected before an exotic getter threw.
   }
@@ -1924,7 +1942,8 @@ function candidateSources(
     if (sources.length >= room) break;
     if (sameValue(a.value, a.repr, repr, plain)) sources.push({ kind: 'arg', key: a.key });
   }
-  for (const p of index.paths) {
+  const paths = indexedPaths(index, plain);
+  for (const p of paths) {
     if (sources.length >= room) break;
     if (sameValue(p.value, p.repr, repr, plain)) sources.push({ kind: 'parsed', path: p.segs });
   }
@@ -1946,7 +1965,7 @@ function candidateSources(
     ...index.args.flatMap((entry) =>
       inferTransforms({ kind: 'arg', key: entry.key }, entry.value, value),
     ),
-    ...index.paths.flatMap((entry) =>
+    ...paths.flatMap((entry) =>
       inferTransforms({ kind: 'parsed', path: entry.segs }, entry.value, value),
     ),
   ];
@@ -2084,7 +2103,7 @@ function sameValue(value: unknown, ownRepr: string | undefined, repr: string, pl
  */
 function sourceProduces(source: Source, prev: PrevCall, repr: string, plain: boolean): boolean {
   if (source.kind === 'const') return source.repr === repr;
-  const resolved = resolveSource(source, prev);
+  const resolved = resolveSource(source, prev, plain);
   return resolved.ok && sameValue(resolved.value, safeStringify(resolved.value), repr, plain);
 }
 
@@ -2139,7 +2158,7 @@ function argOptions(tpl: ArgTemplate, call: PrevCall, now: number): ArgOption[] 
   for (let rank = 0; rank < ranked.length; rank++) {
     const entry = ranked[rank]!;
     if (rank > 0 && entry.src.solo < MIN_SOURCE_SOLO_WINS) continue;
-    const res = resolveSource(entry.src.s, call);
+    const res = resolveSource(entry.src.s, call, !tpl.sections);
     if (!res.ok) continue;
     // An argument that has never named a section is offered the document.
     const value = tpl.sections ? res.value : withoutSection(res.value);
@@ -2194,8 +2213,11 @@ function kindRank(s: Source): number {
   return s.kind === 'arg' ? 0 : s.kind === 'parsed' ? 1 : s.kind === 'transform' ? 2 : 3;
 }
 
-/** This source's value on the current call. `const` always resolves. */
-function resolveSource(s: Source, call: PrevCall): Resolution {
+/**
+ * This source's value on the current call. `const` always resolves. `plain`:
+ * the argument reads results by document (see resolvePlainPath).
+ */
+function resolveSource(s: Source, call: PrevCall, plain = false): Resolution {
   const from = (s.kind === 'arg' || s.kind === 'parsed') && s.sourceTool !== undefined
     ? call.history?.find((prior) => prior.tool === s.sourceTool)
     : call;
@@ -2206,9 +2228,10 @@ function resolveSource(s: Source, call: PrevCall): Resolution {
         ? { ok: true, value: from.args[s.key] }
         : { ok: false };
     case 'parsed':
-      return from ? resolvePath(from.parsed, s.path) : { ok: false };
+      if (!from) return { ok: false };
+      return plain ? resolvePlainPath(from.parsed, s.path) : resolvePath(from.parsed, s.path);
     case 'transform': {
-      const base = resolveSource(s.base, call);
+      const base = resolveSource(s.base, call, plain);
       return base.ok ? applyTransform(s, base.value) : { ok: false };
     }
     case 'const':
@@ -2402,6 +2425,92 @@ function resolvePath(root: unknown, path: readonly string[]): Resolution {
     return { ok: false };
   }
   return { ok: true, value: cur };
+}
+
+/** Rows one list is read for when its rows are counted by document: a bound, not a behaviour. */
+const MAX_DOCUMENT_ROWS = 64;
+/** Rows one plain resolution may read in all, lists inside lists included. */
+const MAX_DOCUMENT_STEPS = 1_024;
+/** Nodes read to learn whether a result names any section at all. */
+const MAX_SECTION_SCAN = 4_096;
+
+const SECTIONED = new WeakMap<object, boolean>();
+
+/**
+ * Whether a result names a section anywhere (withoutSection's sense). Most
+ * results do not, and for those the plain reading is the result as it stands:
+ * this is the test that keeps every list of issues, files and rows out of
+ * the document walk below. Bounded; a section past the bound reads as none.
+ */
+function namesSections(parsed: unknown): boolean {
+  if (typeof parsed !== 'object' || parsed === null) return false;
+  const known = SECTIONED.get(parsed);
+  if (known !== undefined) return known;
+  let left = MAX_SECTION_SCAN;
+  const scan = (value: unknown, depth: number): boolean => {
+    if (--left < 0 || depth > 8) return false;
+    if (typeof value === 'string') return namesSection(value);
+    if (Array.isArray(value)) return value.some((item) => scan(item, depth + 1));
+    return isPlainObject(value) && Object.values(value).some((item) => scan(item, depth + 1));
+  };
+  let found = false;
+  try {
+    found = scan(parsed, 0);
+  } catch {
+    found = false;
+  }
+  SECTIONED.set(parsed, found);
+  return found;
+}
+
+/**
+ * Walk a stored path the way the plain reading of an argument does: by
+ * DOCUMENT. A search answers with ten hits that are sections of four pages,
+ * and the agent opens pages, so for an argument that has never named a
+ * section "row 1" is the second page the list names, not its second line.
+ *
+ * At each list on the path, a row whose value at the rest of the path names
+ * the document an earlier row named is not a row, when either of the two
+ * names a section. Rows that name no section are never dropped, and a value
+ * that is not a string never drops its row: a list of issues, or of commits
+ * that share one file, reads exactly as resolvePath reads it. Never throws.
+ */
+function resolvePlainPath(root: unknown, path: readonly string[]): Resolution {
+  if (!namesSections(root)) return resolvePath(root, path);
+  let steps = MAX_DOCUMENT_STEPS;
+  const walk = (start: unknown, from: number): Resolution => {
+    let cur = start;
+    for (let i = from; i < path.length; i++) {
+      const seg = path[i]!;
+      if (Array.isArray(cur)) {
+        const idx = Number(seg);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return { ok: false };
+        const documents: Array<{ doc: string; sectioned: boolean }> = [];
+        const rows = Math.min(cur.length, MAX_DOCUMENT_ROWS);
+        let counted = -1;
+        for (let row = 0; row < rows; row++) {
+          if (--steps < 0) return { ok: false };
+          const leaf = walk(cur[row], i + 1);
+          if (leaf.ok && typeof leaf.value === 'string') {
+            const doc = withoutSection(leaf.value) as string;
+            const sectioned = doc !== leaf.value;
+            if (documents.some((seen) => seen.doc === doc && (sectioned || seen.sectioned))) continue;
+            documents.push({ doc, sectioned });
+          }
+          if (++counted === idx) return leaf;
+        }
+        return { ok: false };
+      }
+      if (!isPlainObject(cur) || !Object.prototype.hasOwnProperty.call(cur, seg)) return { ok: false };
+      cur = cur[seg];
+    }
+    return { ok: true, value: cur };
+  };
+  try {
+    return walk(root, 0);
+  } catch {
+    return { ok: false };
+  }
 }
 
 // -- small utilities ----------------------------------------------------------

@@ -1549,6 +1549,61 @@ describe('a result that names a section, followed as its document', () => {
     expect(predictedUrls(reloaded, hits('https://d.test/n/page#s'))).toEqual(['https://d.test/n/page#s']);
   });
 
+  it('counts the rows of a result by document, not by line', () => {
+    const learner = new TransitionLearner({ now });
+    // Each search answers with sections of a first page, then a second page.
+    // The agent opens the first page, then (in a new exchange) the second.
+    const first = hits('https://d.test/a/one#x', 'https://d.test/a/one#y', 'https://d.test/a/two', 'https://d.test/a/three#z');
+    const second = hits('https://d.test/b/one#p', 'https://d.test/b/one#q', 'https://d.test/b/one#r', 'https://d.test/b/two#s');
+    const third = hits('https://d.test/c/one', 'https://d.test/c/one#u', 'https://d.test/c/two#v');
+    for (const found of [first, second, third]) {
+      const pages = [...new Set(found.results.map((hit) => hit.contentUrl.replace(/#.*$/, '')))];
+      observePair(learner, 'docs', search(found), fetch(pages[0]!));
+      observePair(learner, 'docs', search(found), fetch(pages[1]!));
+    }
+
+    // Three lines of the first page come before the second: it is still row 1.
+    const urls = predictedUrls(
+      learner,
+      hits('https://d.test/n/alpha#1', 'https://d.test/n/alpha#2', 'https://d.test/n/alpha#3', 'https://d.test/n/beta#4', 'https://d.test/n/gamma'),
+    );
+    expect(urls.slice(0, 2).sort()).toEqual(['https://d.test/n/alpha', 'https://d.test/n/beta']);
+
+    // One source per page explains every observation after the first of each:
+    // only the first request for a second page could not have been predicted.
+    const template = learner.exportState().transitions.find((x) => x.nextTool === 'fetch')!.templates[0]!;
+    expect(template).toMatchObject({ derived: 5, missed: 1 });
+    expect(template.sources.filter((src) => src.kind === 'parsed').map((src) => src.path!.join('.')).sort()).toEqual([
+      'results.0.contentUrl',
+      'results.1.contentUrl',
+    ]);
+  });
+
+  it('reads rows as lines again for an argument that asks for sections', () => {
+    const learner = new TransitionLearner({ now });
+    const found = (page: string) => hits(`https://d.test/${page}#a`, `https://d.test/${page}#b`, `https://d.test/${page}-next#c`);
+    // The agent asks for the second line as it stands, section and all.
+    observePair(learner, 'docs', search(found('p')), fetch('https://d.test/p#b'));
+    observePair(learner, 'docs', search(found('q')), fetch('https://d.test/q#b'));
+    observePair(learner, 'docs', search(found('r')), fetch('https://d.test/r#b'));
+    expect(predictedUrls(learner, found('s'))).toEqual(['https://d.test/s#b']);
+  });
+
+  it('never drops a row where no row names a section', () => {
+    const learner = new TransitionLearner({ now });
+    const found = (...repos: string[]) => ({ items: repos.map((repo, i) => ({ repo, number: i + 1 })) });
+    const list = (parsed: unknown): CallSpec => ({ tool: 'search', args: { q: 'x' }, parsed });
+    const get = (repo: string, number: number): CallSpec => ({ tool: 'get', args: { repo, number } });
+    // The agent reads the second row. Its repository is often the first row's too.
+    observePair(learner, 'gh', list(found('acme/api', 'acme/api', 'acme/web')), get('acme/api', 2));
+    observePair(learner, 'gh', list(found('acme/web', 'acme/api', 'acme/api')), get('acme/api', 2));
+    observePair(learner, 'gh', list(found('acme/cli', 'acme/web', 'acme/api')), get('acme/web', 2));
+
+    const next = learner.predict(mkCall('gh', 'search', { q: 'x' }, found('acme/one', 'acme/one', 'acme/two')));
+    // Row 1 is the second line, though it names the repository row 0 named.
+    expect(next[0]!.args).toEqual({ repo: 'acme/one', number: 2 });
+  });
+
   it('leaves alone a value whose # is not a section of a document', () => {
     const learner = new TransitionLearner({ now });
     const list = (parsed: unknown): CallSpec => ({ tool: 'list', args: {}, parsed });
