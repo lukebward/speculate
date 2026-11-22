@@ -25,7 +25,7 @@ import { canonicalKey } from './keys.js';
 import { ToolKnowledge, type RecordForm } from './tools.js';
 import { intentMappings } from './intent.js';
 import type { MemorySnapshot, PersistedState } from './persistence.js';
-import type { SpeculateOptions, StatsReport, ToolResult } from './types.js';
+import type { CallSpan, SpeculateOptions, StatsReport, ToolResult } from './types.js';
 
 export type { SpeculationIo } from './executor.js';
 
@@ -49,6 +49,13 @@ export const DEFAULT_OPTIONS: SpeculateOptions = {
   minExpectedSavedMs: 15,
 };
 
+/** What `beginReal` hands back for the call's `observe`. */
+export interface StartedCall {
+  mayWaitBehindSpeculation: boolean;
+  /** False when the call began claimed by a prefetched result; absent reads as true. */
+  onServer?: boolean;
+}
+
 /** What a real call through the host revealed. */
 export interface RealOutcome {
   result: ToolResult;
@@ -60,6 +67,11 @@ export interface RealOutcome {
   form?: RecordForm;
   isError: boolean;
   latencyMs: number;
+  /**
+   * When the agent made the call and when it had its answer, both on the
+   * host's clock. Lets the learner tell a parallel step from a sequence.
+   */
+  span?: CallSpan;
 }
 
 /**
@@ -150,6 +162,7 @@ export class Speculator {
     this.budget = new BudgetManager({}, {
       now,
       defaults: { transport: 'stdio', maxPerMinute: this.options.maxPerMinute },
+      concurrency: (server) => this.tools.concurrency(server),
     });
     // The cap belongs to the learner as much as to the predictor: it sizes
     // the beam (§13.18).
@@ -316,11 +329,14 @@ export class Speculator {
     this.cache.abandonAll();
   }
 
-  /** A real call is about to run through the host. */
-  beginReal(server: string): { mayWaitBehindSpeculation: boolean } {
+  /**
+   * A real call is about to run through the host. `claimed`: a prefetched
+   * result is expected to answer it, so it is not a call on the server.
+   */
+  beginReal(server: string, claimed = false): StartedCall {
     const mayWaitBehindSpeculation = this.budget.specInFlight(server) > 0;
-    this.budget.realStarted(server);
-    return { mayWaitBehindSpeculation };
+    this.budget.realStarted(server, !claimed);
+    return { mayWaitBehindSpeculation, onServer: !claimed };
   }
 
   /**
@@ -334,9 +350,11 @@ export class Speculator {
     args: Record<string, unknown>,
     outcome: RealOutcome | null,
     io: SpeculationIo,
-    started: { mayWaitBehindSpeculation: boolean } = { mayWaitBehindSpeculation: false },
+    started: StartedCall = { mayWaitBehindSpeculation: false },
   ): void {
-    this.budget.realFinished(server);
+    // Read before this call leaves the count: was it running beside another?
+    const overlap = started.onServer === false ? 1 : this.budget.concurrency(server);
+    this.budget.realFinished(server, started.onServer !== false);
     const trigger = this.realSettled(server, tool, args);
     if (!outcome) {
       this.executor.drainServer(server, io);
@@ -356,6 +374,7 @@ export class Speculator {
         // successful call showed.
         servable: outcome.isError ? prior?.servable ?? false : outcome.servable,
         form: outcome.isError ? prior?.form : outcome.form,
+        overlap,
         args,
       });
     }
@@ -370,7 +389,7 @@ export class Speculator {
     }
     if (outcome.isError) return;
     if (this.tools.isSuspended(server, tool)) this.tools.resetSuspension(server, tool);
-    this.learn(server, tool, args, outcome.result, outcome.latencyMs, outcome.isReadOnly, io, trigger);
+    this.learn(server, tool, args, outcome.result, outcome.latencyMs, outcome.isReadOnly, io, trigger, outcome.span);
   }
 
   /** Marks the agent's call settled; returns where it started in the order of calls, if it was keyed. */
@@ -392,11 +411,12 @@ export class Speculator {
     args: Record<string, unknown>,
     claim: Pick<Claim, 'result' | 'latencyMs'>,
     io: SpeculationIo,
+    span?: CallSpan,
   ): void {
-    this.budget.realFinished(server);
+    this.budget.realFinished(server, false);
     const trigger = this.realSettled(server, tool, args);
     this.executor.drainServer(server, io);
-    this.learn(server, tool, args, claim.result, claim.latencyMs, true, io, trigger);
+    this.learn(server, tool, args, claim.result, claim.latencyMs, true, io, trigger, span);
   }
 
   private learn(
@@ -408,6 +428,7 @@ export class Speculator {
     isReadOnly: boolean,
     io: SpeculationIo,
     trigger?: number,
+    span?: CallSpan,
   ): void {
     // §5.5: off means off. A disabled mod learns nothing and stores nothing.
     if (!this.enabled) return;
@@ -428,6 +449,7 @@ export class Speculator {
         result,
         latencyMs,
         timestamp: this.now(),
+        ...(span === undefined ? {} : { span }),
         eligibleTarget: isReadOnly,
       });
       if (predictions.length > 0) this.executor.submit(predictions, io, { trigger });

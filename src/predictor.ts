@@ -6,7 +6,7 @@
  * rules (§5.2, contained) → validate/normalize predictions → per-rule
  * feedback scoring (§5.6) → batch dedupe on canonical key → rank and cap.
  */
-import type { ToolResult } from './types.js';
+import type { CallSpan, ToolResult } from './types.js';
 import { canonicalKey } from './keys.js';
 import type { LatencyEstimator } from './latency.js';
 import type { CandidateCalibration } from './calibration.js';
@@ -61,6 +61,8 @@ export interface CompletedCall {
   result: ToolResult;
   latencyMs: number;
   timestamp: number;
+  /** When the agent made the call and had its answer (ObservedCall.span). */
+  span?: CallSpan;
   /** Whether this real call was eligible to have been prefetched. */
   eligibleTarget?: boolean;
 }
@@ -133,6 +135,7 @@ export class Predictor {
       parsed,
       timestamp: call.timestamp,
       latencyMs: call.latencyMs,
+      ...(call.span === undefined ? {} : { span: call.span }),
     };
 
     const candidates: ScoredPrediction[] = [];

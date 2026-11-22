@@ -1566,3 +1566,92 @@ describe('a result that names a section, followed as its document', () => {
     expect(ids({ items: [{ id: 'src/app.ts#L10' }] })).toEqual(['src/app.ts']);
   });
 });
+
+describe('a step of calls the agent made together', () => {
+  /** A call with the times the agent made it and had its answer. */
+  const spanned = (tool: string, args: Record<string, unknown>, parsed: unknown, startedAt: number, endedAt: number): ObservedCall => ({
+    ...mkCall('gh', tool, args, parsed, endedAt),
+    span: { startedAt, endedAt },
+  });
+  const rows = (...numbers: number[]) => numbers.map((number) => ({ number, title: `issue ${number}` }));
+  /** A list, a second of thought, then two reads in one step: both begin before either ends. */
+  const round = (learner: TransitionLearner, at: number, a: number, b: number, listed = rows(a, b)): void => {
+    // The learner's own clock moves on between the two answers, as a real one does.
+    t = at + 400;
+    learner.observe(spanned('list', { repo: 'r' }, listed, at, at + 400));
+    t = at + 1_800;
+    learner.observe(spanned('get', { repo: 'r', number: a }, { number: a }, at + 1_400, at + 1_800));
+    t = at + 1_801;
+    learner.observe(spanned('get', { repo: 'r', number: b }, { number: b }, at + 1_400, at + 1_800));
+  };
+  const predictedNumbers = (learner: TransitionLearner, listed: unknown): unknown[] =>
+    learner
+      .predict(mkCall('gh', 'list', { repo: 'r' }, listed))
+      .filter((p) => p.tool === 'get')
+      .map((p) => p.args['number']);
+  const transitions = (learner: TransitionLearner): string[] =>
+    learner.exportState().transitions.map((x) => `${x.prevTool}>${x.nextTool}:${x.count}`);
+
+  it('reads both as following the call before the step, not one as following the other', () => {
+    const learner = new TransitionLearner({ now });
+    round(learner, 10_000, 11, 12);
+    round(learner, 20_000, 21, 22);
+    round(learner, 30_000, 31, 32);
+
+    // No read was an answer to its sibling: it began before the sibling ended.
+    expect(transitions(learner)).toContain('list>get:6');
+    expect(transitions(learner).some((x) => x.startsWith('get>get'))).toBe(false);
+    // So the list predicts the whole step, from rows it has not seen before.
+    expect(predictedNumbers(learner, rows(71, 72)).sort()).toEqual([71, 72]);
+  });
+
+  it('reads a call made after the answer to the last one as following it', () => {
+    const learner = new TransitionLearner({ now });
+    for (const at of [10_000, 20_000, 30_000]) {
+      learner.observe(spanned('list', { repo: 'r' }, rows(1, 2), at, at + 400));
+      learner.observe(spanned('get', { repo: 'r', number: 1 }, { number: 1 }, at + 1_400, at + 1_800));
+      // The second read begins a second after the first one's answer.
+      learner.observe(spanned('get', { repo: 'r', number: 2 }, { number: 2 }, at + 2_800, at + 3_200));
+    }
+    expect(transitions(learner)).toContain('list>get:3');
+    expect(transitions(learner)).toContain('get>get:3');
+  });
+
+  it('reads calls with no times as a sequence, as before', () => {
+    const learner = new TransitionLearner({ now });
+    for (const at of [10_000, 20_000, 30_000]) {
+      learner.observe(mkCall('gh', 'list', { repo: 'r' }, rows(1, 2), at));
+      learner.observe(mkCall('gh', 'get', { repo: 'r', number: 1 }, { number: 1 }, at + 10));
+      learner.observe(mkCall('gh', 'get', { repo: 'r', number: 2 }, { number: 2 }, at + 20));
+    }
+    expect(transitions(learner)).toContain('list>get:3');
+    expect(transitions(learner)).toContain('get>get:3');
+  });
+
+  it('offers both rows of a list that never changes, whichever was memorized first', () => {
+    const learner = new TransitionLearner({ now });
+    // The same two issues each time: row 0 is explained by its path and by the
+    // literal the first sighting memorized, and the two never disagree.
+    round(learner, 10_000, 41, 42);
+    round(learner, 20_000, 41, 42);
+    round(learner, 30_000, 41, 42);
+    expect(predictedNumbers(learner, rows(41, 42)).sort()).toEqual([41, 42]);
+    // Both are read from the list, not remembered: other rows give other reads.
+    expect(predictedNumbers(learner, rows(51, 52)).sort()).toEqual([51, 52]);
+  });
+
+  it('gives a path no standing from agreeing with a literal that has explained more', () => {
+    const learner = new TransitionLearner({ now });
+    const status = (branch: string): CallSpec => ({ tool: 'status', args: {}, parsed: { branch } });
+    const config = { tool: 'get_config', args: { name: 'main' } };
+    // The agent reads the config named "main" whatever the branch is. The
+    // branch is sometimes "main" too, which is a coincidence, not a rule.
+    observePair(learner, 'gh', status('dev'), config);
+    observePair(learner, 'gh', status('main'), config);
+    observePair(learner, 'gh', status('main'), config);
+    observePair(learner, 'gh', status('main'), config);
+
+    const names = learner.predict(mkCall('gh', 'status', {}, { branch: 'release' })).map((p) => p.args['name']);
+    expect(names).toEqual(['main']);
+  });
+});

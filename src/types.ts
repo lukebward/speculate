@@ -51,6 +51,19 @@ export interface ObservedCall {
   parsed: unknown | null;
   timestamp: number;
   latencyMs: number;
+  /**
+   * When the agent made the call and when it had its answer, on the
+   * observer's own clock, where the observer knows both. They decide what
+   * the call follows: see the learner's stepTrigger (a parallel step).
+   * Absent, the call follows the one observed before it.
+   */
+  span?: CallSpan;
+}
+
+/** When a call began and ended, both read from one clock. */
+export interface CallSpan {
+  startedAt: number;
+  endedAt: number;
 }
 
 /** A concrete predicted next call. Args must be fully materialized. */

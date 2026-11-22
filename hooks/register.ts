@@ -157,6 +157,9 @@ export const register: Register = on => {
       })
     }
 
+    // When the model made this call: with when it gets its answer, what
+    // tells the learner a step of several calls from a sequence of them.
+    const beganAt = await $.clock.now()
     // The wait for a prefetch still in flight is bounded by a host timer,
     // started only if there is such a prefetch to wait for.
     let stop: AbortController | undefined
@@ -175,8 +178,9 @@ export const register: Register = on => {
       claim = null
     }
 
-    const started = speculator.beginReal(server)
-    const startedAt = await $.clock.now()
+    const started = speculator.beginReal(server, claim !== null)
+    // A join may have waited; the tool's own latency starts after it.
+    const startedAt = claim?.source === 'joined' ? await $.clock.now() : beganAt
     if (claim) claimed.add(e.tool_use_id)
     let ran: Awaited<ReturnType<typeof next>> | undefined
     let wasAsked = false
@@ -189,7 +193,7 @@ export const register: Register = on => {
 
     if (claim && ran.isError === true && ran.text === SERVED) {
       claim.commit()
-      speculator.observeServed(server, tool, args, claim, io)
+      speculator.observeServed(server, tool, args, claim, io, { startedAt: beganAt, endedAt: await $.clock.now() })
       const { hits, joins, estimatedSavedMs } = speculator.stats()
       $.ui.status(`speculate: ${hits + joins} served, ${(estimatedSavedMs / 1000).toFixed(1)}s saved`)
       save()
@@ -215,6 +219,7 @@ export const register: Register = on => {
           form: typeof ran.result === 'string' ? ('text' as const) : ('blocks' as const),
           isError: ran.isError === true,
           latencyMs: endedAt - startedAt,
+          span: { startedAt: beganAt, endedAt },
         }
     speculator.observe(server, tool, args, outcome, io, started)
     save()

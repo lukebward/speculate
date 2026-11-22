@@ -302,3 +302,41 @@ describe('recordOf', () => {
     expect(recordOf({ content: [{ type: 'text' }] }, 'text')).toBeNull();
   });
 });
+
+describe('overlap', () => {
+  it('keeps the most calls a server was seen to run at once, per tool and per server', () => {
+    const k = new ToolKnowledge(() => 5);
+    expect(k.concurrency('s')).toBe(1);
+    k.record('s', 'list', { readOnly: true, servable: true, args: {} });
+    k.record('s', 'get', { readOnly: true, servable: true, overlap: 3, args: {} });
+    expect(k.fact('s', 'list')).not.toHaveProperty('overlap');
+    expect(k.fact('s', 'get')!.overlap).toBe(3);
+    expect(k.concurrency('s')).toBe(3);
+    expect(k.concurrency('other')).toBe(1);
+    // A later call that ran alone does not take it back.
+    k.record('s', 'get', { readOnly: true, servable: true, overlap: 1, args: {} });
+    expect(k.concurrency('s')).toBe(3);
+  });
+
+  it('survives storage and merging, bounded and whole', () => {
+    const k = new ToolKnowledge(() => 5);
+    k.record('s', 'get', { readOnly: true, servable: true, overlap: 4, args: {} });
+    const stored = JSON.parse(JSON.stringify(k.exportState())) as ToolFacts;
+    const back = new ToolKnowledge(() => 6);
+    back.importState(stored);
+    expect(back.concurrency('s')).toBe(4);
+    expect(sanitizeToolFacts(stored, 0, createSecretGuard()).value['s']!['get']!.overlap).toBe(4);
+
+    const alone: ToolFacts = { s: { get: { readOnly: true, servable: true, shapes: [], lastSeen: 9 } } };
+    expect(mergeToolFacts(stored, alone)['s']!['get']!.overlap).toBe(4);
+    expect(mergeToolFacts(alone, stored)['s']!['get']!.overlap).toBe(4);
+
+    const odd = new ToolKnowledge(() => 6);
+    odd.importState({ s: { a: { readOnly: true, servable: true, overlap: 2.9, shapes: [], lastSeen: 1 },
+      b: { readOnly: true, servable: true, overlap: 1e9, shapes: [], lastSeen: 1 },
+      c: { readOnly: true, servable: true, overlap: 'many', shapes: [], lastSeen: 1 } } });
+    expect(odd.fact('s', 'a')!.overlap).toBe(2);
+    expect(odd.fact('s', 'b')!.overlap).toBe(16);
+    expect(odd.fact('s', 'c')).not.toHaveProperty('overlap');
+  });
+});

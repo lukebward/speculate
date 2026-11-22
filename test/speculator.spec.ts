@@ -765,3 +765,51 @@ describe('addUsage', () => {
     expect(delta).toEqual(copy);
   });
 });
+
+describe('calls the agent runs together', () => {
+  const once = (h: ReturnType<typeof harness>, tool: string, started: ReturnType<Speculator['beginReal']>) =>
+    h.spec.observe(S, tool, ARGS, h.outcome(text({ tool, ...ARGS })), h.io, started);
+
+  it('are remembered per server, and the next session may prefetch that many at once', async () => {
+    const h = harness();
+    expect(h.spec.tools.concurrency(S)).toBe(1);
+    // Two reads in flight at the same time: the server runs calls together.
+    const first = h.spec.beginReal(S);
+    const second = h.spec.beginReal(S);
+    h.advance(400);
+    once(h, LIST, first);
+    once(h, GET, second);
+    await settle();
+    expect(h.spec.tools.concurrency(S)).toBe(2);
+
+    const next = harness();
+    next.spec.importMemory(h.spec.exportMemory() as never);
+    expect(next.spec.budget.tryAcquire(S)).toEqual({ ok: true });
+    expect(next.spec.budget.tryAcquire(S)).toEqual({ ok: true });
+    expect(next.spec.budget.tryAcquire(S)).toEqual({ ok: false, reason: 'concurrency' });
+  });
+
+  it('one after another leave the server serial', async () => {
+    const h = harness();
+    once(h, LIST, h.spec.beginReal(S));
+    once(h, GET, h.spec.beginReal(S));
+    await settle();
+    expect(h.spec.tools.concurrency(S)).toBe(1);
+    expect(h.spec.budget.tryAcquire(S)).toEqual({ ok: true });
+    expect(h.spec.budget.tryAcquire(S)).toEqual({ ok: false, reason: 'stdio-busy' });
+  });
+
+  it('a call a prefetch is answering is not a call on the server', async () => {
+    const h = harness();
+    const real = h.spec.beginReal(S);
+    const claimed = h.spec.beginReal(S, true);
+    expect(claimed.onServer).toBe(false);
+    h.advance(400);
+    // The hooks turned the claim down and the call ran after all: still not counted.
+    once(h, GET, claimed);
+    once(h, LIST, real);
+    await settle();
+    expect(h.spec.tools.concurrency(S)).toBe(1);
+    expect(h.spec.budget.realInFlight(S)).toBe(0);
+  });
+});

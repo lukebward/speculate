@@ -364,6 +364,8 @@ interface PrevCall {
   args: Record<string, unknown>;
   parsed: unknown;
   timestamp: number;
+  /** When the call had its answer, on the observer's clock (ObservedCall.span). */
+  endedAt?: number;
   priorTool?: string;
   /** Newest first, excludes this call, and never exported. */
   history?: HistoryCall[];
@@ -374,6 +376,7 @@ interface HistoryCall {
   args: Record<string, unknown>;
   parsed: unknown;
   timestamp: number;
+  endedAt?: number;
   /** False for a latest occurrence whose payload exceeded the copy budget. */
   available: boolean;
   /** Conservative retained-size estimate, including keys and node overhead. */
@@ -672,7 +675,12 @@ export class TransitionLearner {
   // -- observation ----------------------------------------------------------
 
   private observeInner(call: ObservedCall): void {
-    const prev = this.lastCallByServer.get(call.server);
+    const last = this.lastCallByServer.get(call.server);
+    const lastGap = last ? call.timestamp - last.timestamp : Number.POSITIVE_INFINITY;
+    const chained = last !== undefined && lastGap >= 0 && lastGap <= this.maxGapMs ? last : undefined;
+    // What this call FOLLOWS is not always the call observed before it: see
+    // stepTrigger. The history it leaves behind is still every recent call.
+    const prev = chained && stepTrigger(chained, call);
     const gap = prev ? call.timestamp - prev.timestamp : Number.POSITIVE_INFINITY;
     const linked = prev !== undefined && gap >= 0 && gap <= this.maxGapMs ? prev : undefined;
     this.lastCallByServer.set(call.server, {
@@ -680,8 +688,9 @@ export class TransitionLearner {
       args: call.args,
       parsed: call.parsed,
       timestamp: call.timestamp,
+      ...(call.span === undefined ? {} : { endedAt: call.span.endedAt }),
       priorTool: linked?.tool,
-      history: linked ? recentHistory(linked, call.timestamp, this.maxGapMs) : [],
+      history: chained ? recentHistory(chained, call.timestamp, this.maxGapMs) : [],
     });
     if (!linked) return;
 
@@ -948,6 +957,7 @@ function historySnapshot(call: PrevCall): HistoryCall | null {
     args: {},
     parsed: null,
     timestamp: call.timestamp,
+    ...(call.endedAt === undefined ? {} : { endedAt: call.endedAt }),
     available: false,
     bytes: 256 + call.tool.length * 2,
   };
@@ -996,6 +1006,50 @@ function historySnapshot(call: PrevCall): HistoryCall | null {
     // let an older value from the same tool silently become current again.
     return marker;
   }
+}
+
+/**
+ * The least time between a result reaching a model and a call the model
+ * makes because of it: a request has to go out and an answer start coming
+ * back. A call that began sooner than this after another ended was not
+ * written in answer to it.
+ */
+const MIN_REACTION_MS = 300;
+
+/**
+ * The call `call` follows, given the one observed just before it.
+ *
+ * A model often issues several calls in one step. They run side by side, or
+ * one behind the other within moments, and the observer hears of them in the
+ * order they settle; but none of them was written with a sibling's result in
+ * hand. Each follows the call whose result the model had read when it wrote
+ * the step: the most recent call that had ENDED, by a model's reaction time,
+ * before this one began. Linking the siblings to one another instead teaches
+ * "the second read follows the first", and the second can then never be
+ * prefetched before the step starts, because its trigger has not finished.
+ *
+ * Both times come from the observer's one clock (ObservedCall.span). Where
+ * either is unknown the call follows the one before it, as it always did.
+ */
+function stepTrigger(last: PrevCall, call: ObservedCall): PrevCall | undefined {
+  const began = call.span?.startedAt;
+  const inTime = (endedAt: number | undefined): boolean =>
+    began === undefined || endedAt === undefined || began - endedAt >= MIN_REACTION_MS;
+  if (inTime(last.endedAt)) return last;
+  const history = last.history ?? [];
+  const at = history.findIndex((earlier) => inTime(earlier.endedAt));
+  if (at === -1) return undefined;
+  const trigger = history[at]!;
+  // Its payload was too large to keep: nothing can be derived from it.
+  if (!trigger.available) return undefined;
+  return {
+    tool: trigger.tool,
+    args: trigger.args,
+    parsed: trigger.parsed,
+    timestamp: trigger.timestamp,
+    ...(trigger.endedAt === undefined ? {} : { endedAt: trigger.endedAt }),
+    history: history.slice(at + 1),
+  };
 }
 
 function recentHistory(prev: PrevCall, timestamp: number, maxGapMs: number): HistoryCall[] {
@@ -1581,7 +1635,8 @@ function seedTemplate(
       : candidateSources(index, value, repr, true, !sections).map((s) => newSource(s, now));
   // One sighting explained by exactly one hypothesis is that hypothesis's
   // first solo win; explained by several, it separates none of them.
-  if (sources.length === 1) sources[0]!.solo = 1;
+  const alone = soleExplanation(sources);
+  if (alone) alone.solo = 1;
   const derived = sources.length > 0 ? 1 : 0;
   return { sources, derived, missed: priorMisses + (derived === 0 ? 1 : 0), sections };
 }
@@ -1677,13 +1732,34 @@ function updateTemplates(
     // something no other one does?", which is exactly what a value nothing
     // else explained shows. The two counters answer different questions and a
     // source still needs MIN_SOURCE_SOLO_WINS of them to be offered.
-    const explanations = matched.length + admitted.length;
-    if (explanations === 1) (matched[0] ?? admitted[0]!).solo += 1;
+    const alone = soleExplanation([...matched, ...admitted]);
+    if (alone) alone.solo += 1;
     if (admitted.length > 0) {
       tpl.sources.push(...admitted);
       evictSources(tpl, now, admitted.length);
     }
   }
+}
+
+/**
+ * The hypothesis that alone explains an observation, if one does.
+ *
+ * A memorized literal beside exactly one derivation does not count against
+ * it, as long as the literal has never explained more than the derivation
+ * has: the two have agreed on every observation so far, and of two readings
+ * that agree, the one that follows the trigger is the one worth a standing
+ * of its own. This is what lets a step of sibling reads (rows 0 and 1 of the
+ * same list) offer both rows when the template's first sighting happened to
+ * memorize one of them. A literal that has explained observations the
+ * derivation did not keeps the tie a tie, and a literal never earns a solo
+ * win from a tie, so a stale constant is still no fallback.
+ */
+function soleExplanation(explained: ScoredSource[]): ScoredSource | undefined {
+  if (explained.length === 1) return explained[0];
+  const derivations = explained.filter((src) => src.s.kind !== 'const');
+  if (derivations.length !== 1) return undefined;
+  const derivation = derivations[0]!;
+  return explained.every((src) => src === derivation || src.score <= derivation.score) ? derivation : undefined;
 }
 
 /** A newly discovered hypothesis: one observation of evidence, no solo win. */

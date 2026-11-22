@@ -371,6 +371,38 @@ test('a prompt naming a pull request prefetches it before the model asks', { tim
   expect(upstream.filter(u => u.by === 'model')).toEqual([])
 })
 
+test('prefetches reads together on a server the agent itself ran reads together on', { timeoutMs: 20_000 }, async ($, on) => {
+  const { clock, upstream } = world(on)
+  const GET_41 = { owner: 'acme', repo: 'api', issue_number: 41 }
+  const prefetchedGets = () => upstream.filter(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue').length
+  /** The model issues both reads in one step: they run at the same time. */
+  const readBoth = async () => {
+    const pending = [GET_41, GET_42].map(args => $.tool.call({ tool: 'mcp__gh__get_issue', ...args } as never))
+    await clock.advance(1_000)
+    await Promise.all(pending)
+  }
+  await startSession($, clock)
+  for (let round = 0; round < 3; round++) {
+    await call($, clock, 'mcp__gh__list_issues', LIST)
+    await readBoth()
+  }
+
+  // The list now predicts both reads. A get takes 400 ms, so within 300 ms of
+  // the list's answer a server taken one call at a time has started only one.
+  const before = prefetchedGets()
+  const listing = $.tool.call({ tool: 'mcp__gh__list_issues', ...LIST } as never)
+  await clock.advance(400)
+  await listing
+  for (let step = 0; step < 3; step++) await clock.advance(100)
+  expect(prefetchedGets() - before).toBe(2)
+
+  // Both were ready when the model asked: neither read went to the server again.
+  await clock.advance(500)
+  const mark = upstream.length
+  await readBoth()
+  expect(upstream.slice(mark).filter(u => u.by === 'model')).toEqual([])
+})
+
 test('/speculate reports, and /speculate forget clears what was learned', { timeoutMs: 20_000 }, async ($, on) => {
   const { clock, store } = world(on)
   await startSession($, clock)

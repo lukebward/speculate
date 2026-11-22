@@ -30,6 +30,11 @@ export interface ToolFact {
   servable: boolean;
   /** Set when that form is one text; absent for content blocks. */
   form?: 'text';
+  /**
+   * The most of the agent's own calls seen running on this tool's server at
+   * once, as of this tool's last real call; absent when none ever overlapped.
+   */
+  overlap?: number;
   /** Sorted argument key sets seen on real calls, most recent first. */
   shapes: string[];
   lastSeen: number;
@@ -62,7 +67,7 @@ export class ToolKnowledge {
   record(
     server: string,
     tool: string,
-    observed: { readOnly: boolean; servable: boolean; form?: RecordForm; args: Record<string, unknown> },
+    observed: { readOnly: boolean; servable: boolean; form?: RecordForm; overlap?: number; args: Record<string, unknown> },
   ): void {
     let byTool = this.facts.get(server);
     if (!byTool) {
@@ -76,6 +81,7 @@ export class ToolKnowledge {
       readOnly: observed.readOnly,
       servable: observed.servable,
       ...(observed.form === 'text' ? { form: 'text' as const } : {}),
+      ...overlapField(Math.max(prior?.overlap ?? 1, observed.overlap ?? 1)),
       shapes,
       lastSeen: this.now(),
     });
@@ -89,6 +95,16 @@ export class ToolKnowledge {
   /** The form the host recorded this tool's last real result in. */
   form(server: string, tool: string): RecordForm {
     return this.fact(server, tool)?.form ?? 'blocks';
+  }
+
+  /**
+   * How many of the agent's own calls this server has been seen to run at
+   * once, across its tools; 1 when none ever overlapped.
+   */
+  concurrency(server: string): number {
+    let most = 1;
+    for (const fact of this.facts.get(server)?.values() ?? []) most = Math.max(most, fact.overlap ?? 1);
+    return most;
   }
 
   /** True only when the host affirmatively reported the tool read-only. */
@@ -171,14 +187,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function validFact(value: unknown): ToolFact | null {
   if (!isRecord(value)) return null;
-  const { readOnly, servable, form, shapes, lastSeen } = value;
+  const { readOnly, servable, form, overlap, shapes, lastSeen } = value;
   if (typeof readOnly !== 'boolean' || typeof servable !== 'boolean') return null;
   if (typeof lastSeen !== 'number' || !Number.isFinite(lastSeen) || lastSeen < 0) return null;
   if (!Array.isArray(shapes)) return null;
   const clean = shapes
     .filter((shape): shape is string => typeof shape === 'string' && shape.length <= MAX_LABEL * 4)
     .slice(0, MAX_SHAPES);
-  return { readOnly, servable, ...(form === 'text' ? { form: 'text' as const } : {}), shapes: clean, lastSeen };
+  return {
+    readOnly,
+    servable,
+    ...(form === 'text' ? { form: 'text' as const } : {}),
+    ...overlapField(overlap),
+    shapes: clean,
+    lastSeen,
+  };
+}
+
+const MAX_OVERLAP = 16;
+
+/** `overlap` as stored: a whole number of calls above one, bounded; nothing otherwise. */
+function overlapField(value: unknown): { overlap?: number } {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 2) return {};
+  return { overlap: Math.min(Math.floor(value), MAX_OVERLAP) };
 }
 
 /**
@@ -256,8 +287,11 @@ export function mergeToolFacts(a: ToolFacts | undefined, b: ToolFacts | undefine
           continue;
         }
         const [newer, older] = fact.lastSeen >= prior.lastSeen ? [fact, prior] : [prior, fact];
+        const { overlap: _newerOverlap, ...verdict } = newer;
         out[server]![tool] = {
-          ...newer,
+          ...verdict,
+          // What a server was once seen to run together it can run together.
+          ...overlapField(Math.max(newer.overlap ?? 1, older.overlap ?? 1)),
           shapes: [...new Set([...newer.shapes, ...older.shapes])].slice(0, MAX_SHAPES),
         };
       }

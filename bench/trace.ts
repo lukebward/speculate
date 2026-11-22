@@ -179,17 +179,25 @@ export async function replayTraces(traces: readonly Trace[], options: ReplayOpti
     await main;
   };
 
-  // What the server answered each recorded call, for a prefetch of the same call.
+  // What the server answered each recorded call, for a prefetch of the same
+  // call: the answer of the session being replayed when it made that call (a
+  // list returns something else another day), else of any session that did.
   const answers = new Map<string, TraceCall>();
+  const answersOf = new Map<Trace, Map<string, TraceCall>>();
   const typical = new Map<string, number[]>();
   for (const trace of traces) {
+    const own = new Map<string, TraceCall>();
+    answersOf.set(trace, own);
     for (const call of trace.calls) {
       if (call.isError) continue;
-      answers.set(stable([call.server, call.tool, call.args]), call);
-      const key = `${call.server}\0${call.tool}`;
-      typical.set(key, [...(typical.get(key) ?? []), call.latencyMs]);
+      const key = stable([call.server, call.tool, call.args]);
+      answers.set(key, call);
+      own.set(key, call);
+      const tool = `${call.server}\0${call.tool}`;
+      typical.set(tool, [...(typical.get(tool) ?? []), call.latencyMs]);
     }
   }
+  let current: Map<string, TraceCall> | undefined;
   const usual = (server: string, tool: string): number => {
     const seen = [...(typical.get(`${server}\0${tool}`) ?? [300])].sort((a, b) => a - b);
     return seen[seen.length >> 1]!;
@@ -199,7 +207,8 @@ export async function replayTraces(traces: readonly Trace[], options: ReplayOpti
   const io: SpeculationIo = {
     call: async (server, tool, args) => {
       prefetched.push({ tool, args });
-      const recorded = answers.get(stable([server, tool, args]));
+      const key = stable([server, tool, args]);
+      const recorded = current?.get(key) ?? answers.get(key);
       await sleep(recorded?.latencyMs ?? usual(server, tool));
       return asResult(recorded?.text ?? '');
     },
@@ -230,17 +239,19 @@ export async function replayTraces(traces: readonly Trace[], options: ReplayOpti
 
   for (const [index, trace] of traces.entries()) {
     prefetched = [];
+    current = answersOf.get(trace);
     const session: ReplayedSession = { label: trace.label, calls: [], prefetched };
     const counted = index >= warmup;
 
     const one = async (call: TraceCall): Promise<void> => {
+      const startedAt = now();
       const claim = await speculator.serve(call.server, call.tool, call.args, io, sleep(8_500), 8_500);
       const answer = claim ? recordOf(claim.result, speculator.tools.form(call.server, call.tool)) : null;
-      const started = speculator.beginReal(call.server);
+      const started = speculator.beginReal(call.server, claim !== null && answer !== null);
       if (claim && answer !== null) {
         await sleep(servedMs);
         claim.commit();
-        speculator.observeServed(call.server, call.tool, call.args, claim, io);
+        speculator.observeServed(call.server, call.tool, call.args, claim, io, { startedAt, endedAt: now() });
         session.calls.push({ tool: call.tool, served: true, isError: false });
         return;
       }
@@ -253,6 +264,7 @@ export async function replayTraces(traces: readonly Trace[], options: ReplayOpti
         form: call.form,
         isError: call.isError,
         latencyMs: call.latencyMs,
+        span: { startedAt, endedAt: now() },
       };
       speculator.observe(call.server, call.tool, call.args, outcome, io, started);
       session.calls.push({ tool: call.tool, served: false, isError: call.isError });

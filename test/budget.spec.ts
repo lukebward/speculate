@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BudgetManager } from '../src/budget.js';
+import { BudgetManager, MAX_LEARNED_CONCURRENT } from '../src/budget.js';
 
 /** Fake clock helper. */
 function clock(start = 0): { now: () => number; advance: (ms: number) => void; set: (t: number) => void } {
@@ -221,5 +221,80 @@ describe('BudgetManager — server independence', () => {
     bm.realStarted('gh');
     bm.release('fs');
     expect(bm.tryAcquire('fs').ok).toBe(true);
+  });
+});
+
+describe('BudgetManager — a stdio server the agent has run calls together on', () => {
+  const serial = () => new BudgetManager({ gh: { transport: 'stdio' } });
+
+  it('is serial until two of the agent\'s own calls are in flight at once', () => {
+    const bm = serial();
+    expect(bm.concurrency('gh')).toBe(1);
+    bm.realStarted('gh');
+    bm.realFinished('gh');
+    bm.realStarted('gh');
+    bm.realFinished('gh');
+    // One after the other is no evidence.
+    expect(bm.concurrency('gh')).toBe(1);
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'stdio-busy' });
+  });
+
+  it('then speculates within what the agent itself had in flight', () => {
+    const bm = serial();
+    bm.realStarted('gh');
+    bm.realStarted('gh');
+    expect(bm.concurrency('gh')).toBe(2);
+    // Both of the agent's calls are still running: the server is as busy as it has been seen.
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'concurrency' });
+    bm.realFinished('gh');
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'concurrency' });
+    bm.realFinished('gh');
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.specInFlight('gh')).toBe(2);
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'concurrency' });
+  });
+
+  it('never runs more than its own cap, however many calls the agent ran together', () => {
+    const bm = serial();
+    for (let i = 0; i < 8; i++) bm.realStarted('gh');
+    for (let i = 0; i < 8; i++) bm.realFinished('gh');
+    expect(bm.concurrency('gh')).toBe(8);
+    for (let i = 0; i < MAX_LEARNED_CONCURRENT; i++) expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'concurrency' });
+  });
+
+  it('does not take a call answered from a prefetch for a call on the server', () => {
+    const bm = serial();
+    bm.realStarted('gh');
+    bm.realStarted('gh', false);
+    expect(bm.realInFlight('gh')).toBe(2);
+    expect(bm.concurrency('gh')).toBe(1);
+    bm.realFinished('gh', false);
+    bm.realFinished('gh');
+    expect(bm.realInFlight('gh')).toBe(0);
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'stdio-busy' });
+  });
+
+  it('starts from what earlier sessions saw', () => {
+    const bm = new BudgetManager({}, { defaults: { transport: 'stdio' }, concurrency: (server) => (server === 'gh' ? 3 : 1) });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'concurrency' });
+    expect(bm.tryAcquire('other')).toEqual({ ok: true });
+    expect(bm.tryAcquire('other')).toEqual({ ok: false, reason: 'stdio-busy' });
+  });
+
+  it('leaves an http budget as it was', () => {
+    const bm = new BudgetManager({ gh: { transport: 'http' } });
+    bm.realStarted('gh');
+    bm.realStarted('gh');
+    bm.realStarted('gh');
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: true });
+    expect(bm.tryAcquire('gh')).toEqual({ ok: false, reason: 'concurrency' });
   });
 });
