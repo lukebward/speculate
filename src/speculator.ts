@@ -24,6 +24,7 @@ import { morphologicalPairs } from './priming.js';
 import { canonicalKey } from './keys.js';
 import { ToolKnowledge, type RecordForm } from './tools.js';
 import { intentMappings } from './intent.js';
+import { promptFacts } from './prompt.js';
 import type { MemorySnapshot, PersistedState } from './persistence.js';
 import type { CallSpan, SpeculateOptions, StatsReport, ToolResult } from './types.js';
 
@@ -463,12 +464,40 @@ export class Speculator {
   // -------------------------------------------------------------------------
 
   /**
-   * The person submitted a prompt. When its words name exactly one known
-   * read-only tool call, prefetch it while the model reads the prompt.
+   * The person submitted a prompt. Two readings of it can start a read while
+   * the model is still reading:
+   *
+   * - what it names (promptFacts) becomes the call the first call of the
+   *   exchange follows, so the learner can read arguments out of it, and
+   *   whatever it has learned to read from such prompts is prefetched now;
+   * - words that name exactly one known read-only call outright (intent).
+   *
+   * `at` is the host's clock at the submission, the clock call spans are on.
    * Returns the number of predictions submitted.
    */
-  prompt(text: string, cwd: string, io: SpeculationIo): number {
+  prompt(text: string, cwd: string, io: SpeculationIo, at?: number): number {
     if (!this.enabled) return 0;
+    let submitted = 0;
+    try {
+      const facts = promptFacts(text);
+      const timestamp = this.now();
+      this.learner.notePrompt(facts, timestamp, at);
+      if (facts) {
+        for (const server of this.tools.servers()) {
+          const predictions = this.predictor.promptSubmitted(server, timestamp);
+          if (predictions.length === 0) continue;
+          this.executor.submit(predictions, io);
+          submitted += predictions.length;
+        }
+      }
+    } catch {
+      // Reading a prompt is best-effort; the prompt already went to the model.
+    }
+    return submitted + this.promptIntent(text, cwd, io);
+  }
+
+  /** The hand-written readings: words that name one known read outright. */
+  private promptIntent(text: string, cwd: string, io: SpeculationIo): number {
     const matches: Array<{ server: string; tool: string; args: Record<string, unknown>; ruleId: string }> = [];
     for (const mapping of intentMappings(text, cwd)) {
       for (const server of this.tools.servers()) {

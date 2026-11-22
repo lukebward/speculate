@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { TransitionLearner, decayedScore } from '../src/learner.js';
 import type { SerializedSource } from '../src/learner.js';
 import type { ObservedCall } from '../src/types.js';
+import { promptFacts } from '../src/prompt.js';
 
 const DAY_MS = 24 * 3600_000;
 
@@ -1708,5 +1709,177 @@ describe('a step of calls the agent made together', () => {
 
     const names = learner.predict(mkCall('gh', 'status', {}, { branch: 'release' })).map((p) => p.args['name']);
     expect(names).toEqual(['main']);
+  });
+});
+
+describe('a prompt that names something', () => {
+  const REPO = { owner: 'acme', repo: 'api' };
+  /** One exchange: the prompt, a second for the model, then the calls it makes one after another. */
+  const exchange = (learner: TransitionLearner, at: number, prompt: string, calls: Array<[string, Record<string, unknown>]>): void => {
+    learner.notePrompt(promptFacts(prompt), at, at);
+    let time = at + 1_000;
+    for (const [tool, args] of calls) {
+      learner.observe({ ...mkCall('gh', tool, args, { ok: true }, time + 400), span: { startedAt: time, endedAt: time + 400 } });
+      time += 1_500;
+    }
+  };
+  const issue = (n: number): Array<[string, Record<string, unknown>]> => [['get_issue', { ...REPO, issue_number: n }]];
+  const offered = (learner: TransitionLearner): Array<[string, unknown]> =>
+    learner.promptPredictions('gh').map((p) => [p.tool, p.args['issue_number'] ?? p.args['pull_number']]);
+
+  it('is what the first call of the exchange follows, and its arguments are read from it', () => {
+    const learner = new TransitionLearner({ now });
+    exchange(learner, 100_000, 'Read issue 41 in acme/api.', issue(41));
+    exchange(learner, 300_000, 'Read issue 42 in acme/api.', issue(42));
+
+    // A third prompt, a number never seen: the read is known before the model asks.
+    learner.notePrompt(promptFacts('Read issue 977 in acme/api.'), 500_000, 500_000);
+    expect(learner.promptPredictions('gh')).toMatchObject([
+      { server: 'gh', tool: 'get_issue', args: { ...REPO, issue_number: 977 }, horizon: 'next' },
+    ]);
+    expect(learner.promptPredictions('other')).toEqual([]);
+  });
+
+  it('offers a read only for a prompt that names its subject the way earlier ones did', () => {
+    const learner = new TransitionLearner({ now });
+    exchange(learner, 100_000, 'Read issue 41.', issue(41));
+    exchange(learner, 300_000, 'Read issue 42.', issue(42));
+    exchange(learner, 500_000, 'Read pull request 7.', [['get_pull_request', { ...REPO, pull_number: 7 }]]);
+    exchange(learner, 700_000, 'Read pull request 8.', [['get_pull_request', { ...REPO, pull_number: 8 }]]);
+
+    learner.notePrompt(promptFacts('Read pull request 9.'), 900_000, 900_000);
+    expect(offered(learner)).toEqual([['get_pull_request', 9]]);
+    learner.notePrompt(promptFacts('Read issue 43.'), 1_100_000, 1_100_000);
+    expect(offered(learner)).toEqual([['get_issue', 43]]);
+    // "ticket" was never the word before the number of anything read.
+    learner.notePrompt(promptFacts('Close ticket 44.'), 1_300_000, 1_300_000);
+    expect(offered(learner)).toEqual([]);
+  });
+
+  it('offers nothing the server would be asked whatever the person wrote', () => {
+    const learner = new TransitionLearner({ now });
+    // Every exchange opens with the same list: it reads nothing from the prompt.
+    const list: [string, Record<string, unknown>] = ['list_issues', { ...REPO, state: 'open' }];
+    exchange(learner, 100_000, 'Read issue 41.', [list, ...issue(41)]);
+    exchange(learner, 300_000, 'Read issue 42.', [list, ...issue(42)]);
+
+    learner.notePrompt(promptFacts('Read issue 43.'), 500_000, 500_000);
+    expect(learner.promptPredictions('gh')).toEqual([]);
+    // The read after the list still takes its number from the prompt, one call back.
+    const listed: ObservedCall = {
+      ...mkCall('gh', 'list_issues', { ...REPO, state: 'open' }, { ok: true }, 501_400),
+      span: { startedAt: 501_000, endedAt: 501_400 },
+    };
+    learner.observe(listed);
+    expect(learner.predict(listed)).toMatchObject([{ tool: 'get_issue', args: { ...REPO, issue_number: 43 } }]);
+  });
+
+  it('follows a step of calls made together back to the prompt', () => {
+    const learner = new TransitionLearner({ now });
+    const together = (at: number, prompt: string, n: number): void => {
+      learner.notePrompt(promptFacts(prompt), at, at);
+      for (const tool of ['get_issue', 'get_issue_comments']) {
+        learner.observe({
+          ...mkCall('gh', tool, { ...REPO, issue_number: n }, { ok: true }, at + 2_500),
+          span: { startedAt: at + 1_000, endedAt: at + 2_500 },
+        });
+      }
+    };
+    together(100_000, 'Read issue 41 and its comments.', 41);
+    together(300_000, 'Read issue 42 and its comments.', 42);
+
+    learner.notePrompt(promptFacts('Read issue 43 and its comments.'), 500_000, 500_000);
+    expect(offered(learner).sort()).toEqual([['get_issue', 43], ['get_issue_comments', 43]]);
+    // Neither read was learned as following the other.
+    expect(learner.exportState().transitions.map((x) => `${x.prevTool}>${x.nextTool}`).sort()).toEqual([
+      '@prompt>get_issue',
+      '@prompt>get_issue_comments',
+    ]);
+  });
+
+  it('leaves the chain as it was when the prompt names nothing', () => {
+    const learner = new TransitionLearner({ now });
+    const turn = (at: number, prompt: string): void => {
+      learner.notePrompt(promptFacts(prompt), at, at);
+      learner.observe(mkCall('gh', 'status', {}, { ok: true }, at + 1_000));
+      learner.observe(mkCall('gh', 'log', {}, { ok: true }, at + 2_000));
+    };
+    turn(10_000, 'what changed?');
+    turn(20_000, 'and now?');
+    turn(30_000, 'again');
+    // The first call of a turn follows the last call of the turn before, as it always did.
+    expect(learner.exportState().transitions.map((x) => `${x.prevTool}>${x.nextTool}:${x.count}`).sort()).toEqual([
+      'log>status:2',
+      'status>log:3',
+    ]);
+    expect(learner.promptPredictions('gh')).toEqual([]);
+  });
+
+  it('stores where a value was read, never the value or the prompt', () => {
+    const learner = new TransitionLearner({ now });
+    exchange(learner, 100_000, 'Read issue 90210 about "the secret plan".', issue(90210));
+    exchange(learner, 300_000, 'Read issue 90211 about "the other plan".', issue(90211));
+    exchange(learner, 500_000, 'Read issue 90212 about "a third plan".', issue(90212));
+
+    const stored = JSON.stringify(learner.exportState());
+    expect(stored).toContain('"named","issue"');
+    expect(stored).not.toMatch(/plan|90211|90212/);
+    // The first sighting's literal is kept like any other constant argument; it never wins.
+    const template = learner.exportState().transitions[0]!.templates.find((t) => t.name === 'issue_number')!;
+    expect(template.sources.filter((src) => src.kind === 'const').map((src) => src.repr)).toEqual(['90210']);
+  });
+});
+
+describe('which call follows, told by the call before the last one', () => {
+  /** A walk: the list, then each of two items and its comments, then on to the pull requests. */
+  const walk = (learner: TransitionLearner, at: number, stopAfter?: number): ObservedCall => {
+    const steps: Array<[string, Record<string, unknown>, unknown]> = [
+      ['list', {}, [{ id: 1 }, { id: 2 }]],
+      ['get', { id: 1 }, { id: 1 }],
+      ['comments', { id: 1 }, []],
+      ['get', { id: 2 }, { id: 2 }],
+      ['comments', { id: 2 }, []],
+      ['pulls', {}, []],
+    ];
+    let last!: ObservedCall;
+    for (const [i, [tool, args, parsed]] of steps.slice(0, stopAfter ?? steps.length).entries()) {
+      last = mkCall('gh', tool, args, parsed, at + i * 1_000);
+      learner.observe(last);
+    }
+    return last;
+  };
+  const taught = (): TransitionLearner => {
+    const learner = new TransitionLearner({ now });
+    for (const at of [1_000_000, 2_000_000, 3_000_000, 4_000_000]) walk(learner, at);
+    return learner;
+  };
+
+  it('ranks the next item first after the first comments, and moving on first after the last', () => {
+    const learner = taught();
+    // "comments" is followed by "get" as often as by "pulls": only what came before tells.
+    const afterFirst = learner.predict(walk(learner, 5_000_000, 3));
+    expect(afterFirst.map((p) => p.tool)).toEqual(['get', 'pulls']);
+    expect(afterFirst[0]!.args).toEqual({ id: 2 });
+
+    const again = taught();
+    expect(again.predict(walk(again, 5_000_000, 5))[0]!.tool).toBe('pulls');
+  });
+
+  it('tells the less likely call as less likely, so nothing downstream ranks it first', () => {
+    const learner = taught();
+    const [likely, unlikely] = learner.predict(walk(learner, 5_000_000, 3));
+    expect(likely!.confidence).toBeCloseTo(0.55);
+    // Half the sightings, none of them after a list-then-item: 0.325 to 0.675.
+    expect(unlikely!.confidence).toBeCloseTo(0.55 * (0.325 / 0.675));
+  });
+
+  it('stores the context as tool names only', () => {
+    const contexts = taught()
+      .exportState()
+      .transitions.flatMap((x) => (x.contexts ?? []).map((context) => context.key))
+      .filter((key) => key.includes('|before:'));
+    expect(contexts).toContain('tool:get|before:list');
+    expect(contexts).toContain('tool:get|before:comments');
+    expect(contexts.every((key) => /^tool:[a-z]+\|before:[a-z]+$/.test(key))).toBe(true);
   });
 });

@@ -529,6 +529,65 @@ describe('prompt', () => {
     h.spec.observe(S, 'get_pull_request', PR_ARGS, h.outcome(text({})), h.io);
     expect(h.spec.prompt('what is a pull request?', '/w', h.io)).toBe(0);
   });
+
+  describe('what a prompt names', () => {
+    const issue = (n: number) => ({ repo: 'acme/api', issue_number: n });
+    /** One exchange: the prompt, a second for the model, then its one read. */
+    async function ask(h: ReturnType<typeof harness>, n: number) {
+      const submitted = h.spec.prompt(`Read issue ${n} in acme/api.`, '/w', h.io, h.now());
+      h.advance(1_000);
+      await settle();
+      const claim = await h.real(GET, issue(n));
+      return { submitted, served: claim !== null };
+    }
+
+    it('is read for the first call once two prompts named their subject the same way', async () => {
+      const h = harness();
+      expect(await ask(h, 41)).toEqual({ submitted: 0, served: false });
+      expect(await ask(h, 42)).toEqual({ submitted: 0, served: false });
+
+      // A number the mod has never seen, read out of the prompt before the model asks.
+      h.io.calls.length = 0;
+      expect(await ask(h, 977)).toEqual({ submitted: 1, served: true });
+      expect(h.io.calls.map((c) => [c.server, c.tool, c.args])).toEqual([[S, GET, issue(977)]]);
+      expect(stats(h.spec)).toMatchObject({ hits: 1, speculativeCalls: 1, wasted: 0 });
+    });
+
+    it('carries to the next session, and holds nothing the prompt said', async () => {
+      const h = harness();
+      await ask(h, 41);
+      await ask(h, 42);
+      const memory = h.spec.exportMemory();
+      expect(JSON.stringify(memory)).toContain('@prompt');
+      expect(JSON.stringify(memory)).not.toContain('Read issue');
+
+      const next = harness();
+      next.spec.importMemory(memory as never);
+      expect(await ask(next, 55)).toEqual({ submitted: 1, served: true });
+    });
+
+    it('starts nothing for a prompt that names its subject another way, or names none', async () => {
+      const h = harness();
+      await ask(h, 41);
+      await ask(h, 42);
+      h.io.calls.length = 0;
+      expect(h.spec.prompt('Close ticket 43 in acme/api.', '/w', h.io, h.now())).toBe(0);
+      expect(h.spec.prompt('What is an issue?', '/w', h.io, h.now())).toBe(0);
+      await settle();
+      expect(h.io.calls).toEqual([]);
+    });
+
+    it('is not read while the mod is off', async () => {
+      const h = harness();
+      await ask(h, 41);
+      await ask(h, 42);
+      const off = harness({ mode: 'off' });
+      off.spec.importMemory(h.spec.exportMemory() as never);
+      expect(off.spec.prompt('Read issue 43 in acme/api.', '/w', off.io, off.now())).toBe(0);
+      await settle();
+      expect(off.io.calls).toEqual([]);
+    });
+  });
 });
 
 // --- sessionStart ----------------------------------------------------------------

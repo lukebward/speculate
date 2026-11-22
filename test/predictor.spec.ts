@@ -896,3 +896,75 @@ describe('prediction telemetry and adaptive admission', () => {
     ]);
   });
 });
+
+describe('a step of calls made together', () => {
+  const at = (startedAt: number, endedAt: number) => ({ timestamp: endedAt, span: { startedAt, endedAt } });
+  const call = (tool: string, args: Record<string, unknown>) => ({
+    server: SERVER,
+    tool,
+    args,
+    result: jsonResult({}),
+    latencyMs: 400,
+    eligibleTarget: true,
+  });
+  function stepSetup() {
+    const metrics = makeMetrics();
+    const calibration = new CandidateCalibrator({ now: () => 1 });
+    const predictor = new Predictor({
+      maxPerTrigger: 3,
+      metrics,
+      calibration,
+      learner: rulesLearner([
+        { id: 'row', trigger: 'list', predict: () => [pred('get', { id: 1 }, 0.5, 'row'), { ...pred('get', { id: 2 }, 0.4, 'row'), ruleId: 'row' }] },
+        { id: 'after-get', trigger: 'get', predict: (c) => [pred('comments', { id: c.args.id }, 0.5, 'after-get')] },
+      ]),
+    });
+    const evaluated = () =>
+      metrics.events.filter((ev) => ev.type === 'prediction_evaluated').map((ev) => [ev.tool, ev.rank ?? null]);
+    const judged = () =>
+      metrics.events
+        .filter((ev) => ev.type === 'candidate_evaluated')
+        .map((ev) => `${ev.tool}:${ev.rank}:${ev.correct ? 'right' : 'wrong'}`);
+    return { predictor, calibration, evaluated, judged };
+  }
+
+  it('is scored against the batch offered before the step, each call of it', () => {
+    const { predictor, evaluated, judged } = stepSetup();
+    predictor.observe({ ...call('list', {}), ...at(0, 400) });
+    // Both reads begin a second after the list answered, before either ends.
+    predictor.observe({ ...call('get', { id: 1 }), ...at(1_400, 1_800) });
+    predictor.observe({ ...call('get', { id: 2 }), ...at(1_400, 1_800) });
+    expect(evaluated()).toEqual([['get', 1], ['get', 2]]);
+    // Nothing is wrong yet: the step may not be over.
+    expect(judged()).toEqual(['get:1:right', 'get:2:right']);
+  });
+
+  it('calls a candidate wrong only once the step is over and nothing asked for it', () => {
+    const { predictor, evaluated, judged } = stepSetup();
+    predictor.observe({ ...call('list', {}), ...at(0, 400) });
+    predictor.observe({ ...call('get', { id: 1 }), ...at(1_400, 1_800) });
+    expect(judged()).toEqual(['get:1:right']);
+    // The next call comes after the read's answer: a new step, scored against the read's own batch.
+    predictor.observe({ ...call('comments', { id: 1 }), ...at(3_000, 3_400) });
+    expect(judged()).toEqual(['get:1:right', 'get:2:wrong', 'comments:1:right']);
+    expect(evaluated()).toEqual([['get', 1], ['comments', 1]]);
+  });
+
+  it('scores each call against the last batch when calls carry no times', () => {
+    const { predictor, evaluated, judged } = stepSetup();
+    const plain = (tool: string, args: Record<string, unknown>, timestamp: number) => ({ ...call(tool, args), timestamp });
+    predictor.observe(plain('list', {}, 1));
+    predictor.observe(plain('get', { id: 1 }, 2));
+    predictor.observe(plain('get', { id: 2 }, 3));
+    expect(evaluated()).toEqual([['get', 1], ['get', null]]);
+    expect(judged()).toEqual(['get:1:right', 'get:2:wrong', 'comments:1:wrong']);
+  });
+
+  it('keeps a sibling without a batch out of the count', () => {
+    const { predictor, evaluated } = stepSetup();
+    // The first two calls of a session, made together: nothing was offered before them.
+    predictor.observe({ ...call('get', { id: 1 }), ...at(1_000, 1_400) });
+    predictor.observe({ ...call('get', { id: 2 }), ...at(1_000, 1_400) });
+    expect(evaluated()).toEqual([]);
+  });
+});

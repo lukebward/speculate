@@ -278,7 +278,9 @@ function runSession(setup: SessionSetup): Promise<StreamLine[]> {
     createInterface({ input: child.stdout }).on('line', line => lines.push({ at: Date.now(), line }));
     const finish = (): void => {
       clearTimeout(timer);
-      if (opts.keep) writeFileSync(setup.log, lines.map(entry => entry.line).join('\n'));
+      // The stream does not hold the prompt; the replay (bench/replay.ts) needs it.
+      const asked = JSON.stringify({ type: 'bench_prompt', text: setup.prompt });
+      if (opts.keep) writeFileSync(setup.log, [asked, ...lines.map(entry => entry.line)].join('\n'));
       done(lines);
     };
     child.on('error', finish);

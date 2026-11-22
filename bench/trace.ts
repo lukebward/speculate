@@ -38,6 +38,13 @@ export interface TraceCall {
 export interface Trace {
   /** Where it came from, for the report. */
   label: string;
+  /** What the person asked, when the recording kept it (`bench_prompt`). */
+  prompt?: string;
+  /**
+   * Milliseconds the model took to begin its first answer. The stream's first
+   * dated event comes at least this long after the prompt went in.
+   */
+  leadMs?: number;
   calls: TraceCall[];
 }
 
@@ -60,6 +67,8 @@ export function extractTrace(lines: readonly StreamLine[], label: string): Trace
   const open = new Map<string, { name: string; args: Record<string, unknown>; at: number }>();
   const calls: TraceCall[] = [];
   let first: number | null = null;
+  let prompt: string | undefined;
+  let leadMs: number | undefined;
   for (const { at, line } of lines) {
     let event: unknown;
     try {
@@ -68,6 +77,14 @@ export function extractTrace(lines: readonly StreamLine[], label: string): Trace
       continue;
     }
     if (!isRecord(event)) continue;
+    // Written by the live runner ahead of the stream, which does not hold the prompt.
+    if (event['type'] === 'bench_prompt' && typeof event['text'] === 'string') {
+      prompt = event['text'];
+      continue;
+    }
+    if (leadMs === undefined && event['type'] === 'stream_event' && typeof event['ttft_ms'] === 'number' && event['ttft_ms'] >= 0) {
+      leadMs = event['ttft_ms'];
+    }
     const stamped = typeof event['timestamp'] === 'string' ? Date.parse(event['timestamp']) : NaN;
     const ts = Number.isFinite(stamped) ? stamped : at;
     // A stream read back from a file has no arrival times: the session starts
@@ -101,7 +118,7 @@ export function extractTrace(lines: readonly StreamLine[], label: string): Trace
     }
   }
   calls.sort((a, b) => a.startMs - b.startMs);
-  return { label, calls };
+  return { label, ...(prompt === undefined ? {} : { prompt }), ...(leadMs === undefined ? {} : { leadMs }), calls };
 }
 
 export interface ReplayedCall {
@@ -275,6 +292,12 @@ export async function replayTraces(traces: readonly Trace[], options: ReplayOpti
       const tools = [...new Set(trace.calls.map(call => mcpToolName(call.server, call.tool)))];
       void servers;
       speculator.sessionStart(tools, io);
+      // The prompt goes in, and the model takes its time to begin answering:
+      // the recording's first dated event is no sooner than that after it.
+      if (trace.prompt !== undefined) {
+        speculator.prompt(trace.prompt, '/work', io, now());
+        await sleep(trace.leadMs ?? 0);
+      }
       // Calls the model issued together (one began before another ended) run together.
       let previousEnd = 0;
       let step: TraceCall[] = [];

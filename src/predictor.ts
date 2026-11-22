@@ -7,6 +7,7 @@
  * feedback scoring (§5.6) → batch dedupe on canonical key → rank and cap.
  */
 import type { CallSpan, ToolResult } from './types.js';
+import { MIN_REACTION_MS } from './learner.js';
 import { canonicalKey } from './keys.js';
 import type { LatencyEstimator } from './latency.js';
 import type { CandidateCalibration } from './calibration.js';
@@ -43,6 +44,8 @@ export interface PredictorOptions {
     predict(call: ObservedCall): Prediction[];
     /** Session-opening reads worth prefetching at proxy start (§13.15). */
     openerPredictions?(server: string): Prediction[];
+    /** The calls the person's prompt predicts, when it named something. */
+    promptPredictions?(server: string): Prediction[];
   };
   /** Shared persisted latency source used by adaptive admission. */
   latency?: LatencyEstimator;
@@ -103,6 +106,13 @@ export class Predictor {
   private readonly calibration: CandidateCalibration | undefined;
   /** Last ranked batch emitted on each server, for real recall@K telemetry. */
   private readonly pendingEvaluation = new Map<string, PendingCandidateEvaluation[]>();
+  /**
+   * Per server, the batch the current step of calls is scored against: the
+   * candidates no call of the step has matched yet, and how many it held.
+   */
+  private readonly stepEvaluation = new Map<string, { unmatched: PendingCandidateEvaluation[]; size: number }>();
+  /** When the last observed call on each server had its answer (CompletedCall.span). */
+  private readonly lastEnded = new Map<string, number>();
 
   constructor(opts: PredictorOptions) {
     this.learner = opts.learner;
@@ -192,6 +202,35 @@ export class Predictor {
     return this.selectBatch(candidates, server);
   }
 
+  /**
+   * The person's prompt named something, and the learner has it: the calls
+   * it predicts on `server`, through the same pipeline as a batch that
+   * follows a call. The next real call on the server is scored against this
+   * batch, so the first call of an exchange is a prediction opportunity like
+   * any other, and a learned reading of prompts that keeps missing is muted
+   * like any other rule. Returns [] when nothing qualifies; never throws.
+   */
+  promptSubmitted(server: string, timestamp: number): Prediction[] {
+    if (!this.learner?.promptPredictions) return [];
+    const candidates: ScoredPrediction[] = [];
+    let order = 0;
+    try {
+      for (const raw of this.learner.promptPredictions(server)) {
+        const learnedId =
+          typeof (raw as { ruleId?: unknown } | null)?.ruleId === 'string'
+            ? (raw as { ruleId: string }).ruleId
+            : 'learned:unknown';
+        const p = validatePrediction(raw, server, learnedId, 'next');
+        if (!p) continue;
+        const candidate = this.scoreCandidate(p, p.ruleId, order++, timestamp);
+        if (candidate) candidates.push(candidate);
+      }
+    } catch {
+      return [];
+    }
+    return this.selectBatch(candidates, server, timestamp);
+  }
+
   admitResolved(
     server: string,
     resolved: readonly ResolvedCandidate[],
@@ -277,6 +316,7 @@ export class Predictor {
       const { prediction } = candidate;
       return {
         key: dedupeKey(prediction, index),
+        server,
         tool: prediction.tool,
         ruleId: prediction.ruleId,
         candidateId: candidate.candidateId,
@@ -291,49 +331,92 @@ export class Predictor {
   }
 
   /**
-   * Compare the exact next eligible real call with the batch produced after
-   * the prior call on this server. This measures predictor recall separately
+   * Compare the next eligible real call with the batch produced after the
+   * prior call on this server. This measures predictor recall separately
    * from policy, budget, upstream latency, and TTL timing—the cache hit rate
    * deliberately combines all of those and cannot diagnose model quality.
+   *
+   * A model often issues several calls in one step, and none of them was
+   * written with a sibling's answer in hand (see the learner's stepTrigger).
+   * So the batch a call is scored against is the one offered before its
+   * STEP: a call that began before the previous call's answer was a
+   * reaction time old is scored against what is left of the batch its
+   * sibling was scored against, not against the batch its sibling produced.
+   * A candidate is wrong only when no call of the step matched it. Scoring
+   * the second read of a step against the first read's own batch called a
+   * correct prediction wrong every time, and taught the calibration to drop
+   * exactly the predictions that let a step be prefetched whole.
    */
   private evaluatePreviousBatch(call: CompletedCall): void {
-    const prior = this.pendingEvaluation.get(call.server);
-    if (prior === undefined) return; // first call: no preceding opportunity
-    this.pendingEvaluation.delete(call.server);
+    const ended = this.lastEnded.get(call.server);
+    if (call.span === undefined) this.lastEnded.delete(call.server);
+    else this.lastEnded.set(call.server, call.span.endedAt);
+    const sibling =
+      call.span !== undefined && ended !== undefined && call.span.startedAt - ended < MIN_REACTION_MS;
+
+    let candidates: PendingCandidateEvaluation[];
+    let size: number;
+    if (sibling) {
+      const step = this.stepEvaluation.get(call.server);
+      if (step === undefined) return; // the step began with nothing to be scored against
+      candidates = step.unmatched;
+      size = step.size;
+    } else {
+      // A new step: whatever the last one never asked for was wrong.
+      this.settleStep(call.server, call.timestamp);
+      const prior = this.pendingEvaluation.get(call.server);
+      if (prior === undefined) return; // first call: no preceding opportunity
+      this.pendingEvaluation.delete(call.server);
+      candidates = prior;
+      size = prior.length;
+    }
     if (call.eligibleTarget === false) return;
-    let rank: number | undefined;
+
+    let matched: PendingCandidateEvaluation | undefined;
     try {
       const actual = canonicalKey(call.server, call.tool, call.args);
-      const at = prior.findIndex((candidate) => candidate.key === actual);
-      if (at >= 0) rank = at + 1;
-      for (const candidate of prior) {
-        const correct = candidate.key === actual;
-        this.calibration?.observe(candidate.candidateId, correct, call.timestamp);
-        this.metrics.record({
-          type: 'candidate_evaluated',
-          server: call.server,
-          tool: candidate.tool,
-          ruleId: candidate.ruleId,
-          candidateId: candidate.candidateId,
-          rank: candidate.rank,
-          probability: candidate.probability,
-          baseConfidence: candidate.baseConfidence,
-          admitted: candidate.admitted,
-          correct,
-          timestamp: call.timestamp,
-        });
-      }
+      matched = candidates.find((candidate) => candidate.key === actual);
     } catch {
       // Unkeyable real args are not a measurable cache opportunity.
       return;
     }
+    if (matched) this.recordCandidate(matched, true, call.timestamp);
+    const unmatched = candidates.filter((candidate) => candidate !== matched);
+    this.stepEvaluation.set(call.server, { unmatched, size });
+    // With no span there is no telling a step: each call is a step of its own.
+    if (call.span === undefined) this.settleStep(call.server, call.timestamp);
     this.metrics.record({
       type: 'prediction_evaluated',
       server: call.server,
       tool: call.tool,
-      rank,
-      candidateCount: prior.length,
+      rank: matched?.rank,
+      candidateCount: size,
       timestamp: call.timestamp,
+    });
+  }
+
+  /** The step on `server` is over: the candidates no call of it matched were wrong. */
+  private settleStep(server: string, timestamp: number): void {
+    const step = this.stepEvaluation.get(server);
+    if (step === undefined) return;
+    this.stepEvaluation.delete(server);
+    for (const candidate of step.unmatched) this.recordCandidate(candidate, false, timestamp);
+  }
+
+  private recordCandidate(candidate: PendingCandidateEvaluation, correct: boolean, timestamp: number): void {
+    this.calibration?.observe(candidate.candidateId, correct, timestamp);
+    this.metrics.record({
+      type: 'candidate_evaluated',
+      server: candidate.server,
+      tool: candidate.tool,
+      ruleId: candidate.ruleId,
+      candidateId: candidate.candidateId,
+      rank: candidate.rank,
+      probability: candidate.probability,
+      baseConfidence: candidate.baseConfidence,
+      admitted: candidate.admitted,
+      correct,
+      timestamp,
     });
   }
 
@@ -402,6 +485,7 @@ export class Predictor {
 
 interface PendingCandidateEvaluation {
   key: string;
+  server: string;
   tool: string;
   ruleId: string;
   candidateId: string;

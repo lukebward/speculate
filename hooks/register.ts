@@ -98,7 +98,7 @@ export const register: Register = on => {
       sleep: ms => $.clock.sleep(ms),
     }
     speculator.sessionStart((await $.tool.list()).filter(info => info.mcp).map(info => info.name), io)
-    speculator.prompt(e.text, await $.session.cwd(), io)
+    speculator.prompt(e.text, await $.session.cwd(), io, await $.clock.now())
     return result
   }).catch(($, e, next) => next(e))
 

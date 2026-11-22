@@ -371,6 +371,36 @@ test('a prompt naming a pull request prefetches it before the model asks', { tim
   expect(upstream.filter(u => u.by === 'model')).toEqual([])
 })
 
+test('a prompt that names an issue prefetches its read, once two such prompts were seen', { timeoutMs: 20_000 }, async ($, on) => {
+  const { clock, upstream } = world(on)
+  const issue = (issue_number: number) => ({ owner: 'acme', repo: 'api', issue_number })
+  const ask = async (text: string) => {
+    const submitted = $.prompt.submit({ text } as never)
+    await clock.advance(1_000)
+    await submitted
+  }
+  await startSession($, clock)
+  // Two exchanges: the person names an issue, the model reads it.
+  await ask('Read issue 7 and summarise it.')
+  await call($, clock, 'mcp__gh__get_issue', issue(7))
+  await ask('Read issue 8 and summarise it.')
+  await call($, clock, 'mcp__gh__get_issue', issue(8))
+
+  // A third issue, never read before: its number is in the prompt, and the
+  // read starts while the model is still reading it.
+  upstream.length = 0
+  await ask('Read issue 42 and summarise it.')
+  expect(upstream).toEqual([{ tool: 'mcp__gh__get_issue', args: issue(42), by: 'plugin' }])
+  const got = await call($, clock, 'mcp__gh__get_issue', issue(42))
+  expect(JSON.parse(got.text).title).toBe('Rate limiter drops burst traffic')
+  expect(upstream.filter(u => u.by === 'model')).toEqual([])
+
+  // A prompt that names nothing the reads were ever taken from starts nothing.
+  upstream.length = 0
+  await ask('Thanks. What does "flaky" mean here?')
+  expect(upstream).toEqual([])
+})
+
 test('prefetches reads together on a server the agent itself ran reads together on', { timeoutMs: 20_000 }, async ($, on) => {
   const { clock, upstream } = world(on)
   const GET_41 = { owner: 'acme', repo: 'api', issue_number: 41 }

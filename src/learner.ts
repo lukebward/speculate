@@ -18,6 +18,7 @@
  * Dependency-free besides types.js/keys.js. No metrics, no logging.
  */
 import { stableStringify } from './keys.js';
+import { PROMPT_TOOL } from './prompt.js';
 import type { ObservedCall, Prediction } from './types.js';
 
 export interface TransitionLearnerOptions {
@@ -420,6 +421,12 @@ export class TransitionLearner {
   /** Most recent observed call and bounded prior snapshots per server. */
   private readonly lastCallByServer = new Map<string, PrevCall>();
   /**
+   * The prompt the person last submitted, when it named something (see
+   * notePrompt). It stands in for a call on EVERY server: the next call on a
+   * server that has made none since follows it. Never exported.
+   */
+  private prompt: PrevCall | undefined;
+  /**
    * Primed transitions (§13.9): (server, prev, next) pairs shipped as
    * product knowledge or derived from tool-name morphology. A primed
    * transition reaches the prediction threshold on its FIRST sighting
@@ -472,6 +479,68 @@ export class TransitionLearner {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * The person submitted a prompt. `facts` is what it names (promptFacts),
+   * or null when it names nothing.
+   *
+   * A prompt that names something starts a chain of its own: the first call
+   * on each server after it is learned as following `@prompt`, with the
+   * prompt's identifiers as the result its arguments can be read from, and
+   * the calls before it as history. A prompt that names nothing leaves each
+   * server's chain as it was, as before prompts were read at all.
+   */
+  notePrompt(facts: unknown, timestamp: number, endedAt?: number): void {
+    this.prompt =
+      facts === null || facts === undefined
+        ? undefined
+        : {
+            tool: PROMPT_TOOL,
+            args: {},
+            parsed: facts,
+            timestamp,
+            ...(endedAt === undefined ? {} : { endedAt }),
+          };
+  }
+
+  /**
+   * The calls the prompt itself predicts on `server`, while the model is
+   * still reading it. Only a prediction that takes a value from the prompt
+   * is offered: a call the server would be asked whatever the person wrote
+   * is a session opener's business (§13.15), not a reading of this prompt.
+   * Never throws; may return [].
+   */
+  promptPredictions(server: string): Prediction[] {
+    try {
+      const head = this.headFor(server);
+      if (head?.tool !== PROMPT_TOOL) return [];
+      return this.predictInner(
+        {
+          server,
+          tool: PROMPT_TOOL,
+          args: {},
+          result: { content: [] },
+          parsed: head.parsed,
+          timestamp: head.timestamp,
+          latencyMs: 0,
+        },
+        head,
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  /** What the next call on `server` follows: its last call, or a prompt submitted since. */
+  private headFor(server: string): PrevCall | undefined {
+    const stored = this.lastCallByServer.get(server);
+    const prompt = this.prompt;
+    if (!prompt || (stored !== undefined && stored.timestamp >= prompt.timestamp)) return stored;
+    return {
+      ...prompt,
+      history: stored ? recentHistory(stored, prompt.timestamp, this.maxGapMs) : [],
+    };
   }
 
   /** Increments whenever tracked transitions change (dirty tracking). */
@@ -675,7 +744,7 @@ export class TransitionLearner {
   // -- observation ----------------------------------------------------------
 
   private observeInner(call: ObservedCall): void {
-    const last = this.lastCallByServer.get(call.server);
+    const last = this.headFor(call.server);
     const lastGap = last ? call.timestamp - last.timestamp : Number.POSITIVE_INFINITY;
     const chained = last !== undefined && lastGap >= 0 && lastGap <= this.maxGapMs ? last : undefined;
     // What this call FOLLOWS is not always the call observed before it: see
@@ -803,12 +872,15 @@ export class TransitionLearner {
 
   // -- prediction -----------------------------------------------------------
 
-  private predictInner(call: ObservedCall): Prediction[] {
+  /** `from`: the head to read arguments from, when the caller holds it (a prompt). */
+  private predictInner(call: ObservedCall, from?: PrevCall): Prediction[] {
     const now = this.now();
     const candidates: Array<{
       state: TransitionState;
       ruleId: string;
       score: number;
+      /** The transition's share of what follows this call, context included. */
+      share: number;
       weight: number;
       args: Record<string, unknown>;
     }> = [];
@@ -825,14 +897,18 @@ export class TransitionLearner {
     const head = this.lastCallByServer.get(call.server);
     // Only the observed trigger owns this history. An arbitrary predict()
     // call must not borrow the latest head's preceding values.
-    const sourceCall: PrevCall = head?.tool === call.tool &&
+    const sourceCall: PrevCall = from ?? (head?.tool === call.tool &&
       head.timestamp === call.timestamp && head.args === call.args && head.parsed === call.parsed
       ? head
-      : call;
+      : call);
+    // What the same transitions would offer had the prompt named nothing:
+    // those calls do not read the prompt, and are not offered for it.
+    const unprompted: PrevCall | undefined =
+      from?.tool === PROMPT_TOOL ? { ...from, parsed: null } : undefined;
     // Session-start has no real preceding context. Treating '<start>' as one
     // makes opener frequency overpower the decayed bigram prior and erases
     // regime changes; context is reserved for genuine three-call histories.
-    const availableContexts = head?.priorTool ? contextKeys(head).reverse() : [];
+    const availableContexts = !from && head?.priorTool ? contextKeys(head).reverse() : [];
     const chosenContext = availableContexts.find((key) =>
       matching.reduce((sum, state) => sum + (state.contexts.get(key)?.count ?? 0), 0) >= 3,
     );
@@ -858,8 +934,16 @@ export class TransitionLearner {
         ? 0.65 * baseProbability + 0.35 * contextProbability
         : baseProbability;
       const combos = materializeCombos(state, sourceCall, now, this.maxPredictionsPerTrigger);
+      const whatever = unprompted
+        ? new Set(
+            materializeCombos(state, unprompted, now, this.maxPredictionsPerTrigger).map((c) =>
+              safeStringify(c.args),
+            ),
+          )
+        : undefined;
       for (let comboRank = 0; comboRank < combos.length; comboRank++) {
         const c = combos[comboRank]!;
+        if (whatever?.has(safeStringify(c.args))) continue;
         candidates.push({
           state,
           // Keep rank 1's historic id so existing feedback survives upgrade;
@@ -867,6 +951,7 @@ export class TransitionLearner {
           // the primary candidate's hits.
           ruleId: comboRank === 0 ? baseRuleId : `${baseRuleId}#${comboRank + 1}`,
           score: score * c.weight,
+          share: score,
           weight: c.weight,
           args: c.args,
         });
@@ -899,6 +984,7 @@ export class TransitionLearner {
           },
           ruleId: prediction.ruleId,
           score: prediction.confidence,
+          share: 1,
           weight: prediction.confidence / 0.45,
           args: prediction.args,
         });
@@ -915,6 +1001,12 @@ export class TransitionLearner {
         (a.ruleId < b.ruleId ? -1 : a.ruleId > b.ruleId ? 1 : 0) ||
         b.weight - a.weight,
     );
+    // The likeliest transition on offer. A transition's confidence is told
+    // relative to it, so that what the learner knows about WHICH call follows
+    // (frequency, and the calls before this one) reaches whoever ranks these
+    // against latency: two transitions seen equally often are not equally
+    // likely after this particular call.
+    const lead = candidates.reduce((most, c) => Math.max(most, c.share), 0);
     // No `key` stamped: the predictor owns canonical cache keying.
     const out: Prediction[] = [];
     const emitted = new Set<string>();
@@ -938,7 +1030,10 @@ export class TransitionLearner {
         // well-observed transition's third choice clip back up to the cap and
         // arrive indistinguishable from its first. The best combo weighs
         // exactly 1, so a single-candidate transition is unchanged.
-        confidence: Math.min(0.55, 0.25 + 0.1 * c.state.count) * c.weight,
+        // The same holds across transitions: the likeliest keeps the ramp,
+        // and a less likely one is discounted by how much less likely it is.
+        confidence:
+          Math.min(0.55, 0.25 + 0.1 * c.state.count) * c.weight * (lead > 0 ? c.share / lead : 1),
         ruleId: c.ruleId,
         // The observed transition predicts the next call, including when
         // all arguments are constants. Only session openers are standing.
@@ -1014,7 +1109,7 @@ function historySnapshot(call: PrevCall): HistoryCall | null {
  * back. A call that began sooner than this after another ended was not
  * written in answer to it.
  */
-const MIN_REACTION_MS = 300;
+export const MIN_REACTION_MS = 300;
 
 /**
  * The call `call` follows, given the one observed just before it.
@@ -1568,12 +1663,23 @@ function resultShape(value: unknown): string {
   return value === null ? 'null' : typeof value;
 }
 
-/** Coarse then rich: prediction backs off in exactly this order. */
+/**
+ * Coarse then rich: prediction backs off in exactly this order.
+ *
+ * The last key reaches one call further back. A walk over a list reads an
+ * item and its comments, the next item and its comments, then moves on:
+ * after "comments" the next call is another item the first time and
+ * something else the last time, and only the call before the item (the list,
+ * or the comments of the item before) tells the two apart.
+ */
 function contextKeys(call: PrevCall): string[] {
   const prior = call.priorTool ?? '<start>';
   const coarse = `tool:${prior}`;
   const args = Object.keys(call.args).sort().join(',');
-  return [coarse, `${coarse}|args:${args}|result:${resultShape(call.parsed)}`];
+  const rich = `${coarse}|args:${args}|result:${resultShape(call.parsed)}`;
+  // history[0] is the call before this one (`prior`); history[1] the one before that.
+  const before = call.priorTool === undefined ? undefined : call.history?.[1]?.tool;
+  return before === undefined ? [coarse, rich] : [coarse, rich, `${coarse}|before:${before}`];
 }
 
 function initialContexts(prev: PrevCall, now: number): Map<string, ContextEvidence> {

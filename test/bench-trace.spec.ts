@@ -40,6 +40,22 @@ describe('extractTrace', () => {
     ]);
   });
 
+  it('reads the prompt the runner kept and the model\'s time to begin', () => {
+    const trace = extractTrace(
+      [
+        line({ type: 'bench_prompt', text: 'Read issue 4.' }),
+        line({ type: 'stream_event', ttft_ms: 512 }),
+        line({ type: 'stream_event', ttft_ms: 300 }),
+        use(1_000, 'a', 'mcp__gh__get_issue', { issue_number: 4 }),
+        result(1_400, 'a', '{}'),
+      ],
+      'asked',
+    );
+    // The first request's time to first token: later ones are not the prompt's.
+    expect(trace).toMatchObject({ prompt: 'Read issue 4.', leadMs: 512 });
+    expect(extractTrace([use(1_000, 'a', 'mcp__gh__get_issue', {}), result(1_400, 'a', '{}')], 'bare')).not.toHaveProperty('prompt');
+  });
+
   it('orders calls by when the model made them and skips a subagent and noise', () => {
     const trace = extractTrace(
       [
@@ -103,6 +119,20 @@ describe('replayTraces', () => {
     const report = await replayTraces([pair('a', 1, 2), pair('b', 3, 4), pair('c', 5, 6), pair('d', 7, 8)], { warmup: 3 });
     expect(report.calls).toBe(3);
     expect(report.sessions[0]!.calls).toHaveLength(3);
+  });
+
+  it('gives the core the prompt, and the model its time to begin', async () => {
+    const asked = (label: string, n: number): Trace => ({
+      label,
+      prompt: `Read issue ${n}.`,
+      leadMs: 600,
+      calls: [{ server: 's', tool: 'get_issue', args: { issue_number: n }, text: JSON.stringify({ number: n }), form: 'blocks', isError: false, startMs: 200, latencyMs: 400 }],
+    });
+    const report = await replayTraces([asked('a', 1), asked('b', 2), asked('c', 3)], { warmup: 2 });
+    // The third prompt names an issue never read: the read is prefetched from the prompt.
+    expect(report.sessions[0]!.prefetched).toEqual([{ tool: 'get_issue', args: { issue_number: 3 } }]);
+    expect(report.sessions[0]!.calls).toEqual([{ tool: 'get_issue', served: true, isError: false }]);
+    expect(report).toMatchObject({ calls: 1, served: 1, prefetches: 1, recallAt1: 1 });
   });
 
   it('keeps an errored call out of what is served or learned as servable', async () => {

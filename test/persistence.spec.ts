@@ -611,7 +611,10 @@ describe('TransitionLearner export/import', () => {
     expect(out[0]!.args).toEqual({ x: 'v' });
     // Score defaults to count, so the pre-existing ordering is preserved.
     expect(out.map((p) => p.tool)).toEqual(['z', 'b']);
-    expect(out[1]!.confidence).toBeCloseTo(0.45); // count 2 survived the load
+    // Count 2 survived the load (the 0.45 ramp), told relative to the
+    // likelier transition: 2 of every 5 sightings to its 5.
+    expect(out[0]!.confidence).toBeCloseTo(0.55);
+    expect(out[1]!.confidence).toBeCloseTo(0.45 * (2 / 5));
     expect(l.openerPredictions('s')).toHaveLength(1);
   });
 
