@@ -798,6 +798,22 @@ Hooks (2026-11-22). Reasons are in
   asked about every call.
 - `bench:live --host-tools` leaves the host's own tools in both arms.
 
+Measurement of these hooks (2026-11-22, Claude Code 2.1.330,
+`claude-haiku-5-5`, 132 sessions, the Artifact tool in both arms). Once the
+names are kept, the first request of a session is the same size with the mod
+as without it; with the old hooks it was 533 tokens shorter. Hit rate,
+scripted workflow, repeated question, new subjects: 94%, 95% and 50% on the
+mock server, 83%, 58% and 33% on Microsoft Learn, and 97%, 58% and 0% on the
+Hugging Face Hub. Median tool wait per session fell 58%, 82% and 49% on the
+mock server, 80%, 31% and 36% on Microsoft Learn, and 56% and 62% in the
+first two Hub workloads. Session time fell 35%, 28% and 9% on the mock
+server. On Microsoft Learn it fell 6% in the scripted workflow and rose 31%
+in the repeated question, where the model chose a very large page in three
+sessions of the `on` arm and none of the `off` arm; over four runs it has
+done that as often without the mod as with it. 72% of prefetches were used.
+Tables and limits are in the
+[benchmark guide](local-learning-benchmark.md#results-the-hooks-at-toolrun-2026-11-22).
+
 Prediction (2026-11-22). Reasons are in
 [§13.32](implementation-notes.md#1332-prediction-that-fits-how-a-model-calls-2026-11-22).
 
@@ -838,7 +854,10 @@ prefetches were used.
 The day's first runs showed no gain in session time on the hosted servers.
 The cause was the place the benchmark runs in: a cloud session offers Claude
 Code's Artifact tool, the host builds that tool differently once any mod
-hooks tool calls, and the API then answered each request about 170 ms later.
-The runner now keeps that tool out of both arms and reports the model's time
-to first token for each. Tables, the first runs, and limits are in the
+hooks tool calls, and in those hours the API answered each such request
+about 170 ms later. The runner now keeps that tool out of both arms and
+reports the model's time to first token for each. Measured again twelve
+hours later, the changed request was answered as fast as the unchanged one,
+so the 170 ms is not a fixed cost; and with the hooks above the mod no longer
+changes the request. Tables, the first runs, and limits are in the
 [benchmark guide](local-learning-benchmark.md#results-after-the-prediction-changes-2026-11-22).

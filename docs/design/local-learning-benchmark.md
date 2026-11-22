@@ -128,6 +128,189 @@ the unused prefetches as well as the served calls, and session time as well
 as tool wait. Keep the result file: it holds every
 session and every call, so a reader can check a summary against it.
 
+### Results: the hooks at `tool.run` (2026-11-22)
+
+The mod after
+[§13.33](implementation-notes.md#1333-serving-where-the-host-means-a-call-to-be-served-2026-11-22):
+it answers an allowed call at `tool.run`, its hook names the MCP tools and no
+other tool, and it keeps those names in its option. Prediction is the code of
+[the section below](#results-after-the-prediction-changes-2026-11-22),
+unchanged. So this run asks two things. Does the mod serve what it served
+before? And does the host still send the model a different request when the
+mod is loaded?
+
+It was run with `--host-tools`: Claude Code's Artifact tool is in both arms,
+as it is in any cloud session.
+
+| Condition | Value |
+| --- | --- |
+| Mod | `7754dc5`, loaded from a copy made with `git archive` (`--mod`) |
+| Host | Claude Code 2.1.330, headless (`claude -p`), no tool disallowed (`--host-tools`) |
+| Model | `claude-haiku-5-5` for both arms |
+| Servers | Microsoft Learn, the Hugging Face Hub, and the bundled mock GitHub server over stdio with 1.5 s added to every call |
+| Run from | The same Linux cloud container (Node 22.23.5), behind an HTTPS egress proxy, 15:43 to 16:08 UTC |
+| Size | Hosted servers: 8 pairs per workload, pairs 1 and 2 learning, 3 to 8 warm. Mock server: 6 pairs, 4 warm. 132 sessions, $1.07 of model use |
+| Result files | [`bench/results/2026-11-22/tool-run-hooks/`](https://github.com/lukebward/speculate/tree/main/bench/results/2026-11-22/tool-run-hooks) |
+
+Hit rate, warm pairs. "Before" is the run of the section below, made twelve
+hours earlier with the hooks of v1.0:
+
+| Server | Workload | Calls | Served | Hit rate | Hit rate before | Prefetches | Used | Unused | Recall@1 | Recall@3 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 32 | 30 | 94% | 97% | 31 | 97% | 1 | 94% | 100% |
+| Mock GitHub, 1.5 s | repeat | 20 | 19 | 95% | 95% | 19 | 100% | 0 | 40% | 80% |
+| Mock GitHub, 1.5 s | varied | 8 | 4 | 50% | 50% | 4 | 100% | 0 | 25% | 50% |
+| Microsoft Learn | scripted | 41 | 34 | 83% | 97% | 54 | 63% | 20 | 56% | 95% |
+| Microsoft Learn | repeat | 19 | 11 | 58% | 53% | 19 | 58% | 8 | 42% | 53% |
+| Microsoft Learn | varied | 18 | 6 | 33% | 37% | 13 | 46% | 7 | 22% | 33% |
+| Hugging Face Hub | scripted | 36 | 35 | 97% | 97% | 50 | 70% | 15 | 86% | 100% |
+| Hugging Face Hub | repeat | 12 | 7 | 58% | 18% | 14 | 50% | 7 | 33% | 33% |
+| Hugging Face Hub | varied | 16 | 0 | 0% | 0% | 0 | n/a | 0 | 0% | 0% |
+
+Across the nine rows, 146 of 202 calls were served (72%) from 204 prefetches
+(72% used).
+
+Per session, medians over the warm sessions of each arm:
+
+| Server | Workload | Tool wait per session, off | Tool wait per session, on | Change | Pairs with less wait | Session time, off | Session time, on | Change |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 12127 ms | 5089 ms | -58% | 4 of 4 | 23883 ms | 15615 ms | -35% |
+| Mock GitHub, 1.5 s | repeat | 7594 ms | 1355 ms | -82% | 4 of 4 | 9536 ms | 6910 ms | -28% |
+| Mock GitHub, 1.5 s | varied | 3040 ms | 1557 ms | -49% | 2 of 4 | 5549 ms | 5061 ms | -9% |
+| Microsoft Learn | scripted | 2240 ms | 455 ms | -80% | 6 of 6 | 10792 ms | 10149 ms | -6% |
+| Microsoft Learn | repeat | 1175 ms | 808 ms | -31% | 6 of 6 | 8613 ms | 11250 ms | +31% |
+| Microsoft Learn | varied | 1473 ms | 938 ms | -36% | 5 of 6 | 8645 ms | 8522 ms | -1% |
+| Hugging Face Hub | scripted | 478 ms | 209 ms | -56% | 6 of 6 | 9304 ms | 9178 ms | -1% |
+| Hugging Face Hub | repeat | 354 ms | 133 ms | -62% | 4 of 6 | 7104 ms | 6595 ms | -7% |
+| Hugging Face Hub | varied | 189 ms | 210 ms | +11% | 1 of 6 | 7300 ms | 7114 ms | -3% |
+
+Per call:
+
+| Server | Workload | Calls off / on | Errors off / on | Served | Prefetches | Unused | Mean wait per call, off | Mean wait per call, on |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 32 / 32 | 0 / 0 | 30 (6 ready, 24 joined) | 31 | 1 | 1516 ms | 637 ms |
+| Mock GitHub, 1.5 s | repeat | 20 / 20 | 0 / 0 | 19 (12 ready, 7 joined) | 19 | 0 | 1519 ms | 280 ms |
+| Mock GitHub, 1.5 s | varied | 8 / 8 | 0 / 0 | 4 (4 ready, 0 joined) | 4 | 0 | 1521 ms | 778 ms |
+| Microsoft Learn | scripted | 39 / 41 | 0 / 0 | 34 (31 ready, 3 joined) | 54 | 20 | 375 ms | 80 ms |
+| Microsoft Learn | repeat | 18 / 19 | 0 / 0 | 11 (11 ready, 0 joined) | 19 | 8 | 411 ms | 221 ms |
+| Microsoft Learn | varied | 19 / 18 | 0 / 0 | 6 (6 ready, 0 joined) | 13 | 7 | 505 ms | 331 ms |
+| Hugging Face Hub | scripted | 36 / 36 | 0 / 0 | 35 (35 ready, 0 joined) | 50 | 15 | 91 ms | 36 ms |
+| Hugging Face Hub | repeat | 12 / 12 | 4 / 0 | 7 (7 ready, 0 joined) | 14 | 7 | 148 ms | 63 ms |
+| Hugging Face Hub | varied | 14 / 16 | 1 / 0 | 0 (0 ready, 0 joined) | 0 | 0 | 103 ms | 114 ms |
+
+The model's side of the same sessions, with the Artifact tool in both arms:
+
+| Server | Workload | Model time to first token, off | Model time to first token, on | Time in the model per session, off | Time in the model per session, on |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 491 ms | 483 ms | 7991 ms | 7663 ms |
+| Mock GitHub, 1.5 s | repeat | 489 ms | 498 ms | 5033 ms | 4242 ms |
+| Mock GitHub, 1.5 s | varied | 480 ms | 496 ms | 2685 ms | 2540 ms |
+| Microsoft Learn | scripted | 542 ms | 533 ms | 5949 ms | 6768 ms |
+| Microsoft Learn | repeat | 496 ms | 534 ms | 6443 ms | 9201 ms |
+| Microsoft Learn | varied | 504 ms | 512 ms | 6324 ms | 6272 ms |
+| Hugging Face Hub | scripted | 494 ms | 496 ms | 6322 ms | 6004 ms |
+| Hugging Face Hub | repeat | 459 ms | 465 ms | 5241 ms | 5001 ms |
+| Hugging Face Hub | varied | 463 ms | 462 ms | 5742 ms | 5612 ms |
+
+And the size of each session's first request to the model, `on` arm minus
+`off` arm, in tokens, from the event streams the run kept:
+
+| Server | Pair 1 (scripted, repeat, varied) | Pairs 2 and later, all workloads |
+| --- | ---: | ---: |
+| Mock GitHub | -532, -533, -535 | -7 to +4 |
+| Microsoft Learn | -532, -529, -534 | -4 to +5 |
+| Hugging Face Hub | -529, -533, -534 | -6 to +4 |
+
+What the tables show:
+
+- **The host sends the model the same request with the mod as without it.**
+  In pair 1 the mod has no names yet, so its hook is asked about every call,
+  and the host builds its Artifact tool without one option: a request about
+  533 tokens shorter. From pair 2 the hook names the MCP tools, and the
+  requests are the same size to within what a date or a path changes. The
+  host's debug log says the same of two sessions run for the purpose:
+  `edit_hook=true` in the first, `edit_hook=false` in the second.
+- **Time to first token is the same in both arms**, in all nine rows. See
+  [below](#the-delay-on-model-requests-measured-again) for what that does and
+  does not show.
+- **The mock server is as it was**: 94%, 95% and 50% against 97%, 95% and
+  50%, one served call fewer in 60. Sessions were 35%, 28% and 9% shorter.
+- **The new subject is served again.** The first build of these hooks kept
+  the tool names at the first prompt. The host reloads a mod whose option
+  changes, and that reload cost the mod the prompt: the varied workload on the
+  mock server fell to 25% (2 of 8). The names are now kept when the turn
+  ends, and it is back at 50%.
+- **Microsoft Learn's scripted 83% is the model, not the hooks.** In five of
+  the six warm `on` sessions, and in three of the six `off` sessions, the
+  model made its last fetch twice: a seventh call, the same as the sixth, that the
+  prompt does not ask for. A call that was just answered is not prefetched
+  again, so each of those is a miss: 5 of the 7. Of the six calls the prompt
+  dictates, 34 of 36 were served. The first run of the day had the same habit
+  in five sessions and came to 88%; the reported run had it in one and came
+  to 97%.
+- **Microsoft Learn's repeated question took longer with the mod, and the
+  mod did not cause it.** Tool wait fell in six of six pairs. Time in the
+  model rose by 2.8 s. In three of the six warm `on` sessions, and in none of
+  the `off` sessions, the model chose a page too large for the host to hand
+  it inline (over about 50,000 characters). The host saves such a result to a
+  file and the model reads the file in one more step. Which page to open is
+  the model's choice among the search hits it was given, and a search with
+  the same words returned the same bytes in both arms. Over the four runs of
+  this workload (one the day before, three this day) it happened in 9 of 32
+  `off` sessions and 8 of 32 `on` sessions. Where it
+  falls on one arm, it outweighs everything the mod can save on a server this
+  fast: the run before this one showed the same workload 14% shorter.
+- **The Hub's repeated question was served more often** (7 of 12 against 4 of
+  22) because the model made the same calls again more often in this run, and
+  made no argument errors in the `on` arm. Nothing about the Hub changed.
+
+In the learning pairs the mod served 2 of 16 calls on the mock server's
+scripted workload, 2 of 13 on Microsoft Learn's, and none elsewhere.
+
+Not measured: each row is four or six warm sessions, one model, one day, one
+network location. The first session of each workload ran with no names, so
+its hook was asked about every call; that session is a learning pair and is
+in no warm figure. A session under an organization's managed settings, which
+may refuse to keep the mod's option, was not run. Nor was a session on a
+person's own machine, or one that mixes shell commands into MCP reads, where
+these hooks discard more than the old ones did. The proxy was not run again.
+
+#### The delay on model requests, measured again
+
+[The first runs of the day](#the-first-runs-of-the-day-and-what-was-wrong-with-them)
+found every model request about 170 ms slower to its first token in the `on`
+arm, and traced it to the request: with a mod that hooks every tool call, the
+host sends a tool list 533 tokens shorter. That finding has two parts, and
+only one of them held.
+
+The difference in the request is stable. It was there in pair 1 of every
+workload of this run, and in probe sessions at 16:20 UTC with a mod that has
+one hook that does nothing:
+
+| Mod | `edit_hook` in the debug log | Request size | Time to first token of the request | Of the session |
+| --- | --- | ---: | ---: | ---: |
+| none | false | 37852 tokens | 624 ms | 731 ms |
+| `tool.call`, no matcher | true | 37319 | 618 ms | 737 ms |
+| `classic.PreToolUse`, `/^mcp__/` | true | 37320 | 619 ms | 742 ms |
+| `tool.run`, no matcher | true | 37318 | 618 ms | 749 ms |
+
+Medians of eight sessions a row, one request each, the four rows run in
+turn. The difference in time is not there. Nor was it in this run's nine first `on` sessions, which had the
+shorter request: a median of 501 ms against 489 ms in the `off` arm. Between
+01:24 and 02:53 UTC it was in every one of five result files, 150 ms to
+185 ms each. So for some hours the API answered the shorter request later,
+and twelve hours on it did not. Why was not found, and it is the API's side,
+which this project cannot see.
+
+What follows for the mod:
+
+- The 170 ms is not a fixed cost of a mod with tool hooks. Do not quote it as
+  one.
+- With the hooks of this section the question does not arise after a first
+  session: the request is the one the host sends with no mod.
+- A session time from the first runs of the day still compares more than the
+  mod, as that section says.
+
 ### Results: after the prediction changes (2026-11-22)
 
 The mod after the changes of
@@ -294,9 +477,10 @@ is in no request. Probe mods and the host's debug log found the cause:
 
 So the runner now disallows that tool in both arms, and prints the model's
 side of each arm beside the rest. A session's eight to ten requests carried
-1.2 s to 1.8 s that belonged to where the benchmark ran. The cost is real for
-a session that has the Artifact tool: a mod with tool hooks slows each model
-request there by about that much, whatever the mod does.
+1.2 s to 1.8 s that belonged to where the benchmark ran. In those hours the
+cost was real for a session that has the Artifact tool. Twelve hours later
+the same shorter request was answered as fast as the full one: see
+[the delay measured again](#the-delay-on-model-requests-measured-again).
 
 The first runs are a second sample of hit rate, which that cost does not
 change. Scripted, repeat, varied: 97%, 95% and 50% on the mock server (the
@@ -332,7 +516,8 @@ errors included.
   `huggingface-haiku-cold.json`) gave a median wait per call of 67 ms off and
   74 ms on. The time is the host dispatching hooks.
 - **In a session that has the Artifact tool**, about 170 ms on every request
-  to the model, as above.
+  to the model in the first runs, as above. It was not found again later in
+  the day, and the hooks of the section above do not change the request.
 
 #### What was not measured
 

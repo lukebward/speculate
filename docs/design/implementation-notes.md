@@ -1061,6 +1061,8 @@ What the measurement says about the design:
   an MCP server's tool names are not known when the hooks register. The
   runner now keeps the tool out of both arms and reports the model's time to
   first token per arm, so a difference of this kind shows in the output.
+  (Both halves of this were revised later the same day, in §13.33: the hooks
+  can avoid the changed request, and the delay did not last.)
 
 Verification: 574 unit specs, 14 mod tests under Claude Code 2.1.330 and
 2.1.302, `claude plugin validate`. Offline evaluation: recall at 3 0.8599
@@ -1069,8 +1071,9 @@ Verification: 574 unit specs, 14 mod tests under Claude Code 2.1.330 and
 ### 13.33 Serving where the host means a call to be served (2026-11-22)
 
 §13.32 ended on a cost the hooks could not avoid: once a mod hooks tool calls
-with a matcher the host cannot read ahead, a session that has Claude Code's
-Artifact tool pays about 170 ms on every request to the model. That was a
+with a matcher the host cannot read ahead, the host sends the model a
+different request in a session that has Claude Code's Artifact tool, and that
+morning each such request was answered about 170 ms later. That was a
 symptom. The mod stood in the wrong place, and was asked about far more than
 it answers.
 
@@ -1161,8 +1164,31 @@ opinion on a question the host already answers, held to a lower standard.
 then with the mod itself: `tool.run` fires for the model's MCP calls and for
 the mod's own (which pass through); an answer there reaches the model and
 PostToolUse; a settings PreToolUse hook that denies a call ends it before
-`tool.run`; with names, the host reports `edit_hook=false` and the model's
-time to first token is the same as with no mod, the Artifact tool present.
-The mod's tests pass on 2.1.326 and 2.1.330; on 2.1.325 the module is
-refused. Not verified: a session under an organization's managed settings,
-and a session on a person's own machine.
+`tool.run`; with names, the host reports `edit_hook=false`. The mod's tests
+pass on 2.1.326 and 2.1.330; on 2.1.325 the module is refused. Not verified:
+a session under an organization's managed settings, and a session on a
+person's own machine.
+
+**Measured** in 132 live sessions with the Artifact tool in both arms
+([tables](local-learning-benchmark.md#results-the-hooks-at-toolrun-2026-11-22)):
+
+- The request is the host's own. In the first session of each of nine
+  workloads, before there were names, the first request of the `on` arm was
+  529 to 535 tokens shorter than the `off` arm's. In every later session the
+  two were within 7 tokens.
+- What the mod serves did not change. Hit rate on the mock server was 94%,
+  95% and 50% (97%, 95% and 50% with the old hooks); on the hosted servers it
+  moved with what the model chose to call, in both directions.
+- The delay that started this did not last. It was in every run made
+  between 01:24 and 02:53 UTC. At 16:20 UTC a mod with one pass-through hook
+  on every tool call (`tool.call`, `classic.PreToolUse` or `tool.run`) still
+  got the shorter request, and the API answered it as fast as the full one:
+  618 ms against 624 ms, eight sessions each. So the 170 ms was a state of
+  the API during those hours and not a fixed cost of tool hooks. Its cause
+  was not found.
+
+That last point removes one of the reasons this section started from, and
+the design does not rest on it. The mod now answers where the host means a
+call to be answered, a served call is seen by PostToolUse, the mod no longer
+stands in front of the built-in tools, and it leaves the host's request to
+the model alone, whatever the API makes of a changed one on a given day.

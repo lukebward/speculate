@@ -69,15 +69,21 @@ the median time a session waited on MCP tools.
 
 | Server | Sessions repeat a scripted workflow | An ordinary question, asked again | A new subject every session |
 | --- | --- | --- | --- |
-| A mock server that takes 1.5 s per call | 97% hit rate, 59% less tool wait, session 32% shorter | 95%, 83% less, 18% shorter | 50%, 49% less, 13% shorter |
-| Microsoft Learn (about 0.4 s per call) | 97%, 87% less, 19% shorter | 53%, 37% less, 14% shorter | 37%, 13% less, no gain |
-| Hugging Face Hub (about 70 ms per call) | 97%, 61% less, no gain | 18%, no gain | 0%, nothing prefetched |
+| A mock server that takes 1.5 s per call | 94% hit rate, 58% less tool wait, session 35% shorter | 95%, 82% less, 28% shorter | 50%, 49% less, 9% shorter |
+| Microsoft Learn (about 0.4 s per call) | 83%, 80% less, 6% shorter | 58%, 31% less, session 31% longer | 33%, 36% less, no gain |
+| Hugging Face Hub (about 70 ms per call) | 97%, 56% less, no gain | 58%, 62% less, 7% shorter | 0%, nothing prefetched |
 
 - On the mock server the scripted session waited 12.1 s on tools without
-  Speculate and 5.0 s with it. On Microsoft Learn it waited 2.4 s and 0.3 s.
+  Speculate and 5.1 s with it. On Microsoft Learn it waited 2.2 s and 0.5 s.
 - The slower the server, the more of a session Speculate removes. Against a
   server that answers in 70 ms there is too little to remove.
-- Of the prefetches started, 71% were used. The rest are extra reads against
+- On a fast server most of a session is the model's own time, and that
+  varies more than Speculate can save. On Microsoft Learn the repeated
+  question took 31% longer with Speculate in this run and 14% less in the
+  run before it. In this run the model chose a very large page in three
+  sessions with Speculate and in none without. Over four runs it did that as
+  often without Speculate as with it.
+- Of the prefetches started, 72% were used. The rest are extra reads against
   the server.
 - The first two sessions teach it. Almost nothing is served in them.
 - A new subject is served when the prompt names it ("issue 41"). When the
@@ -85,10 +91,10 @@ the median time a session waited on MCP tools.
 - The Hub answers in Markdown, which Speculate cannot read arguments from, so
   only an exact repeat of an earlier call is served there.
 - Speculate's hooks add less than 10 ms to a call it does not answer.
-- In a Claude Code session that offers the Artifact tool (a cloud session),
-  any mod that hooks tool calls makes each model request about 170 ms slower.
-  That is the host's doing and was measured separately. The numbers above are
-  from sessions without that tool.
+- Speculate does not change what Claude Code sends to the model. Once it has
+  named your MCP tools, a session's request is the same size with it as
+  without it, and the model's time to first token was the same in every
+  workload.
 
 The
 [benchmark guide](https://lukebward.github.io/speculate/design/local-learning-benchmark/)
