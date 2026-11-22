@@ -5,6 +5,11 @@
  * annotates the tools the workloads call `readOnlyHint: true`. The runner
  * checks that annotation before a session starts and refuses otherwise.
  *
+ * Two are hosted services. The third is the repository's own mock GitHub
+ * server with a delay injected into every call: the hosted ones answer in
+ * well under a second, and this is the only way here to see a server that
+ * takes seconds. It is a mock, and a result on it says so.
+ *
  * Three workloads per server, from most to least favourable to prediction:
  *
  *   scripted  the prompt dictates each call and its arguments, one at a time.
@@ -17,6 +22,8 @@
  *
  * Fixtures only. Production learning never sees a name from this file.
  */
+
+import { fileURLToPath } from 'node:url';
 
 export type WorkloadKey = 'scripted' | 'repeat' | 'varied';
 export const WORKLOADS: readonly WorkloadKey[] = ['scripted', 'repeat', 'varied'];
@@ -33,11 +40,21 @@ export type CallDirect = (name: string, args: Record<string, unknown>) => Promis
 /** Whatever `plan` hands the prompts; recorded in the result file. */
 export type ScenarioContext = Record<string, unknown>;
 
+/** How a session reaches the server: a hosted address, or a local process. */
+export type ServerSpec =
+  | { readonly url: string }
+  | { readonly command: string; readonly args: readonly string[]; readonly env?: Readonly<Record<string, string>> };
+
+/** The server in one line, for a header or a result file. */
+export function describeServer(server: ServerSpec): string {
+  return 'url' in server ? server.url : `${server.command} ${server.args.join(' ')}`;
+}
+
 export interface Scenario {
   /** Also the server's name in the session: tools are `mcp__<key>__<tool>`. */
   readonly key: string;
   readonly label: string;
-  readonly url: string;
+  readonly server: ServerSpec;
   /** Every tool the scripted workload names. All must be read-only. */
   readonly needTools: readonly string[];
   /**
@@ -117,7 +134,7 @@ const MSLEARN_TOPICS = [
 const mslearn: Scenario = {
   key: 'mslearn',
   label: 'Microsoft Learn',
-  url: 'https://learn.microsoft.com/api/mcp',
+  server: { url: 'https://learn.microsoft.com/api/mcp' },
   needTools: ['microsoft_docs_search', 'microsoft_docs_fetch'],
   results: 'json',
   async plan(call) {
@@ -183,7 +200,7 @@ const HUB_TASKS = [
 const huggingface: Scenario = {
   key: 'huggingface',
   label: 'Hugging Face Hub',
-  url: 'https://huggingface.co/mcp',
+  server: { url: 'https://huggingface.co/mcp' },
   needTools: ['hub_repo_search', 'hub_repo_details'],
   results: 'markdown',
   async plan(call) {
@@ -245,7 +262,7 @@ const LIBRARIES = [
 const context7: Scenario = {
   key: 'context7',
   label: 'Context7',
-  url: 'https://mcp.context7.com/mcp',
+  server: { url: 'https://mcp.context7.com/mcp' },
   needTools: ['resolve-library-id', 'query-docs'],
   results: 'markdown',
   async plan(call) {
@@ -280,4 +297,62 @@ const context7: Scenario = {
   },
 };
 
-export const SCENARIOS: Readonly<Record<string, Scenario>> = { mslearn, huggingface, context7 };
+const MOCK_LATENCY_MS = process.env['SPECULATE_BENCH_MOCK_LATENCY_MS'] ?? '1500';
+const MOCK_ISSUES = [41, 42, 43];
+const MOCK_PULLS = [5, 7, 8];
+
+/**
+ * The bundled mock GitHub server (mock/mock-github.ts) over stdio, with every
+ * call delayed by 1.5 s: an issue-and-pull-request session against a slow
+ * server. Fixture repository acme/api; results are JSON in one text block.
+ */
+const mockgithub: Scenario = {
+  key: 'mockgithub',
+  label: `Mock GitHub, ${MOCK_LATENCY_MS} ms injected per call`,
+  server: {
+    command: process.execPath,
+    args: [
+      fileURLToPath(new URL('../node_modules/tsx/dist/cli.mjs', import.meta.url)),
+      fileURLToPath(new URL('../mock/mock-github.ts', import.meta.url)),
+    ],
+    env: { SPECULATE_MOCK_LATENCY_MS: MOCK_LATENCY_MS },
+  },
+  needTools: ['list_issues', 'get_issue', 'get_issue_comments', 'list_pull_requests', 'get_pull_request', 'get_pull_request_diff'],
+  results: 'json',
+  async plan() {
+    return { owner: 'acme', repo: 'api', issues: MOCK_ISSUES.slice(0, 2), pull: MOCK_PULLS[0]!, latencyMs: Number(MOCK_LATENCY_MS) };
+  },
+  prompt(workload, ctx, pair) {
+    const repo = { owner: 'acme', repo: 'api' };
+    if (workload === 'scripted') {
+      const issues = ctx['issues'] as number[];
+      const pull = ctx['pull'] as number;
+      return scriptedPrompt('mockgithub', [
+        { tool: 'list_issues', args: { ...repo, state: 'open' } },
+        ...issues.flatMap(issue_number => [
+          { tool: 'get_issue', args: { ...repo, issue_number } },
+          { tool: 'get_issue_comments', args: { ...repo, issue_number } },
+        ]),
+        { tool: 'list_pull_requests', args: { ...repo, state: 'open' } },
+        { tool: 'get_pull_request', args: { ...repo, pull_number: pull } },
+        { tool: 'get_pull_request_diff', args: { ...repo, pull_number: pull } },
+      ]);
+    }
+    if (workload === 'repeat') {
+      return (
+        'Use the mockgithub MCP tools on the repository acme/api. List the open issues, read the two with the ' +
+        'lowest numbers together with their comments, and tell me in two sentences which is more urgent.'
+      );
+    }
+    const subjects = [
+      ...MOCK_ISSUES.map(n => `issue ${n} and its comments`),
+      ...MOCK_PULLS.map(n => `pull request ${n} and its diff`),
+    ];
+    return (
+      `Use the mockgithub MCP tools on the repository acme/api. Read ${pick(subjects, pair)}, ` +
+      'and summarise it in two sentences.'
+    );
+  },
+};
+
+export const SCENARIOS: Readonly<Record<string, Scenario>> = { mslearn, huggingface, context7, mockgithub };

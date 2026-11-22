@@ -33,7 +33,9 @@
  * server; Claude Code reads HTTPS_PROXY by itself.
  *
  * Options:
- *   --scenario KEY      mslearn | huggingface | context7 (default mslearn)
+ *   --scenario KEY      mslearn | huggingface | context7, or mockgithub: the
+ *                       bundled mock server with 1.5 s injected into each call
+ *                       (default mslearn)
  *   --workload KEY      scripted | repeat | varied | all (default all)
  *   --pairs N           off/on pairs per workload (default 8)
  *   --warmup N          leading pairs reported as learning sessions (default 2)
@@ -59,6 +61,7 @@ import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   markdownHitTable,
@@ -79,11 +82,13 @@ import {
   type Usage,
 } from './measure.js';
 import {
+  describeServer,
   SCENARIOS,
   WORKLOADS,
   type DirectResult,
   type Scenario,
   type ScenarioContext,
+  type ServerSpec,
   type WorkloadKey,
 } from './scenarios.js';
 
@@ -165,14 +170,24 @@ function options(): Options | null {
  */
 async function discover(scenario: Scenario): Promise<{ readOnly: string[]; ctx: ScenarioContext }> {
   const client = new Client({ name: 'speculate-bench', version: '1.0.0' }, { capabilities: {} });
-  await client.connect(new StreamableHTTPClientTransport(new URL(scenario.url)));
+  const { server } = scenario;
+  await client.connect(
+    'url' in server
+      ? new StreamableHTTPClientTransport(new URL(server.url))
+      : new StdioClientTransport({
+          command: server.command,
+          args: [...server.args],
+          env: { ...(process.env as Record<string, string>), ...server.env },
+          stderr: 'ignore',
+        }),
+  );
   try {
     const { tools } = await client.listTools();
     const readOnly = tools.filter(tool => tool.annotations?.readOnlyHint === true).map(tool => tool.name);
     const refused = scenario.needTools.filter(name => !readOnly.includes(name));
     if (refused.length > 0) {
       throw new Error(
-        `refusing to run: ${refused.join(', ')} not annotated readOnlyHint:true by ${scenario.url} ` +
+        `refusing to run: ${refused.join(', ')} not annotated readOnlyHint:true by ${describeServer(server)} ` +
           `(it lists ${tools.map(tool => tool.name).join(', ')})`,
       );
     }
@@ -286,7 +301,7 @@ function proxyMcpConfig(cli: string, scenario: Scenario, dir: string): string {
       mode: 'annotated',
       log: 'off',
       persistence: { enabled: true, path: join(dir, 'proxy-state.json') },
-      servers: { upstream: { url: scenario.url } },
+      servers: { upstream: 'url' in scenario.server ? { url: scenario.server.url } : { command: scenario.server.command, args: scenario.server.args, env: scenario.server.env } },
     }),
   );
   const env: Record<string, string> = { XDG_STATE_HOME: dir };
@@ -301,6 +316,13 @@ function proxyMcpConfig(cli: string, scenario: Scenario, dir: string): string {
     }),
   );
   return mcpConfig;
+}
+
+/** The server as a session's MCP config names it. */
+function sessionServer(server: ServerSpec): Record<string, unknown> {
+  return 'url' in server
+    ? { type: 'http', url: server.url }
+    : { command: server.command, args: server.args, ...(server.env ? { env: server.env } : {}) };
 }
 
 const pad = (value: string | number, width: number): string => String(value).padStart(width);
@@ -349,13 +371,13 @@ function capture(command: string, args: string[]): string {
 async function run(opts: Options): Promise<void> {
   const { scenario } = opts;
   const variant = opts.proxy ? `, proxy ${capture(process.execPath, [opts.proxy, '--version'])} in the on arm` : '';
-  console.log(`\n${scenario.label} (${scenario.url}), model ${opts.model}${opts.cold ? ', cold (the mod forgets before every session)' : ''}${variant}`);
+  console.log(`\n${scenario.label} (${describeServer(scenario.server)}), model ${opts.model}${opts.cold ? ', cold (the mod forgets before every session)' : ''}${variant}`);
   const { readOnly, ctx } = await discover(scenario);
   const allowed = readOnly.map(tool => `mcp__${scenario.key}__${tool}`);
 
   const root = mkdtempSync(join(tmpdir(), 'speculate-live-'));
   const mcpConfig = join(root, 'mcp.json');
-  writeFileSync(mcpConfig, JSON.stringify({ mcpServers: { [scenario.key]: { type: 'http', url: scenario.url } } }));
+  writeFileSync(mcpConfig, JSON.stringify({ mcpServers: { [scenario.key]: sessionServer(scenario.server) } }));
 
   const out: ResultFile = {
     meta: {
@@ -368,7 +390,7 @@ async function run(opts: Options): Promise<void> {
       node: process.version,
       platform: process.platform,
       scenario: scenario.key,
-      url: scenario.url,
+      url: describeServer(scenario.server),
       results: scenario.results,
       model: opts.model,
       pairs: opts.pairs,

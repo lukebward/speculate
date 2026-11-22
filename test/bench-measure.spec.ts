@@ -350,6 +350,7 @@ describe('scenarios', () => {
       mslearn: { queries: ['q1', 'q2'], picked: [['https://a', 'https://b'], ['https://c', 'https://d']] },
       huggingface: { queries: ['q1', 'q2'], picked: [['o/a', 'o/b'], ['o/c', 'o/d']] },
       context7: { libs: ['x', 'y'], ids: ['/o/x', '/o/y'] },
+      mockgithub: { issues: [41, 42], pull: 5 },
     };
     for (const scenario of Object.values(SCENARIOS)) {
       const ctx = contexts[scenario.key]!;
@@ -363,8 +364,9 @@ describe('scenarios', () => {
       }
       const scripted = scenario.prompt('scripted', ctx, 1);
       for (const tool of scenario.needTools) expect(scripted).toContain(tool);
+      // The mock repository has six things to read; the hosted servers have a subject per pair.
       const varied = new Set(Array.from({ length: 12 }, (_, i) => scenario.prompt('varied', ctx, i + 1)));
-      expect(varied.size).toBe(12);
+      expect(varied.size).toBe(scenario.key === 'mockgithub' ? 6 : 12);
     }
   });
 });
