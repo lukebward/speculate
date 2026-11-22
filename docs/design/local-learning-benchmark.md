@@ -267,6 +267,17 @@ What the tables show:
 In the learning pairs the mod served 2 of 16 calls on the mock server's
 scripted workload, 2 of 13 on Microsoft Learn's, and none elsewhere.
 
+What a call costs that the mod does not answer was measured again, since
+every hook on that path is new: a `--cold` run of the Hub's scripted workload
+(12 pairs, 72 calls an arm, nothing served, `huggingface-haiku-cold.json`).
+The median wait per call was 71.5 ms off and 82.5 ms on, 11 ms more. The
+session with the mod waited longer in all 12 pairs (a median of 518 ms on its
+six calls against 443 ms).
+The two cold runs of the old hooks gave 8.5 ms each. The difference between
+those and this is inside what the Hub's own times move from run to run, so
+read it as about 10 ms then and now. The host's debug log puts about 2 ms of
+it on the `classic.PostToolUse` hook, which is asked about every call.
+
 Not measured: each row is four or six warm sessions, one model, one day, one
 network location. The first session of each workload ran with no names, so
 its hook was asked about every call; that session is a learning pair and is

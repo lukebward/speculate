@@ -17,7 +17,7 @@ The mod is loaded from a copy of a commit (`--mod`); `meta.mod` names it.
 
 | File | What it is |
 | --- | --- |
-| `tool-run-hooks/` | The last runs of the day: the mod at `7754dc5`, which answers at `tool.run` and names the MCP tools its hook is for. Run with `--host-tools`, so Claude Code's Artifact tool is in both arms. `mockgithub-haiku.json` (6 pairs a workload), `mslearn-haiku.json` and `huggingface-haiku.json` (8 pairs) |
+| `tool-run-hooks/` | The last runs of the day: the mod at `7754dc5`, which answers at `tool.run` and names the MCP tools its hook is for. Run with `--host-tools`, so Claude Code's Artifact tool is in both arms. `mockgithub-haiku.json` (6 pairs a workload), `mslearn-haiku.json` and `huggingface-haiku.json` (8 pairs), and `huggingface-haiku-cold.json` (`--cold`, 12 pairs: what these hooks cost a call) |
 | `mockgithub-haiku.json` | The reported run on the bundled mock GitHub server with 1.5 s added to every call: three workloads, 6 pairs each, the mod at `feceba2` |
 | `mslearn-haiku.json`, `huggingface-haiku.json` | The reported run on the hosted servers: three workloads, 8 pairs each, the mod at `9f46b24` |
 | `mockgithub-haiku-9f46b24.json` | The mock server with the mod one commit earlier, before a session's opening reads were started in order |

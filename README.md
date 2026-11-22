@@ -90,7 +90,7 @@ the median time a session waited on MCP tools.
   model must search for it, the search itself is never predicted.
 - The Hub answers in Markdown, which Speculate cannot read arguments from, so
   only an exact repeat of an earlier call is served there.
-- Speculate's hooks add less than 10 ms to a call it does not answer.
+- Speculate's hooks add about 10 ms to a call it does not answer.
 - Speculate does not change what Claude Code sends to the model. Once it has
   named your MCP tools, a session's request is the same size with it as
   without it, and the model's time to first token was the same in every
