@@ -15,7 +15,7 @@ it was.
 
 ## Install
 
-Requires Claude Code 2.1.296 or later. In a terminal session:
+Requires Claude Code 2.1.326 or later. In a terminal session:
 
 ```
 /plugin install speculate --marketplace lukebward/speculate

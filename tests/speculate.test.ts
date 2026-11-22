@@ -71,7 +71,14 @@ interface Upstream {
 interface WorldOptions {
   allow?: readonly string[]
   store?: Record<string, unknown>
-  settings?: Record<string, unknown>
+  /** The host's settings do not keep what a mod sets (an organization's, say). */
+  refuseConfig?: boolean
+}
+
+/** One change a mod asked the host's settings to keep. */
+interface ConfigSet {
+  key: string
+  value: unknown
 }
 
 /** Tools a PreToolUse settings hook denies; a test adds to it mid-session. */
@@ -94,6 +101,11 @@ function world(on: On, options: WorldOptions = {}) {
   on('store.keys', async () => ({ value: [...store.keys()] }))
   on('ui.status', async () => ({ value: undefined }) as never)
   const upstream: Upstream[] = []
+  const configured: ConfigSet[] = []
+  on('config.set', async ($, e) => {
+    configured.push({ key: e.key, value: e.value })
+    return (options.refuseConfig ? { deny: 'managed settings own this row' } : { value: e.value }) as never
+  })
   const allow = new Set(options.allow ?? [...Object.keys(TOOLS), ...Object.keys(BUILTINS)])
   const deny = denyPre
 
@@ -105,6 +117,9 @@ function world(on: On, options: WorldOptions = {}) {
 
   on('classic.PreToolUse', async ($, e, next) =>
     deny.has(String(e.tool)) ? { deny: 'a settings hook refused it' } : next(e))
+  // No settings hook waits on a tool's result in these sessions.
+  on('classic.PostToolUse', async () => ({}) as never)
+  on('classic.PostToolUseFailure', async () => ({}) as never)
   on('tool.call', async ($, e, next) => {
     const { tool, tool_use_id: _id, ...args } = e as unknown as { tool: string; tool_use_id: string } & Args
     const by = next.origin.plugin === 'engine' ? 'model' : 'plugin'
@@ -129,15 +144,21 @@ function world(on: On, options: WorldOptions = {}) {
   })
   on('tool.check', async ($, e) => ({ decision: allow.has(e.tool) ? 'allow' : 'ask' }) as const)
   on('tool.list', async () => ({ value: Object.keys(TOOLS).map(name => ({ name, description: name, mcp: true })) }))
-  on('settings.read', async () => ({ value: options.settings ?? {} }))
   on('session.cwd', async () => ({ value: '/work' }))
   on('session.start', async ($, e) => ({ cwd: e.cwd }))
   on('session.end', async ($, e) => e as never)
   on('prompt.submit', async ($, e) => ({ text: e.text }))
   on('command.register', async () => ({ value: undefined }) as never)
 
-  return { clock, upstream, store, allow }
+  return { clock, upstream, store, allow, configured }
 }
+
+/**
+ * The mod's option as the host hands it over once the mod has named this
+ * session's tools: every test but the ones about that first session runs so.
+ */
+const NAMED = { tools: Object.keys(TOOLS).sort().join(',') }
+const WATCHING = { timeoutMs: 20_000, options: NAMED }
 
 type Kit = Parameters<Parameters<typeof test>[1] extends infer B ? B extends (...a: infer P) => unknown ? (...a: P) => unknown : never : never>[0]
 
@@ -157,6 +178,19 @@ async function call(
       ? ran.result
       : Array.isArray(ran.result) ? String((ran.result[0] as { text?: string })?.text ?? '') : ''
   return { text, isError: ran.isError === true, result: ran.result }
+}
+
+let toolUse = 0
+
+/** What a session raises once a tool has run: the mod hears of a built-in call only here. */
+async function settled($: Kit, tool: string, args: Args, response: unknown = 'ok') {
+  await ($ as never as { classic: { PostToolUse(e: object): Promise<unknown> } }).classic.PostToolUse({
+    tool_name: tool,
+    tool_input: args,
+    tool_response: response,
+    tool_use_id: `toolu_${++toolUse}`,
+    duration_ms: 5,
+  })
 }
 
 async function startSession($: Kit, clock: ReturnType<typeof mock.clock>, prompt = 'Look at the open issues.') {
@@ -182,7 +216,7 @@ async function learnChain($: Kit, clock: ReturnType<typeof mock.clock>, rounds =
   }
 }
 
-test('learns a list-then-get chain and serves the get from a prefetch', { timeoutMs: 20_000 }, async ($, on) => {
+test('learns a list-then-get chain and serves the get from a prefetch', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
 
@@ -203,7 +237,7 @@ test('learns a list-then-get chain and serves the get from a prefetch', { timeou
 
 const SEARCH = { q: 'is:open label:bug' }
 
-test('serves a tool that returns structured content, in the form the host records it', { timeoutMs: 20_000 }, async ($, on) => {
+test('serves a tool that returns structured content, in the form the host records it', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
 
@@ -226,7 +260,7 @@ test('serves a tool that returns structured content, in the form the host record
   expect(JSON.parse(got.text).results).toHaveLength(2)
 })
 
-test('a prefetch that is not the one text the host records is not served', { timeoutMs: 20_000 }, async ($, on) => {
+test('a prefetch that is not the one text the host records is not served', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
   for (let i = 0; i < 4; i++) {
@@ -244,7 +278,7 @@ test('a prefetch that is not the one text the host records is not served', { tim
   expect(JSON.parse(got.text)).toEqual({ query: SEARCH.q, results: [] })
 })
 
-test('never prefetches a call the person does not allow', { timeoutMs: 20_000 }, async ($, on) => {
+test('never prefetches a call the person does not allow', WATCHING, async ($, on) => {
   const { clock, upstream, allow } = world(on)
   const prefetchedGets = () => upstream.filter(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue').length
   await startSession($, clock)
@@ -266,7 +300,7 @@ test('never prefetches a call the person does not allow', { timeoutMs: 20_000 },
   expect(prefetchedGets()).toBe(whileAllowed)
 })
 
-test('a PreToolUse hook that refuses the call wins over a prefetched result', { timeoutMs: 20_000 }, async ($, on) => {
+test('a PreToolUse hook that refuses the call wins over a prefetched result', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
   await learnChain($, clock)
@@ -281,7 +315,7 @@ test('a PreToolUse hook that refuses the call wins over a prefetched result', { 
   expect(got.text).toContain('a settings hook refused it')
 })
 
-test('a call that may write clears what was prefetched', { timeoutMs: 20_000 }, async ($, on) => {
+test('a call that may write clears what was prefetched', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
   await learnChain($, clock)
@@ -295,7 +329,7 @@ test('a call that may write clears what was prefetched', { timeoutMs: 20_000 }, 
   expect(upstream.slice(before).filter(u => u.by === 'model').map(u => u.tool)).toEqual(['mcp__gh__get_issue'])
 })
 
-test('a shell command that may write clears what was prefetched', { timeoutMs: 20_000 }, async ($, on) => {
+test('a shell command clears what was prefetched', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
   await learnChain($, clock)
@@ -303,14 +337,16 @@ test('a shell command that may write clears what was prefetched', { timeoutMs: 2
   await clock.advance(2_000)
   expect(upstream.at(-1)).toEqual({ tool: 'mcp__gh__get_issue', args: GET_42, by: 'plugin' })
   // The shell reaches the same service by another road: the prefetched issue may be stale.
+  // The mod is not asked about a shell command; it hears of it once it has run.
   await call($, clock, 'Bash', { command: 'gh issue edit 42 --title Renamed' })
+  await settled($, 'Bash', { command: 'gh issue edit 42 --title Renamed' })
 
   const before = upstream.length
   await call($, clock, 'mcp__gh__get_issue', GET_42)
   expect(upstream.slice(before).filter(u => u.by === 'model').map(u => u.tool)).toEqual(['mcp__gh__get_issue'])
 })
 
-test('a built-in call the host holds read-only leaves what was prefetched', { timeoutMs: 20_000 }, async ($, on) => {
+test('a built-in tool that only reads leaves what was prefetched', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
   await learnChain($, clock)
@@ -318,6 +354,7 @@ test('a built-in call the host holds read-only leaves what was prefetched', { ti
   await clock.advance(2_000)
   expect(upstream.at(-1)).toEqual({ tool: 'mcp__gh__get_issue', args: GET_42, by: 'plugin' })
   await call($, clock, 'Read', { file_path: '/work/README.md' })
+  await settled($, 'Read', { file_path: '/work/README.md' })
 
   const before = upstream.length
   const got = await call($, clock, 'mcp__gh__get_issue', GET_42)
@@ -325,16 +362,7 @@ test('a built-in call the host holds read-only leaves what was prefetched', { ti
   expect(upstream.slice(before).filter(u => u.by === 'model')).toEqual([])
 })
 
-test('a PostToolUse hook written for a tool keeps that tool out of speculation', { timeoutMs: 20_000 }, async ($, on) => {
-  const settings = { hooks: { PostToolUse: [{ matcher: 'mcp__gh__get_issue', hooks: [{ type: 'command', command: 'true' }] }] } }
-  const { clock, upstream } = world(on, { settings })
-  await startSession($, clock)
-  await learnChain($, clock, 4)
-  expect(upstream.filter(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue')).toEqual([])
-  expect(upstream.some(u => u.by === 'plugin' && u.tool === 'mcp__gh__list_issues')).toBe(true)
-})
-
-test('what one session learned starts the next one', { timeoutMs: 20_000 }, async ($, on) => {
+test('what one session learned starts the next one', WATCHING, async ($, on) => {
   const { clock, upstream, store } = world(on)
   // Openers are the session's habitual first reads: a few sessions establish one.
   for (let session = 0; session < 3; session++) {
@@ -353,7 +381,7 @@ test('what one session learned starts the next one', { timeoutMs: 20_000 }, asyn
   expect(upstream.filter(u => u.by === 'plugin').map(u => u.tool)).toContain('mcp__gh__list_issues')
 })
 
-test('a prompt naming a pull request prefetches it before the model asks', { timeoutMs: 20_000 }, async ($, on) => {
+test('a prompt naming a pull request prefetches it before the model asks', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   await startSession($, clock)
   // One real call teaches Speculate the tool is a read and its argument shape.
@@ -371,7 +399,7 @@ test('a prompt naming a pull request prefetches it before the model asks', { tim
   expect(upstream.filter(u => u.by === 'model')).toEqual([])
 })
 
-test('a prompt that names an issue prefetches its read, once two such prompts were seen', { timeoutMs: 20_000 }, async ($, on) => {
+test('a prompt that names an issue prefetches its read, once two such prompts were seen', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   const issue = (issue_number: number) => ({ owner: 'acme', repo: 'api', issue_number })
   const ask = async (text: string) => {
@@ -401,7 +429,7 @@ test('a prompt that names an issue prefetches its read, once two such prompts we
   expect(upstream).toEqual([])
 })
 
-test('prefetches reads together on a server the agent itself ran reads together on', { timeoutMs: 20_000 }, async ($, on) => {
+test('prefetches reads together on a server the agent itself ran reads together on', WATCHING, async ($, on) => {
   const { clock, upstream } = world(on)
   const GET_41 = { owner: 'acme', repo: 'api', issue_number: 41 }
   const prefetchedGets = () => upstream.filter(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue').length
@@ -433,12 +461,93 @@ test('prefetches reads together on a server the agent itself ran reads together 
   expect(upstream.slice(mark).filter(u => u.by === 'model')).toEqual([])
 })
 
-test('/speculate reports, and /speculate forget clears what was learned', { timeoutMs: 20_000 }, async ($, on) => {
+const FIRST = { timeoutMs: 20_000 }
+
+test('names the tools a session offers, and leaves the start to the module the host reloads', FIRST, async ($, on) => {
+  const { clock, upstream, configured } = world(on)
+  await startSession($, clock)
+
+  // No names yet: the first prompt asks the host to keep this session's MCP
+  // tools in the plugin's option, sorted, under the plugin's own key.
+  expect(configured).toEqual([{ key: 'speculate.tools', value: NAMED.tools }])
+  // The host reloads a module whose option changed. This one starts nothing.
+  expect(upstream).toEqual([])
+
+  // Where the host did not reload it after all, it asks once and goes on:
+  // every call is watched, and the chain is learned and served as ever.
+  await startSession($, clock, 'And now?')
+  expect(configured).toHaveLength(1)
+  await learnChain($, clock)
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  const before = upstream.length
+  await call($, clock, 'mcp__gh__get_issue', GET_42)
+  expect(upstream.slice(before).filter(u => u.by === 'model')).toEqual([])
+})
+
+test('works with every call watched where the settings do not keep the names', FIRST, async ($, on) => {
+  const { clock, upstream, configured } = world(on, { refuseConfig: true })
+  await startSession($, clock)
+  expect(configured).toHaveLength(1)
+  await learnChain($, clock)
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  expect(upstream.at(-1)).toEqual({ tool: 'mcp__gh__get_issue', args: GET_42, by: 'plugin' })
+
+  // Asked about every call, it has the host's own verdict on a built-in one:
+  // a read leaves the prefetched issue, a shell command does not.
+  await call($, clock, 'Read', { file_path: '/work/README.md' })
+  let before = upstream.length
+  await call($, clock, 'mcp__gh__get_issue', GET_42)
+  expect(upstream.slice(before).filter(u => u.by === 'model')).toEqual([])
+
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  await call($, clock, 'Bash', { command: 'gh issue edit 42 --title Renamed' })
+  before = upstream.length
+  await call($, clock, 'mcp__gh__get_issue', GET_42)
+  expect(upstream.slice(before).filter(u => u.by === 'model').map(u => u.tool)).toEqual(['mcp__gh__get_issue'])
+
+  // It asks once a session, not at every prompt, and says how it is running.
+  await startSession($, clock, 'And now?')
+  expect(configured).toHaveLength(1)
+  const report = await $.command.run({ command: 'speculate' } as never)
+  expect(report.text).toContain('your settings did not keep the list of MCP tools')
+})
+
+test('hears of a tool it does not name once it has run, and names it at the next prompt', {
+  timeoutMs: 20_000,
+  options: { tools: Object.keys(TOOLS).filter(name => name !== 'mcp__gh__get_pull_request').sort().join(',') },
+}, async ($, on) => {
+  const { clock, upstream, configured } = world(on)
+  const PULL = { owner: 'acme', repo: 'api', pull_number: 3 }
+  await startSession($, clock)
+  // A server connected since the names were kept: nothing to change until it shows.
+  expect(configured).toEqual([{ key: 'speculate.tools', value: NAMED.tools }])
+  configured.length = 0
+
+  // (The host did not reload the module here, so it runs on with the names it has.)
+  await startSession($, clock, 'Read pull request 3.')
+  for (let i = 0; i < 3; i++) {
+    const got = await call($, clock, 'mcp__gh__get_pull_request', PULL)
+    await settled($, 'mcp__gh__get_pull_request', PULL, [{ type: 'text', text: got.text }])
+    await clock.advance(1_000)
+  }
+  // It learned the tool is there. It was never asked about it before a run,
+  // so it has no word that the tool only reads, and it prefetches nothing for it.
+  const report = await $.command.run({ command: 'speculate' } as never)
+  expect(report.text).toContain(`Known MCP tools: 1, prefetchable reads: 0`)
+  expect(report.text).toContain(`Watching ${Object.keys(TOOLS).length - 1} MCP tools by name.`)
+  expect(upstream.filter(u => u.by === 'plugin')).toEqual([])
+})
+
+test('/speculate reports, and /speculate forget clears what was learned', WATCHING, async ($, on) => {
   const { clock, store } = world(on)
   await startSession($, clock)
   await call($, clock, 'mcp__gh__list_issues', LIST)
   const report = await $.command.run({ command: 'speculate' } as never)
   expect(report.text).toContain('Known MCP tools: 1')
+  expect(report.text).toContain(`Watching ${Object.keys(TOOLS).length} MCP tools by name.`)
 
   const forgot = await $.command.run({ command: 'speculate', args: 'forget' } as never)
   expect(forgot.text).toContain('forgot')

@@ -24,7 +24,7 @@ jobs:
         # mods API is early access and people run newer builds than the pin,
         # so `latest` runs too: it shows a host change the day it ships, and
         # never fails the workflow over a release this repository did not make.
-        claude: ['2.1.302', latest]
+        claude: ['2.1.326', latest]
     continue-on-error: ${{ matrix.claude == 'latest' }}
     runs-on: ubuntu-latest
     steps:

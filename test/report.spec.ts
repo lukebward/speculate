@@ -3,17 +3,23 @@
  */
 import { describe, expect, it } from 'vitest';
 import { formatReport } from '../src/report.js';
-import { CLAIM_BYPASSED, Speculator } from '../src/speculator.js';
+import { Speculator } from '../src/speculator.js';
 
 describe('formatReport', () => {
-  it('says speculation is running by saying nothing about it being off', () => {
-    const spec = new Speculator();
-    expect(formatReport(spec.stats(), null, {})).not.toMatch(/off for this session/i);
+  const stats = () => new Speculator().stats();
+
+  it('says how many MCP tools the hooks name', () => {
+    expect(formatReport(stats(), null, {}, { named: 12 })).toContain('Watching 12 MCP tools by name.');
   });
 
-  it('says so, and why, when speculation stopped itself', () => {
-    const report = formatReport({ ...new Speculator().stats(), halted: CLAIM_BYPASSED }, null, {});
-    expect(report).toMatch(/off for this session/i);
-    expect(report).toMatch(/PreToolUse/);
+  it('says so while every tool call is watched, and why', () => {
+    const unsaved = formatReport(stats(), null, {}, { all: 'unsaved' });
+    expect(unsaved).toContain('Watching every tool call until the list of MCP tools is saved');
+    const refused = formatReport(stats(), null, {}, { all: 'refused' });
+    expect(refused).toContain('your settings did not keep the list of MCP tools');
+  });
+
+  it('says nothing about watching when it is not told', () => {
+    expect(formatReport(stats(), null, {})).not.toMatch(/Watching/);
   });
 });

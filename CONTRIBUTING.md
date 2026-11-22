@@ -14,7 +14,7 @@ npm run bench:live   # opt-in: real sessions against hosted MCP servers, mod off
 npm run bench:replay # sessions a live run kept (--keep), replayed through the core offline
 ```
 
-`test:mod` and `validate` need Claude Code 2.1.296 or later on PATH. To run
+`test:mod` and `validate` need Claude Code 2.1.326 or later on PATH. To run
 your checkout in a real session, start `claude --plugin-dir .`; edits reload
 when the turn that made them ends.
 

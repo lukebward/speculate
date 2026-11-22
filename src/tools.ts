@@ -54,7 +54,7 @@ export function argShape(args: Record<string, unknown>): string {
 export class ToolKnowledge {
   private facts = new Map<string, Map<string, ToolFact>>();
   private readonly suspended = new Map<string, string>();
-  private hooked: (server: string, tool: string) => boolean = () => false;
+  private watched: (server: string, tool: string) => boolean = () => true;
   private mutations = 0;
 
   constructor(private readonly now: () => number = Date.now) {}
@@ -119,7 +119,7 @@ export class ToolKnowledge {
     if (!fact.servable) return { eligible: false, reason: 'not-servable' };
     const suspension = this.suspended.get(suspensionKey(server, tool));
     if (suspension) return { eligible: false, reason: `suspended:${suspension}` };
-    if (this.hooked(server, tool)) return { eligible: false, reason: 'tool-hooks' };
+    if (!this.watched(server, tool)) return { eligible: false, reason: 'not-watched' };
     return { eligible: true, reason: 'read-only' };
   }
 
@@ -138,13 +138,12 @@ export class ToolKnowledge {
   }
 
   /**
-   * Tools that settings hooks (PreToolUse/PostToolUse) watch. Serving a
-   * prefetched result answers the call above those hooks, so a watched tool
-   * is never speculated: the hooks keep seeing every call they were written
-   * to see.
+   * The tools whose calls the hooks are asked about before they run, and can
+   * therefore answer. A prefetch for any other tool could never be used, so
+   * such a tool is not speculated. Every tool, until the hooks say otherwise.
    */
-  setHooked(predicate: (server: string, tool: string) => boolean): void {
-    this.hooked = predicate;
+  setWatched(predicate: (server: string, tool: string) => boolean): void {
+    this.watched = predicate;
   }
 
   suspend(server: string, tool: string, reason: string): void {

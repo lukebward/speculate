@@ -1,53 +1,91 @@
 /**
  * Speculate as a Claude Code mod.
  *
- * Claude Code raises `tool.call` for every MCP call the model makes. This
- * module answers a call from a prefetched result when it holds one for
- * exactly that call and the host would run the call without asking;
- * otherwise the call runs through Claude Code as normal and the speculator
- * learns from it. `prompt.submit` and `session.start` feed it the two
- * earlier signals: the person's words and the session's habitual openers.
+ * Claude Code raises `tool.run` when a call has been allowed and is about to
+ * run: after the permission check, after the person's PreToolUse hooks, after
+ * any question about it was answered. This module answers such a call from a
+ * prefetched result when it holds one for exactly that call; otherwise the
+ * tool runs and the speculator learns from it. `prompt.submit` and
+ * `session.start` feed it the two earlier signals: the person's words and the
+ * session's habitual openers.
  *
- * Every host operation is spelled here, inside a hook, and handed to the
- * speculator as a closure (SpeculationIo). The speculator itself is pure.
+ * The hook names the MCP tools it is for, and no other tool. Claude Code
+ * treats a tool that a mod may answer with more caution, so a hook on every
+ * tool call costs every tool something (src/watch.ts). The names are whatever
+ * servers the person has connected, which nothing knows when hooks register,
+ * so the module keeps them itself in its one option, and Claude Code reloads
+ * it when that option changes. Until there are names it is asked about every
+ * call. A call it is not asked about before it runs (a built-in tool, an MCP
+ * tool it does not name yet) it hears of afterwards, at PostToolUse.
+ *
+ * Every host operation is spelled here, inside a hook or a function a hook
+ * hands `$` to, and reaches the speculator as a closure (SpeculationIo). The
+ * speculator itself is pure.
  */
-import type { Register } from 'claude-code'
-import { addUsage, mcpToolName, parseMcpToolName, Speculator, unservedReason, type SpeculationIo } from '../src/speculator.js'
+import type { EngineInterface, Register } from 'claude-code'
+import { addUsage, mcpToolName, parseMcpToolName, Speculator, type SpeculationIo } from '../src/speculator.js'
 import { MemoryCodec } from '../src/persistence.js'
-import { settingsToolWatch } from '../src/hookGuard.js'
-import { mayWriteOutside } from '../src/sideEffects.js'
+import { mayWriteByName, mayWriteOutside } from '../src/sideEffects.js'
 import { recordOf } from '../src/tools.js'
-import { formatReport } from '../src/report.js'
+import { formatReport, type Watch } from '../src/report.js'
+import { mergeWatched, WATCH_OPTION, watchedTools, watchOption } from '../src/watch.js'
 import type { ToolResult } from '../src/types.js'
 
 const MEMORY_KEY = 'memory'
 const TOTALS_KEY = 'totals'
 const SAVE_DELAY_MS = 2_000
 const SWEEP_EVERY_MS = 5_000
-/** Head room a join leaves in the hook's own 10 s budget for the real call path. */
-const JOIN_MARGIN_MS = 1_500
-/** The `tool.call` keys that are the engine's, never the tool's arguments. */
+/** The longest a call waits for a prefetch of it that is still in flight. */
+const MAX_JOIN_WAIT_MS = 8_500
+/** This plugin's name: what Claude Code keys its option by (`<plugin>.<field>`). */
+const PLUGIN = 'speculate'
+/** The call's keys that are the engine's, never the tool's arguments. */
 const RESERVED = new Set(['tool', 'tool_use_id', 'agentId', 'requestMeta', 'consent'])
-/** The PreToolUse refusal that stops a claimed call; the model never reads it. */
-const SERVED = 'Speculate answered this call from a prefetched result.'
 
 type Store = {
   get: (key: string) => Promise<unknown>
   set: (key: string, value: unknown) => Promise<void>
 }
 
-export const register: Register = on => {
+/** The host as the speculator's hands: its own MCP calls, its permission check, its clock. */
+function hostIo($: EngineInterface): SpeculationIo {
+  return {
+    call: (server, tool, args) => $.mcp.call(server, tool, args) as Promise<ToolResult>,
+    authorize: async (server, tool, args) =>
+      (await $.tool.check({ tool: mcpToolName(server, tool), input: args })).decision === 'allow',
+    sleep: ms => $.clock.sleep(ms),
+  }
+}
+
+/** The plugin's own store. */
+function hostStore($: EngineInterface): Store {
+  return { get: key => $.store.get(key), set: (key, value) => $.store.set(key, value) }
+}
+
+export const register: Register = (on, options) => {
+  /** The MCP tools the `tool.run` hook names: what this module last kept in its option. */
+  const watched = watchedTools(options[WATCH_OPTION])
+  const names = new Set(watched)
+  /** With names, the hook is for those tools alone. With none yet, it is asked about every call. */
+  const named = watched.length > 0
+  /** The value this instance asked the host to keep, when the host did not reload it for it. */
+  let asked: string | null = null
+  /** The host's settings would not keep the names: every call stays watched, and no more is asked. */
+  let refused = false
+
   // Module state starts over on a reload; learned memory comes back from the
   // store at the next session.start, which a reload raises too.
-  let speculator = new Speculator()
+  const fresh = (): Speculator => {
+    const made = new Speculator()
+    // A prefetch for a tool the hook is not asked about could never be used.
+    if (named) made.tools.setWatched((server, tool) => names.has(mcpToolName(server, tool)))
+    return made
+  }
+  let speculator = fresh()
   let codec = new MemoryCodec()
   let savedRevision = speculator.revision
   let saveQueued = false
   let saving: Promise<void> = Promise.resolve()
-  /** tool_use_ids of calls a prefetched result is waiting to answer. */
-  const claimed = new Set<string>()
-  /** Those of them this mod's PreToolUse hook has been asked about. */
-  const asked = new Set<string>()
 
   const persist = (store: Store): Promise<void> => {
     saving = saving.then(async () => {
@@ -64,6 +102,16 @@ export const register: Register = on => {
     }).catch(() => {})
     return saving
   }
+  /** Saves soon, once, however many calls ask. */
+  const saveSoon = (after: (ms: number, run: () => void) => unknown, store: Store): void => {
+    if (saveQueued || speculator.revision === savedRevision) return
+    saveQueued = true
+    after(SAVE_DELAY_MS, () => {
+      saveQueued = false
+      void persist(store)
+    })
+  }
+  const watch = (): Watch => (named ? { named: watched.length } : { all: refused ? 'refused' : 'unsaved' })
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
@@ -86,76 +134,59 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     const result = await next(e)
     if (!speculator.enabled || 'drop' in result) return result
-    // Settings may have changed since the last prompt; so may the tools. The
-    // first prompt is when a server's openers fire: MCP servers are connected
-    // by then, and the model is about to spend seconds reading the prompt.
-    const watch = settingsToolWatch(await $.settings.read())
-    speculator.tools.setHooked((server, tool) => watch(mcpToolName(server, tool)))
-    const io: SpeculationIo = {
-      call: (server, tool, args) => $.mcp.call(server, tool, args) as Promise<ToolResult>,
-      authorize: async (server, tool, args) =>
-        (await $.tool.check({ tool: mcpToolName(server, tool), input: args })).decision === 'allow',
-      sleep: ms => $.clock.sleep(ms),
+    // MCP servers are connected by the first prompt, and the model is about
+    // to spend seconds reading it.
+    const offered = (await $.tool.list()).filter(info => info.mcp).map(info => info.name)
+
+    // Name the tools this session offers, where the hook does not name them
+    // yet. The host keeps the names in this plugin's option and reloads the
+    // module with them, in time for the model's first call.
+    const wanted = refused ? null : mergeWatched(watched, offered)
+    if (wanted !== null) {
+      const value = watchOption(wanted)
+      if (value !== asked) {
+        await persist(hostStore($))
+        asked = value
+        const kept = await $.config
+          .set({ key: `${PLUGIN}.${WATCH_OPTION}`, value })
+          .then(set => !('deny' in set && set.deny !== undefined), () => false)
+        // Kept: the module that replaces this one starts from here.
+        if (kept) return result
+      }
+      // Not kept, or kept and this module is still the one running: go on as it is.
+      refused = true
     }
-    speculator.sessionStart((await $.tool.list()).filter(info => info.mcp).map(info => info.name), io)
+
+    const io = hostIo($)
+    speculator.sessionStart(offered, io)
     speculator.prompt(e.text, await $.session.cwd(), io, await $.clock.now())
     return result
   }).catch(($, e, next) => next(e))
 
-  // A claimed call runs through the host as far as its PreToolUse hooks.
-  // When they let it through unchanged, this hook stops it before the tool
-  // runs, and the tool.call hook answers with the claimed result. When they
-  // deny, ask, or rewrite it, the call goes on exactly as it would have.
-  // Only an MCP call can be claimed, so only MCP calls pass through here.
-  on('classic.PreToolUse', { tool: /^mcp__/ }, async ($, e, next) => {
-    if (claimed.has(e.tool_use_id)) asked.add(e.tool_use_id)
-    const decision = await next(e)
-    if (!claimed.has(e.tool_use_id)) return decision
-    if (decision.deny !== undefined || decision.ask !== undefined || decision.updatedInput !== undefined) {
-      return decision
-    }
-    return { deny: SERVED }
-  }).catch(($, e, next) => next(e))
-
-  on('tool.call', async ($, e, next) => {
+  // A call the host has allowed, about to run. Only the model's own calls are
+  // served or learned from: a plugin's call (this mod's prefetches through
+  // $.mcp.call among them) runs untouched. A hook here that fails is skipped
+  // and the tool runs, which is what a failure of this one should come to.
+  on('tool.run', (named ? { tool: watched } : {}) as { tool?: RegExp[] }, async ($, e, next) => {
+    if (!speculator.enabled || next.origin.plugin !== 'engine') return next(e)
     const name = parseMcpToolName(String(e.tool))
     if (!name) {
-      // A built-in tool. Nothing is served or learned, but a shell command or
-      // a file edit can change what any server would return: once one that
-      // may have written settles, nothing prefetched before it is kept.
-      if (!speculator.enabled) return next(e)
-      let ran: Awaited<ReturnType<typeof next>>
+      // Asked about every call, for want of names: a shell command or a file
+      // edit can change what any server would return, so once one that may
+      // have written settles, nothing prefetched before it is kept.
       try {
-        ran = await next(e)
+        const ran = await next(e)
+        if (mayWriteOutside(String(e.tool), ran)) speculator.externalWrite()
+        return ran
       } catch (err) {
         speculator.externalWrite() // interrupted partway: assume it wrote
         throw err
       }
-      if (mayWriteOutside(String(e.tool), ran)) speculator.externalWrite()
-      return ran
     }
-    // Only the model's own calls are served or learned from. A plugin's call
-    // (this mod's own prefetches through $.mcp.call among them) runs through
-    // the host untouched: its permission check, its hooks, the tool.
-    if (!speculator.enabled || next.origin.plugin !== 'engine') return next(e)
     const { server, tool } = name
     const args: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(e)) if (!RESERVED.has(key)) args[key] = value
-
-    const io: SpeculationIo = {
-      call: (s, t, a) => $.mcp.call(s, t, a) as Promise<ToolResult>,
-      authorize: async (s, t, a) =>
-        (await $.tool.check({ tool: mcpToolName(s, t), input: a })).decision === 'allow',
-      sleep: ms => $.clock.sleep(ms),
-    }
-    const save = (): void => {
-      if (saveQueued || speculator.revision === savedRevision) return
-      saveQueued = true
-      $.clock.after(SAVE_DELAY_MS, () => {
-        saveQueued = false
-        void persist({ get: key => $.store.get(key), set: (key, value) => $.store.set(key, value) })
-      })
-    }
+    const io = hostIo($)
 
     // When the model made this call: with when it gets its answer, what
     // tells the learner a step of several calls from a sequence of them.
@@ -163,12 +194,13 @@ export const register: Register = on => {
     // The wait for a prefetch still in flight is bounded by a host timer,
     // started only if there is such a prefetch to wait for.
     let stop: AbortController | undefined
-    const joinWaitMs = Math.max(0, next.budget.remainingMs - JOIN_MARGIN_MS)
     const deadline = (): Promise<unknown> => {
       stop = new AbortController()
-      return $.clock.sleep(joinWaitMs, { signal: stop.signal }).catch(() => new Promise<never>(() => {}))
+      return $.clock.sleep(MAX_JOIN_WAIT_MS, { signal: stop.signal }).catch(() => new Promise<never>(() => {}))
     }
-    let claim = await speculator.serve(server, tool, args, io, deadline, joinWaitMs)
+    // The host allowed this exact call before it asked: it is not asked again.
+    let claim = await speculator.serve(server, tool, args, io, deadline, MAX_JOIN_WAIT_MS, true)
+    const waited = stop !== undefined
     stop?.abort()
     // The answer goes back in the form the host recorded this tool's real
     // result in. A prefetch that cannot take that form is not the record.
@@ -179,33 +211,23 @@ export const register: Register = on => {
     }
 
     const started = speculator.beginReal(server, claim !== null)
-    // A join may have waited; the tool's own latency starts after it.
-    const startedAt = claim?.source === 'joined' ? await $.clock.now() : beganAt
-    if (claim) claimed.add(e.tool_use_id)
-    let ran: Awaited<ReturnType<typeof next>> | undefined
-    let wasAsked = false
-    try {
-      ran = await next(e)
-    } finally {
-      claimed.delete(e.tool_use_id)
-      wasAsked = asked.delete(e.tool_use_id)
-    }
-
-    if (claim && ran.isError === true && ran.text === SERVED) {
+    if (claim) {
       claim.commit()
       speculator.observeServed(server, tool, args, claim, io, { startedAt: beganAt, endedAt: await $.clock.now() })
       const { hits, joins, estimatedSavedMs } = speculator.stats()
       $.ui.status(`speculate: ${hits + joins} served, ${(estimatedSavedMs / 1000).toFixed(1)}s saved`)
-      save()
+      saveSoon((ms, run) => $.clock.after(ms, run), hostStore($))
       return { result: answer }
     }
-    // The hooks had another say, or this session runs no plugin PreToolUse
-    // hooks (an organization's managed settings): the tool ran for real. In
-    // the second case no claim can ever answer a call, and after a couple in
-    // a row the speculator stops itself rather than go on prefetching.
-    if (claim) {
-      claim.discard(unservedReason(wasAsked, ran))
-      if (!speculator.enabled) $.ui.status('speculate: off for this session (see /speculate)')
+
+    // A join that came to nothing waited; the tool's own latency starts after it.
+    const startedAt = waited ? await $.clock.now() : beganAt
+    let ran: Awaited<ReturnType<typeof next>>
+    try {
+      ran = await next(e)
+    } catch (err) {
+      speculator.observe(server, tool, args, null, io, started)
+      throw err
     }
     const endedAt = await $.clock.now()
     const outcome = ran.deny !== undefined
@@ -222,29 +244,79 @@ export const register: Register = on => {
           span: { startedAt: beganAt, endedAt },
         }
     speculator.observe(server, tool, args, outcome, io, started)
-    save()
+    saveSoon((ms, run) => $.clock.after(ms, run), hostStore($))
     return ran
-  }).catch(($, e, next) => next(e))
+  })
+
+  // What the hook above is not asked about, heard of once it has run: with
+  // names, that is every built-in tool and any MCP tool not named yet. The
+  // host gives no read-only verdict here, so a built-in call is judged by its
+  // tool's name, and an MCP tool that was never seen run counts as a write.
+  on('classic.PostToolUse', async ($, e, next) => {
+    if (named && speculator.enabled && next.origin.plugin === 'engine') {
+      const toolName = String(e.tool_name)
+      const name = parseMcpToolName(toolName)
+      if (!name) {
+        if (mayWriteByName(toolName)) speculator.externalWrite()
+      } else if (!names.has(toolName)) {
+        const endedAt = await $.clock.now()
+        const took = typeof e.duration_ms === 'number' && e.duration_ms >= 0 ? e.duration_ms : 0
+        speculator.observeLate(name.server, name.tool, argsOf(e.tool_input), {
+          result: toToolResult(e.tool_response, undefined, false),
+          form: typeof e.tool_response === 'string' ? 'text' : 'blocks',
+          isError: false,
+          latencyMs: took,
+          span: { startedAt: endedAt - took, endedAt },
+        }, hostIo($))
+        saveSoon((ms, run) => $.clock.after(ms, run), hostStore($))
+      }
+    }
+    return next(e)
+  })
+
+  // The same for a call that failed or was interrupted: it may have run partway.
+  on('classic.PostToolUseFailure', async ($, e, next) => {
+    if (named && speculator.enabled && next.origin.plugin === 'engine') {
+      const toolName = String(e.tool_name)
+      const name = parseMcpToolName(toolName)
+      if (!name) {
+        if (mayWriteByName(toolName)) speculator.externalWrite()
+      } else if (!names.has(toolName)) {
+        speculator.observeLate(name.server, name.tool, argsOf(e.tool_input), {
+          result: toToolResult(String(e.error ?? ''), undefined, true),
+          form: 'text',
+          isError: true,
+          latencyMs: typeof e.duration_ms === 'number' && e.duration_ms >= 0 ? e.duration_ms : 0,
+        }, hostIo($))
+      }
+    }
+    return next(e)
+  })
 
   on('command.run', { command: 'speculate' }, async ($, e) => {
     if ((e.args ?? '').trim() === 'forget') {
       speculator.close()
       await $.store.delete(MEMORY_KEY)
       await $.store.delete(TOTALS_KEY)
-      speculator = new Speculator()
+      speculator = fresh()
       codec = new MemoryCodec()
       savedRevision = speculator.revision
       return { text: 'Speculate forgot everything it learned, and cleared its totals.' }
     }
-    await persist({ get: key => $.store.get(key), set: (key, value) => $.store.set(key, value) })
-    return { text: formatReport(speculator.stats(), await $.store.get(TOTALS_KEY), speculator.tools.exportState()) }
+    await persist(hostStore($))
+    return { text: formatReport(speculator.stats(), await $.store.get(TOTALS_KEY), speculator.tools.exportState(), watch()) }
   })
 
   on('session.end', async ($, e, next) => {
     speculator.close()
-    await persist({ get: key => $.store.get(key), set: (key, value) => $.store.set(key, value) })
+    await persist(hostStore($))
     return next(e)
   })
+}
+
+/** A call's arguments as the settings hooks carry them. */
+function argsOf(input: unknown): Record<string, unknown> {
+  return input !== null && typeof input === 'object' && !Array.isArray(input) ? { ...(input as Record<string, unknown>) } : {}
 }
 
 /** The host's record of an MCP call as an MCP result, for the learner. */

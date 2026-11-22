@@ -133,13 +133,13 @@ describe('eligibility', () => {
     expect(h.suppressed()['policy:not-servable']).toBe(1);
   });
 
-  it('suppresses a tool that settings hooks watch', async () => {
+  it('suppresses a tool the hooks are not asked about, since nothing could use its result', async () => {
     const h = makeHarness('http');
-    h.tools.setHooked((_s, tool) => tool === 'a');
+    h.tools.setWatched((_s, tool) => tool !== 'a');
     h.executor.submit([pred('a', 0.9)], h.io);
     await settle();
     expect(h.io.calls).toHaveLength(0);
-    expect(h.suppressed()['policy:tool-hooks']).toBe(1);
+    expect(h.suppressed()['policy:not-watched']).toBe(1);
   });
 
   it('re-checks eligibility at drain time (suspension between queue and fire)', async () => {

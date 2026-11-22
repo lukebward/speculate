@@ -8,13 +8,18 @@ import type { UsageCounters } from './metrics.js';
 import type { ToolFacts } from './tools.js';
 import type { StatsReport } from './types.js';
 
-/** The `halted` reason a host that skips the mod's PreToolUse hook leads to. */
-const HOOK_SKIPPED = 'pre-tool-use-skipped';
+/**
+ * Which calls the hooks are asked about before they run: the MCP tools they
+ * name (how many), or every tool call, because the list of names is not
+ * saved yet or the host's settings refused to keep it.
+ */
+export type Watch = { named: number } | { all: 'unsaved' | 'refused' };
 
 export function formatReport(
-  session: StatsReport & { cache: { ready: number; inFlight: number }; halted?: string | null },
+  session: StatsReport & { cache: { ready: number; inFlight: number } },
   totals: unknown,
   tools: ToolFacts,
+  watch?: Watch,
 ): string {
   const lifetime = usage(totals);
   const known = Object.entries(tools).flatMap(([server, byTool]) =>
@@ -23,14 +28,6 @@ export function formatReport(
   const reads = known.filter(({ fact }) => fact.readOnly && fact.servable);
 
   const lines = ['Speculate'];
-  if (session.halted) {
-    lines.push(
-      '',
-      session.halted === HOOK_SKIPPED
-        ? 'Off for this session. Claude Code ran calls Speculate held prefetched results for without asking its PreToolUse hook, which is where a result is handed over (managed settings that allow only managed hooks do this). Prefetching could only add upstream calls here, so it stopped.'
-        : `Off for this session (${escape(session.halted)}).`,
-    );
-  }
   lines.push(
     '',
     'This session',
@@ -54,6 +51,15 @@ export function formatReport(
     '',
     `Known MCP tools: ${known.length}, prefetchable reads: ${reads.length}`,
   );
+  if (watch && 'named' in watch) {
+    lines.push(`  Watching ${watch.named} MCP tools by name.`);
+  } else if (watch) {
+    lines.push(
+      watch.all === 'refused'
+        ? '  Watching every tool call: your settings did not keep the list of MCP tools. Speculate works, but Claude Code treats a mod that may answer any tool with more caution.'
+        : '  Watching every tool call until the list of MCP tools is saved, at the next prompt.',
+    );
+  }
   const suppressed = Object.entries(session.suppressed).sort((a, b) => b[1] - a[1]).slice(0, 5);
   if (suppressed.length > 0) {
     lines.push(`  Most common reasons a prediction was not started: ${suppressed.map(([reason, n]) => `${escape(reason)} (${n})`).join(', ')}`);

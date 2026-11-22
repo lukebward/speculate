@@ -33,15 +33,6 @@ export type { SpeculationIo } from './executor.js';
 /** How many of a session's leading reads are recorded as openers (§13.15). */
 const OPENER_RECORD_LIMIT = 3;
 const INTENT_CONFIDENCE = 0.95;
-/**
- * Why a claim was discarded when the host ran the claimed call for real
- * without asking the mod's PreToolUse hook, which is where a claimed result
- * is handed over. A host that does this every time can never be served.
- */
-export const CLAIM_BYPASSED = 'pre-tool-use-skipped';
-/** How many such claims in a row it takes to conclude that, and stop. */
-const BYPASS_LIMIT = 2;
-
 export const DEFAULT_OPTIONS: SpeculateOptions = {
   mode: 'on',
   maxPredictionsPerTrigger: 3,
@@ -89,16 +80,6 @@ export interface Claim {
   discard(reason: string): void;
 }
 
-/**
- * Why a claimed call was not answered from its claim. `asked`: the mod's
- * PreToolUse hook was reached for the call. When it was, the hooks beneath
- * turned the claim down. When it was not and the tool still ran, the host
- * skipped the hook; a call that was refused or failed never got that far.
- */
-export function unservedReason(asked: boolean, ran: { deny?: unknown; isError?: unknown }): string {
-  return asked || ran.deny !== undefined || ran.isError === true ? 'tool-hooks' : CLAIM_BYPASSED;
-}
-
 export interface McpToolName {
   server: string;
   tool: string;
@@ -137,10 +118,6 @@ export class Speculator {
   private readonly started = new Set<string>();
   /** Usage counters already folded into the cross-session totals. */
   private reportedUsage: UsageCounters | null = null;
-  /** Claims in a row the host ran for real without asking (CLAIM_BYPASSED). */
-  private bypassedClaims = 0;
-  /** Set once speculation has stopped itself; it stays stopped. */
-  private haltReason: string | null = null;
 
   constructor(options: Partial<SpeculateOptions> = {}, opts: { now?: () => number } = {}) {
     this.options = { ...DEFAULT_OPTIONS, ...options };
@@ -192,7 +169,7 @@ export class Speculator {
   }
 
   get enabled(): boolean {
-    return this.options.mode !== 'off' && this.haltReason === null;
+    return this.options.mode !== 'off';
   }
 
   // -------------------------------------------------------------------------
@@ -209,6 +186,10 @@ export class Speculator {
    * is how long that is from now. A prefetch this tool's usual latency says
    * cannot land within it is not joined at all: waiting out the deadline
    * and then starting the real call would only make a slow read slower.
+   *
+   * `allowed`: the host has already allowed this exact call, arguments and
+   * all (a hook at `tool.run` is only ever asked about such a call), so it
+   * is not asked again.
    */
   async serve(
     server: string,
@@ -217,6 +198,7 @@ export class Speculator {
     io: SpeculationIo,
     deadline?: Promise<unknown> | (() => Promise<unknown>),
     maxJoinWaitMs?: number,
+    allowed = false,
   ): Promise<Claim | null> {
     if (!this.enabled) return null;
     this.executor.supersedePendingNext(server);
@@ -242,14 +224,14 @@ export class Speculator {
     const { ruleId } = found.meta;
     const wasted = (reason: string): void =>
       this.metrics.record({ type: 'invalidated', server, tool, ruleId, reason });
-    const discard = (reason: string): void => {
-      wasted(reason);
-      this.claimSettled(reason === CLAIM_BYPASSED);
-    };
+    const discard = (reason: string): void => wasted(reason);
 
     // The host decides at the moment of use, as it would for the real call:
     // a rule or mode that changed since the prefetch is honored.
-    if (!this.tools.eligibility(server, tool).eligible || !(await this.authorized(io, server, tool, args))) {
+    if (
+      !this.tools.eligibility(server, tool).eligible ||
+      !(allowed || (await this.authorized(io, server, tool, args)))
+    ) {
       if (found.outcome === 'joined') found.promise.then(noop, noop);
       wasted('host-permission');
       return null;
@@ -271,7 +253,6 @@ export class Speculator {
             ageMs,
             ttlFraction,
           });
-          this.claimSettled(false);
         },
         discard,
       };
@@ -310,24 +291,9 @@ export class Speculator {
       latencyMs: found.meta.upstreamLatencyMs ?? this.now() - found.meta.issuedAt,
       commit: () => {
         this.metrics.record({ type: 'joined', server, tool, ruleId, savedMs });
-        this.claimSettled(false);
       },
       discard,
     };
-  }
-
-  /**
-   * A claim was committed or discarded. Claims the host keeps running for
-   * real without asking (CLAIM_BYPASSED) can never be answered, so each
-   * prefetch behind one is a wasted upstream call: after a few in a row,
-   * speculation stops itself. Any other outcome shows the host does ask.
-   */
-  private claimSettled(bypassed: boolean): void {
-    this.bypassedClaims = bypassed ? this.bypassedClaims + 1 : 0;
-    if (this.bypassedClaims < BYPASS_LIMIT || this.haltReason !== null) return;
-    this.haltReason = CLAIM_BYPASSED;
-    this.executor.abandonPending();
-    this.cache.abandonAll();
   }
 
   /**
@@ -391,6 +357,48 @@ export class Speculator {
     if (outcome.isError) return;
     if (this.tools.isSuspended(server, tool)) this.tools.resetSuspension(server, tool);
     this.learn(server, tool, args, outcome.result, outcome.latencyMs, outcome.isReadOnly, io, trigger, outcome.span);
+  }
+
+  /**
+   * A call the hooks heard of only after it ran, because its tool is not one
+   * they watch yet (see ToolKnowledge.setWatched). The host's read-only
+   * verdict for it is not known: what earlier calls showed about the tool
+   * stands, and a tool never seen before counts as one that may write, which
+   * discards what was prefetched from its server. The call is still learned
+   * from, so the tool is no stranger once the hooks do watch it.
+   */
+  observeLate(
+    server: string,
+    tool: string,
+    args: Record<string, unknown>,
+    late: { result: ToolResult; form: RecordForm; isError: boolean; latencyMs: number; span?: CallSpan },
+    io: SpeculationIo,
+  ): void {
+    if (!this.enabled) return;
+    const prior = this.tools.fact(server, tool);
+    try {
+      this.executor.realStarted(server, canonicalKey(server, tool, args));
+    } catch {
+      // Unkeyable arguments: the call is learned from all the same.
+    }
+    // Not a call on the server now: it has already come back.
+    this.budget.realStarted(server, false);
+    this.observe(
+      server,
+      tool,
+      args,
+      {
+        result: late.result,
+        isReadOnly: prior?.readOnly === true,
+        servable: !late.isError,
+        form: late.form,
+        isError: late.isError,
+        latencyMs: late.latencyMs,
+        ...(late.span === undefined ? {} : { span: late.span }),
+      },
+      io,
+      { mayWaitBehindSpeculation: false, onServer: false },
+    );
   }
 
   /** Marks the agent's call settled; returns where it started in the order of calls, if it was keyed. */
@@ -653,8 +661,8 @@ export class Speculator {
     return delta;
   }
 
-  stats(): StatsReport & { cache: { ready: number; inFlight: number }; halted: string | null } {
-    return { ...this.metrics.statsSnapshot(), cache: this.cache.size(), halted: this.haltReason };
+  stats(): StatsReport & { cache: { ready: number; inFlight: number } } {
+    return { ...this.metrics.statsSnapshot(), cache: this.cache.size() };
   }
 }
 

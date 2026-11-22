@@ -23,6 +23,38 @@ export interface CallVerdict {
   isReadOnly?: unknown;
 }
 
+/**
+ * Built-in tools that read, ask, or keep the session's own books whatever
+ * their input: the ones the host holds read-only on every call.
+ */
+const READS_ONLY = new Set([
+  ...SESSION_BOOKKEEPING,
+  'Read',
+  'Glob',
+  'Grep',
+  'ToolSearch',
+  'WebSearch',
+  'WebFetch',
+  'TaskList',
+  'TaskGet',
+  'BashOutput',
+  'AskUserQuestion',
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'Skill',
+]);
+
+/**
+ * The same question for a call the hooks hear of only after it ran, with no
+ * verdict from the host: by the tool's name alone. A tool not known to only
+ * read counts as a write, a shell command included whatever it ran. That
+ * discards more than the verdict would; it never keeps what the verdict
+ * would have discarded.
+ */
+export function mayWriteByName(tool: string): boolean {
+  return !READS_ONLY.has(tool);
+}
+
 export function mayWriteOutside(tool: string, ran: CallVerdict): boolean {
   if (ran.deny !== undefined) return false;
   if (ran.isReadOnly === true) return false;

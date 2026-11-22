@@ -68,13 +68,15 @@ describe('ToolKnowledge eligibility', () => {
     expect(k.eligibility('s', 't').eligible).toBe(true);
   });
 
-  it('never speculates a tool that settings hooks watch', () => {
+  it('speculates only a tool the hooks are asked about before it runs', () => {
     const k = new ToolKnowledge(() => 0);
     k.record('s', 'watched', read);
-    k.record('s', 'free', read);
-    k.setHooked((server, tool) => server === 's' && tool === 'watched');
-    expect(k.eligibility('s', 'watched')).toEqual({ eligible: false, reason: 'tool-hooks' });
-    expect(k.eligibility('s', 'free').eligible).toBe(true);
+    k.record('s', 'other', read);
+    // Until the hooks say which tools they watch, it is all of them.
+    expect(k.eligibility('s', 'other').eligible).toBe(true);
+    k.setWatched((server, tool) => server === 's' && tool === 'watched');
+    expect(k.eligibility('s', 'other')).toEqual({ eligible: false, reason: 'not-watched' });
+    expect(k.eligibility('s', 'watched').eligible).toBe(true);
   });
 
   it('bumps revision on record and import', () => {

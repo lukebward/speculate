@@ -2,8 +2,19 @@
   "name": "speculate",
   "version": "1.0.0",
   "description": "Learns your MCP call patterns and prefetches likely read-only calls, so Claude Code waits less on tools.",
-  "author": { "name": "Luke Ward", "url": "https://github.com/lukebward" },
+  "author": {
+    "name": "Luke Ward",
+    "url": "https://github.com/lukebward"
+  },
   "homepage": "https://github.com/lukebward/speculate",
   "repository": "https://github.com/lukebward/speculate",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "tools": {
+      "type": "string",
+      "title": "Watched MCP tools (leave as it is)",
+      "description": "The MCP tools Speculate is asked about before they run, separated by commas. Speculate fills this in and keeps it current itself.",
+      "default": ""
+    }
+  }
 }

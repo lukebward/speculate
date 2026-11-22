@@ -52,6 +52,8 @@
  *   --claude BIN        the Claude Code binary (default claude)
  *   --json FILE         write every session and the summaries
  *   --keep              keep the temporary directories (raw event streams)
+ *   --host-tools        leave the host's own tools in both arms (HOST_ONLY_TOOLS):
+ *                       measures what a mod's hooks cost a session that has them
  *   --summarize FILES   print the Markdown tables for result files, run nothing
  */
 import { execFileSync, spawn } from 'node:child_process';
@@ -106,7 +108,8 @@ const SESSION_TIMEOUT_MS = 300_000;
  * such a request about 200 ms later, on every step of every session: a cost
  * of where the benchmark ran, charged to the mod. Without the tool the two
  * arms' requests are the same and so is the model's time to first token.
- * Naming a tool the host does not have is harmless.
+ * Naming a tool the host does not have is harmless. `--host-tools` leaves
+ * the tool in, to measure exactly that cost for a given mod.
  */
 const HOST_ONLY_TOOLS = ['Artifact'];
 /** The most one session may spend on the model before Claude Code stops it. */
@@ -125,6 +128,7 @@ interface Options {
   claude: string;
   json: string | null;
   keep: boolean;
+  hostTools: boolean;
 }
 
 const flag = (name: string): string | undefined => {
@@ -174,6 +178,7 @@ function options(): Options | null {
     claude: flag('claude') ?? 'claude',
     json: flag('json') ?? null,
     keep: has('keep'),
+    hostTools: has('host-tools'),
   };
 }
 
@@ -279,7 +284,7 @@ function runSession(setup: SessionSetup): Promise<StreamLine[]> {
     '--output-format', 'stream-json',
     '--verbose',
     '--max-budget-usd', SESSION_BUDGET_USD,
-    '--disallowedTools', ...HOST_ONLY_TOOLS,
+    ...(opts.hostTools ? [] : ['--disallowedTools', ...HOST_ONLY_TOOLS]),
     ...(arm === 'on' && opts.proxy === null ? ['--plugin-dir', opts.mod] : []),
   ];
   return new Promise(done => {
@@ -401,7 +406,7 @@ async function run(opts: Options): Promise<void> {
       startedAt: new Date().toISOString(),
       revision: capture('git', ['rev-parse', 'HEAD']),
       dirtySrc: capture('git', ['status', '--porcelain', '--', 'src', 'hooks']) !== '',
-      disallowedTools: HOST_ONLY_TOOLS,
+      disallowedTools: opts.hostTools ? [] : HOST_ONLY_TOOLS,
       mod: opts.proxy ? null : opts.mod === resolve(ROOT) ? 'this checkout' : opts.mod,
       proxy: opts.proxy ? capture(process.execPath, [opts.proxy, '--version']) : null,
       claudeCode: capture(opts.claude, ['--version']),

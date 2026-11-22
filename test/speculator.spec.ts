@@ -7,11 +7,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   addUsage,
-  CLAIM_BYPASSED,
   mcpToolName,
   parseMcpToolName,
   Speculator,
-  unservedReason,
   type RealOutcome,
   type SpeculationIo,
 } from '../src/speculator.js';
@@ -683,71 +681,94 @@ describe("mode 'off'", () => {
   });
 });
 
-// --- a host that never lets a claim answer ------------------------------------------
+// --- a call the host has already allowed -----------------------------------------------
 
-describe('a host that runs claimed calls without asking the mod', () => {
-  /**
-   * One call by the agent on a host that runs it for real whether or not a
-   * prefetched result was claimed for it. Returns whether one was.
-   */
-  async function ranAnyway(h: ReturnType<typeof harness>, tool: string, reason: string) {
-    const claim = await h.spec.serve(S, tool, ARGS, h.io);
-    const started = h.spec.beginReal(S);
-    claim?.discard(reason);
-    h.advance(400);
-    h.spec.observe(S, tool, ARGS, h.outcome(text({ tool, ...ARGS })), h.io, started);
-    h.advance(100);
-    await settle();
-    return claim !== null;
-  }
+describe('a call the host has already allowed', () => {
+  it('is answered without asking the host again', async () => {
+    // Asked the usual way, a host that would now say no means no answer.
+    const asked = harness();
+    await asked.warm();
+    asked.io.allow = false;
+    expect(await asked.spec.serve(S, GET, ARGS, asked.io)).toBeNull();
 
-  it('stops speculating once two claims in a row ran without its PreToolUse hook being asked', async () => {
-    const h = harness();
-    await h.warm(); // GET is prefetched; each call below prefetches the other
-    expect(await ranAnyway(h, GET, CLAIM_BYPASSED)).toBe(true);
-    expect(h.spec.enabled).toBe(true); // one alone could be another plugin's doing
-    expect(stats(h.spec).halted).toBeNull();
-
-    expect(await ranAnyway(h, LIST, CLAIM_BYPASSED)).toBe(true);
-    expect(h.spec.enabled).toBe(false);
-    expect(stats(h.spec).halted).toBe(CLAIM_BYPASSED);
-    // Off means off: nothing left standing, nothing new started, nothing served.
-    expect(h.spec.cache.size()).toEqual({ ready: 0, inFlight: 0 });
-    const prefetches = h.io.calls.length;
-    await h.real(GET);
-    await h.real(LIST);
-    expect(h.io.calls).toHaveLength(prefetches);
-    expect(await h.spec.serve(S, GET, ARGS, h.io)).toBeNull();
-  });
-
-  it('keeps speculating when a served call comes between two such claims', async () => {
+    // A hook at tool.run is asked only about a call the host allowed, as allowed.
     const h = harness();
     await h.warm();
-    expect(await ranAnyway(h, GET, CLAIM_BYPASSED)).toBe(true);
-    expect(await h.real(LIST)).not.toBeNull(); // claimed and answered: the host does ask
-    expect(await ranAnyway(h, GET, CLAIM_BYPASSED)).toBe(true);
-    expect(h.spec.enabled).toBe(true);
+    h.io.allow = false;
+    const claim = await h.spec.serve(S, GET, ARGS, h.io, undefined, undefined, true);
+    expect(claim).not.toBeNull();
+    expect(claim!.source).toBe('hit');
   });
 
-  it('keeps speculating when the PreToolUse hooks it was asked about turned the claims down', async () => {
+  it('is still not answered for a tool that stopped being a read', async () => {
     const h = harness();
     await h.warm();
-    expect(await ranAnyway(h, GET, 'tool-hooks')).toBe(true);
-    expect(await ranAnyway(h, LIST, 'tool-hooks')).toBe(true);
-    expect(await ranAnyway(h, GET, 'tool-hooks')).toBe(true);
-    expect(h.spec.enabled).toBe(true);
+    h.spec.observe(S, GET, { repo: 'other' }, h.outcome(text({}), { isReadOnly: false }), h.io);
+    expect(await h.spec.serve(S, GET, ARGS, h.io, undefined, undefined, true)).toBeNull();
   });
 });
 
-describe('unservedReason', () => {
-  const ran = { result: [], text: 'ok' };
-  it.each([
-    ['its hook was asked and the hooks beneath decided otherwise', true, ran, 'tool-hooks'],
-    ['its hook was never asked and the tool ran', false, ran, CLAIM_BYPASSED],
-    ['its hook was never asked because a hook above refused the call', false, { result: [], text: 'no', isError: true }, 'tool-hooks'],
-    ['its hook was never asked because the call was denied', false, { deny: 'no' }, 'tool-hooks'],
-  ] as Array<[string, boolean, Record<string, unknown>, string]>)('%s', (_what, asked, outcome, expected) => {
-    expect(unservedReason(asked, outcome)).toBe(expected);
+// --- a call heard of only after it ran --------------------------------------------------
+
+describe('a call the hooks heard of only after it ran', () => {
+  const late = (tool: string, over: Partial<Parameters<Speculator['observeLate']>[3]> = {}) => ({
+    result: text({ tool, ...ARGS }),
+    form: 'blocks' as const,
+    isError: false,
+    latencyMs: 400,
+    ...over,
+  });
+
+  it('is learned from, but its tool is no read until the host says so', async () => {
+    const h = harness();
+    for (let round = 0; round < 3; round++) {
+      h.spec.observeLate(S, LIST, ARGS, late(LIST), h.io);
+      h.advance(500);
+      h.spec.observeLate(S, GET, ARGS, late(GET), h.io);
+      h.advance(500);
+    }
+    await settle();
+    // No verdict was ever heard: nothing may be prefetched yet.
+    expect(h.io.calls).toEqual([]);
+    expect(h.spec.tools.eligibility(S, GET)).toMatchObject({ eligible: false, reason: 'not-read-only' });
+
+    // The same tools through the host, verdict and all: the pattern is already known.
+    await h.real(GET);
+    await h.real(LIST);
+    await settle();
+    expect(h.io.calls.map((c) => c.tool)).toEqual([GET]);
+  });
+
+  it('keeps what earlier verdicts said about its tool', async () => {
+    const h = harness();
+    await h.real(LIST);
+    await h.real(GET);
+    h.spec.observeLate(S, GET, ARGS, late(GET), h.io);
+    expect(h.spec.tools.isReadOnly(S, GET)).toBe(true);
+  });
+
+  it('discards what was prefetched from the server of a tool never seen before', async () => {
+    const h = harness();
+    await h.warm();
+    expect(h.spec.cache.size().ready).toBe(1);
+    h.spec.observeLate(S, 'close_issue', { number: 1 }, late('close_issue'), h.io);
+    expect(h.spec.cache.size()).toEqual({ ready: 0, inFlight: 0 });
+  });
+
+  it('leaves the count of calls in flight as it was', async () => {
+    const h = harness();
+    const running = h.spec.beginReal(S);
+    h.spec.observeLate(S, GET, ARGS, late(GET), h.io);
+    expect(h.spec.budget.realInFlight(S)).toBe(1);
+    // It was not on the server beside the other call: no evidence of calls run together.
+    h.spec.observe(S, LIST, ARGS, h.outcome(text({})), h.io, running);
+    expect(h.spec.tools.concurrency(S)).toBe(1);
+  });
+
+  it('does nothing while the mod is off', () => {
+    const h = harness({ mode: 'off' });
+    h.spec.observeLate(S, GET, ARGS, late(GET), h.io);
+    expect(h.spec.tools.fact(S, GET)).toBeUndefined();
   });
 });
 

@@ -66,7 +66,7 @@ jobs:
       # The mod itself, in Claude Code's own test kit: `npm test` covers the
       # core only. Same pinned build as ci.yml's `mod` job; move them together.
       - name: Install Claude Code
-        run: npm install --global @anthropic-ai/claude-code@2.1.302
+        run: npm install --global @anthropic-ai/claude-code@2.1.326
       - run: claude plugin validate .
       - run: claude plugin test .
 
