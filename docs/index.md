@@ -64,9 +64,12 @@ for exactly the same thing.
   a path) becomes the first call's arguments.
 - **Prefetches only what you already allow.** A tool must have run read-only,
   and your permission settings must already allow the exact call.
-- **Answers exact matches only, after your hooks.** A served call still runs
-  through your PreToolUse hooks. A miss, a write, or any call your hooks object
-  to runs exactly as it would have.
+- **Answers exact matches only, after your hooks.** Speculate answers a call
+  at the point where Claude Code is about to run the tool: after the
+  permission check and your PreToolUse hooks. A miss, a write, or any call
+  your hooks object to runs exactly as it would have.
+- **Asked about MCP tools only.** It names the tools it wants to be asked
+  about, so built-in tools such as Bash and Edit run without it.
 
 ## Non-goals
 

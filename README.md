@@ -103,19 +103,24 @@ mod; it has not been run against this one.
   from the server's `readOnlyHint`. Speculate never prefetches a tool it has
   not seen run, or one that reported otherwise.
 - **Only calls you already allow.** A prefetch starts only when your
-  permission settings would run that exact call without asking. Speculate
-  checks again when the result arrives and again before it answers. It never
-  causes a permission prompt.
-- **Your PreToolUse hooks still decide.** A served call goes through your
-  PreToolUse hooks first. If a hook denies, asks, or rewrites the call, it runs
-  exactly as it would have without Speculate. Prefetches are real calls, so
-  your hooks see them too.
+  permission settings would run that exact call without asking, and Speculate
+  checks again when the result arrives. It answers a call only after Claude
+  Code itself has allowed that call. It never causes a permission prompt.
+- **Your hooks still decide and still see.** Speculate answers a call at the
+  point where Claude Code is about to run the tool, after your PreToolUse
+  hooks. A call a hook denies never reaches it. A call a hook rewrites is
+  answered only if Speculate holds a result for the rewritten call. Your
+  PostToolUse hooks run on a served result as on any other. Prefetches are
+  real calls, so your hooks see them too.
+- **It is asked about MCP tools only.** Speculate names the tools it wants to
+  be asked about, and keeps that list of your MCP tools' names itself, in its
+  option in your settings. Built-in tools such as Bash and Edit run without it.
 - **Exact bytes, once, briefly.** A served result is exactly what the server
   returned for that call. It is used at most once and kept for at most 30
   seconds, in memory only. Any call that is not read-only flushes everything
   prefetched from that server. A shell command, a file edit, or any other
-  built-in call that Claude Code does not report read-only flushes everything
-  prefetched from every server.
+  built-in call that is not known to only read flushes everything prefetched
+  from every server.
 
 See [safety and storage](https://lukebward.github.io/speculate/safety/) for the
 full rules and what is stored on disk.
@@ -133,13 +138,15 @@ full rules and what is stored on disk.
   on it together. On a slow server that the model uses strictly one call at a
   time, a served call still waits for a prefetch that started only when the
   call before it returned.
-- PostToolUse hooks do not run for a served call, because no tool ran. They do
-  run for the prefetch that produced it. A PostToolUse hook whose matcher names
-  a specific tool keeps that tool out of speculation entirely.
-- Where an organization manages Claude Code, installed plugins cannot hook
-  PreToolUse, so Speculate can never answer a call. Once two calls in a row
-  that it held an answer for have run anyway, it turns itself off for the
-  session, and `/speculate` says so. Every call runs as usual.
+- A shell command discards everything prefetched, whatever it ran. Speculate
+  hears of a built-in call only after it ran, with no word from Claude Code on
+  whether it wrote. In a session that mixes shell commands with MCP reads,
+  fewer calls are served.
+- The first turn with a newly connected MCP server only learns. Speculate
+  names the server's tools when that turn ends, and is told that a tool only
+  reads when it then sees the tool run. In a headless session, which has one
+  turn, that is the whole first session.
+- It has not been tested under an organization's managed settings.
 - A prefetch still in flight when the model asks is waited for only if the
   tool's usual latency says it will land within about eight seconds. A slower
   read is left to run as a normal call.

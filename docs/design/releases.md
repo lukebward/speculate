@@ -776,6 +776,28 @@ and Microsoft Learn's search is such a tool.
 This measures `main` as a whole against no mod. It does not isolate the
 changes listed above from v1.0.0, and none of them is a speedup claim.
 
+Hooks (2026-11-22). Reasons are in
+[§13.33](implementation-notes.md#1333-serving-where-the-host-means-a-call-to-be-served-2026-11-22).
+
+- **Requires Claude Code 2.1.326 or later** (was 2.1.296). On an older host
+  the mod does not load, and every call runs as usual.
+- The mod answers a call at `tool.run`: after the permission check and the
+  person's PreToolUse hooks, when the host is about to run the tool. It no
+  longer refuses the call from a PreToolUse hook of its own.
+- A served call reaches PostToolUse hooks. A tool with a PostToolUse hook
+  written for it is no longer kept out of speculation.
+- The mod no longer turns itself off where its PreToolUse hook is not asked.
+  It has no such hook.
+- The mod is asked about MCP tools only, by name. It keeps the names in a new
+  option, `tools` ("Watched MCP tools" in `/config`), which it sets itself
+  when a turn ends in a session that offers a tool it does not name. Built-in
+  tools such as Bash and Edit run without it.
+- A shell command now always discards what was prefetched. The mod hears of
+  it after it ran, with no verdict from the host on whether it wrote.
+- `/speculate` says how many MCP tools the mod is asked about, or that it is
+  asked about every call.
+- `bench:live --host-tools` leaves the host's own tools in both arms.
+
 Prediction (2026-11-22). Reasons are in
 [§13.32](implementation-notes.md#1332-prediction-that-fits-how-a-model-calls-2026-11-22).
 

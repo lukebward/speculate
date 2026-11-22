@@ -12,9 +12,12 @@ Shows whether speculation is paying for itself:
   behind a prefetch, and next-call recall at 1 and at 3.
 - **All sessions:** the same counters summed across every session.
 - **Known MCP tools:** how many tools Speculate has seen run, and how many of
-  them it may prefetch.
+  them it may prefetch. Under it, how many MCP tools it is asked about by
+  name, or that it is asked about every tool call (before the names are
+  saved, or where your settings do not keep them).
 - The most common reasons a prediction was not started this session, such as
   `host-permission` (your settings would ask), `policy:not-read-only`,
+  `policy:not-watched` (an MCP tool Speculate does not name yet),
   `low-utility` (too fast to be worth it), or `dedup`.
 
 Saved time is estimated: a served call is credited with the upstream time its

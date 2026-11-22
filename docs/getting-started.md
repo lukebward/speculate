@@ -51,6 +51,11 @@ server mostly teaches it. From then on:
   by URL or listing a directory, starts that read with no learning at all;
 - a session's usual opening reads start when its first prompt arrives.
 
+When the first turn of the first session ends, Speculate writes the names of
+your MCP tools to its option in your settings ("Watched MCP tools" in
+`/config`), and Claude Code reloads it with them. From then on it is asked
+about those tools only. Leave the option as it is; Speculate keeps it current.
+
 Only tools that have already run read-only, and that your permission settings
 already allow without asking, are ever prefetched. A tool that always prompts
 for permission is never touched. To let Speculate help with a server, allow

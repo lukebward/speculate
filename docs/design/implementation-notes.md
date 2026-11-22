@@ -1065,3 +1065,104 @@ What the measurement says about the design:
 Verification: 574 unit specs, 14 mod tests under Claude Code 2.1.330 and
 2.1.302, `claude plugin validate`. Offline evaluation: recall at 3 0.8599
 (0.8592 before), waste per hit unchanged at 1.85, floor unchanged.
+
+### 13.33 Serving where the host means a call to be served (2026-11-22)
+
+§13.32 ended on a cost the hooks could not avoid: once a mod hooks tool calls
+with a matcher the host cannot read ahead, a session that has Claude Code's
+Artifact tool pays about 170 ms on every request to the model. That was a
+symptom. The mod stood in the wrong place, and was asked about far more than
+it answers.
+
+**Where it stood.** v1.0 claimed a prefetched result at `tool.call`, which
+fires before the permission check, and had to let the call run on through the
+person's PreToolUse hooks before it could answer. So it also hooked
+`classic.PreToolUse`, and refused the call there itself to keep the tool from
+running (§13.29). Three things followed from that one trick. A served call
+never reached PostToolUse, so a tool with a PostToolUse hook written for it
+had to be kept out of speculation. Where an organization lets only its own
+PreToolUse hooks run, the refusal never came and the mod had to notice and
+stop itself (§13.30). And the host was asked a second time whether a call it
+was about to allow was allowed.
+
+**Where the host means it to stand.** Claude Code 2.1.326 added `tool.run`:
+it fires when a call has been allowed and is about to run, after `tool.call`,
+PreToolUse, `tool.check` and whoever settled an ask, and never for a refusal.
+A hook there answers in the tool's place with `{ result }`, "a success
+PostToolUse sees". The mod now serves there, and all three consequences go:
+"your PreToolUse hooks still decide" holds by where the hook stands, a served
+call reaches PostToolUse like any result, and nothing has to be noticed. A
+hook that rewrites the arguments is honored too: the mod is asked about the
+call as allowed, and answers only what it holds for exactly that.
+
+**What it is asked about.** The host's own words on a hook at `tool.call` or
+`tool.run`: "a hook that may match a tool, even one that only passes
+`next(e)` on, turns off for that tool what would carry its output past the
+hook: the move to the background, a served call's live output". v1.0's hook
+had no matcher, so it did that to every tool, Bash included. The Artifact
+cost is the same rule seen from another side: a hook that may answer Edit or
+Write changes how the host builds a tool of its own. A matcher that is a
+list of tool names is read ahead; a regular expression is not, and counts as
+every tool. So the hook must name the MCP tools, and nothing knows their
+names when hooks register.
+
+**The mod keeps the names.** A mod's options are the one thing it receives at
+registration, and a mod may set its own option (`$.config.set`), on which the
+host reloads it. So the manifest declares one option, `tools`, and the mod
+writes the session's MCP tool names to it when a turn ends in a session that
+offers one it does not name. Four details:
+
+- A list-valued option has no settings row and cannot be set; a text option
+  can. The names are stored separated by commas.
+- `$.config.set` and `$.tool.list` are not available at `session.end` in a
+  headless session. They are at `prompt.submit` and at `turn.complete`.
+- The first version wrote the names at the first prompt, so that the same
+  session had them. The reload is quick (9 to 31 ms), but it starts the
+  module over, and that cost the module the prompt: what the prompt named
+  never reached the learner, and no opening read started. Where the prompt
+  names the subject (the mock server's new-subject workload) the hit rate
+  fell from 50% to 25%. At `turn.complete` nothing is in flight that a reload
+  would lose. The hook acts on the main turn only: a subagent's turn ends
+  inside the turn that spawned it.
+- With no names yet, and where settings refuse to keep them, the hook has no
+  matcher and the mod works as before, at the cost above. The first turn
+  after an upgrade is that case.
+
+**What it hears of afterwards.** A call the hook is not asked about reaches
+the mod at `classic.PostToolUse`, which costs the host nothing (measured: the
+request is unchanged). Two kinds matter. An MCP tool not named yet is learned
+from, with the tool's own duration as the host reports it; but the host's
+read-only verdict comes only to a hook at `tool.run`, so such a tool is not
+prefetched until it has been named and seen to run. And a built-in tool,
+which may have changed what a server would return (§13.30): with no verdict,
+it is judged by its name. A tool that only reads does not discard; anything
+else does, and that includes every shell command, where the verdict used to
+spare `git status`. That is a real loss for a session that mixes shell
+commands into a chain of MCP reads, taken so that the mod is not in the way
+of every shell command the model runs. A classifier of shell commands of the
+mod's own would win it back and was not written: it would be a second
+opinion on a question the host already answers, held to a lower standard.
+
+**What it costs.**
+
+- Claude Code 2.1.326 or later. A module that names `tool.run` does not load
+  on an older host; it is refused when the module is read, so one module
+  cannot carry both paths. The mod stops, the session does not.
+- One option in the person's settings, and one row in `/config` that they
+  should leave alone.
+- One reload, between turns, in a session whose tools the mod does not name
+  yet. What was prefetched in memory is lost; what was learned is saved
+  first.
+- A server connected after the names exist only teaches for one turn: its
+  calls are heard of after they ran, and none is served until the turn ends
+  and the names are kept.
+
+**Verified** on Claude Code 2.1.330 with probe mods and the host's debug log,
+then with the mod itself: `tool.run` fires for the model's MCP calls and for
+the mod's own (which pass through); an answer there reaches the model and
+PostToolUse; a settings PreToolUse hook that denies a call ends it before
+`tool.run`; with names, the host reports `edit_hook=false` and the model's
+time to first token is the same as with no mod, the Artifact tool present.
+The mod's tests pass on 2.1.326 and 2.1.330; on 2.1.325 the module is
+refused. Not verified: a session under an organization's managed settings,
+and a session on a person's own machine.

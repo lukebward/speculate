@@ -26,12 +26,12 @@ A tool becomes a speculation target only when all of these hold:
    only when it takes that same form. Otherwise it is discarded.
 3. **You already allow it.** `$.tool.check` reports that Claude Code would run
    this exact call, with these arguments, without asking. Speculate checks
-   before starting the prefetch, again when its result arrives, and again
-   before answering with it. It never raises a permission prompt.
-4. **No PostToolUse hook is written for it.** A served call skips PostToolUse,
-   since no tool ran. A settings hook whose matcher names specific tools keeps
-   those tools out of speculation entirely. Catch-all matchers (none, `*`,
-   `.*`) do not.
+   before starting the prefetch and again when its result arrives. It never
+   raises a permission prompt.
+4. **Speculate is asked about it before it runs.** It answers a call at the
+   point where Claude Code is about to run the tool, and it is asked only
+   about the MCP tools it names (see [the tools it watches](#the-tools-it-watches)).
+   A tool it does not name yet is learned from, not prefetched.
 
 Annotations are hints the server makes about itself. A server that marks a
 writing tool `readOnlyHint: true` misleads Claude Code too. Speculate makes
@@ -42,27 +42,46 @@ them.
 
 ## How a served call runs
 
-When the model asks for a call that a prefetch already answered, Speculate
-claims the result and lets the call run through Claude Code as far as its
-PreToolUse hooks:
+Speculate answers a call at one point only: when Claude Code has allowed the
+call and is about to run the tool (`tool.run`). By then the permission check
+has passed, your PreToolUse hooks have run, and any question about the call
+has been answered.
 
-- If your hooks deny it, ask about it, or rewrite its arguments, the claim is
-  dropped. The call goes on exactly as it would have without Speculate, and the
+- If your settings or your hooks deny the call, Speculate is never asked
+  about it. The call ends exactly as it would have without Speculate, and the
   prefetch counts as waste.
-- If they let it through unchanged, Speculate stops the call before the tool
-  runs and answers with the claimed result.
+- If a hook rewrites the call's arguments, Speculate is asked about the call
+  as rewritten. It answers only if it holds a result for exactly those
+  arguments.
+- If the call is allowed as it stands and Speculate holds its result, it
+  answers in the tool's place. Your PostToolUse hooks then run on that answer
+  as on any result.
 
 Prefetches are real calls through Claude Code, made with `$.mcp.call`. They go
 through your permission settings and your PreToolUse and PostToolUse hooks like
 any other call, so an audit hook sees every request that actually reached a
-server.
+server, and sees the served call too.
 
-Where an organization manages Claude Code, installed plugins cannot hook
-PreToolUse. Speculate then never answers a call: every call runs as usual. A
-prefetch it can never use is only an extra upstream call, so once two calls in
-a row that it held an answer for have run for real without its PreToolUse hook
-being asked, it stops prefetching and learning for the rest of the session.
-`/speculate` reports that it is off, and why.
+## The tools it watches
+
+A mod says which tools it wants to be asked about. Claude Code treats a tool
+that a mod may answer with more caution, so Speculate asks about MCP tools
+only, by name. It does not know the names in advance: they are whatever
+servers you have connected. So it keeps the list itself, in its one option:
+
+- When a turn ends in a session that offers an MCP tool it does not name
+  yet, Speculate writes the tools' names to its option. Claude Code keeps the
+  option in your settings (`pluginConfigs`, under `speculate`) and reloads
+  Speculate with the new names. It waits for the end of the turn so that the
+  reload interrupts nothing.
+- The option shows in `/config` as "Watched MCP tools". Leave it as it is. If
+  you clear it, Speculate fills it in again.
+- Until the list exists, and where your settings refuse to keep it (an
+  organization's may), Speculate is asked about every tool call. It still
+  works; `/speculate` says which of the two it is doing.
+
+Speculate hears of every other call only after it ran: a built-in tool such
+as Bash or Edit, or an MCP tool it does not name yet.
 
 ## Hard rules
 
@@ -77,13 +96,14 @@ being asked, it stops prefetching and learning for the rest of the session.
   including one that failed, discards everything prefetched from that server
   and cancels what was queued.
 - **Writes outside MCP flush everything.** A shell command or a file edit can
-  change what any server would return. When a built-in tool call settles
-  without Claude Code reporting it read-only, including one that failed or was
-  interrupted, everything prefetched from every server is discarded. The
-  agent's own task-list tools (`TodoWrite`, `TaskCreate`, `TaskUpdate`) are the
-  exception: they change nothing outside the session. A write that does not go
-  through Claude Code at all (a teammate, another terminal) is still invisible;
-  the 30 seconds bound it.
+  change what any server would return. When a built-in tool call settles,
+  including one that failed or was interrupted, everything prefetched from
+  every server is discarded, unless the tool is one that only reads (Read,
+  Glob, Grep, a web search, the tool search) or only keeps the agent's own
+  task list. A shell command always discards, whatever it ran: Speculate hears
+  of it only afterwards, with no verdict from Claude Code on what it did. A
+  write that does not go through Claude Code at all (a teammate, another
+  terminal) is still invisible; the 30 seconds bound it.
 - **Auth errors suspend.** A prefetch that fails with an authorization error is
   not kept, and the tool is not prefetched again until a real call to it
   succeeds.
@@ -125,6 +145,11 @@ Claude Code's configuration directory (`~/.claude/plugins/store/`). It holds:
 - per tool, whether it ran read-only, the argument **names** it was called
   with, and how many of the model's calls its server has run at the same time;
 - cumulative counters for `/speculate`.
+
+One thing is kept outside that store: the names of your MCP tools, in
+Speculate's option in your Claude Code settings (see
+[the tools it watches](#the-tools-it-watches)). `/speculate forget` does not
+clear it; `/config` does.
 
 Tool results are never stored. Before anything is written, values and names
 that look like credentials (bearer tokens, private keys, JWTs, URLs with
