@@ -42,9 +42,13 @@ claude --plugin-dir ./speculate
 Speculate learns from the MCP calls Claude makes, so the first session with a
 server mostly teaches it. From then on:
 
-- after a read, the reads that usually follow it start in the background;
+- after a read, the reads that usually follow it start in the background,
+  together when the model itself has run reads on that server together;
+- a prompt that names its subject the way earlier prompts did ("read issue
+  41", a pull request link, a file path) starts the read of that subject
+  before the model asks. Speculate needs two such prompts first;
 - a prompt that names a read outright, such as reviewing a GitHub pull request
-  by URL or listing a directory, starts that read before the model asks;
+  by URL or listing a directory, starts that read with no learning at all;
 - a session's usual opening reads start when its first prompt arrives.
 
 Only tools that have already run read-only, and that your permission settings

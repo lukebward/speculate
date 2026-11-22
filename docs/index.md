@@ -60,7 +60,8 @@ for exactly the same thing.
   connections, with its credentials. No server configuration is wrapped or
   rewritten.
 - **Learns from real calls.** Transitions between reads, a session's usual
-  opening reads, and prompts that name a read outright.
+  opening reads, and how the subject a prompt names (an issue number, a link,
+  a path) becomes the first call's arguments.
 - **Prefetches only what you already allow.** A tool must have run read-only,
   and your permission settings must already allow the exact call.
 - **Answers exact matches only, after your hooks.** A served call still runs

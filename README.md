@@ -45,10 +45,13 @@ servers that 0.x wrapped keep working through a plain pass-through.
   Claude Code as normal. Speculate learns transitions, such as `list_issues`
   followed by `get_issue` for a number from that list.
 - **Prefetches likely reads.** After a call, Speculate starts the most likely
-  next reads through Claude Code's own connection to the server. It also does
-  this when your prompt names a read outright ("review
-  https://github.com/acme/api/pull/7") and when a session starts with its
-  usual first reads.
+  next reads through Claude Code's own connection to the server. Where the
+  model has run reads on a server together, it starts them together.
+- **Reads your prompt for the subject.** The first call of an exchange takes
+  its arguments from your words. After two prompts that named a subject the
+  same way ("read issue 41", a pull request link, a file path), Speculate
+  starts the read of the third while the model is still reading the prompt.
+  A session's usual first reads start the same way.
 - **Answers exact matches.** When the model then asks for a call with the same
   server, tool and arguments, the result is already there or on its way.
   Anything else runs normally.
@@ -59,34 +62,37 @@ everything Speculate has learned.
 
 ## Measured
 
-In paired real sessions against two hosted MCP servers, with Speculate off
-and on (Claude Code 2.1.330, Claude Haiku 5.5, six warm pairs per workload,
-one day):
+In paired real sessions with Speculate off and on (Claude Code 2.1.330,
+Claude Haiku 5.5, four to six warm pairs per workload, 2026-11-22). Hit rate
+is the share of the model's MCP calls answered from a prefetch.
 
-- When sessions repeated a scripted workflow, the median time a session
-  waited on tools fell 40% on Microsoft Learn (2.1 s to 1.3 s) and 61% on the
-  Hugging Face Hub (420 ms to 162 ms), in every pair.
-- When every session asked about a new subject, no call was served. On the
-  Hub, which answers in about 70 ms, sessions then waited longer on tools
-  with Speculate than without.
-- An ordinary question asked again came out between those two, from a large
-  gain to a loss, depending on whether the model made the same calls again.
-- Session time did not measurably change. Tools were at most a fifth of a
-  session; the model was the rest.
-- Speculate's hooks add about 9 ms to a call it does not answer.
-- Hit rate, the share of the model's calls answered from a prefetch, was 67%
-  and 100% on the scripted workflow, 56% and 17% on the repeated question,
-  and 0% on new subjects. Of the prefetches started, 65% were used.
-- The last proxy release (0.25.0), run in the same sessions, did better on
-  the scripted workflow: a 100% hit rate on both servers and 96% and 77% less
-  tool wait. Its predictor was no more accurate. Run side by side on one
-  workload, it started 58 prefetches to Speculate's 27 and used 64% of them
-  to Speculate's 89%.
+| Server | Sessions repeat a scripted workflow | An ordinary question, asked again | A new subject every session |
+| --- | --- | --- | --- |
+| A mock server that takes 1.5 s per call | 97% hit rate, 62% less tool wait | 95%, 78% less | 50%, 36% less |
+| Microsoft Learn (about 0.4 s per call) | 88%, 82% less | 74%, 74% less | 32%, 30% less |
+| Hugging Face Hub (about 70 ms per call) | 89%, 60% less | 36%, 29% more | 0%, nothing prefetched |
 
-Both servers answer in well under a second. Nothing was measured on a server
-that takes seconds per call. The
+- Tool wait is the median time a session waited on MCP tools. On the mock
+  server the scripted session waited 12.1 s without Speculate and 4.6 s with
+  it, and the whole session took a quarter less time. On the two hosted
+  servers the model is most of a session, and session time did not measurably
+  change.
+- Of the prefetches started, 76% were used. The rest are extra reads against
+  the server.
+- The first two sessions teach it. Almost nothing is served in them.
+- A new subject is served when the prompt names it ("issue 41"). When the
+  model must search for it, the search itself is never predicted.
+- The Hub answers in Markdown, which Speculate cannot read arguments from, so
+  only an exact repeat of an earlier call is served there. It also answers
+  about one call in twenty-five slowly, which moves a 70 ms comparison either
+  way: a second run gave 100%, 6% and 0%.
+- Speculate's hooks add less than 10 ms to a call it does not answer.
+
+The
 [benchmark guide](https://lukebward.github.io/speculate/design/local-learning-benchmark/)
-has the method, the costs, and the limits.
+has the method, every table, the costs, and the limits. The last proxy
+release (0.25.0) was measured the day before against an earlier build of the
+mod; it has not been run against this one.
 
 ## Safety
 
@@ -116,10 +122,15 @@ full rules and what is stored on disk.
 
 - It covers MCP tools only. Built-in tools such as Bash and Read are not
   prefetched.
-- A tool that returns structured content is never prefetched. Claude Code
-  hands such a result to a mod as text, and Speculate serves only results it
-  can hand back in the form they came. The search tool of Microsoft Learn is
-  one.
+- It predicts from what a prompt names and from what results say. A call
+  whose arguments the model writes itself, such as a search query, is never
+  predicted, and which search results a model opens is a judgment. In the
+  measured sessions Speculate had about half of those pages ready.
+- A new kind of prompt or call must be seen twice before it is predicted.
+- A server is used one call at a time until the model itself has run calls
+  on it together. On a slow server that the model uses strictly one call at a
+  time, a served call still waits for a prefetch that started only when the
+  call before it returned.
 - PostToolUse hooks do not run for a served call, because no tool ran. They do
   run for the prefetch that produced it. A PostToolUse hook whose matcher names
   a specific tool keeps that tool out of speculation entirely.

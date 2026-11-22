@@ -929,3 +929,118 @@ Verification: 502 unit specs, 21 of them the benchmark's arithmetic; 10 mod
 tests and `claude plugin validate` under Claude Code 2.1.330. Only
 `bench/` and its spec are new code: `src/` and `hooks/` are unchanged, so
 nothing above is a change in the mod's behavior.
+
+### 13.32 Prediction that fits how a model calls (2026-11-22)
+
+§13.31 measured the mod and found it served on a scripted flow and little
+else. Each change here comes from a miss that a recording showed: `bench:live
+--keep` keeps a session's event stream, and `bench/replay.ts` runs those
+calls through the mod's own core on a virtual clock, so a change to
+prediction can be tried against what a model did before it is measured.
+Results are in the
+[benchmark guide](local-learning-benchmark.md#results-after-the-prediction-changes-2026-11-22).
+
+**A tool that returns structured content is served.** §13.31 left open
+whether a hook can return such a result in the form the host would have
+produced. It can. Claude Code records the result of a tool with an
+`outputSchema` as one string, the JSON of its `structuredContent`, and hands
+a mod's own `$.mcp.call` that same string as a single text block. The hooks
+now note per tool which form the host recorded (`blocks` or `text`) and
+answer in that form (`recordOf`). A prefetch that is not exactly that one
+block is discarded, not served.
+
+**A result names sections, and an agent asks for documents.** A search hit
+points at `guide/install#windows` and the next call fetches `guide/install`.
+For an argument whose observed values never named a section, a source's value
+is read without it (`ArgTemplate.sections`). The same reading then counts the
+rows of a list by document: ten hits that are sections of four pages are
+four rows. Without that, rows 0 to 2 were often one page and one prediction
+came out of a search however much was learned. In two recordings of twelve
+new-subject sessions the first three documents held 68% of the pages the
+model opened, the first three lines 51%. Rows that name no section are never
+dropped, so a list of issues reads as before.
+
+**A step of calls follows the call before the step.** A model issues several
+calls in one step. The observer hears of them in the order they settle, and
+§5.3 linked each to the one before it: "the second read follows the first".
+The second could then never be prefetched before the step, because its
+trigger had not finished. The hooks now pass each call's span on the host
+clock, and a call that began less than 300 ms after the previous call's
+answer is read as its sibling: both follow the last call that had ended, by a
+model's reaction time, before the step began (`stepTrigger`). The predictor
+scores a step the same way. Scored against its sibling's batch, the second
+read of a step was called wrong every time, and that went to calibration.
+
+**A server is serial until the agent shows otherwise.** §13.29 budgets every
+server as stdio because the host does not say how it reaches one. That holds
+a step of two 1.5 s reads to one prefetch. When the agent's own calls have
+been in flight on a server together, the server takes calls together, and
+speculation may too: never more in flight, its own and the agent's, than the
+agent alone has had, and never more than three of its own. The evidence is
+kept with the tool facts, so it carries to the next session. A call a
+prefetch is answering is not a call on the server and is no evidence.
+
+**A literal that only ever agreed with a derivation gives way to it.** §13.18
+admits a second source for an argument only after it alone explained two
+observations. A template's first sighting memorizes its value as a literal
+beside whatever path produced it, and against a list that does not change the
+two agree forever: neither ever explains alone, and row 0 of a two-row step
+was never offered. A derivation now earns the solo win when the only other
+explanations are literals that have explained no more than it has. A literal
+still earns nothing from a tie, so a stale constant is still no fallback.
+
+**The prompt is the call a first call follows.** The first call of an
+exchange takes its arguments from the person's words. `src/prompt.ts` lays
+out the identifiers in a prompt (numbers and the word before each, links,
+`owner/name` pairs, paths, quoted text) as a result, and a prompt that names
+something becomes the head of every server's chain, as `@prompt`. Nothing
+else is new: the learner reads `issue_number` from `named.issue` as it reads
+it from a list row, and the read starts while the model is still reading the
+prompt. Two rules keep it honest. Only a prediction that takes a value from
+the prompt is offered, since a call made whatever the person wrote is an
+opener's business (§13.15). And a prompt that names nothing leaves each chain
+as it was. The word before a number is what separates subjects: after
+"issue 41" and "pull request 7", `named.issue` resolves for one prompt and
+`named.request` for the other, and a prediction with an argument that does
+not resolve is never made. What is stored is the path. The hand-written
+intent rules of §13 stay; this is the learned form of the same idea.
+
+**The learner's ranking reaches the predictor.** After an item's comments
+the next call is another item the first time and something else the last
+time. A context key that reaches one call further back
+(`tool:get_issue|before:list_issues`) tells the two apart. It did not help
+until a second fault was fixed: every transition's first choice was emitted
+at the same confidence ramp, and the predictor then ranked by expected saving,
+so a 3 ms difference in learned latency decided the order. A transition's
+confidence is now told relative to the likeliest one on offer.
+
+What the measurement says about the design:
+
+- **Hit rate followed prediction, as §13.31 said it would.** On the mock
+  server with 1.5 s calls, the scripted workload went from 84% to 97% of
+  calls served, the repeated question from 50% to 95%, and new subjects from
+  0% to 50%, with 1 unused prefetch in 55. On Microsoft Learn the three went
+  from 67%, 56% and 0% to 88%, 74% and 32%, and the median session waited
+  82%, 74% and 30% less on tools.
+- **A serial server has a floor.** The scripted mock session waits 4.6 s on
+  tools instead of 12.1 s, at a 97% hit rate. Its eight calls take 1.5 s each
+  on a server the agent uses one call at a time, and the model leaves 0.7 s
+  between them: 22 of the 31 served calls were joined in flight. Only calls
+  the agent itself has run together are prefetched together, so a strictly
+  sequential agent on a slow server gains the model's time between calls and
+  no more.
+- **New subjects are bounded by what a prompt and a result can say.** Where
+  the prompt names the subject, the session is served whole after two prompts
+  of its kind. Where the model writes its own search query, the search cannot
+  be predicted, and which hits it opens is a judgment: 32% on Microsoft Learn
+  with 46% of prefetches used.
+- **A fast server is still marginal.** On the Hub a served call takes about
+  25 ms instead of about 70 ms, and about one call in twenty-five takes over
+  300 ms whoever makes it. The median session waited 60% less on tools in the
+  scripted workload; the means did not move reliably. Its results are
+  Markdown, which gives the learner nothing to read arguments from, so the
+  other two workloads are served only where the model repeats a call exactly.
+
+Verification: 568 unit specs, 14 mod tests under Claude Code 2.1.330 and
+2.1.302, `claude plugin validate`. Offline evaluation: recall at 3 0.8599
+(0.8592 before), waste per hit unchanged at 1.85, floor unchanged.

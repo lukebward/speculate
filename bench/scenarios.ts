@@ -344,10 +344,11 @@ const mockgithub: Scenario = {
         'lowest numbers together with their comments, and tell me in two sentences which is more urgent.'
       );
     }
-    const subjects = [
-      ...MOCK_ISSUES.map(n => `issue ${n} and its comments`),
-      ...MOCK_PULLS.map(n => `pull request ${n} and its diff`),
-    ];
+    // An issue, then a pull request, and so on: no two sessions running share a kind of subject.
+    const subjects = MOCK_ISSUES.flatMap((issue, i) => [
+      `issue ${issue} and its comments`,
+      `pull request ${MOCK_PULLS[i]!} and its diff`,
+    ]);
     return (
       `Use the mockgithub MCP tools on the repository acme/api. Read ${pick(subjects, pair)}, ` +
       'and summarise it in two sentences.'

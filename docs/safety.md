@@ -20,8 +20,10 @@ A tool becomes a speculation target only when all of these hold:
    that verdict from the server's `readOnlyHint`. A tool Speculate has never
    seen run is not a target, and a later call that comes back otherwise revokes
    it on the spot.
-2. **Its result can stand in.** The real call returned plain MCP content
-   blocks, so a prefetched result can answer the same call.
+2. **Its result can stand in.** Claude Code recorded the real call's result
+   as MCP content blocks, or as one text (it does that for a tool that
+   returns structured content). A prefetched result answers the same call
+   only when it takes that same form. Otherwise it is discarded.
 3. **You already allow it.** `$.tool.check` reports that Claude Code would run
    this exact call, with these arguments, without asking. Speculate checks
    before starting the prefetch, again when its result arrives, and again
@@ -88,6 +90,27 @@ being asked, it stops prefetching and learning for the rest of the session.
 - **Real calls come first.** Claude Code does not tell a mod how it reaches a
   server, so Speculate treats every server as serial: it prefetches only while
   no real call to that server is running, one at a time, at most 30 a minute.
+- **A server runs calls together only after the model did.** When the model's
+  own calls have been in flight on a server at the same time, Speculate may
+  prefetch there together too. It never has more calls in flight, its own and
+  the model's, than the model alone has had, and never more than three of its
+  own.
+
+## What is read from your prompt
+
+When you submit a prompt, Speculate reads the identifiers in it: whole
+numbers and the word before each ("issue 41"), links, `owner/name` pairs,
+file paths, and text in double quotes or backticks. It reads the first 4,000
+characters and ignores a link that carries a login.
+
+It uses them for one thing. The first call of an exchange takes its arguments
+from your words, so after two prompts that named a subject the same way,
+Speculate can start that read while the model is still reading the prompt.
+Only a call that takes a value from the prompt starts this way.
+
+The identifiers stay in memory until the next prompt. What is stored is where
+a value was read from (for example, "the number after the word issue"), never
+the value and never the prompt.
 
 ## What is stored
 
@@ -95,12 +118,12 @@ Speculate keeps its learning in the plugin's own store, a JSON file under
 Claude Code's configuration directory (`~/.claude/plugins/store/`). It holds:
 
 - learned transitions: tool names, where each argument came from (an earlier
-  argument, a field of an earlier result, or a constant), and filtered constant
-  values;
+  argument, a field of an earlier result, an identifier in the prompt, or a
+  constant), and filtered constant values;
 - each session's usual opening reads, with their arguments;
 - per-rule feedback and latency aggregates;
-- per tool, whether it ran read-only and the argument **names** it was called
-  with;
+- per tool, whether it ran read-only, the argument **names** it was called
+  with, and how many of the model's calls its server has run at the same time;
 - cumulative counters for `/speculate`.
 
 Tool results are never stored. Before anything is written, values and names
@@ -119,8 +142,9 @@ can remain as learned constants, and the store is not encrypted. Run
 
     A prefetch tells the upstream service what you are *probably* about to do,
     before the agent commits to it. Read-only bounds changes, not disclosure.
-    A session's usual opening reads run when its first prompt arrives. If that
-    matters for a server, do not allow its tools without asking.
+    A session's usual opening reads run when its first prompt arrives, and so
+    does a read that Speculate has learned to take from what a prompt names.
+    If that matters for a server, do not allow its tools without asking.
 
 **Reads with side effects.** Even a read can write an audit entry, mark
 something as seen, count against a rate limit, or be billed. An unused

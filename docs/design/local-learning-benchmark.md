@@ -22,6 +22,8 @@ The one like-for-like comparison of the two is
 | `npm run bench:live` | Tool wait and session time in real Claude Code sessions with the mod off and on, against hosted MCP servers, with a real model choosing the calls | Network and service noise; a few pairs per workload; one model and one network location per run; spends model tokens and other people's server time, so it is opt-in |
 | `npm run bench:live -- --cold` | What the mod's hooks cost a call it cannot help: the same sessions with the mod's memory cleared before each one | Only meaningful with the scripted workload, where both arms make the same calls |
 | `npm run bench:live -- --proxy <cli.js>` | A 0.x proxy release in the same sessions, in place of the mod: the release's `dist/src/cli.js` in front of the server | The proxy by its config-file path only; a second run, so not the same minutes as the mod's |
+| `npm run bench:live -- --scenario mockgithub` | The same sessions against the bundled mock GitHub server with 1.5 s added to every call: what the mod does where a call takes seconds | A fixture, not a service: every call takes the same time and nothing is rate limited. The model and the host are real |
+| `npm run bench:replay -- --dir <kept>` | The sessions a live run kept (`--keep`), replayed through the mod's core on a virtual clock: which recorded calls the core would have served | Not a measurement. The model's calls are fixed to the recording and the host's own costs are not in it |
 | `npm run eval` | Generic offline replay prediction recall and adversarial floor | A synthetic corpus; no timing and no whole-task speedup |
 
 `npm test` and `npm run test:mod` establish behavior, not speed.
@@ -97,9 +99,11 @@ SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario huggingface --json huggi
 npm run bench:live -- --summarize mslearn.json huggingface.json
 ```
 
-`--pairs`, `--warmup`, `--model`, `--workload`, `--cold`, `--proxy` and `--mod`
-(another checkout to load in the `on` arm) are described at the top of
-`bench/live.ts`. Claude
+`--pairs`, `--warmup`, `--model`, `--workload`, `--cold`, `--proxy`, `--keep`
+and `--mod` (another checkout to load in the `on` arm) are described at the
+top of `bench/live.ts`. Load the mod from a copy (`--mod`) when the checkout
+may change during a run: the `on` arm reads the mod's files at the start of
+every session. Claude
 Code must be able to authenticate from the environment, because each arm's
 configuration directory starts empty. Behind an HTTPS proxy, set
 `NODE_USE_ENV_PROXY=1` for the runner's own check of the server.
@@ -112,6 +116,161 @@ moves a mean a long way. Report the learning pairs as well as the warm ones,
 the unused prefetches as well as the served calls, and session time as well
 as tool wait. Keep the result file: it holds every
 session and every call, so a reader can check a summary against it.
+
+### Results: after the prediction changes (2026-11-22)
+
+The mod at `9f46b24`, which holds the changes of
+[§13.32](implementation-notes.md#1332-prediction-that-fits-how-a-model-calls-2026-11-22):
+tools that return structured content are served, a step of parallel calls is
+predicted and prefetched together, a result's rows are counted by document,
+and the first call of an exchange is read out of the prompt. The
+[2026-11-21 results](#results-main-after-v100-2026-11-21) below are the
+record of the code before them.
+
+| Condition | Value |
+| --- | --- |
+| Mod | `9f46b24`, loaded from a copy made with `git archive` (`--mod`) |
+| Host | Claude Code 2.1.330, headless (`claude -p`) |
+| Model | `claude-haiku-5-5` for both arms |
+| Servers | Microsoft Learn (about 250 ms a fetch and 450 ms a search), the Hugging Face Hub (about 70 ms a call), and the bundled mock GitHub server over stdio with 1.5 s added to every call |
+| Run from | The same Linux cloud container as the day before (Node 22.23.5), behind an HTTPS egress proxy |
+| Size | Hosted servers: 8 pairs per workload, pairs 1 and 2 learning, 3 to 8 warm. Mock server: 6 pairs, 4 warm. 180 sessions in the four reported files (the Hub twice), $1.34 of model use |
+| Result files | [`bench/results/2026-11-22/`](https://github.com/lukebward/speculate/tree/main/bench/results/2026-11-22) |
+
+Hit rate first, since it does not depend on how fast a server is. Warm pairs:
+
+| Server | Workload | Calls | Served | Hit rate | Hit rate before | Prefetches | Used | Unused | Recall@1 | Recall@3 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 32 | 31 | 97% | 84% | 32 | 97% | 1 | 94% | 100% |
+| Mock GitHub, 1.5 s | repeat | 20 | 19 | 95% | 50% | 19 | 100% | 0 | 45% | 75% |
+| Mock GitHub, 1.5 s | varied | 8 | 4 | 50% | 0% | 4 | 100% | 0 | 25% | 50% |
+| Microsoft Learn | scripted | 41 | 36 | 88% | 67% | 51 | 71% | 15 | 59% | 100% |
+| Microsoft Learn | repeat | 19 | 14 | 74% | 56% | 21 | 67% | 7 | 53% | 74% |
+| Microsoft Learn | varied | 19 | 6 | 32% | 0% | 13 | 46% | 7 | 26% | 32% |
+| Hugging Face Hub | scripted | 36 | 32 | 89% | 100% | 43 | 74% | 11 | 58% | 100% |
+| Hugging Face Hub | repeat | 14 | 5 | 36% | 17% | 11 | 45% | 6 | 17% | 25% |
+| Hugging Face Hub | varied | 17 | 0 | 0% | 0% | 0 | n/a | 0 | 0% | 0% |
+
+"Before" is the 2026-11-21 run for the hosted servers (`77df2fe`) and, for the
+mock server, a run of `3c9b4a9` earlier on the same day
+(`mockgithub-haiku-before.json`), which already served structured content.
+Across the nine rows, 147 of 206 calls were served (71%) from 194 prefetches
+(76% used).
+
+The same pairs, per session. Tool wait and session time are medians over the
+warm sessions of each arm:
+
+| Server | Workload | Tool wait per session, off | Tool wait per session, on | Change | Pairs with less wait | Session time, off | Session time, on | Change |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 12118 ms | 4552 ms | -62% | 4 of 4 | 22882 ms | 17094 ms | -25% |
+| Mock GitHub, 1.5 s | repeat | 7580 ms | 1693 ms | -78% | 4 of 4 | 9397 ms | 7172 ms | -24% |
+| Mock GitHub, 1.5 s | varied | 3034 ms | 1942 ms | -36% | 2 of 4 | 5987 ms | 5582 ms | -7% |
+| Microsoft Learn | scripted | 2340 ms | 412 ms | -82% | 6 of 6 | 11403 ms | 11520 ms | +1% |
+| Microsoft Learn | repeat | 1373 ms | 358 ms | -74% | 6 of 6 | 7946 ms | 9558 ms | +20% |
+| Microsoft Learn | varied | 1437 ms | 1011 ms | -30% | 4 of 6 | 8632 ms | 8176 ms | -5% |
+| Hugging Face Hub | scripted | 450 ms | 182 ms | -60% | 4 of 6 | 9416 ms | 10602 ms | +13% |
+| Hugging Face Hub | repeat | 163 ms | 210 ms | +29% | 3 of 6 | 6944 ms | 7776 ms | +12% |
+| Hugging Face Hub | varied | 353 ms | 286 ms | -19% | 2 of 6 | 8865 ms | 8996 ms | +1% |
+
+And per call:
+
+| Server | Workload | Calls off / on | Errors off / on | Served | Prefetches | Unused | Mean wait per call, off | Mean wait per call, on |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 32 / 32 | 0 / 0 | 31 (9 ready, 22 joined) | 32 | 1 | 1515 ms | 588 ms |
+| Mock GitHub, 1.5 s | repeat | 20 / 20 | 0 / 0 | 19 (12 ready, 7 joined) | 19 | 0 | 1516 ms | 268 ms |
+| Mock GitHub, 1.5 s | varied | 8 / 8 | 0 / 0 | 4 (2 ready, 2 joined) | 4 | 0 | 1517 ms | 869 ms |
+| Microsoft Learn | scripted | 39 / 41 | 0 / 0 | 36 (35 ready, 1 joined) | 51 | 15 | 366 ms | 57 ms |
+| Microsoft Learn | repeat | 19 / 19 | 0 / 0 | 14 (14 ready, 0 joined) | 21 | 7 | 459 ms | 138 ms |
+| Microsoft Learn | varied | 18 / 19 | 0 / 0 | 6 (6 ready, 0 joined) | 13 | 7 | 485 ms | 340 ms |
+| Hugging Face Hub | scripted | 36 / 36 | 0 / 0 | 32 (32 ready, 0 joined) | 43 | 11 | 76 ms | 68 ms |
+| Hugging Face Hub | repeat | 12 / 12 | 4 / 2 | 5 (5 ready, 0 joined) | 11 | 6 | 96 ms | 187 ms |
+| Hugging Face Hub | varied | 19 / 15 | 4 / 2 | 0 (0 ready, 0 joined) | 0 | 0 | 173 ms | 137 ms |
+
+What the tables show:
+
+- **A slow server is where the time is.** With 1.5 s per call, a session
+  waited 7.6 s less on tools in the scripted workload and 5.9 s less in the
+  repeated question, and session time fell by a quarter. This is the first
+  workload in which session time moved by more than its own noise. The server
+  is a fixture, so read it as what a slow server allows, not as a service.
+- **Microsoft Learn's search is served now.** It returns structured content
+  and was the call the mod could not answer the day before. With it served,
+  every distinct call of the scripted session was answered from the third
+  session on. The five calls not served are the model fetching the last page
+  a second time, in five of six sessions and in the `off` arm as well; a
+  repeat of the call just made is never prefetched.
+- **A step of parallel reads is prefetched whole.** In the repeated question
+  on the mock server the model lists, then reads two issues and their
+  comments in one or two steps. Hit rate went from 50% to 95% with no unused
+  prefetch, because both reads of a step are now predicted from the list and
+  run together on a server the model itself has used that way.
+- **A new subject named in the prompt is served.** On the mock server the
+  varied prompts name an issue or a pull request by number, alternately. The
+  two sessions that had two earlier prompts of their kind were served whole
+  (849 ms and 31 ms of tool wait against 3035 ms); the two before them could
+  not be. With six subjects in the fixture, that is the 50%.
+- **A new subject the model has to search for is half served.** On Microsoft
+  Learn the varied session is a search and two page fetches. The search is the
+  model's own wording and is never predicted. One of the two pages was ready
+  in most sessions: 6 of 19 calls, with 7 of 13 prefetches unused. Which hits
+  a model opens is a judgment, and position is all the learner has.
+- **The Hub is as it was.** Its results are Markdown, which gives the learner
+  nothing to read arguments from, so only an exact repeat is served: the
+  scripted workload, and little of the other two. In the varied workload
+  nothing was prefetched in either run, and the arms differ by what the two
+  sessions happened to call.
+- **Session time moved only on the slow server.** On the hosted servers the
+  model is four fifths of a session or more, and session medians differ
+  between the arms by more than the tool wait removed, in both directions.
+
+#### A second run of the Hub
+
+The Hub's means are not stable. In a direct probe from the same container, 3
+of 72 calls took over 300 ms against a median of about 60 ms, whichever call
+it was and whether or not it repeated an earlier one. In the warm pairs of the
+two benchmark runs 13 of 313 answered calls did, in both arms. One such call is most of a session's
+tool wait there. The whole Hub benchmark was therefore run twice
+(`huggingface-haiku-second.json`):
+
+| Workload | Run | Hit rate | Median tool wait per session | Pairs with less wait | Median wait per call, off | Median wait per call, on |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| scripted | first | 89% | 450 ms to 182 ms (-60%) | 4 of 6 | 72 ms | 26 ms |
+| scripted | second | 100% | 442 ms to 160 ms (-64%) | 6 of 6 | 70 ms | 25 ms |
+| repeat | first | 36% | 163 ms to 210 ms (+29%) | 3 of 6 | 76 ms | 35 ms |
+| repeat | second | 6% | 209 ms to 290 ms (+39%) | 3 of 6 | 80 ms | 98 ms |
+| varied | first | 0% | 353 ms to 286 ms (-19%) | 2 of 6 | 79 ms | 83 ms |
+| varied | second | 0% | 166 ms to 402 ms (+143%) | 1 of 6 | 78 ms | 87 ms |
+
+The scripted workload repeats: a served call takes about 25 ms instead of
+about 70 ms. The repeated question depends on whether the model words its
+calls as it did before, and it did so less in the second run. In the varied
+workload the mod did nothing but add its hooks to each call, and the two
+runs point in opposite directions: the sessions of a pair made different
+calls, the model's own argument errors included.
+
+#### What it costs
+
+- **Unused prefetches.** 47 of 194 across the nine rows. Most are on
+  Microsoft Learn, where a search predicts up to three pages and the model
+  opens two, and on the Hub's scripted workload, where a call already
+  answered earlier in the session is prefetched again.
+- **The first two sessions.** Nothing new is predicted before it has been
+  seen twice. In the learning pairs the mod served 2 of 12 calls on Microsoft
+  Learn's scripted workload, 2 of 16 on the mock server's, and none elsewhere.
+- **A call it does not answer** still waits about 9 ms longer, as measured
+  [the day before](#what-the-mod-costs). The trims of `3c9b4a9` did not
+  change that measurably: a `--cold` run of the Hub at that commit (12 pairs,
+  `huggingface-haiku-cold.json`) gave a median wait per call of 67 ms off and
+  74 ms on. The time is the host dispatching hooks.
+
+#### What was not measured
+
+Each row is four or six warm sessions, one model, one day, one network
+location. The mock server is a fixture with one fixed latency. The varied
+workload on the mock server has six subjects, so two counted sessions carry
+its result. The proxy was not run again; its
+[2026-11-21 results](#against-the-last-proxy-release) are the comparison,
+against the mod of that day. No server that needs a credential was measured.
 
 ### Results: `main` after v1.0.0 (2026-11-21)
 
@@ -352,6 +511,12 @@ recall recorded:
 
 ##### Why the search is never served
 
+!!! note "No longer true"
+
+    This explains the 2026-11-21 result. A tool that returns structured
+    content has been served since `24a6579`: see the
+    [2026-11-22 results](#results-after-the-prediction-changes-2026-11-22).
+
 The mod records a tool as servable only when Claude Code hands its hook the
 tool's result as an array of content blocks (`hooks/register.ts`), because
 that is the form in which a mod can hand a result back. Microsoft Learn's
@@ -422,15 +587,38 @@ calls are not enough to give that workload a number.
 
 ## Offline replay
 
+Two instruments replay calls with no server and no model.
+
+`npm run bench:replay` replays the sessions a live run kept (`--keep`)
+through the mod's core, driven as the hooks drive it: memory carried from
+session to session, the recorded prompt, the model's recorded time before
+each call, and a prefetch answered with what the server answered the recorded
+call. It prints which calls the core would have served. Its use is to try a
+change to prediction against what a model really did, in a second and at no
+cost. For the changes of 2026-11-22 it gave, before each was measured live,
+97%, 95% and 50% for the three mock workloads; the live run then gave the
+same three numbers. It is still not a measurement. The model's calls are
+fixed to the recording, where a real model might have asked differently once
+a call came back sooner.
+
+```bash
+SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario mockgithub --keep
+npm run bench:replay -- --dir /tmp/speculate-live-XXXX --workload repeat --verbose
+```
+
 `npm run eval` replays a synthetic corpus through the generic learner and
 scores whether the agent's next call, tool and arguments both, was among the
-predictions. It has no clock and no server. At `77df2fe` (2026-11-21) it
-reports what it reported at v0.20, because the learner has not changed since:
+predictions. It has no clock and no server. At `9f46b24` (2026-11-22):
 
 | Corpus | Pairs | recall@1 | recall@3 | Predictions wasted per hit |
 | --- | ---: | ---: | ---: | ---: |
-| Workflow archetypes (headline) | 1,470 | 57.2% | 85.9% | 1.85 |
+| Workflow archetypes (headline) | 1,470 | 57.2% | 86.0% | 1.85 |
 | Adversarial floor | 300 | 8.7% | 8.7% | 9.08 |
+
+The corpus has no prompts and no call times, so the prompt reading and the
+parallel steps of 2026-11-22 are outside it. Recall at 3 was 85.9% before
+them; the difference is the rule for a literal that only ever agreed with a
+derivation.
 
 Cold start, workflow archetypes with no warm-up excluded, recall@3: 0% in
 session 1, 50.0% in session 2, 68.3% in session 3, 74.2% in sessions 4 and 5,
@@ -438,8 +626,8 @@ session 1, 50.0% in session 2, 68.3% in session 3, 74.2% in sessions 4 and 5,
 
 Read it beside the live results, not instead of them. The corpus is authored
 sessions in which workflows recur, so its headline is nearest the live
-scripted workload. The live varied workload, where no call was served, is
-what the same learner does when they do not.
+scripted workload. The live varied workload is what the same learner does
+when they do not.
 
 ## History: the 0.x proxy
 

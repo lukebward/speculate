@@ -775,3 +775,37 @@ and Microsoft Learn's search is such a tool.
 
 This measures `main` as a whole against no mod. It does not isolate the
 changes listed above from v1.0.0, and none of them is a speedup claim.
+
+Prediction (2026-11-22). Reasons are in
+[§13.32](implementation-notes.md#1332-prediction-that-fits-how-a-model-calls-2026-11-22).
+
+- A tool that returns structured content is prefetched and served. Claude
+  Code records such a result as one text, and the mod answers in that form.
+- A search hit that names a section of a page (`guide/install#windows`) is
+  followed as the page, and the rows of such a result are counted by page.
+- Calls a model issues in one step are learned as following the call before
+  the step, so a list predicts both reads of the step after it.
+- A server is used one call at a time until the model's own calls have run on
+  it together. After that the mod prefetches there together too: never more
+  calls in flight than the model alone has had, and at most three of its own.
+- The first call of an exchange is read out of the prompt. After two prompts
+  that named a subject the same way ("read issue 41", a link, a path), the
+  read of the third starts while the model reads the prompt. What is stored
+  is where the value was read from, not the value or the prompt.
+- Two transitions seen equally often are ranked by the calls before them,
+  and that ranking now reaches the choice of what to prefetch first.
+- `--scenario mockgithub` runs the live benchmark against the bundled mock
+  server with 1.5 s per call. `npm run bench:replay` replays the sessions a
+  live run kept through the mod's core, offline.
+
+Measurement (2026-11-22, Claude Code 2.1.330, `claude-haiku-5-5`, four to six
+warm pairs per workload). Hit rate, scripted workflow, repeated question, new
+subjects: 97%, 95% and 50% on the mock server (84%, 50% and 0% before these
+changes), 88%, 74% and 32% on Microsoft Learn (67%, 56% and 0%), and 89%, 36%
+and 0% on the Hugging Face Hub (100%, 17% and 0%). Median tool wait per
+session fell 62%, 78% and 36% on the mock server and 82%, 74% and 30% on
+Microsoft Learn. On the Hub it fell 60% in the scripted workflow and did not
+improve in the other two. Session time fell by a quarter on the mock server
+and did not measurably change on the hosted ones. 76% of prefetches were
+used. Tables, the second Hub run, and limits are in the
+[benchmark guide](local-learning-benchmark.md#results-after-the-prediction-changes-2026-11-22).
