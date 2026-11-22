@@ -42,6 +42,13 @@ export interface SessionMeasure {
   /** The host's own totals for the session; null when it never reported. */
   durationMs: number | null;
   apiMs: number | null;
+  /**
+   * The median, over the session's requests to the model, of the host's time
+   * to the first token. The mod is in no request, so the two arms should
+   * agree; where they do not, the host is sending the arms different requests
+   * and a session time compares more than the mod.
+   */
+  modelFirstTokenMs: number | null;
   turns: number | null;
   costUsd: number | null;
   /** The model the host says it ran, which an alias such as `haiku` hides. */
@@ -125,6 +132,7 @@ export function measureSession(lines: readonly StreamLine[]): SessionMeasure {
   let costUsd: number | null = null;
   let servedModel: string | null = null;
   let ok = false;
+  const firstTokens: number[] = [];
 
   for (const { at, line } of lines) {
     let event: unknown;
@@ -140,6 +148,12 @@ export function measureSession(lines: readonly StreamLine[]): SessionMeasure {
 
     if (event['type'] === 'system' && event['subtype'] === 'init' && typeof event['model'] === 'string') {
       servedModel = event['model'];
+      continue;
+    }
+    // One per request of the session's own turn; a subagent's are its own.
+    if (event['type'] === 'stream_event' && typeof event['parent_tool_use_id'] !== 'string') {
+      const ttft = finite(event['ttft_ms']);
+      if (ttft !== null && ttft >= 0) firstTokens.push(ttft);
       continue;
     }
     if (event['type'] === 'result') {
@@ -189,6 +203,7 @@ export function measureSession(lines: readonly StreamLine[]): SessionMeasure {
     toolWallMs: unionLength(spans),
     durationMs,
     apiMs,
+    modelFirstTokenMs: median(firstTokens),
     turns,
     costUsd,
     servedModel,
@@ -233,6 +248,10 @@ export interface ArmSummary {
   medianCallWaitMs: number | null;
   medianSessionToolWaitMs: number | null;
   medianSessionDurationMs: number | null;
+  /** Median over sessions of the model's time to first token (SessionMeasure.modelFirstTokenMs). */
+  medianModelFirstTokenMs: number | null;
+  /** Median over sessions of the time the host spent in requests to the model. */
+  medianSessionApiMs: number | null;
 }
 
 export interface PhaseSummary {
@@ -305,6 +324,9 @@ function summarizeArm(rows: readonly SessionRow[]): ArmSummary {
     medianCallWaitMs: median(waits),
     medianSessionToolWaitMs: median(rows.map(row => row.toolWaitMs)),
     medianSessionDurationMs: median(rows.flatMap(row => (row.durationMs === null ? [] : [row.durationMs]))),
+    // Absent from a result file written before these were measured.
+    medianModelFirstTokenMs: median(rows.flatMap(row => (typeof row.modelFirstTokenMs === 'number' ? [row.modelFirstTokenMs] : []))),
+    medianSessionApiMs: median(rows.flatMap(row => (typeof row.apiMs === 'number' ? [row.apiMs] : []))),
   };
 }
 
@@ -456,6 +478,27 @@ export function markdownHitTable(summaries: readonly Summary[], phase: Phase = '
  * The same phase per session, as medians: what the tools cost a session, and
  * the session itself. One slow call moves a median far less than a mean.
  */
+/**
+ * One phase of each summary as a Markdown table of the model's side of a
+ * session: what the mod does not touch, and so what the two arms must share
+ * for a session time to compare the mod and nothing else.
+ */
+export function markdownModelTable(summaries: readonly Summary[], phase: Phase = 'warm'): string {
+  const lines = [
+    '| Server | Workload | Model time to first token, off | Model time to first token, on | Time in the model per session, off | Time in the model per session, on |',
+    '| --- | --- | ---: | ---: | ---: | ---: |',
+  ];
+  for (const summary of summaries) {
+    const p = summary[phase];
+    lines.push(
+      `| ${summary.scenario} | ${summary.workload} ` +
+        `| ${ms(p.off.medianModelFirstTokenMs ?? null)} | ${ms(p.on.medianModelFirstTokenMs ?? null)} ` +
+        `| ${ms(p.off.medianSessionApiMs ?? null)} | ${ms(p.on.medianSessionApiMs ?? null)} |`,
+    );
+  }
+  return lines.join('\n');
+}
+
 export function markdownSessionTable(summaries: readonly Summary[], phase: Phase = 'warm'): string {
   const lines = [
     '| Server | Workload | Pairs | Tool wait per session, off | Tool wait per session, on | Change | Pairs with less wait | Session time, off | Session time, on | Change |',

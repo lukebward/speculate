@@ -86,6 +86,15 @@ What is measured, and from where:
   ready in time, counts here and not in the hit rate, so the gap between the
   two is what was lost after prediction.
 
+- **Model time to first token** and **time in the model** are the host's
+  own figures for each request and for the session. The mod is in no request
+  to the model, so the two arms should agree. Where they do not, the host is
+  sending the arms different requests, and a session time then compares more
+  than the mod. This happened: see
+  [the first runs of 2026-11-22](#the-first-runs-of-the-day-and-what-was-wrong-with-them).
+  The runner keeps Claude Code's Artifact tool out of both arms for that
+  reason.
+
 A pair is left out of a summary only when one of its sessions failed or got no
 result from any MCP call; the count of excluded pairs is reported.
 
@@ -109,7 +118,8 @@ configuration directory starts empty. Behind an HTTPS proxy, set
 `NODE_USE_ENV_PROXY=1` for the runner's own check of the server.
 
 Report the revision, the Claude Code version, the model, the date and where
-the run was made from. Report hit rate beside tool wait: a wait is a property
+the run was made from. Check the model's side of the two arms before reading
+a session time. Report hit rate beside tool wait: a wait is a property
 of the server as much as of Speculate, and a hit rate is not. Lead the waits
 with per-session medians: a phase has a few dozen calls, and one slow call
 moves a mean a long way. Report the learning pairs as well as the warm ones,
@@ -119,22 +129,23 @@ session and every call, so a reader can check a summary against it.
 
 ### Results: after the prediction changes (2026-11-22)
 
-The mod at `9f46b24`, which holds the changes of
+The mod after the changes of
 [§13.32](implementation-notes.md#1332-prediction-that-fits-how-a-model-calls-2026-11-22):
 tools that return structured content are served, a step of parallel calls is
 predicted and prefetched together, a result's rows are counted by document,
-and the first call of an exchange is read out of the prompt. The
+the first call of an exchange is read out of the prompt, and a session's
+opening reads start in the order the session makes them. The
 [2026-11-21 results](#results-main-after-v100-2026-11-21) below are the
 record of the code before them.
 
 | Condition | Value |
 | --- | --- |
-| Mod | `9f46b24`, loaded from a copy made with `git archive` (`--mod`) |
-| Host | Claude Code 2.1.330, headless (`claude -p`) |
+| Mod | Mock server: `feceba2`. Hosted servers: `9f46b24`, which differs from it only in the order of a session's opening reads. Each loaded from a copy made with `git archive` (`--mod`) |
+| Host | Claude Code 2.1.330, headless (`claude -p`), its Artifact tool disallowed in both arms ([why](#the-first-runs-of-the-day-and-what-was-wrong-with-them)) |
 | Model | `claude-haiku-5-5` for both arms |
 | Servers | Microsoft Learn (about 250 ms a fetch and 450 ms a search), the Hugging Face Hub (about 70 ms a call), and the bundled mock GitHub server over stdio with 1.5 s added to every call |
 | Run from | The same Linux cloud container as the day before (Node 22.23.5), behind an HTTPS egress proxy |
-| Size | Hosted servers: 8 pairs per workload, pairs 1 and 2 learning, 3 to 8 warm. Mock server: 6 pairs, 4 warm. 180 sessions in the four reported files (the Hub twice), $1.34 of model use |
+| Size | Hosted servers: 8 pairs per workload, pairs 1 and 2 learning, 3 to 8 warm. Mock server: 6 pairs, 4 warm. 132 sessions in the three reported files, $0.99 of model use |
 | Result files | [`bench/results/2026-11-22/`](https://github.com/lukebward/speculate/tree/main/bench/results/2026-11-22) |
 
 Hit rate first, since it does not depend on how fast a server is. Warm pairs:
@@ -142,126 +153,185 @@ Hit rate first, since it does not depend on how fast a server is. Warm pairs:
 | Server | Workload | Calls | Served | Hit rate | Hit rate before | Prefetches | Used | Unused | Recall@1 | Recall@3 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Mock GitHub, 1.5 s | scripted | 32 | 31 | 97% | 84% | 32 | 97% | 1 | 94% | 100% |
-| Mock GitHub, 1.5 s | repeat | 20 | 19 | 95% | 50% | 19 | 100% | 0 | 45% | 75% |
+| Mock GitHub, 1.5 s | repeat | 20 | 19 | 95% | 50% | 19 | 100% | 0 | 40% | 80% |
 | Mock GitHub, 1.5 s | varied | 8 | 4 | 50% | 0% | 4 | 100% | 0 | 25% | 50% |
-| Microsoft Learn | scripted | 41 | 36 | 88% | 67% | 51 | 71% | 15 | 59% | 100% |
-| Microsoft Learn | repeat | 19 | 14 | 74% | 56% | 21 | 67% | 7 | 53% | 74% |
-| Microsoft Learn | varied | 19 | 6 | 32% | 0% | 13 | 46% | 7 | 26% | 32% |
-| Hugging Face Hub | scripted | 36 | 32 | 89% | 100% | 43 | 74% | 11 | 58% | 100% |
-| Hugging Face Hub | repeat | 14 | 5 | 36% | 17% | 11 | 45% | 6 | 17% | 25% |
-| Hugging Face Hub | varied | 17 | 0 | 0% | 0% | 0 | n/a | 0 | 0% | 0% |
+| Microsoft Learn | scripted | 37 | 36 | 97% | 67% | 54 | 67% | 18 | 68% | 97% |
+| Microsoft Learn | repeat | 19 | 10 | 53% | 56% | 18 | 56% | 8 | 37% | 53% |
+| Microsoft Learn | varied | 19 | 7 | 37% | 0% | 15 | 47% | 8 | 26% | 37% |
+| Hugging Face Hub | scripted | 36 | 35 | 97% | 100% | 51 | 69% | 16 | 81% | 100% |
+| Hugging Face Hub | repeat | 22 | 4 | 18% | 17% | 14 | 29% | 10 | 8% | 17% |
+| Hugging Face Hub | varied | 21 | 0 | 0% | 0% | 0 | n/a | 0 | 0% | 0% |
 
 "Before" is the 2026-11-21 run for the hosted servers (`77df2fe`) and, for the
-mock server, a run of `3c9b4a9` earlier on the same day
-(`mockgithub-haiku-before.json`), which already served structured content.
-Across the nine rows, 147 of 206 calls were served (71%) from 194 prefetches
-(76% used).
+mock server, a run of `3c9b4a9` earlier on the same day, which already served
+structured content. Across the nine rows, 146 of 214 calls were served (68%)
+from 207 prefetches (71% used).
 
 The same pairs, per session. Tool wait and session time are medians over the
 warm sessions of each arm:
 
 | Server | Workload | Tool wait per session, off | Tool wait per session, on | Change | Pairs with less wait | Session time, off | Session time, on | Change |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Mock GitHub, 1.5 s | scripted | 12118 ms | 4552 ms | -62% | 4 of 4 | 22882 ms | 17094 ms | -25% |
-| Mock GitHub, 1.5 s | repeat | 7580 ms | 1693 ms | -78% | 4 of 4 | 9397 ms | 7172 ms | -24% |
-| Mock GitHub, 1.5 s | varied | 3034 ms | 1942 ms | -36% | 2 of 4 | 5987 ms | 5582 ms | -7% |
-| Microsoft Learn | scripted | 2340 ms | 412 ms | -82% | 6 of 6 | 11403 ms | 11520 ms | +1% |
-| Microsoft Learn | repeat | 1373 ms | 358 ms | -74% | 6 of 6 | 7946 ms | 9558 ms | +20% |
-| Microsoft Learn | varied | 1437 ms | 1011 ms | -30% | 4 of 6 | 8632 ms | 8176 ms | -5% |
-| Hugging Face Hub | scripted | 450 ms | 182 ms | -60% | 4 of 6 | 9416 ms | 10602 ms | +13% |
-| Hugging Face Hub | repeat | 163 ms | 210 ms | +29% | 3 of 6 | 6944 ms | 7776 ms | +12% |
-| Hugging Face Hub | varied | 353 ms | 286 ms | -19% | 2 of 6 | 8865 ms | 8996 ms | +1% |
+| Mock GitHub, 1.5 s | scripted | 12120 ms | 4991 ms | -59% | 4 of 4 | 23203 ms | 15799 ms | -32% |
+| Mock GitHub, 1.5 s | repeat | 7578 ms | 1302 ms | -83% | 4 of 4 | 8638 ms | 7121 ms | -18% |
+| Mock GitHub, 1.5 s | varied | 3043 ms | 1547 ms | -49% | 3 of 4 | 6140 ms | 5346 ms | -13% |
+| Microsoft Learn | scripted | 2413 ms | 310 ms | -87% | 6 of 6 | 11772 ms | 9527 ms | -19% |
+| Microsoft Learn | repeat | 1527 ms | 957 ms | -37% | 4 of 6 | 10382 ms | 8967 ms | -14% |
+| Microsoft Learn | varied | 1404 ms | 1227 ms | -13% | 3 of 6 | 8437 ms | 9007 ms | +7% |
+| Hugging Face Hub | scripted | 442 ms | 173 ms | -61% | 6 of 6 | 9227 ms | 8873 ms | -4% |
+| Hugging Face Hub | repeat | 182 ms | 261 ms | +44% | 2 of 6 | 6918 ms | 6696 ms | -3% |
+| Hugging Face Hub | varied | 203 ms | 354 ms | +75% | 2 of 6 | 7325 ms | 8247 ms | +13% |
 
-And per call:
+Per call:
 
 | Server | Workload | Calls off / on | Errors off / on | Served | Prefetches | Unused | Mean wait per call, off | Mean wait per call, on |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Mock GitHub, 1.5 s | scripted | 32 / 32 | 0 / 0 | 31 (9 ready, 22 joined) | 32 | 1 | 1515 ms | 588 ms |
-| Mock GitHub, 1.5 s | repeat | 20 / 20 | 0 / 0 | 19 (12 ready, 7 joined) | 19 | 0 | 1516 ms | 268 ms |
-| Mock GitHub, 1.5 s | varied | 8 / 8 | 0 / 0 | 4 (2 ready, 2 joined) | 4 | 0 | 1517 ms | 869 ms |
-| Microsoft Learn | scripted | 39 / 41 | 0 / 0 | 36 (35 ready, 1 joined) | 51 | 15 | 366 ms | 57 ms |
-| Microsoft Learn | repeat | 19 / 19 | 0 / 0 | 14 (14 ready, 0 joined) | 21 | 7 | 459 ms | 138 ms |
-| Microsoft Learn | varied | 18 / 19 | 0 / 0 | 6 (6 ready, 0 joined) | 13 | 7 | 485 ms | 340 ms |
-| Hugging Face Hub | scripted | 36 / 36 | 0 / 0 | 32 (32 ready, 0 joined) | 43 | 11 | 76 ms | 68 ms |
-| Hugging Face Hub | repeat | 12 / 12 | 4 / 2 | 5 (5 ready, 0 joined) | 11 | 6 | 96 ms | 187 ms |
-| Hugging Face Hub | varied | 19 / 15 | 4 / 2 | 0 (0 ready, 0 joined) | 0 | 0 | 173 ms | 137 ms |
+| Mock GitHub, 1.5 s | scripted | 32 / 32 | 0 / 0 | 31 (7 ready, 24 joined) | 32 | 1 | 1515 ms | 621 ms |
+| Mock GitHub, 1.5 s | repeat | 20 / 20 | 0 / 0 | 19 (11 ready, 8 joined) | 19 | 0 | 1516 ms | 238 ms |
+| Mock GitHub, 1.5 s | varied | 8 / 8 | 0 / 0 | 4 (4 ready, 0 joined) | 4 | 0 | 1522 ms | 773 ms |
+| Microsoft Learn | scripted | 38 / 37 | 0 / 0 | 36 (33 ready, 3 joined) | 54 | 18 | 383 ms | 46 ms |
+| Microsoft Learn | repeat | 18 / 19 | 0 / 0 | 10 (10 ready, 0 joined) | 18 | 8 | 507 ms | 307 ms |
+| Microsoft Learn | varied | 19 / 19 | 0 / 0 | 7 (7 ready, 0 joined) | 15 | 8 | 447 ms | 356 ms |
+| Hugging Face Hub | scripted | 36 / 36 | 0 / 0 | 35 (35 ready, 0 joined) | 51 | 16 | 76 ms | 30 ms |
+| Hugging Face Hub | repeat | 12 / 12 | 4 / 10 | 4 (4 ready, 0 joined) | 14 | 10 | 97 ms | 83 ms |
+| Hugging Face Hub | varied | 12 / 17 | 3 / 4 | 0 (0 ready, 0 joined) | 0 | 0 | 123 ms | 128 ms |
+
+And the model's side of the same sessions, which the mod does not touch. The
+two arms must agree here for a session time to compare the mod and nothing
+else, and they do:
+
+| Server | Workload | Model time to first token, off | Model time to first token, on | Time in the model per session, off | Time in the model per session, on |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 481 ms | 497 ms | 7402 ms | 8110 ms |
+| Mock GitHub, 1.5 s | repeat | 480 ms | 479 ms | 4328 ms | 4747 ms |
+| Mock GitHub, 1.5 s | varied | 490 ms | 492 ms | 2989 ms | 3030 ms |
+| Microsoft Learn | scripted | 540 ms | 529 ms | 6274 ms | 6499 ms |
+| Microsoft Learn | repeat | 578 ms | 530 ms | 7950 ms | 6726 ms |
+| Microsoft Learn | varied | 489 ms | 507 ms | 5959 ms | 6449 ms |
+| Hugging Face Hub | scripted | 486 ms | 496 ms | 6033 ms | 5991 ms |
+| Hugging Face Hub | repeat | 469 ms | 455 ms | 5221 ms | 5285 ms |
+| Hugging Face Hub | varied | 456 ms | 448 ms | 5660 ms | 6460 ms |
 
 What the tables show:
 
 - **A slow server is where the time is.** With 1.5 s per call, a session
-  waited 7.6 s less on tools in the scripted workload and 5.9 s less in the
-  repeated question, and session time fell by a quarter. This is the first
-  workload in which session time moved by more than its own noise. The server
-  is a fixture, so read it as what a slow server allows, not as a service.
-- **Microsoft Learn's search is served now.** It returns structured content
-  and was the call the mod could not answer the day before. With it served,
-  every distinct call of the scripted session was answered from the third
-  session on. The five calls not served are the model fetching the last page
-  a second time, in five of six sessions and in the `off` arm as well; a
-  repeat of the call just made is never prefetched.
+  waited 7.1 s less on tools in the scripted workload and 6.3 s less in the
+  repeated question, and the whole session was 32% and 18% shorter. The
+  server is a fixture, so read it as what a slow server allows, not as a
+  service.
+- **Session time now follows tool wait on Microsoft Learn too.** The scripted
+  session waited 2.1 s less on tools and took 2.2 s less in all, 19%. The day
+  before, the same workload showed no change in session time, and the cause
+  was not the mod: see below.
+- **Microsoft Learn's search is served.** It returns structured content and
+  was the call the mod could not answer the day before. Every distinct call
+  of the scripted session was answered from the third session on, 36 of 37.
 - **A step of parallel reads is prefetched whole.** In the repeated question
   on the mock server the model lists, then reads two issues and their
   comments in one or two steps. Hit rate went from 50% to 95% with no unused
-  prefetch, because both reads of a step are now predicted from the list and
-  run together on a server the model itself has used that way.
+  prefetch: both reads of a step are predicted from the list and run together
+  on a server the model itself has used that way.
 - **A new subject named in the prompt is served.** On the mock server the
   varied prompts name an issue or a pull request by number, alternately. The
   two sessions that had two earlier prompts of their kind were served whole
-  (849 ms and 31 ms of tool wait against 3035 ms); the two before them could
+  (52 ms and 45 ms of tool wait against 3040 ms); the two before them could
   not be. With six subjects in the fixture, that is the 50%.
-- **A new subject the model has to search for is half served.** On Microsoft
-  Learn the varied session is a search and two page fetches. The search is the
-  model's own wording and is never predicted. One of the two pages was ready
-  in most sessions: 6 of 19 calls, with 7 of 13 prefetches unused. Which hits
-  a model opens is a judgment, and position is all the learner has.
+- **A new subject the model has to search for is partly served.** On
+  Microsoft Learn the varied session is a search and two page fetches. The
+  search is the model's own wording and is never predicted. One of the two
+  pages was ready in most sessions: 7 of 19 calls, with 8 of 15 prefetches
+  unused. Which hits a model opens is a judgment, and position is all the
+  learner has. Session time did not improve.
+- **An ordinary question asked again depends on the model.** On Microsoft
+  Learn the model made the same calls again for 10 of 19 calls in this run and
+  14 of 19 in the first run of the day. An exact-match buffer has nothing for
+  a reworded call.
 - **The Hub is as it was.** Its results are Markdown, which gives the learner
   nothing to read arguments from, so only an exact repeat is served: the
   scripted workload, and little of the other two. In the varied workload
-  nothing was prefetched in either run, and the arms differ by what the two
-  sessions happened to call.
-- **Session time moved only on the slow server.** On the hosted servers the
-  model is four fifths of a session or more, and session medians differ
-  between the arms by more than the tool wait removed, in both directions.
+  nothing was prefetched, and the arms differ by what the two sessions
+  happened to call (17 calls against 12).
 
-#### A second run of the Hub
+#### The first runs of the day, and what was wrong with them
+
+The benchmark was first run with the mod at `9f46b24` and no tool disallowed
+(`with-artifact-tool/` in the result files). Hit rates were as good, and
+session time did not fall on the hosted servers although tool wait did. The
+model's side of those sessions shows why:
+
+| Server | Workload | Model time to first token, off | Model time to first token, on | Time in the model per session, off | Time in the model per session, on |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Mock GitHub, 1.5 s | scripted | 499 ms | 648 ms | 7781 ms | 9320 ms |
+| Mock GitHub, 1.5 s | repeat | 485 ms | 674 ms | 4701 ms | 4572 ms |
+| Mock GitHub, 1.5 s | varied | 480 ms | 631 ms | 2543 ms | 3353 ms |
+| Microsoft Learn | scripted | 577 ms | 718 ms | 6540 ms | 8332 ms |
+| Microsoft Learn | repeat | 580 ms | 762 ms | 5699 ms | 8015 ms |
+| Microsoft Learn | varied | 496 ms | 678 ms | 6217 ms | 6308 ms |
+| Hugging Face Hub | scripted | 491 ms | 665 ms | 6135 ms | 7329 ms |
+| Hugging Face Hub | repeat | 469 ms | 645 ms | 5456 ms | 6047 ms |
+| Hugging Face Hub | varied | 462 ms | 629 ms | 6873 ms | 6917 ms |
+
+Every request to the model took about 170 ms longer to its first token in the
+`on` arm, in all nine workloads, the ones with no prefetch included. The mod
+is in no request. Probe mods and the host's debug log found the cause:
+
+- The container the benchmark runs in is a cloud session, and Claude Code
+  there offers a tool of its own, Artifact, that a local session does not.
+- When any mod hooks tool calls before they run (`tool.call`, `tool.check`,
+  `tool.run` or `classic.PreToolUse`) with a matcher the host cannot read
+  ahead (none, or a regular expression), the host builds that tool without
+  one of its options (`edit_hook=true` in the debug log). An empty mod, a
+  `prompt.submit` hook, a `classic.PostToolUse` hook, and a `tool.call` hook
+  whose matcher is a list of tool names leave it alone.
+- The tool list opens every request, so the `on` arm sent a request 533
+  tokens shorter than the `off` arm's, and the API answered it about 200 ms
+  later (time to first token, six samples a side, with a pass-through hook
+  that does nothing).
+- With the Artifact tool disallowed in both arms the requests are the same
+  and so is the time to first token: 609 to 640 ms with no mod, 609 to 622 ms
+  with the mod.
+
+So the runner now disallows that tool in both arms, and prints the model's
+side of each arm beside the rest. A session's eight to ten requests carried
+1.2 s to 1.8 s that belonged to where the benchmark ran. The cost is real for
+a session that has the Artifact tool: a mod with tool hooks slows each model
+request there by about that much, whatever the mod does.
+
+The first runs are a second sample of hit rate, which that cost does not
+change. Scripted, repeat, varied: 97%, 95% and 50% on the mock server (the
+same); 88%, 74% and 32% on Microsoft Learn; 89%, 36% and 0% on the Hub, and
+100%, 6% and 0% in a second run of it.
+
+#### The Hub's slow answers
 
 The Hub's means are not stable. In a direct probe from the same container, 3
 of 72 calls took over 300 ms against a median of about 60 ms, whichever call
-it was and whether or not it repeated an earlier one. In the warm pairs of the
-two benchmark runs 13 of 313 answered calls did, in both arms. One such call is most of a session's
-tool wait there. The whole Hub benchmark was therefore run twice
-(`huggingface-haiku-second.json`):
-
-| Workload | Run | Hit rate | Median tool wait per session | Pairs with less wait | Median wait per call, off | Median wait per call, on |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| scripted | first | 89% | 450 ms to 182 ms (-60%) | 4 of 6 | 72 ms | 26 ms |
-| scripted | second | 100% | 442 ms to 160 ms (-64%) | 6 of 6 | 70 ms | 25 ms |
-| repeat | first | 36% | 163 ms to 210 ms (+29%) | 3 of 6 | 76 ms | 35 ms |
-| repeat | second | 6% | 209 ms to 290 ms (+39%) | 3 of 6 | 80 ms | 98 ms |
-| varied | first | 0% | 353 ms to 286 ms (-19%) | 2 of 6 | 79 ms | 83 ms |
-| varied | second | 0% | 166 ms to 402 ms (+143%) | 1 of 6 | 78 ms | 87 ms |
-
-The scripted workload repeats: a served call takes about 25 ms instead of
-about 70 ms. The repeated question depends on whether the model words its
-calls as it did before, and it did so less in the second run. In the varied
-workload the mod did nothing but add its hooks to each call, and the two
-runs point in opposite directions: the sessions of a pair made different
-calls, the model's own argument errors included.
+it was and whether or not it repeated an earlier one. In the first two Hub
+runs 13 of 313 answered calls in the warm pairs did, in both arms. One such
+call is most of a session's tool wait there. Across the three runs the
+scripted workload repeats: median tool wait per session fell 60%, 64% and
+61%, and a served call took about 25 ms instead of about 70 ms. In the
+repeated question the median session waited longer with the mod in all three
+(29%, 39% and 44%), while the pooled wait per call was lower in two of them:
+the sessions of a pair make different calls there, the model's own argument
+errors included.
 
 #### What it costs
 
-- **Unused prefetches.** 47 of 194 across the nine rows. Most are on
+- **Unused prefetches.** 61 of 207 across the nine rows. Most are on
   Microsoft Learn, where a search predicts up to three pages and the model
   opens two, and on the Hub's scripted workload, where a call already
   answered earlier in the session is prefetched again.
 - **The first two sessions.** Nothing new is predicted before it has been
-  seen twice. In the learning pairs the mod served 2 of 12 calls on Microsoft
+  seen twice. In the learning pairs the mod served 3 of 13 calls on Microsoft
   Learn's scripted workload, 2 of 16 on the mock server's, and none elsewhere.
 - **A call it does not answer** still waits about 9 ms longer, as measured
   [the day before](#what-the-mod-costs). The trims of `3c9b4a9` did not
   change that measurably: a `--cold` run of the Hub at that commit (12 pairs,
   `huggingface-haiku-cold.json`) gave a median wait per call of 67 ms off and
   74 ms on. The time is the host dispatching hooks.
+- **In a session that has the Artifact tool**, about 170 ms on every request
+  to the model, as above.
 
 #### What was not measured
 
@@ -270,7 +340,9 @@ location. The mock server is a fixture with one fixed latency. The varied
 workload on the mock server has six subjects, so two counted sessions carry
 its result. The proxy was not run again; its
 [2026-11-21 results](#against-the-last-proxy-release) are the comparison,
-against the mod of that day. No server that needs a credential was measured.
+against the mod of that day and with the Artifact tool in both of its arms.
+Whether a local Claude Code session has the Artifact tool was not checked
+from a local machine. No server that needs a credential was measured.
 
 ### Results: `main` after v1.0.0 (2026-11-21)
 

@@ -12,16 +12,21 @@ npm run bench:live -- --summarize bench/results/2026-11-21/mslearn-haiku.json be
 
 ## 2026-11-22
 
-The mod at `9f46b24`, after the prediction changes of that day. Loaded from a
-copy of the commit (`--mod`).
+After the prediction changes of that day. The mod is loaded from a copy of a
+commit (`--mod`); `meta.mod` names it.
 
 | File | What it is |
 | --- | --- |
-| `mockgithub-haiku.json` | The bundled mock GitHub server with 1.5 s added to every call: three workloads, 6 pairs each |
-| `mslearn-haiku.json`, `huggingface-haiku.json` | The reported run on the hosted servers: three workloads, 8 pairs each |
-| `huggingface-haiku-second.json` | The Hub once more, the same hour: its slow answers move a mean, so it was run twice |
-| `mockgithub-haiku-before.json` | The mock server against the mod at `3c9b4a9`, earlier that day, before the changes to prediction. Its varied workload asked about three issues and then three pull requests; the later run alternates them |
+| `mockgithub-haiku.json` | The reported run on the bundled mock GitHub server with 1.5 s added to every call: three workloads, 6 pairs each, the mod at `feceba2` |
+| `mslearn-haiku.json`, `huggingface-haiku.json` | The reported run on the hosted servers: three workloads, 8 pairs each, the mod at `9f46b24` |
+| `mockgithub-haiku-9f46b24.json` | The mock server with the mod one commit earlier, before a session's opening reads were started in order |
 | `huggingface-haiku-cold.json` | `--cold` at `3c9b4a9`: the mod's store cleared before every session, to measure what its hooks cost a call |
+| `with-artifact-tool/` | The day's first runs, before the runner kept Claude Code's Artifact tool out of both arms. With it the host sends the `on` arm a different request and each model request takes about 170 ms longer there, so session times in these files compare more than the mod. Hit rates and tool waits stand. `mockgithub-haiku-3c9b4a9.json` is the mock server against the mod before the changes to prediction; its varied workload asked about three issues and then three pull requests, where later runs alternate them |
+
+`mockgithub-haiku.json` was written by the runner that records the model's
+time to first token. In the other files of this day, the cold run apart, that
+figure was added to each session afterwards from the event streams the run
+kept; nothing else in them was changed.
 
 ```bash
 npm run bench:live -- --summarize bench/results/2026-11-22/mockgithub-haiku.json bench/results/2026-11-22/mslearn-haiku.json bench/results/2026-11-22/huggingface-haiku.json

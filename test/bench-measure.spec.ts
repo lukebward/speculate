@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   markdownHitTable,
+  markdownModelTable,
   markdownSessionTable,
   markdownTable,
   measureSession,
@@ -151,6 +152,22 @@ describe('measureSession', () => {
     expect(measured.toolWaitMs).toBe(250);
   });
 
+  it('reads the model\'s time to first token from the session\'s own requests', () => {
+    const request = (ttft: number, extra: object = {}): StreamLine => ({
+      at: 0,
+      line: JSON.stringify({ type: 'stream_event', ttft_ms: ttft, event: { type: 'message_start' }, ...extra }),
+    });
+    const measured = measureSession([
+      request(480),
+      { at: 0, line: JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta' } }) },
+      request(900, { parent_tool_use_id: 'toolu_sub' }), // a subagent's request is its own
+      request(520),
+      request(640),
+    ]);
+    expect(measured.modelFirstTokenMs).toBe(520);
+    expect(measureSession([]).modelFirstTokenMs).toBeNull();
+  });
+
   it('reports a session that ended in an error as not ok', () => {
     expect(measureSession([done(100, { subtype: 'error_max_budget_usd', is_error: true })]).ok).toBe(false);
   });
@@ -196,6 +213,7 @@ function row(pair: number, arm: 'off' | 'on', waits: number[], extra: Partial<Se
     toolWallMs: waits.reduce((sum, wait) => sum + wait, 0),
     durationMs: 10_000,
     apiMs: 4_000,
+    modelFirstTokenMs: 500,
     turns: 3,
     costUsd: 0.01,
     servedModel: 'm-1',
@@ -304,6 +322,28 @@ describe('summarize', () => {
     expect(counted.warm.recallAt3).toBeCloseTo(0.75);
     expect(markdownHitTable([counted])).toContain('| docs | scripted | 2 | 1 | 50% | 2 | 50% | 1 | 25% | 75% |');
     expect(markdownHitTable([summarize(rows, 1)])).toContain('| docs | scripted | 4 | 3 | 75% | 5 | 60% | 2 | n/a | n/a |');
+  });
+
+  it('reports the model\'s side of each arm, and nothing for a file written before it was measured', () => {
+    const summary = summarize(
+      [
+        row(1, 'off', [100], { modelFirstTokenMs: 500, apiMs: 4_000 }),
+        row(1, 'on', [100], { modelFirstTokenMs: 700, apiMs: 5_200 }),
+        row(2, 'off', [100], { modelFirstTokenMs: 520, apiMs: 4_400 }),
+        row(2, 'on', [100], { modelFirstTokenMs: 660, apiMs: 5_000 }),
+      ],
+      0,
+    );
+    expect(summary.warm.off.medianModelFirstTokenMs).toBe(510);
+    expect(summary.warm.on.medianModelFirstTokenMs).toBe(680);
+    // The arms sent different requests here: a session time would compare more than the mod.
+    expect(markdownModelTable([summary])).toContain('| docs | scripted | 510 ms | 680 ms | 4200 ms | 5100 ms |');
+
+    const old = [row(1, 'off', [100]), row(1, 'on', [100])].map((r) => {
+      const { modelFirstTokenMs: _dropped, ...rest } = r;
+      return rest as SessionRow;
+    });
+    expect(markdownModelTable([summarize(old, 0)])).toContain('| docs | scripted | n/a | n/a | 4000 ms | 4000 ms |');
   });
 
   it('writes a result file that parses back, one session to a line', () => {

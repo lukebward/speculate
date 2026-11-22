@@ -794,18 +794,29 @@ Prediction (2026-11-22). Reasons are in
   is where the value was read from, not the value or the prompt.
 - Two transitions seen equally often are ranked by the calls before them,
   and that ranking now reaches the choice of what to prefetch first.
+- A session's usual opening reads start in the order the session makes
+  them. On a server used one call at a time, the old order (by name) left the
+  session's second read to run for real.
 - `--scenario mockgithub` runs the live benchmark against the bundled mock
   server with 1.5 s per call. `npm run bench:replay` replays the sessions a
-  live run kept through the mod's core, offline.
+  live run kept through the mod's core, offline. The live runner reports the
+  model's time to first token in each arm.
 
 Measurement (2026-11-22, Claude Code 2.1.330, `claude-haiku-5-5`, four to six
 warm pairs per workload). Hit rate, scripted workflow, repeated question, new
 subjects: 97%, 95% and 50% on the mock server (84%, 50% and 0% before these
-changes), 88%, 74% and 32% on Microsoft Learn (67%, 56% and 0%), and 89%, 36%
+changes), 97%, 53% and 37% on Microsoft Learn (67%, 56% and 0%), and 97%, 18%
 and 0% on the Hugging Face Hub (100%, 17% and 0%). Median tool wait per
-session fell 62%, 78% and 36% on the mock server and 82%, 74% and 30% on
-Microsoft Learn. On the Hub it fell 60% in the scripted workflow and did not
-improve in the other two. Session time fell by a quarter on the mock server
-and did not measurably change on the hosted ones. 76% of prefetches were
-used. Tables, the second Hub run, and limits are in the
+session fell 59%, 83% and 49% on the mock server and 87%, 37% and 13% on
+Microsoft Learn. On the Hub it fell 61% in the scripted workflow and did not
+improve in the other two. Session time fell 32%, 18% and 13% on the mock
+server and 19% and 14% in the first two Microsoft Learn workloads. 71% of
+prefetches were used.
+
+The day's first runs showed no gain in session time on the hosted servers.
+The cause was the place the benchmark runs in: a cloud session offers Claude
+Code's Artifact tool, the host builds that tool differently once any mod
+hooks tool calls, and the API then answered each request about 170 ms later.
+The runner now keeps that tool out of both arms and reports the model's time
+to first token for each. Tables, the first runs, and limits are in the
 [benchmark guide](local-learning-benchmark.md#results-after-the-prediction-changes-2026-11-22).

@@ -1014,33 +1014,54 @@ at the same confidence ramp, and the predictor then ranked by expected saving,
 so a 3 ms difference in learned latency decided the order. A transition's
 confidence is now told relative to the likeliest one on offer.
 
+**A session's opening reads start in the order the session makes them.**
+§13.15 ranks openers by evidence, and ties fell to the tool's name and then
+to expected saving. On the mock server the third read of the session was
+started before the second, one call at a time at 1.5 s each, and the second
+then ran for real in every session. Each opener now keeps its place among the
+session's opening reads; evidence picks which start, the places give the
+order.
+
 What the measurement says about the design:
 
 - **Hit rate followed prediction, as §13.31 said it would.** On the mock
   server with 1.5 s calls, the scripted workload went from 84% to 97% of
   calls served, the repeated question from 50% to 95%, and new subjects from
   0% to 50%, with 1 unused prefetch in 55. On Microsoft Learn the three went
-  from 67%, 56% and 0% to 88%, 74% and 32%, and the median session waited
-  82%, 74% and 30% less on tools.
-- **A serial server has a floor.** The scripted mock session waits 4.6 s on
+  from 67%, 56% and 0% to 97%, 53% and 37% (88%, 74% and 32% in an earlier
+  run the same day), and the median session waited 87%, 37% and 13% less on
+  tools.
+- **A serial server has a floor.** The scripted mock session waits 5.0 s on
   tools instead of 12.1 s, at a 97% hit rate. Its eight calls take 1.5 s each
   on a server the agent uses one call at a time, and the model leaves 0.7 s
-  between them: 22 of the 31 served calls were joined in flight. Only calls
+  between them: 24 of the 31 served calls were joined in flight. Only calls
   the agent itself has run together are prefetched together, so a strictly
   sequential agent on a slow server gains the model's time between calls and
   no more.
 - **New subjects are bounded by what a prompt and a result can say.** Where
   the prompt names the subject, the session is served whole after two prompts
   of its kind. Where the model writes its own search query, the search cannot
-  be predicted, and which hits it opens is a judgment: 32% on Microsoft Learn
-  with 46% of prefetches used.
+  be predicted, and which hits it opens is a judgment: 37% on Microsoft Learn
+  with 47% of prefetches used, and no gain in session time.
 - **A fast server is still marginal.** On the Hub a served call takes about
   25 ms instead of about 70 ms, and about one call in twenty-five takes over
-  300 ms whoever makes it. The median session waited 60% less on tools in the
-  scripted workload; the means did not move reliably. Its results are
-  Markdown, which gives the learner nothing to read arguments from, so the
-  other two workloads are served only where the model repeats a call exactly.
+  300 ms whoever makes it. The median session waited 61% less on tools in the
+  scripted workload and its length did not change. Its results are Markdown,
+  which gives the learner nothing to read arguments from, so the other two
+  workloads are served only where the model repeats a call exactly.
+- **The host can cost more than the mod saves, and the benchmark has to look
+  for it.** The first runs of the day showed tool wait down and session time
+  flat. The mod is in no request to the model, yet each request took about
+  170 ms longer in its arm. The benchmark runs in a cloud session, where
+  Claude Code offers an Artifact tool; once any mod hooks tool calls with a
+  matcher the host cannot read ahead, the host builds that tool without one
+  option, the request changes, and the API answers it later. A session with
+  that tool pays this for any mod with tool hooks. The hooks cannot avoid it:
+  a matcher that names tools is read ahead, a regular expression is not, and
+  an MCP server's tool names are not known when the hooks register. The
+  runner now keeps the tool out of both arms and reports the model's time to
+  first token per arm, so a difference of this kind shows in the output.
 
-Verification: 568 unit specs, 14 mod tests under Claude Code 2.1.330 and
+Verification: 574 unit specs, 14 mod tests under Claude Code 2.1.330 and
 2.1.302, `claude plugin validate`. Offline evaluation: recall at 3 0.8599
 (0.8592 before), waste per hit unchanged at 1.85, floor unchanged.

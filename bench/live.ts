@@ -65,6 +65,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   markdownHitTable,
+  markdownModelTable,
   markdownSessionTable,
   markdownTable,
   measureSession,
@@ -95,6 +96,19 @@ import {
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 /** A session that has not finished by now is killed and its pair left out. */
 const SESSION_TIMEOUT_MS = 300_000;
+/**
+ * Tools kept out of both arms, so both send the model the same request.
+ *
+ * Where Claude Code offers its Artifact tool (a cloud session does), it
+ * builds that tool without one of its options as soon as any mod hooks tool
+ * calls. The tool list opens every request, so the `on` arm then sends a
+ * different request from the `off` arm, and the API was measured to answer
+ * such a request about 200 ms later, on every step of every session: a cost
+ * of where the benchmark ran, charged to the mod. Without the tool the two
+ * arms' requests are the same and so is the model's time to first token.
+ * Naming a tool the host does not have is harmless.
+ */
+const HOST_ONLY_TOOLS = ['Artifact'];
 /** The most one session may spend on the model before Claude Code stops it. */
 const SESSION_BUDGET_USD = '1.00';
 
@@ -265,6 +279,7 @@ function runSession(setup: SessionSetup): Promise<StreamLine[]> {
     '--output-format', 'stream-json',
     '--verbose',
     '--max-budget-usd', SESSION_BUDGET_USD,
+    '--disallowedTools', ...HOST_ONLY_TOOLS,
     ...(arm === 'on' && opts.proxy === null ? ['--plugin-dir', opts.mod] : []),
   ];
   return new Promise(done => {
@@ -386,6 +401,7 @@ async function run(opts: Options): Promise<void> {
       startedAt: new Date().toISOString(),
       revision: capture('git', ['rev-parse', 'HEAD']),
       dirtySrc: capture('git', ['status', '--porcelain', '--', 'src', 'hooks']) !== '',
+      disallowedTools: HOST_ONLY_TOOLS,
       mod: opts.proxy ? null : opts.mod === resolve(ROOT) ? 'this checkout' : opts.mod,
       proxy: opts.proxy ? capture(process.execPath, [opts.proxy, '--version']) : null,
       claudeCode: capture(opts.claude, ['--version']),
@@ -472,6 +488,7 @@ function printTables(summaries: Summary[]): void {
   console.log(`\nWarm pairs, per session (medians)\n\n${markdownSessionTable(summaries)}`);
   console.log(`\nWarm pairs, hit rate\n\n${markdownHitTable(summaries)}`);
   console.log(`\nWarm pairs, per call\n\n${markdownTable(summaries)}`);
+  console.log(`\nWarm pairs, the model's side (medians)\n\n${markdownModelTable(summaries)}`);
   console.log(`\nLearning pairs, per session (medians)\n\n${markdownSessionTable(summaries, 'cold')}`);
   console.log(`\nLearning pairs, hit rate\n\n${markdownHitTable(summaries, 'cold')}`);
   console.log(`\nLearning pairs, per call\n\n${markdownTable(summaries, 'cold')}\n`);
