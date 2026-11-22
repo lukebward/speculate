@@ -22,6 +22,7 @@
     "typecheck": "tsc -p tsconfig.core.json && tsc",
     "eval": "tsx eval/eval.ts",
     "bench:live": "tsx bench/live.ts",
+    "bench:replay": "tsx bench/replay.ts",
     "mock-github": "tsx mock/mock-github.ts",
     "prepublishOnly": "npm run typecheck && npm test"
   },

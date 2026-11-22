@@ -322,6 +322,12 @@ interface ArgTemplate {
    * death sentence — see isUnderivable().
    */
   missed: number;
+  /**
+   * An observed value of this argument named a section of a document
+   * (`doc#section`). While none has, a source value that names one is read
+   * as its document: see withoutSection().
+   */
+  sections: boolean;
 }
 
 interface TransitionState {
@@ -603,6 +609,7 @@ export class TransitionLearner {
           underivable: isUnderivable(tpl),
           derived: tpl.derived,
           missed: tpl.missed,
+          ...(tpl.sections ? { sections: true } : {}),
           sources: tpl.sources.map(serializeSource),
         })),
         contexts: [...state.contexts.entries()].map(([key, evidence]) => ({
@@ -1238,7 +1245,7 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
       // that — this one always writes both — and it can only produce a
       // prediction from sources the same file supplied, so it is left as a
       // documented quirk rather than a third code path.
-      templates.set(tpl.name, { sources: [], derived: 0, missed: 1 });
+      templates.set(tpl.name, { sources: [], derived: 0, missed: 1, sections: false });
       continue;
     }
     if (!Array.isArray(tpl.sources)) return null;
@@ -1257,6 +1264,7 @@ function deserializeTransition(raw: unknown, now: number): TransitionState | nul
       sources,
       derived: sources.length === 0 ? 0 : (derived ?? 1),
       missed: missed ?? 0,
+      sections: (tpl as { sections?: unknown }).sections === true,
     });
   }
   const count = Math.min(Math.floor(t.count), MAX_IMPORTED_COUNT);
@@ -1566,15 +1574,16 @@ function seedTemplate(
   now: number,
 ): ArgTemplate {
   const repr = safeStringify(value);
+  const sections = namesSection(value);
   const sources =
     repr === undefined
       ? []
-      : candidateSources(index, value, repr, true).map((s) => newSource(s, now));
+      : candidateSources(index, value, repr, true, !sections).map((s) => newSource(s, now));
   // One sighting explained by exactly one hypothesis is that hypothesis's
   // first solo win; explained by several, it separates none of them.
   if (sources.length === 1) sources[0]!.solo = 1;
   const derived = sources.length > 0 ? 1 : 0;
-  return { sources, derived, missed: priorMisses + (derived === 0 ? 1 : 0) };
+  return { sources, derived, missed: priorMisses + (derived === 0 ? 1 : 0), sections };
 }
 
 /**
@@ -1629,9 +1638,13 @@ function updateTemplates(
       tpl.missed += 1; // a value nothing can represent explains nothing
       continue;
     }
+    // The agent asked for a section itself: from here on this argument's
+    // sources are read exactly as they stand.
+    if (namesSection(value)) tpl.sections = true;
+    const plain = !tpl.sections;
     const matched: ScoredSource[] = [];
     for (const src of tpl.sources) {
-      if (!sourceProduces(src.s, prev, repr)) continue;
+      if (!sourceProduces(src.s, prev, repr, plain)) continue;
       src.score = decayedScore(src.score, src.lastUpdated, now) + 1;
       src.lastUpdated = now;
       src.seen = (src.seen | 1) >>> 0; // this observation, for coherence
@@ -1646,7 +1659,7 @@ function updateTemplates(
 
     const known = new Set(tpl.sources.map((src) => sourceId(src.s)));
     const admitted: ScoredSource[] = [];
-    for (const s of candidateSources(index, value, repr, false)) {
+    for (const s of candidateSources(index, value, repr, false, plain)) {
       if (known.has(sourceId(s))) continue;
       admitted.push(newSource(s, now));
     }
@@ -1780,12 +1793,12 @@ function indexPrevCall(prev: PrevCall): PrevIndex {
  * list positions without retaining every value it walks. Bounds make a huge
  * or hostile result degrade to fewer hypotheses rather than CPU/state blowup.
  */
-function matchingParsedPaths(parsed: unknown, repr: string): ParsedPath[] {
+function matchingParsedPaths(parsed: unknown, repr: string, plain: boolean): ParsedPath[] {
   const out: ParsedPath[] = [];
   let visited = 0;
   const walk = (value: unknown, path: string[], depth: number): void => {
     if (depth > 8 || visited++ >= 1_024 || out.length >= MAX_SOURCES_PER_ARG) return;
-    if (path.length > 0 && safeStringify(value) === repr) out.push({ segs: path, value });
+    if (path.length > 0 && sameValue(value, safeStringify(value), repr, plain)) out.push({ segs: path, value });
     if (Array.isArray(value)) {
       // Keep learned positional hypotheses to the first few rows. Schema
       // cold-start extraction below can materialize arbitrary list items from
@@ -1826,17 +1839,18 @@ function candidateSources(
   value: unknown,
   repr: string,
   withConst: boolean,
+  plain: boolean,
 ): Source[] {
   const sources: Source[] = [];
   // Priority order is baked into seed order: arg-copy, parsed-path, const.
   const room = withConst ? MAX_SOURCES_PER_ARG - 1 : MAX_SOURCES_PER_ARG;
   for (const a of index.args) {
     if (sources.length >= room) break;
-    if (a.repr === repr) sources.push({ kind: 'arg', key: a.key });
+    if (sameValue(a.value, a.repr, repr, plain)) sources.push({ kind: 'arg', key: a.key });
   }
   for (const p of index.paths) {
     if (sources.length >= room) break;
-    if (p.repr === repr) sources.push({ kind: 'parsed', path: p.segs });
+    if (sameValue(p.value, p.repr, repr, plain)) sources.push({ kind: 'parsed', path: p.segs });
   }
   // The targeted deep walk fills a blind spot, it does not multiply aliases
   // for a value the cheap bounded index already found. That distinction keeps
@@ -1844,7 +1858,7 @@ function candidateSources(
   // learning row 17 (or a deeply nested id) when it is the only derivation.
   if (sources.length === 0) {
     const knownPaths = new Set<string>();
-    for (const p of matchingParsedPaths(index.parsed, repr)) {
+    for (const p of matchingParsedPaths(index.parsed, repr, plain)) {
       if (sources.length >= room) break;
       const id = p.segs.join('\x00');
       if (knownPaths.has(id)) continue;
@@ -1877,7 +1891,7 @@ function candidateSources(
       if (visited.has(prior.tool)) continue;
       visited.add(prior.tool);
       if (!prior.available) continue;
-      for (const source of candidateSources(indexPrevCall(prior), value, repr, false)) {
+      for (const source of candidateSources(indexPrevCall(prior), value, repr, false, plain)) {
         if (sources.length >= room) break;
         if (source.kind === 'arg' || source.kind === 'parsed') {
           sources.push({ ...source, sourceTool: prior.tool });
@@ -1958,11 +1972,44 @@ function applyTransform(
   }
 }
 
-/** Would `source`, applied to this instance's previous call, yield `repr`? */
-function sourceProduces(source: Source, prev: PrevCall, repr: string): boolean {
+/**
+ * `doc#section` as `doc`, for a string that reads as a reference to a
+ * document (a path or an address before the `#`); any other value as it is.
+ *
+ * Results name sections, and agents ask for documents: a search hit points
+ * at `guide/install#windows` and the next call fetches `guide/install`. An
+ * argument whose observed values never named a section cannot be matched by a
+ * prediction that names one, so for that argument a source's value is read
+ * without it. One observed value that does name a section turns this off for
+ * the argument (ArgTemplate.sections).
+ */
+function withoutSection(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const at = value.indexOf('#');
+  if (at <= 0) return value;
+  const doc = value.slice(0, at);
+  return /[/.]/.test(doc) ? doc : value;
+}
+
+/** Whether a value names a section of a document, in withoutSection's sense. */
+function namesSection(value: unknown): boolean {
+  return withoutSection(value) !== value;
+}
+
+/** Whether `value` is the one written as `repr`: as it stands or, when `plain`, without its section. */
+function sameValue(value: unknown, ownRepr: string | undefined, repr: string, plain: boolean): boolean {
+  if (ownRepr === repr) return true;
+  return plain && namesSection(value) && safeStringify(withoutSection(value)) === repr;
+}
+
+/**
+ * Would `source`, applied to this instance's previous call, yield `repr`?
+ * `plain`: the argument has never named a section (see withoutSection).
+ */
+function sourceProduces(source: Source, prev: PrevCall, repr: string, plain: boolean): boolean {
   if (source.kind === 'const') return source.repr === repr;
   const resolved = resolveSource(source, prev);
-  return resolved.ok && safeStringify(resolved.value) === repr;
+  return resolved.ok && sameValue(resolved.value, safeStringify(resolved.value), repr, plain);
 }
 
 /** One distinct value an argument could take on the current call. */
@@ -2018,7 +2065,9 @@ function argOptions(tpl: ArgTemplate, call: PrevCall, now: number): ArgOption[] 
     if (rank > 0 && entry.src.solo < MIN_SOURCE_SOLO_WINS) continue;
     const res = resolveSource(entry.src.s, call);
     if (!res.ok) continue;
-    const repr = safeStringify(res.value);
+    // An argument that has never named a section is offered the document.
+    const value = tpl.sections ? res.value : withoutSection(res.value);
+    const repr = safeStringify(value);
     if (repr === undefined) continue; // an unrepresentable value is no answer
     // Hypotheses that agree on this call are one candidate, carrying the
     // best-evidenced one's score: offering the same value twice would spend
@@ -2031,7 +2080,7 @@ function argOptions(tpl: ArgTemplate, call: PrevCall, now: number): ArgOption[] 
       continue;
     }
     const option: ArgOption = {
-      value: res.value,
+      value,
       repr,
       score: entry.score,
       weight: 1,

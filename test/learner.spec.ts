@@ -1499,3 +1499,70 @@ describe('self-transitions', () => {
     expect(preds[0]!.args).toEqual({ q: 'y' }); // arg-copy tracks the current call
   });
 });
+
+describe('a result that names a section, followed as its document', () => {
+  const hits = (...urls: string[]) => ({ results: urls.map((contentUrl) => ({ title: 't', contentUrl })) });
+  const search = (parsed: unknown): CallSpec => ({ tool: 'search', args: { query: 'q' }, parsed });
+  const fetch = (url: string): CallSpec => ({ tool: 'fetch', args: { url } });
+  const predictedUrls = (learner: TransitionLearner, parsed: unknown): unknown[] =>
+    learner.predict(mkCall('docs', 'search', { query: 'q' }, parsed)).map((p) => p.args['url']);
+
+  it('offers the document when the agent has only ever asked for documents', () => {
+    const learner = new TransitionLearner({ now });
+    // The first hit names no section, the second and third do: one hypothesis explains all three.
+    observePair(learner, 'docs', search(hits('https://d.test/a/install', 'https://d.test/a/other')), fetch('https://d.test/a/install'));
+    observePair(learner, 'docs', search(hits('https://d.test/b/setup#windows', 'https://d.test/b/x')), fetch('https://d.test/b/setup'));
+    observePair(learner, 'docs', search(hits('https://d.test/c/guide#intro', 'https://d.test/c/y')), fetch('https://d.test/c/guide'));
+
+    const urls = predictedUrls(learner, hits('https://d.test/new/page#part-2', 'https://d.test/new/z'));
+    expect(urls[0]).toBe('https://d.test/new/page');
+    expect(urls.some((url) => String(url).includes('#'))).toBe(false);
+
+    const template = learner.exportState().transitions.find((x) => x.nextTool === 'fetch')!.templates[0]!;
+    expect(template).not.toHaveProperty('sections');
+    // Every observation was derivable from the first hit, sections or not.
+    expect(template.derived).toBe(3);
+    expect(template.missed).toBe(0);
+  });
+
+  it('offers the value as it stands once the agent has asked for a section', () => {
+    const learner = new TransitionLearner({ now });
+    observePair(learner, 'docs', search(hits('https://d.test/a/install#linux')), fetch('https://d.test/a/install#linux'));
+    observePair(learner, 'docs', search(hits('https://d.test/b/setup#windows')), fetch('https://d.test/b/setup#windows'));
+
+    expect(predictedUrls(learner, hits('https://d.test/new/page#part-2'))).toEqual(['https://d.test/new/page#part-2']);
+    const template = learner.exportState().transitions.find((x) => x.nextTool === 'fetch')!.templates[0]!;
+    expect(template).toMatchObject({ sections: true });
+  });
+
+  it('one request for a section ends the reading for that argument, and the choice survives a reload', () => {
+    const learner = new TransitionLearner({ now });
+    observePair(learner, 'docs', search(hits('https://d.test/a/install')), fetch('https://d.test/a/install'));
+    observePair(learner, 'docs', search(hits('https://d.test/b/setup#windows')), fetch('https://d.test/b/setup'));
+    expect(predictedUrls(learner, hits('https://d.test/n/page#s'))).toEqual(['https://d.test/n/page']);
+
+    observePair(learner, 'docs', search(hits('https://d.test/c/guide#intro')), fetch('https://d.test/c/guide#intro'));
+    expect(predictedUrls(learner, hits('https://d.test/n/page#s'))).toEqual(['https://d.test/n/page#s']);
+
+    const reloaded = new TransitionLearner({ now });
+    reloaded.importState(JSON.parse(JSON.stringify(learner.exportState())));
+    expect(predictedUrls(reloaded, hits('https://d.test/n/page#s'))).toEqual(['https://d.test/n/page#s']);
+  });
+
+  it('leaves alone a value whose # is not a section of a document', () => {
+    const learner = new TransitionLearner({ now });
+    const list = (parsed: unknown): CallSpec => ({ tool: 'list', args: {}, parsed });
+    const get = (id: string): CallSpec => ({ tool: 'get', args: { id } });
+    observePair(learner, 'docs', list({ items: [{ id: 'A-1' }] }), get('A-1'));
+    observePair(learner, 'docs', list({ items: [{ id: 'B-2' }] }), get('B-2'));
+
+    const ids = (parsed: unknown): unknown[] =>
+      learner.predict(mkCall('docs', 'list', {}, parsed)).map((p) => p.args['id']);
+    // A language, an issue reference, a colour: no path or address before the #.
+    expect(ids({ items: [{ id: 'C#' }] })).toEqual(['C#']);
+    expect(ids({ items: [{ id: '#42' }] })).toEqual(['#42']);
+    expect(ids({ items: [{ id: 'tag#fff' }] })).toEqual(['tag#fff']);
+    // A file and a line anchor is a section of a document.
+    expect(ids({ items: [{ id: 'src/app.ts#L10' }] })).toEqual(['src/app.ts']);
+  });
+});

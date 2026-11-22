@@ -242,6 +242,7 @@ export function sanitizeLearnerState(
         underivable: rawTemplate['underivable'] === true,
         ...(finite(rawTemplate['derived']) ? { derived: rawTemplate['derived'] } : {}),
         ...(finite(rawTemplate['missed']) ? { missed: rawTemplate['missed'] } : {}),
+        ...(rawTemplate['sections'] === true ? { sections: true } : {}),
         sources,
       });
     }
