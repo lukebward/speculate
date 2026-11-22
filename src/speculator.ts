@@ -201,7 +201,7 @@ export class Speculator {
     tool: string,
     args: Record<string, unknown>,
     io: SpeculationIo,
-    deadline?: Promise<unknown>,
+    deadline?: Promise<unknown> | (() => Promise<unknown>),
     maxJoinWaitMs?: number,
   ): Promise<Claim | null> {
     if (!this.enabled) return null;
@@ -274,7 +274,9 @@ export class Speculator {
     }
     let result: ToolResult;
     try {
-      result = await before(found.promise, deadline);
+      // Only a join waits, so only a join starts the wait's clock: a call
+      // with nothing in flight costs the host no timer.
+      result = await before(found.promise, typeof deadline === 'function' ? deadline() : deadline);
     } catch (err) {
       // Never surface a speculative failure for a call the agent made: fall
       // through to the real call, and count the waste so feedback learns.

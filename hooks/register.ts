@@ -106,7 +106,8 @@ export const register: Register = on => {
   // When they let it through unchanged, this hook stops it before the tool
   // runs, and the tool.call hook answers with the claimed result. When they
   // deny, ask, or rewrite it, the call goes on exactly as it would have.
-  on('classic.PreToolUse', async ($, e, next) => {
+  // Only an MCP call can be claimed, so only MCP calls pass through here.
+  on('classic.PreToolUse', { tool: /^mcp__/ }, async ($, e, next) => {
     if (claimed.has(e.tool_use_id)) asked.add(e.tool_use_id)
     const decision = await next(e)
     if (!claimed.has(e.tool_use_id)) return decision
@@ -156,13 +157,16 @@ export const register: Register = on => {
       })
     }
 
-    const stop = new AbortController()
+    // The wait for a prefetch still in flight is bounded by a host timer,
+    // started only if there is such a prefetch to wait for.
+    let stop: AbortController | undefined
     const joinWaitMs = Math.max(0, next.budget.remainingMs - JOIN_MARGIN_MS)
-    const deadline = $.clock
-      .sleep(joinWaitMs, { signal: stop.signal })
-      .catch(() => new Promise<never>(() => {}))
+    const deadline = (): Promise<unknown> => {
+      stop = new AbortController()
+      return $.clock.sleep(joinWaitMs, { signal: stop.signal }).catch(() => new Promise<never>(() => {}))
+    }
     let claim = await speculator.serve(server, tool, args, io, deadline, joinWaitMs)
-    stop.abort()
+    stop?.abort()
     // The answer goes back in the form the host recorded this tool's real
     // result in. A prefetch that cannot take that form is not the record.
     const answer = claim ? recordOf(claim.result, speculator.tools.form(server, tool)) : null
