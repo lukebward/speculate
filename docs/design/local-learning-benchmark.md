@@ -93,7 +93,8 @@ What is measured, and from where:
   than the mod. This happened: see
   [the first runs of 2026-11-22](#the-first-runs-of-the-day-and-what-was-wrong-with-them).
   The runner keeps Claude Code's Artifact tool out of both arms for that
-  reason.
+  reason. `--host-tools` leaves it in: use it to check that a mod's hooks do
+  not change the model's requests in a session that has the tool.
 
 A pair is left out of a summary only when one of its sessions failed or got no
 result from any MCP call; the count of excluded pairs is reported.
@@ -108,9 +109,9 @@ SPECULATE_BENCH_LIVE=1 npm run bench:live -- --scenario huggingface --json huggi
 npm run bench:live -- --summarize mslearn.json huggingface.json
 ```
 
-`--pairs`, `--warmup`, `--model`, `--workload`, `--cold`, `--proxy`, `--keep`
-and `--mod` (another checkout to load in the `on` arm) are described at the
-top of `bench/live.ts`. Load the mod from a copy (`--mod`) when the checkout
+`--pairs`, `--warmup`, `--model`, `--workload`, `--cold`, `--proxy`, `--keep`,
+`--host-tools` and `--mod` (another checkout to load in the `on` arm) are
+described at the top of `bench/live.ts`. Load the mod from a copy (`--mod`) when the checkout
 may change during a run: the `on` arm reads the mod's files at the start of
 every session. Claude
 Code must be able to authenticate from the environment, because each arm's
