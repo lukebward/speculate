@@ -14,6 +14,13 @@ interface Fixture {
   readOnly: boolean
   latencyMs: number
   answer: (args: Args) => unknown
+  /**
+   * The tool returns structured content: the host records its result as one
+   * text (the JSON), and hands a mod's own call that text as one block.
+   */
+  structured?: boolean
+  /** What a mod's own call gets back, when it is not that one block. */
+  prefetched?: (args: Args) => Array<{ type: string; text?: string }>
 }
 
 const ISSUES = [
@@ -29,6 +36,19 @@ const TOOLS: Record<string, Fixture> = {
     answer: args => ISSUES.find(issue => issue.number === args.issue_number) ?? { error: 'not found' },
   },
   mcp__gh__create_issue: { readOnly: false, latencyMs: 100, answer: () => ({ number: 43 }) },
+  mcp__gh__search_issues: {
+    readOnly: true,
+    latencyMs: 500,
+    structured: true,
+    answer: args => ({ query: args.q, results: ISSUES }),
+  },
+  mcp__gh__search_code: {
+    readOnly: true,
+    latencyMs: 500,
+    structured: true,
+    answer: args => ({ query: args.q, results: [] }),
+    prefetched: () => [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }],
+  },
   mcp__gh__get_pull_request: {
     readOnly: true,
     latencyMs: 600,
@@ -97,14 +117,15 @@ function world(on: On, options: WorldOptions = {}) {
     if (!fixture) return next(e)
     upstream.push({ tool, args, by })
     const content = await run(tool, args)
-    return (fixture.readOnly
-      ? { result: content, text: content[0]!.text, isReadOnly: true }
-      : { result: content, text: content[0]!.text }) as never
+    const text = content[0]!.text
+    const result = fixture.structured ? text : content
+    return (fixture.readOnly ? { result, text, isReadOnly: true } : { result, text }) as never
   })
   on('mcp.call', async ($, e) => {
     const tool = `mcp__${e.server}__${e.tool}`
     upstream.push({ tool, args: e.args, by: 'plugin' })
-    return { value: { content: await run(tool, e.args), isError: false } }
+    const content = await run(tool, e.args)
+    return { value: { content: TOOLS[tool]?.prefetched?.(e.args) ?? content, isError: false } }
   })
   on('tool.check', async ($, e) => ({ decision: allow.has(e.tool) ? 'allow' : 'ask' }) as const)
   on('tool.list', async () => ({ value: Object.keys(TOOLS).map(name => ({ name, description: name, mcp: true })) }))
@@ -126,14 +147,16 @@ async function call(
   clock: ReturnType<typeof mock.clock>,
   tool: string,
   args: Args,
-): Promise<{ text: string; isError: boolean }> {
+): Promise<{ text: string; isError: boolean; result: unknown }> {
   const pending = $.tool.call({ tool, ...args } as never) as Promise<{ result?: unknown; text?: string; isError?: boolean }>
   await clock.advance(1_000)
   const ran = await pending
   const text = typeof ran.text === 'string'
     ? ran.text
-    : Array.isArray(ran.result) ? String((ran.result[0] as { text?: string })?.text ?? '') : ''
-  return { text, isError: ran.isError === true }
+    : typeof ran.result === 'string'
+      ? ran.result
+      : Array.isArray(ran.result) ? String((ran.result[0] as { text?: string })?.text ?? '') : ''
+  return { text, isError: ran.isError === true, result: ran.result }
 }
 
 async function startSession($: Kit, clock: ReturnType<typeof mock.clock>, prompt = 'Look at the open issues.') {
@@ -176,6 +199,49 @@ test('learns a list-then-get chain and serves the get from a prefetch', { timeou
   // never went upstream. (The chain goes on predicting past the served get.)
   expect(upstream.slice(before).filter(u => u.by === 'model')).toEqual([])
   expect(upstream.some(u => u.by === 'plugin' && u.tool === 'mcp__gh__get_issue')).toBe(true)
+})
+
+const SEARCH = { q: 'is:open label:bug' }
+
+test('serves a tool that returns structured content, in the form the host records it', { timeoutMs: 20_000 }, async ($, on) => {
+  const { clock, upstream } = world(on)
+  await startSession($, clock)
+
+  // A real call shows the host keeps this tool's result as one text.
+  const real = await call($, clock, 'mcp__gh__search_issues', SEARCH)
+  expect(typeof real.result).toBe('string')
+  for (let i = 0; i < 3; i++) {
+    await call($, clock, 'mcp__gh__list_issues', LIST)
+    await call($, clock, 'mcp__gh__search_issues', SEARCH)
+  }
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  expect(upstream.some(u => u.by === 'plugin' && u.tool === 'mcp__gh__search_issues')).toBe(true)
+
+  const before = upstream.length
+  const got = await call($, clock, 'mcp__gh__search_issues', SEARCH)
+  // Served from the prefetch, and as the same text a real call is recorded as.
+  expect(upstream.slice(before).filter(u => u.by === 'model')).toEqual([])
+  expect(got.result).toBe(real.result)
+  expect(JSON.parse(got.text).results).toHaveLength(2)
+})
+
+test('a prefetch that is not the one text the host records is not served', { timeoutMs: 20_000 }, async ($, on) => {
+  const { clock, upstream } = world(on)
+  await startSession($, clock)
+  for (let i = 0; i < 4; i++) {
+    await call($, clock, 'mcp__gh__list_issues', LIST)
+    await call($, clock, 'mcp__gh__search_code', SEARCH)
+  }
+  await call($, clock, 'mcp__gh__list_issues', LIST)
+  await clock.advance(2_000)
+  expect(upstream.some(u => u.by === 'plugin' && u.tool === 'mcp__gh__search_code')).toBe(true)
+
+  const before = upstream.length
+  const got = await call($, clock, 'mcp__gh__search_code', SEARCH)
+  expect(upstream.slice(before).filter(u => u.by === 'model').map(u => u.tool)).toEqual(['mcp__gh__search_code'])
+  expect(typeof got.result).toBe('string')
+  expect(JSON.parse(got.text)).toEqual({ query: SEARCH.q, results: [] })
 })
 
 test('never prefetches a call the person does not allow', { timeoutMs: 20_000 }, async ($, on) => {

@@ -16,6 +16,7 @@ import { addUsage, mcpToolName, parseMcpToolName, Speculator, unservedReason, ty
 import { MemoryCodec } from '../src/persistence.js'
 import { settingsToolWatch } from '../src/hookGuard.js'
 import { mayWriteOutside } from '../src/sideEffects.js'
+import { recordOf } from '../src/tools.js'
 import { formatReport } from '../src/report.js'
 import type { ToolResult } from '../src/types.js'
 
@@ -160,8 +161,15 @@ export const register: Register = on => {
     const deadline = $.clock
       .sleep(joinWaitMs, { signal: stop.signal })
       .catch(() => new Promise<never>(() => {}))
-    const claim = await speculator.serve(server, tool, args, io, deadline, joinWaitMs)
+    let claim = await speculator.serve(server, tool, args, io, deadline, joinWaitMs)
     stop.abort()
+    // The answer goes back in the form the host recorded this tool's real
+    // result in. A prefetch that cannot take that form is not the record.
+    const answer = claim ? recordOf(claim.result, speculator.tools.form(server, tool)) : null
+    if (claim && answer === null) {
+      claim.discard('record-form')
+      claim = null
+    }
 
     const started = speculator.beginReal(server)
     const startedAt = await $.clock.now()
@@ -181,7 +189,7 @@ export const register: Register = on => {
       const { hits, joins, estimatedSavedMs } = speculator.stats()
       $.ui.status(`speculate: ${hits + joins} served, ${(estimatedSavedMs / 1000).toFixed(1)}s saved`)
       save()
-      return { result: claim.result.content }
+      return { result: answer }
     }
     // The hooks had another say, or this session runs no plugin PreToolUse
     // hooks (an organization's managed settings): the tool ran for real. In
@@ -197,7 +205,10 @@ export const register: Register = on => {
       : {
           result: toToolResult(ran.result, ran.text, ran.isError === true),
           isReadOnly: ran.isReadOnly === true,
-          servable: Array.isArray(ran.result) && ran.isError !== true,
+          // Content blocks, or the one text the host keeps for a tool that
+          // returns structured content: either can be handed back as it came.
+          servable: ran.isError !== true && (Array.isArray(ran.result) || typeof ran.result === 'string'),
+          form: typeof ran.result === 'string' ? ('text' as const) : ('blocks' as const),
           isError: ran.isError === true,
           latencyMs: endedAt - startedAt,
         }
@@ -232,6 +243,6 @@ function toToolResult(record: unknown, text: string | undefined, isError: boolea
   const content = Array.isArray(record)
     ? record.filter((block): block is ToolResult['content'][number] =>
         block !== null && typeof block === 'object' && typeof (block as { type?: unknown }).type === 'string')
-    : [{ type: 'text', text: text ?? '' }]
+    : [{ type: 'text', text: typeof record === 'string' ? record : text ?? '' }]
   return { content, isError }
 }

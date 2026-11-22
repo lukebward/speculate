@@ -4,8 +4,9 @@
  * Eligibility is affirmative and learned from the host. A tool is a
  * speculation target only after a real call through Claude Code reported it
  * read-only (`isReadOnly`, which Claude Code sets from the server's own
- * `readOnlyHint`) and answered with plain content blocks a prefetched result
- * can stand in for. Unknown means no. A tool that later reports otherwise
+ * `readOnlyHint`) and answered in a form a prefetched result can stand in
+ * for: content blocks, or the one text the host keeps for a tool that returns
+ * structured content. Unknown means no. A tool that later reports otherwise
  * loses eligibility on that call.
  *
  * The facts persist across sessions so a known read can be prefetched before
@@ -13,13 +14,22 @@
  * shapes only, never argument values or results.
  */
 import type { SecretGuard } from './privacy.js';
-import type { EligibilityDecision } from './types.js';
+import type { EligibilityDecision, ToolResult } from './types.js';
+
+/**
+ * How the host records a tool's result. Most tools answer in content blocks
+ * and are recorded as those. A tool that declares an output schema returns
+ * structured content, and the host records that as one text: its JSON.
+ */
+export type RecordForm = 'blocks' | 'text';
 
 export interface ToolFact {
   /** The host's last verdict: true when the tool ran read-only. */
   readOnly: boolean;
-  /** The real result was content blocks, so a prefetched result can be served. */
+  /** The real result came in a form a prefetched result can be served in. */
   servable: boolean;
+  /** Set when that form is one text; absent for content blocks. */
+  form?: 'text';
   /** Sorted argument key sets seen on real calls, most recent first. */
   shapes: string[];
   lastSeen: number;
@@ -52,7 +62,7 @@ export class ToolKnowledge {
   record(
     server: string,
     tool: string,
-    observed: { readOnly: boolean; servable: boolean; args: Record<string, unknown> },
+    observed: { readOnly: boolean; servable: boolean; form?: RecordForm; args: Record<string, unknown> },
   ): void {
     let byTool = this.facts.get(server);
     if (!byTool) {
@@ -65,6 +75,7 @@ export class ToolKnowledge {
     byTool.set(tool, {
       readOnly: observed.readOnly,
       servable: observed.servable,
+      ...(observed.form === 'text' ? { form: 'text' as const } : {}),
       shapes,
       lastSeen: this.now(),
     });
@@ -73,6 +84,11 @@ export class ToolKnowledge {
 
   fact(server: string, tool: string): ToolFact | undefined {
     return this.facts.get(server)?.get(tool);
+  }
+
+  /** The form the host recorded this tool's last real result in. */
+  form(server: string, tool: string): RecordForm {
+    return this.fact(server, tool)?.form ?? 'blocks';
   }
 
   /** True only when the host affirmatively reported the tool read-only. */
@@ -155,14 +171,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function validFact(value: unknown): ToolFact | null {
   if (!isRecord(value)) return null;
-  const { readOnly, servable, shapes, lastSeen } = value;
+  const { readOnly, servable, form, shapes, lastSeen } = value;
   if (typeof readOnly !== 'boolean' || typeof servable !== 'boolean') return null;
   if (typeof lastSeen !== 'number' || !Number.isFinite(lastSeen) || lastSeen < 0) return null;
   if (!Array.isArray(shapes)) return null;
   const clean = shapes
     .filter((shape): shape is string => typeof shape === 'string' && shape.length <= MAX_LABEL * 4)
     .slice(0, MAX_SHAPES);
-  return { readOnly, servable, shapes: clean, lastSeen };
+  return { readOnly, servable, ...(form === 'text' ? { form: 'text' as const } : {}), shapes: clean, lastSeen };
+}
+
+/**
+ * A prefetched result as the host would have recorded the real one, or null
+ * when it cannot take that form.
+ *
+ * For a tool recorded as one text, the host hands a mod's own call that same
+ * text as its single text block, so a prefetch of anything else is not the
+ * record and is not served.
+ */
+export function recordOf(result: ToolResult, form: RecordForm): ToolResult['content'] | string | null {
+  if (form === 'blocks') return result.content;
+  const [only, ...rest] = result.content;
+  if (only === undefined || rest.length > 0) return null;
+  return only.type === 'text' && typeof only.text === 'string' ? only.text : null;
 }
 
 function validFacts(raw: unknown): ToolFacts {

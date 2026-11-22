@@ -22,7 +22,7 @@ import { LatencyModel } from './latency.js';
 import { CandidateCalibrator } from './calibration.js';
 import { morphologicalPairs } from './priming.js';
 import { canonicalKey } from './keys.js';
-import { ToolKnowledge } from './tools.js';
+import { ToolKnowledge, type RecordForm } from './tools.js';
 import { intentMappings } from './intent.js';
 import type { MemorySnapshot, PersistedState } from './persistence.js';
 import type { SpeculateOptions, StatsReport, ToolResult } from './types.js';
@@ -54,8 +54,10 @@ export interface RealOutcome {
   result: ToolResult;
   /** The host's verdict on this call (`isReadOnly`). */
   isReadOnly: boolean;
-  /** The host's record was content blocks, which a prefetch can stand in for. */
+  /** The host's record came in a form a prefetch can stand in for. */
   servable: boolean;
+  /** That form, when it is not content blocks (tools.ts RecordForm). */
+  form?: RecordForm;
   isError: boolean;
   latencyMs: number;
 }
@@ -351,6 +353,7 @@ export class Speculator {
         // An error result says nothing about the record's shape; keep what a
         // successful call showed.
         servable: outcome.isError ? prior?.servable ?? false : outcome.servable,
+        form: outcome.isError ? prior?.form : outcome.form,
         args,
       });
     }

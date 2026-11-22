@@ -7,6 +7,7 @@ import {
   ToolKnowledge,
   argShape,
   mergeToolFacts,
+  recordOf,
   sanitizeToolFacts,
   type ToolFact,
   type ToolFacts,
@@ -234,5 +235,70 @@ describe('mergeToolFacts', () => {
     const merged = mergeToolFacts(input, undefined);
     merged['s']!['t']!.shapes.push('mutated');
     expect(input['s']!['t']!.shapes).toEqual(['a']);
+  });
+});
+
+describe('record form', () => {
+  it('is content blocks unless the host recorded one text', () => {
+    const k = new ToolKnowledge(() => 5);
+    expect(k.form('s', 'never-seen')).toBe('blocks');
+    k.record('s', 'plain', { readOnly: true, servable: true, form: 'blocks', args: {} });
+    k.record('s', 'structured', { readOnly: true, servable: true, form: 'text', args: {} });
+    expect(k.form('s', 'plain')).toBe('blocks');
+    expect(k.fact('s', 'plain')).not.toHaveProperty('form');
+    expect(k.form('s', 'structured')).toBe('text');
+    expect(k.eligibility('s', 'structured')).toEqual({ eligible: true, reason: 'read-only' });
+  });
+
+  it('follows the tool when its record changes form', () => {
+    const k = new ToolKnowledge(() => 5);
+    k.record('s', 't', { readOnly: true, servable: true, form: 'text', args: {} });
+    k.record('s', 't', { readOnly: true, servable: true, form: 'blocks', args: {} });
+    expect(k.form('s', 't')).toBe('blocks');
+  });
+
+  it('survives export, import, sanitizing and merging, and nothing else passes for it', () => {
+    const k = new ToolKnowledge(() => 5);
+    k.record('s', 'structured', { readOnly: true, servable: true, form: 'text', args: { q: 1 } });
+    const stored = JSON.parse(JSON.stringify(k.exportState())) as ToolFacts;
+    expect(stored['s']!['structured']).toMatchObject({ form: 'text', servable: true });
+
+    const back = new ToolKnowledge(() => 6);
+    back.importState(stored);
+    expect(back.form('s', 'structured')).toBe('text');
+    expect(sanitizeToolFacts(stored, 0, createSecretGuard()).value['s']!['structured']!.form).toBe('text');
+    expect(mergeToolFacts(stored, undefined)['s']!['structured']!.form).toBe('text');
+
+    const odd = new ToolKnowledge(() => 6);
+    odd.importState({ s: { t: { readOnly: true, servable: true, form: 'html', shapes: [], lastSeen: 1 } } });
+    expect(odd.form('s', 't')).toBe('blocks');
+  });
+
+  it('the newer verdict decides the form when two stores merge', () => {
+    const older: ToolFacts = { s: { t: { readOnly: true, servable: true, form: 'text', shapes: ['q'], lastSeen: 1 } } };
+    const newer: ToolFacts = { s: { t: { readOnly: true, servable: true, shapes: ['q'], lastSeen: 2 } } };
+    expect(mergeToolFacts(older, newer)['s']!['t']).not.toHaveProperty('form');
+    expect(mergeToolFacts(newer, older)['s']!['t']).not.toHaveProperty('form');
+  });
+});
+
+describe('recordOf', () => {
+  const text = (value: string) => ({ type: 'text', text: value });
+
+  it('hands content blocks back as they came', () => {
+    const content = [text('a'), { type: 'image', data: 'x' }];
+    expect(recordOf({ content }, 'blocks')).toBe(content);
+  });
+
+  it('hands a text record back as the one text block a prefetch returned', () => {
+    expect(recordOf({ content: [text('{"results":[1]}')] }, 'text')).toBe('{"results":[1]}');
+    expect(recordOf({ content: [text('')] }, 'text')).toBe('');
+  });
+
+  it('refuses a prefetch that is not exactly one text block', () => {
+    expect(recordOf({ content: [] }, 'text')).toBeNull();
+    expect(recordOf({ content: [text('a'), text('b')] }, 'text')).toBeNull();
+    expect(recordOf({ content: [{ type: 'image', data: 'x' }] }, 'text')).toBeNull();
+    expect(recordOf({ content: [{ type: 'text' }] }, 'text')).toBeNull();
   });
 });
