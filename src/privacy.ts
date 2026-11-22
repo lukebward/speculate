@@ -299,6 +299,7 @@ export function sanitizeLearnerState(
       server: rawOpener['server'], tool: rawOpener['tool'], argsRepr: rawOpener['argsRepr'], count: rawOpener['count'],
       ...(finite(rawOpener['score']) ? { score: rawOpener['score'] } : {}),
       lastUpdated: stamp,
+      ...(finite(rawOpener['slot']) && rawOpener['slot'] > 0 ? { slot: rawOpener['slot'] } : {}),
     });
   }
   return { value: { transitions, openers }, removedSensitive, removedExpired, removedInvalid };

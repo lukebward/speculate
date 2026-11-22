@@ -440,7 +440,7 @@ export class Speculator {
         const slots = this.openerSlots.get(server) ?? OPENER_RECORD_LIMIT;
         if (slots > 0) {
           this.openerSlots.set(server, slots - 1);
-          this.learner.recordOpener(server, tool, args);
+          this.learner.recordOpener(server, tool, args, OPENER_RECORD_LIMIT - slots);
         }
       }
       const predictions = this.predictor.observe({

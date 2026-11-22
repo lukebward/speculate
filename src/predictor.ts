@@ -199,7 +199,10 @@ export class Predictor {
     } catch {
       return [];
     }
-    return this.selectBatch(candidates, server);
+    // The learner gives openers in the order the session makes them, and that
+    // is the order to start them in: expected saving says nothing about which
+    // of two reads the agent asks for first.
+    return this.selectBatch(candidates, server, undefined, true, true);
   }
 
   /**
@@ -262,6 +265,7 @@ export class Predictor {
     server: string,
     timestamp?: number,
     trackNextCall = true,
+    inOrder = false,
   ): Prediction[] {
     const byKey = new Map<string, ScoredPrediction>();
     for (const cand of candidates) {
@@ -279,7 +283,9 @@ export class Predictor {
     }
 
     const ranked = [...byKey.values()].sort(
-      (a, b) => this.utility(b) - this.utility(a) || b.score - a.score || a.order - b.order,
+      inOrder
+        ? (a, b) => a.order - b.order
+        : (a, b) => this.utility(b) - this.utility(a) || b.score - a.score || a.order - b.order,
     );
     // Quality telemetry measures the predictor at the shipped rank cap before
     // latency admission. Otherwise a deliberately suppressed 5 ms Git call

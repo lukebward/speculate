@@ -628,6 +628,34 @@ describe('sessionStart', () => {
     expect(h.spec.sessionStart(names, h.io)).toBe(1);
   });
 
+  it('starts a session\'s opening reads in the order the session makes them', async () => {
+    // Three sessions open the same way: the list, an issue, its comments.
+    const COMMENTS = 'get_issue_comments';
+    let memory: unknown;
+    for (let session = 0; session < 2; session++) {
+      const h = harness();
+      if (memory !== undefined) h.spec.importMemory(memory as never);
+      for (const tool of [LIST, GET, COMMENTS]) h.spec.observe(S, tool, ARGS, h.outcome(text({ tool })), h.io);
+      await settle();
+      memory = h.spec.exportMemory();
+    }
+
+    const h = harness();
+    h.spec.importMemory(memory as never);
+    h.io.auto = false;
+    expect(h.spec.sessionStart([LIST, GET, COMMENTS].map((tool) => mcpToolName(S, tool)), h.io)).toBe(3);
+    await settle();
+    // One call at a time on a server the agent has used one call at a time:
+    // the read the session makes first goes first, whatever its name sorts as.
+    expect(h.io.calls.map((c) => c.tool)).toEqual([LIST]);
+    h.io.calls[0]!.resolve();
+    await settle();
+    expect(h.io.calls.map((c) => c.tool)).toEqual([LIST, GET]);
+    h.io.calls[1]!.resolve();
+    await settle();
+    expect(h.io.calls.map((c) => c.tool)).toEqual([LIST, GET, COMMENTS]);
+  });
+
   it('a later server is still started once it appears', () => {
     const h = withOpener();
     expect(h.spec.sessionStart([mcpToolName('linear', 'list_teams')], h.io)).toBe(0);

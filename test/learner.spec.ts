@@ -1883,3 +1883,51 @@ describe('which call follows, told by the call before the last one', () => {
     expect(contexts.every((key) => /^tool:[a-z]+\|before:[a-z]+$/.test(key))).toBe(true);
   });
 });
+
+describe('the order of a session\'s opening reads', () => {
+  const open = (learner: TransitionLearner, calls: Array<[string, Record<string, unknown>]>): void =>
+    calls.forEach(([tool, args], slot) => learner.recordOpener('gh', tool, args, slot));
+  const SESSION: Array<[string, Record<string, unknown>]> = [
+    ['list_issues', { state: 'open' }],
+    ['get_issue', { issue_number: 41 }],
+    ['get_issue_comments', { issue_number: 41 }],
+  ];
+
+  it('is the order the session makes them in, not their names or their scores', () => {
+    const learner = new TransitionLearner({ now });
+    open(learner, SESSION);
+    t += 1_000;
+    open(learner, SESSION);
+    const offered = learner.openerPredictions('gh');
+    expect(offered.map((p) => p.tool)).toEqual(['list_issues', 'get_issue', 'get_issue_comments']);
+    // Told so that a queue kept by confidence starts them in that order.
+    expect(offered[0]!.confidence).toBeGreaterThan(offered[1]!.confidence);
+    expect(offered[1]!.confidence).toBeGreaterThan(offered[2]!.confidence);
+    expect(offered.every((p) => p.confidence > 0.39 && p.confidence <= 0.4)).toBe(true);
+  });
+
+  it('follows the session when its order changes, and survives a reload', () => {
+    const learner = new TransitionLearner({ now });
+    open(learner, SESSION);
+    open(learner, SESSION);
+    // The sessions now read the issue before the list.
+    open(learner, [SESSION[1]!, SESSION[0]!, SESSION[2]!]);
+    const reloaded = new TransitionLearner({ now });
+    reloaded.importState(JSON.parse(JSON.stringify(learner.exportState())));
+    expect(reloaded.openerPredictions('gh').map((p) => p.tool)).toEqual(['get_issue', 'list_issues', 'get_issue_comments']);
+  });
+
+  it('reads a state file with no order as it always did', () => {
+    const learner = new TransitionLearner({ now });
+    learner.importState({
+      transitions: [],
+      openers: [
+        { server: 'gh', tool: 'b_tool', argsRepr: '{}', count: 3 },
+        { server: 'gh', tool: 'a_tool', argsRepr: '{}', count: 3 },
+        { server: 'gh', tool: 'c_tool', argsRepr: '{}', count: 5 },
+      ],
+    });
+    // By evidence, then by name: the order before places were kept.
+    expect(learner.openerPredictions('gh').map((p) => p.tool)).toEqual(['c_tool', 'a_tool', 'b_tool']);
+  });
+});

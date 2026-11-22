@@ -245,6 +245,8 @@ export interface SerializedOpener {
   score?: number;
   /** Clock reading `score` was taken at. Absent pre-v0.13; defaults to now(). */
   lastUpdated?: number;
+  /** Which of the session's opening reads it last was, 0 the first. Absent: 0. */
+  slot?: number;
 }
 
 export interface SerializedLearner {
@@ -394,6 +396,8 @@ interface OpenerState {
   score: number;
   /** Injected-clock time of the last sighting (eviction tie-break). */
   lastUpdated: number;
+  /** Which of the session's opening reads it last was: 0 the first. */
+  slot: number;
 }
 
 interface SchemaPrior {
@@ -577,6 +581,7 @@ export class TransitionLearner {
     server: string,
     tool: string,
     args: Record<string, unknown>,
+    slot = 0,
   ): void {
     try {
       if (server.includes(' ') || tool.includes(' ') || tool.length === 0) return;
@@ -589,6 +594,7 @@ export class TransitionLearner {
         existing.count = Math.min(existing.count + 1, MAX_IMPORTED_OPENER_COUNT);
         existing.score = decayedScore(existing.score, existing.lastUpdated, now) + 1;
         existing.lastUpdated = now;
+        existing.slot = openerSlot(slot);
       } else {
         this.openers.set(key, {
           server,
@@ -597,6 +603,7 @@ export class TransitionLearner {
           count: 1,
           score: 1,
           lastUpdated: now,
+          slot: openerSlot(slot),
         });
         // Evict the weakest opener (lowest decayed score, then stalest),
         // never the one just recorded.
@@ -627,9 +634,19 @@ export class TransitionLearner {
             decayedScore(a.score, a.lastUpdated, now) ||
           (a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0),
       );
+      // Evidence picks WHICH openers; the session's own order says in what
+      // order. A server taken one call at a time answers them one after the
+      // other, and the agent asks for them in the order it always has: the
+      // second read prefetched first leaves the first to run for real.
+      const chosen = mine
+        .slice(0, this.maxPredictionsPerTrigger)
+        .map((o, at) => ({ o, at }))
+        .sort((a, b) => a.o.slot - b.o.slot || a.at - b.at)
+        .map(({ o }) => o);
       const out: Prediction[] = [];
       const toolRanks = new Map<string, number>();
-      for (const o of mine.slice(0, this.maxPredictionsPerTrigger)) {
+      let ceiling = Number.POSITIVE_INFINITY;
+      for (const o of chosen) {
         let args: unknown;
         try {
           args = JSON.parse(o.argsRepr) as unknown;
@@ -639,11 +656,15 @@ export class TransitionLearner {
         if (!isPlainObject(args)) continue;
         const rank = (toolRanks.get(o.tool) ?? 0) + 1;
         toolRanks.set(o.tool, rank);
+        // Told in the order they are meant to start: whoever queues these by
+        // confidence keeps the session's order.
+        const confidence = Math.min(0.5, 0.2 + 0.1 * o.count, ceiling);
+        ceiling = confidence - 0.001;
         out.push({
           server,
           tool: o.tool,
           args: jsonCopyRecord(args),
-          confidence: Math.min(0.5, 0.2 + 0.1 * o.count),
+          confidence,
           ruleId: `opener:${server}:${o.tool}${rank === 1 ? '' : `#${rank}`}`,
           // The longest horizon there is (§6.2): fired before the agent has
           // made a single call, so nothing at all derives it and the wait to
@@ -699,6 +720,7 @@ export class TransitionLearner {
       count: o.count,
       score: o.score,
       lastUpdated: o.lastUpdated,
+      ...(o.slot > 0 ? { slot: o.slot } : {}),
     }));
     return openers.length > 0 ? { transitions, openers } : { transitions };
   }
@@ -1307,7 +1329,13 @@ function deserializeOpener(raw: unknown, now: number): OpenerState | null {
     count,
     score: importedScore(o.score, count, MAX_IMPORTED_OPENER_COUNT),
     lastUpdated: importedStamp(o.lastUpdated, now),
+    slot: openerSlot(o.slot),
   };
+}
+
+/** An opener's place among a session's opening reads: a small whole number, 0 when unknown. */
+function openerSlot(raw: unknown): number {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 && raw <= 16 ? raw : 0;
 }
 
 /**
