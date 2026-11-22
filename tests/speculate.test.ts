@@ -149,6 +149,7 @@ function world(on: On, options: WorldOptions = {}) {
   on('session.end', async ($, e) => e as never)
   on('prompt.submit', async ($, e) => ({ text: e.text }))
   on('command.register', async () => ({ value: undefined }) as never)
+  on('turn.complete', async () => ({ text: '' }) as never)
 
   return { clock, upstream, store, allow, configured }
 }
@@ -190,6 +191,17 @@ async function settled($: Kit, tool: string, args: Args, response: unknown = 'ok
     tool_response: response,
     tool_use_id: `toolu_${++toolUse}`,
     duration_ms: 5,
+  })
+}
+
+/** The model's turn ends: what a session raises once it has answered. */
+async function endTurn($: Kit) {
+  await ($ as never as { turn: { complete(e: object): Promise<unknown> } }).turn.complete({
+    answer: 'done',
+    durationMs: 3_000,
+    isAborted: false,
+    turnId: 'turn-1',
+    reason: 'answer',
   })
 }
 
@@ -463,31 +475,42 @@ test('prefetches reads together on a server the agent itself ran reads together 
 
 const FIRST = { timeoutMs: 20_000 }
 
-test('names the tools a session offers, and leaves the start to the module the host reloads', FIRST, async ($, on) => {
+test('names the tools a session offers once its first turn ends', FIRST, async ($, on) => {
   const { clock, upstream, configured } = world(on)
   await startSession($, clock)
-
-  // No names yet: the first prompt asks the host to keep this session's MCP
-  // tools in the plugin's option, sorted, under the plugin's own key.
-  expect(configured).toEqual([{ key: 'speculate.tools', value: NAMED.tools }])
-  // The host reloads a module whose option changed. This one starts nothing.
-  expect(upstream).toEqual([])
-
-  // Where the host did not reload it after all, it asks once and goes on:
-  // every call is watched, and the chain is learned and served as ever.
-  await startSession($, clock, 'And now?')
-  expect(configured).toHaveLength(1)
+  // No names yet, so it is asked about every call, and the turn runs as ever:
+  // the chain is learned and served.
+  expect(configured).toEqual([])
   await learnChain($, clock)
   await call($, clock, 'mcp__gh__list_issues', LIST)
   await clock.advance(2_000)
   const before = upstream.length
   await call($, clock, 'mcp__gh__get_issue', GET_42)
   expect(upstream.slice(before).filter(u => u.by === 'model')).toEqual([])
+  expect((await $.command.run({ command: 'speculate' } as never)).text).toContain('Watching every tool call until the list')
+
+  // The turn ends: it asks the host to keep this session's MCP tools in the
+  // plugin's option, sorted, under the plugin's own key. The host reloads a
+  // module whose option changed.
+  await endTurn($)
+  expect(configured).toEqual([{ key: 'speculate.tools', value: NAMED.tools }])
+  // Where the host did not reload it after all, it does not ask again.
+  await endTurn($)
+  await endTurn($)
+  expect(configured).toHaveLength(1)
+})
+
+test('has nothing to keep once it names every tool the session offers', WATCHING, async ($, on) => {
+  const { clock, configured } = world(on)
+  await startSession($, clock)
+  await endTurn($)
+  expect(configured).toEqual([])
 })
 
 test('works with every call watched where the settings do not keep the names', FIRST, async ($, on) => {
   const { clock, upstream, configured } = world(on, { refuseConfig: true })
   await startSession($, clock)
+  await endTurn($)
   expect(configured).toHaveLength(1)
   await learnChain($, clock)
   await call($, clock, 'mcp__gh__list_issues', LIST)
@@ -508,25 +531,20 @@ test('works with every call watched where the settings do not keep the names', F
   await call($, clock, 'mcp__gh__get_issue', GET_42)
   expect(upstream.slice(before).filter(u => u.by === 'model').map(u => u.tool)).toEqual(['mcp__gh__get_issue'])
 
-  // It asks once a session, not at every prompt, and says how it is running.
-  await startSession($, clock, 'And now?')
+  // It asks once, not at the end of every turn, and says how it is running.
+  await endTurn($)
   expect(configured).toHaveLength(1)
   const report = await $.command.run({ command: 'speculate' } as never)
   expect(report.text).toContain('your settings did not keep the list of MCP tools')
 })
 
-test('hears of a tool it does not name once it has run, and names it at the next prompt', {
+test('hears of a tool it does not name once it has run, and names it when the turn ends', {
   timeoutMs: 20_000,
   options: { tools: Object.keys(TOOLS).filter(name => name !== 'mcp__gh__get_pull_request').sort().join(',') },
 }, async ($, on) => {
   const { clock, upstream, configured } = world(on)
   const PULL = { owner: 'acme', repo: 'api', pull_number: 3 }
-  await startSession($, clock)
-  // A server connected since the names were kept: nothing to change until it shows.
-  expect(configured).toEqual([{ key: 'speculate.tools', value: NAMED.tools }])
-  configured.length = 0
-
-  // (The host did not reload the module here, so it runs on with the names it has.)
+  // A server connected since the names were kept offers a tool the hook does not name.
   await startSession($, clock, 'Read pull request 3.')
   for (let i = 0; i < 3; i++) {
     const got = await call($, clock, 'mcp__gh__get_pull_request', PULL)
@@ -539,6 +557,10 @@ test('hears of a tool it does not name once it has run, and names it at the next
   expect(report.text).toContain(`Known MCP tools: 1, prefetchable reads: 0`)
   expect(report.text).toContain(`Watching ${Object.keys(TOOLS).length - 1} MCP tools by name.`)
   expect(upstream.filter(u => u.by === 'plugin')).toEqual([])
+
+  // The turn ends, and it names the tool with the rest.
+  await endTurn($)
+  expect(configured).toEqual([{ key: 'speculate.tools', value: NAMED.tools }])
 })
 
 test('/speculate reports, and /speculate forget clears what was learned', WATCHING, async ($, on) => {

@@ -1,11 +1,12 @@
 /**
  * The speculator: Speculate's read path inside Claude Code (DESIGN.md §3.1).
  *
- * Claude Code runs every MCP call through the mod's `tool.call` hook, which
- * asks the speculator two things. Before the call, `serve`: is there a
- * prefetched result for exactly this call that the host still allows? After
- * a real call, `observe`: learn from it, invalidate on anything not
- * read-only, and prefetch what is likely next. `prompt` and `sessionStart`
+ * Claude Code asks the mod's `tool.run` hook about a call it has allowed and
+ * is about to run, and the hook asks the speculator two things. Before the
+ * tool runs, `serve`: is there a prefetched result for exactly this call?
+ * After a real call, `observe`: learn from it, invalidate on anything not
+ * read-only, and prefetch what is likely next. A call the hook was not asked
+ * about reaches `observeLate` once it has run. `prompt` and `sessionStart`
  * add the two earlier signals: the person's own words, and the session's
  * habitual opening reads.
  *
@@ -68,8 +69,9 @@ export interface RealOutcome {
 
 /**
  * A prefetched result claimed for one real call. Nothing is counted until
- * the call's PreToolUse hooks have had their say: `commit` when the result
- * answered the call, `discard` when the call ran through the host anyway.
+ * the hook knows what became of it: `commit` when the result answered the
+ * call, `discard` when it could not (it does not take the form the host
+ * records this tool's results in) and the tool ran after all.
  */
 export interface Claim {
   result: ToolResult;

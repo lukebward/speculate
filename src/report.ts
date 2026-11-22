@@ -57,7 +57,7 @@ export function formatReport(
     lines.push(
       watch.all === 'refused'
         ? '  Watching every tool call: your settings did not keep the list of MCP tools. Speculate works, but Claude Code treats a mod that may answer any tool with more caution.'
-        : '  Watching every tool call until the list of MCP tools is saved, at the next prompt.',
+        : '  Watching every tool call until the list of MCP tools is saved, when this turn ends.',
     );
   }
   const suppressed = Object.entries(session.suppressed).sort((a, b) => b[1] - a[1]).slice(0, 5);

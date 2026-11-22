@@ -13,10 +13,11 @@
  * treats a tool that a mod may answer with more caution, so a hook on every
  * tool call costs every tool something (src/watch.ts). The names are whatever
  * servers the person has connected, which nothing knows when hooks register,
- * so the module keeps them itself in its one option, and Claude Code reloads
- * it when that option changes. Until there are names it is asked about every
- * call. A call it is not asked about before it runs (a built-in tool, an MCP
- * tool it does not name yet) it hears of afterwards, at PostToolUse.
+ * so the module keeps them itself in its one option, written when a turn
+ * ends, and Claude Code reloads it when that option changes. Until there are
+ * names it is asked about every call. A call it is not asked about before it
+ * runs (a built-in tool, an MCP tool it does not name yet) it hears of
+ * afterwards, at PostToolUse.
  *
  * Every host operation is spelled here, inside a hook or a function a hook
  * hands `$` to, and reaches the speculator as a closure (SpeculationIo). The
@@ -68,9 +69,11 @@ export const register: Register = (on, options) => {
   const names = new Set(watched)
   /** With names, the hook is for those tools alone. With none yet, it is asked about every call. */
   const named = watched.length > 0
-  /** The value this instance asked the host to keep, when the host did not reload it for it. */
+  /** The MCP tools this session offers, as of its last prompt. */
+  let offered: string[] = []
+  /** The value this instance asked the host to keep; the host reloads the module when it does. */
   let asked: string | null = null
-  /** The host's settings would not keep the names: every call stays watched, and no more is asked. */
+  /** The host's settings would not keep the names, or kept them and did not reload: no more is asked. */
   let refused = false
 
   // Module state starts over on a reload; learned memory comes back from the
@@ -136,32 +139,38 @@ export const register: Register = (on, options) => {
     if (!speculator.enabled || 'drop' in result) return result
     // MCP servers are connected by the first prompt, and the model is about
     // to spend seconds reading it.
-    const offered = (await $.tool.list()).filter(info => info.mcp).map(info => info.name)
-
-    // Name the tools this session offers, where the hook does not name them
-    // yet. The host keeps the names in this plugin's option and reloads the
-    // module with them, in time for the model's first call.
-    const wanted = refused ? null : mergeWatched(watched, offered)
-    if (wanted !== null) {
-      const value = watchOption(wanted)
-      if (value !== asked) {
-        await persist(hostStore($))
-        asked = value
-        const kept = await $.config
-          .set({ key: `${PLUGIN}.${WATCH_OPTION}`, value })
-          .then(set => !('deny' in set && set.deny !== undefined), () => false)
-        // Kept: the module that replaces this one starts from here.
-        if (kept) return result
-      }
-      // Not kept, or kept and this module is still the one running: go on as it is.
-      refused = true
-    }
-
+    offered = (await $.tool.list()).filter(info => info.mcp).map(info => info.name)
     const io = hostIo($)
     speculator.sessionStart(offered, io)
     speculator.prompt(e.text, await $.session.cwd(), io, await $.clock.now())
     return result
   }).catch(($, e, next) => next(e))
+
+  // The turn is over, and nothing is in flight that a reload would lose: name
+  // the tools this session offers, where the hook does not name them yet. The
+  // host keeps the names in this plugin's option and reloads the module with
+  // them. (Asked at the prompt instead, the reload would cost the module that
+  // prompt: what it names, and the reads it starts.)
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    // A subagent's turn ends inside the turn that spawned it, which goes on.
+    if (!speculator.enabled || refused || e.agentId !== undefined) return result
+    const wanted = mergeWatched(watched, offered)
+    if (wanted === null) return result
+    const value = watchOption(wanted)
+    // Kept before, and this module is still the one running: it will not be reloaded.
+    if (value === asked) {
+      refused = true
+      return result
+    }
+    await persist(hostStore($))
+    asked = value
+    const kept = await $.config
+      .set({ key: `${PLUGIN}.${WATCH_OPTION}`, value })
+      .then(set => !('deny' in set && set.deny !== undefined), () => false)
+    if (!kept) refused = true
+    return result
+  })
 
   // A call the host has allowed, about to run. Only the model's own calls are
   // served or learned from: a plugin's call (this mod's prefetches through

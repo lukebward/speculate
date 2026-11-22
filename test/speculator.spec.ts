@@ -82,7 +82,7 @@ function harness(options: Partial<SpeculateOptions> = {}) {
     ...over,
   });
 
-  /** One real call through the host as the tool.call hook drives it. */
+  /** One real call through the host as the tool.run hook drives it. */
   async function real(
     tool: string,
     args: Record<string, unknown> = ARGS,
@@ -309,7 +309,7 @@ describe('serve', () => {
     const h = harness();
     await h.warm();
     const claim = await h.spec.serve(S, GET, ARGS, h.io);
-    claim!.discard('tool-hooks');
+    claim!.discard('record-form');
     const s = stats(h.spec);
     expect(s.hits).toBe(0);
     expect(s.invalidated).toBe(1);
